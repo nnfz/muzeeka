@@ -1,7 +1,85 @@
 .app-layout {
   display: flex;
+  flex-direction: column;
   height: 100vh;
   width: 100vw;
   background: var(--bg-deep);
   overflow: hidden;
+}
+
+.app-header {
+  display: flex;
+  align-items: center;
+  background: transparent;
+  gap: 12px;
+  height: var(--header-height);
+  padding: 0 8px;
+  flex-shrink: 0;
+  z-index: 3;
+}
+
+.app-header-spacer {
+  flex: 1;
+  min-width: 0;
+  align-self: stretch;
+}
+
+.search-container {
+  position: relative;
+  width: 220px;
+  flex-shrink: 0;
+}
+
+.search-icon {
+  position: absolute;
+  left: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--text-muted);
+  pointer-events: none;
+}
+
+.search-input {
+  width: 100%;
+  height: 32px;
+  padding: 0 32px 0 34px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-primary);
+  font-size: 12px;
+  font-family: var(--font-family);
+  outline: none;
+  transition: border-color var(--transition-fast), background var(--transition-fast);
+}
+
+.search-input:focus {
+  border-color: var(--border-accent);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.search-input::placeholder {
+  color: var(--text-muted);
+}
+
+.search-clear {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--text-muted);
+  padding: 4px;
+  border-radius: var(--radius-sm);
+  transition: color var(--transition-fast);
+}
+
+.search-clear:hover {
+  color: var(--text-primary);
+}
+
+.app-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  padding-bottom: calc(var(--transport-height) + var(--margin));
 }

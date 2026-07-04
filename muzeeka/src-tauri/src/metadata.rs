@@ -1,6 +1,7 @@
 // Audio metadata reader — ID3, Vorbis, FLAC, MP4, etc. via lofty.
 
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use image::imageops::FilterType;
+use image::{GenericImageView, ImageFormat};
 use lofty::file::{AudioFile, TaggedFile, TaggedFileExt};
 use lofty::picture::PictureType;
 use lofty::read_from_path;
@@ -17,6 +18,7 @@ const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp", "gif"];
 const COVER_NAMES: &[&str] = &[
     "cover", "folder", "front", "album", "albumart", "artwork", "albumartsmall",
 ];
+const THUMB_SIZE: u32 = 96;
 
 #[derive(Debug, Clone, Default)]
 pub struct TrackMetadata {
@@ -127,43 +129,78 @@ fn pick_cover_picture(tag: &Tag) -> Option<(&[u8], String)> {
     Some((data, mime))
 }
 
-fn cache_cover_bytes(audio_path: &Path, data: &[u8], mime: &str, suffix: &str) -> Option<String> {
+fn thumb_cache_path(audio_path: &Path, suffix: &str) -> Option<PathBuf> {
     let cache_dir = COVER_CACHE_DIR.get()?;
-    let cache_path = cache_dir.join(format!(
-        "{}-{}.{}",
-        cache_key(audio_path),
-        suffix,
-        mime_to_ext(mime)
-    ));
+    Some(
+        cache_dir.join(format!(
+            "{}-{}-thumb.jpg",
+            cache_key(audio_path),
+            suffix
+        )),
+    )
+}
+
+fn write_thumbnail_from_bytes(data: &[u8], dest: &Path) -> bool {
+    let image = match image::load_from_memory(data) {
+        Ok(image) => image,
+        Err(_) => return false,
+    };
+    write_thumbnail_from_image(&image, dest)
+}
+
+fn write_thumbnail_from_file(source: &Path, dest: &Path) -> bool {
+    let image = match image::open(source) {
+        Ok(image) => image,
+        Err(_) => return false,
+    };
+    write_thumbnail_from_image(&image, dest)
+}
+
+fn write_thumbnail_from_image(image: &image::DynamicImage, dest: &Path) -> bool {
+    let (width, height) = image.dimensions();
+    let thumb = if width <= THUMB_SIZE && height <= THUMB_SIZE {
+        image.clone()
+    } else {
+        image.resize(THUMB_SIZE, THUMB_SIZE, FilterType::Triangle)
+    };
+
+    thumb.save_with_format(dest, ImageFormat::Jpeg).is_ok()
+}
+
+fn cache_cover_bytes(audio_path: &Path, data: &[u8], mime: &str, suffix: &str) -> Option<String> {
+    let cache_path = thumb_cache_path(audio_path, suffix)?;
 
     if !cache_path.exists() {
-        fs::write(&cache_path, data).ok()?;
+        if !write_thumbnail_from_bytes(data, &cache_path) {
+            let fallback = COVER_CACHE_DIR.get()?.join(format!(
+                "{}-{}.{}",
+                cache_key(audio_path),
+                suffix,
+                mime_to_ext(mime)
+            ));
+            fs::write(&fallback, data).ok()?;
+            return Some(fallback.to_string_lossy().to_string());
+        }
     }
 
     Some(cache_path.to_string_lossy().to_string())
 }
 
 fn cache_cover_file(audio_path: &Path, source: &Path) -> Option<String> {
-    let cache_dir = COVER_CACHE_DIR.get()?;
-    let ext = source
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
-        .filter(|e| IMAGE_EXTENSIONS.contains(&e.as_str()))
-        .unwrap_or_else(|| "jpg".to_string());
-
-    let cache_path = cache_dir.join(format!("{}-nearby.{ext}", cache_key(audio_path)));
+    let cache_path = thumb_cache_path(audio_path, "nearby")?;
 
     let source_modified = fs::metadata(source).and_then(|m| m.modified()).ok();
     let cache_modified = fs::metadata(&cache_path).and_then(|m| m.modified()).ok();
-    let needs_copy = !cache_path.exists()
+    let needs_refresh = !cache_path.exists()
         || match (source_modified, cache_modified) {
             (Some(src), Some(cache)) => src > cache,
             _ => true,
         };
 
-    if needs_copy {
-        fs::copy(source, &cache_path).ok()?;
+    if needs_refresh {
+        if !write_thumbnail_from_file(source, &cache_path) {
+            fs::copy(source, &cache_path).ok()?;
+        }
     }
 
     Some(cache_path.to_string_lossy().to_string())
@@ -235,43 +272,6 @@ pub fn read_metadata(path: &Path, file_name: &str) -> TrackMetadata {
     }
 
     meta
-}
-
-fn path_within_dir(file_path: &Path, dir_path: &Path) -> Option<PathBuf> {
-    let canonical = fs::canonicalize(file_path).ok()?;
-    let dir = fs::canonicalize(dir_path).ok()?;
-
-    #[cfg(windows)]
-    {
-        let file = canonical.to_string_lossy().to_lowercase();
-        let root = dir.to_string_lossy().to_lowercase();
-        if file.starts_with(&root) {
-            return Some(canonical);
-        }
-        return None;
-    }
-
-    #[cfg(not(windows))]
-    {
-        if canonical.starts_with(&dir) {
-            return Some(canonical);
-        }
-        None
-    }
-}
-
-/// Read a cached cover and return a data URL safe for `<img src>`.
-pub fn cover_data_url(path: &str) -> Option<String> {
-    let cache_dir = COVER_CACHE_DIR.get()?;
-    let resolved = path_within_dir(Path::new(path), cache_dir)?;
-    let data = fs::read(&resolved).ok()?;
-    if data.is_empty() {
-        return None;
-    }
-
-    let mime = guess_mime(&data);
-    let encoded = STANDARD.encode(data);
-    Some(format!("data:{mime};base64,{encoded}"))
 }
 
 #[cfg(test)]

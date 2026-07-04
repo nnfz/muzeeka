@@ -75,7 +75,6 @@ pub fn run() {
             commands::library_scan,
             commands::library_scan_paths,
             commands::library_fetch_metadata,
-            commands::library_cover_data_url,
             commands::playlists_load,
             commands::playlists_save,
         ])

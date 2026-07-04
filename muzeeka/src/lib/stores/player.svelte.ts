@@ -1,3 +1,4 @@
+import { prefetchCoverPaths } from '$lib/coverCache';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 
@@ -52,6 +53,10 @@ let currentFileName = $state<string | null>(null);
 let playlists = $state<Playlist[]>([]);
 let activePlaylistId = $state<string | null>(null);
 let currentTrackIndex = $state(-1);
+let shuffleEnabled = $state(false);
+let shuffleOrder = $state<number[]>([]);
+let shufflePosition = $state(0);
+let repeatMode = $state<'off' | 'all' | 'one'>('off');
 let isInitialized = $state(false);
 let persistReady = $state(false);
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -71,8 +76,18 @@ let progress = $derived(duration > 0 ? position / duration : 0);
 let hasTrack = $derived(currentFile !== null);
 let hasTracks = $derived(tracks.length > 0);
 let hasPlaylists = $derived(playlists.length > 0);
-let hasNext = $derived(currentTrackIndex < tracks.length - 1);
-let hasPrev = $derived(currentTrackIndex > 0);
+let hasNext = $derived(
+  repeatMode === 'all' && hasTracks
+    ? true
+    : shuffleEnabled
+      ? shufflePosition < shuffleOrder.length - 1
+      : currentTrackIndex < tracks.length - 1
+);
+let hasPrev = $derived(
+  shuffleEnabled
+    ? shufflePosition > 0 || position > 3
+    : currentTrackIndex > 0
+);
 
 let formattedPosition = $derived(formatTime(position));
 let formattedDuration = $derived(formatTime(duration));
@@ -136,6 +151,7 @@ async function enrichTrackMetadata() {
   try {
     const enriched = await invoke<MusicFile[]>('library_fetch_metadata', { paths });
     mergeMetadataIntoPlaylists(enriched);
+    prefetchCoverPaths(enriched.map((track) => track.cover_path));
     scheduleSave();
   } catch (e) {
     console.error('Failed to fetch track metadata:', e);
@@ -144,6 +160,53 @@ async function enrichTrackMetadata() {
 
 function syncTrackIndex() {
   currentTrackIndex = tracks.findIndex((t) => t.path === currentFile);
+  syncShufflePosition();
+}
+
+function shuffleIndices(count: number): number[] {
+  const indices = Array.from({ length: count }, (_, i) => i);
+  for (let i = indices.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [indices[i], indices[j]] = [indices[j], indices[i]];
+  }
+  return indices;
+}
+
+function rebuildShuffleOrder(keepCurrent = true) {
+  if (tracks.length === 0) {
+    shuffleOrder = [];
+    shufflePosition = 0;
+    return;
+  }
+
+  const indices = shuffleIndices(tracks.length);
+  if (keepCurrent && currentTrackIndex >= 0) {
+    const at = indices.indexOf(currentTrackIndex);
+    if (at > 0) {
+      indices.splice(at, 1);
+      indices.unshift(currentTrackIndex);
+    }
+  }
+
+  shuffleOrder = indices;
+  shufflePosition = 0;
+}
+
+function syncShufflePosition() {
+  if (!shuffleEnabled || currentTrackIndex < 0) return;
+  const pos = shuffleOrder.indexOf(currentTrackIndex);
+  if (pos >= 0) shufflePosition = pos;
+}
+
+function ensureShuffleOrder() {
+  if (!shuffleEnabled) return;
+  if (
+    shuffleOrder.length !== tracks.length ||
+    shuffleOrder.some((index) => index < 0 || index >= tracks.length)
+  ) {
+    rebuildShuffleOrder(currentTrackIndex >= 0);
+    syncShufflePosition();
+  }
 }
 
 function nextPlaylistName(): string {
@@ -184,6 +247,9 @@ async function loadPlaylists() {
       volume = data.volume;
     }
     syncTrackIndex();
+    prefetchCoverPaths(
+      playlists.flatMap((playlist) => playlist.tracks.map((track) => track.cover_path))
+    );
     void enrichTrackMetadata();
   } catch (e) {
     console.error('Failed to load playlists:', e);
@@ -211,6 +277,10 @@ function selectPlaylist(id: string) {
   if (!playlists.some((p) => p.id === id)) return;
   activePlaylistId = id;
   syncTrackIndex();
+  if (shuffleEnabled) rebuildShuffleOrder(currentTrackIndex >= 0);
+  prefetchCoverPaths(
+    playlists.find((p) => p.id === id)?.tracks.map((track) => track.cover_path) ?? []
+  );
   scheduleSave();
 }
 
@@ -245,7 +315,10 @@ function mergeTracksIntoPlaylist(playlistId: string, files: MusicFile[]): number
     p.id === playlistId ? { ...p, tracks: [...p.tracks, ...newTracks] } : p
   );
   syncTrackIndex();
+  if (shuffleEnabled) rebuildShuffleOrder(currentTrackIndex >= 0);
+  prefetchCoverPaths(newTracks.map((track) => track.cover_path));
   scheduleSave();
+  void enrichTrackMetadata();
   return newTracks.length;
 }
 
@@ -314,6 +387,7 @@ async function play(filePath: string) {
       ? trackDisplayTitle(file)
       : filePath.split(/[\\/]/).pop()?.replace(/\.[^/.]+$/, '') ?? null;
     currentTrackIndex = tracks.findIndex((t) => t.path === filePath);
+    syncShufflePosition();
     isPlaying = true;
     isPaused = false;
   } catch (e) {
@@ -352,23 +426,29 @@ async function stop() {
   }
 }
 
+let seekGuardUntil = 0;
+let seekGuardPosition = 0;
+
 async function seek(pos: number) {
+  const clamped = Math.max(0, duration > 0 ? Math.min(pos, duration) : pos);
+  position = clamped;
+  seekGuardPosition = clamped;
+  seekGuardUntil = Date.now() + 400;
+
   try {
-    await invoke('player_seek', { position: pos });
-    position = pos;
+    await invoke('player_seek', { position: clamped });
   } catch (e) {
+    seekGuardUntil = 0;
     console.error('Failed to seek:', e);
   }
 }
 
-async function setVolume(vol: number) {
-  try {
-    volume = Math.max(0, Math.min(1, vol));
-    await invoke('player_set_volume', { volume: volume });
-    scheduleSave();
-  } catch (e) {
+function setVolume(vol: number) {
+  volume = Math.max(0, Math.min(1, vol));
+  void invoke('player_set_volume', { volume }).catch((e) => {
     console.error('Failed to set volume:', e);
-  }
+  });
+  scheduleSave();
 }
 
 async function togglePlayPause() {
@@ -384,25 +464,80 @@ async function togglePlayPause() {
 }
 
 async function nextTrack() {
-  if (hasNext) {
+  if (shuffleEnabled) {
+    ensureShuffleOrder();
+    if (shufflePosition < shuffleOrder.length - 1) {
+      shufflePosition += 1;
+    } else if (repeatMode === 'all') {
+      shufflePosition = 0;
+    } else {
+      return;
+    }
+    await play(tracks[shuffleOrder[shufflePosition]].path);
+    return;
+  }
+
+  if (currentTrackIndex < tracks.length - 1) {
     await play(tracks[currentTrackIndex + 1].path);
+  } else if (repeatMode === 'all' && tracks.length > 0) {
+    await play(tracks[0].path);
   }
 }
 
 async function prevTrack() {
   if (position > 3 && currentFile) {
     await seek(0);
-  } else if (hasPrev) {
+    return;
+  }
+
+  if (shuffleEnabled) {
+    ensureShuffleOrder();
+    if (shufflePosition > 0) {
+      shufflePosition -= 1;
+      await play(tracks[shuffleOrder[shufflePosition]].path);
+    }
+    return;
+  }
+
+  if (hasPrev) {
     await play(tracks[currentTrackIndex - 1].path);
   }
+}
+
+function toggleShuffle() {
+  shuffleEnabled = !shuffleEnabled;
+  if (shuffleEnabled) {
+    rebuildShuffleOrder(currentTrackIndex >= 0);
+    syncShufflePosition();
+  } else {
+    shuffleOrder = [];
+    shufflePosition = 0;
+  }
+}
+
+function toggleRepeat() {
+  repeatMode = repeatMode === 'off' ? 'all' : repeatMode === 'all' ? 'one' : 'off';
 }
 
 // --- Event Listeners ---
 
 function setupListeners() {
   listen<{ position: number; duration: number }>('player:position', (event) => {
-    position = event.payload.position;
+    const newPos = event.payload.position;
     duration = event.payload.duration;
+
+    if (
+      Date.now() < seekGuardUntil &&
+      Math.abs(newPos - seekGuardPosition) > 1
+    ) {
+      return;
+    }
+
+    if (Date.now() >= seekGuardUntil) {
+      seekGuardUntil = 0;
+    }
+
+    position = newPos;
   });
 
   listen<{ is_playing: boolean; is_paused: boolean }>('player:state', (event) => {
@@ -414,8 +549,28 @@ function setupListeners() {
     isPlaying = false;
     isPaused = false;
     position = 0;
-    if (hasNext) {
-      nextTrack();
+
+    if (repeatMode === 'one' && currentFile) {
+      void play(currentFile);
+      return;
+    }
+
+    if (shuffleEnabled) {
+      ensureShuffleOrder();
+      if (shufflePosition < shuffleOrder.length - 1) {
+        shufflePosition += 1;
+        void play(tracks[shuffleOrder[shufflePosition]].path);
+      } else if (repeatMode === 'all') {
+        shufflePosition = 0;
+        void play(tracks[shuffleOrder[0]].path);
+      }
+      return;
+    }
+
+    if (currentTrackIndex < tracks.length - 1) {
+      void nextTrack();
+    } else if (repeatMode === 'all' && tracks.length > 0) {
+      void play(tracks[0].path);
     }
   });
 }
@@ -440,6 +595,8 @@ export function createPlayerStore() {
     get activePlaylistId() { return activePlaylistId; },
     get activePlaylist() { return activePlaylist; },
     get currentTrackIndex() { return currentTrackIndex; },
+    get shuffleEnabled() { return shuffleEnabled; },
+    get repeatMode() { return repeatMode; },
 
     // Derived (getters)
     get progress() { return progress; },
@@ -470,6 +627,8 @@ export function createPlayerStore() {
     togglePlayPause,
     nextTrack,
     prevTrack,
+    toggleShuffle,
+    toggleRepeat,
     init,
   };
 }

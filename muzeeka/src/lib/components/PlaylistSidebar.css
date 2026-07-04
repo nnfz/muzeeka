@@ -1,19 +1,21 @@
 .sidebar {
   position: relative;
   z-index: 2;
-  height: 100%;
+  min-height: 0;
   display: flex;
+  border-radius: var(--radius-sm);
   flex-direction: column;
-  border-right: 1px solid var(--border-subtle);
   overflow: visible;
   flex-shrink: 0;
+  margin: var(--margin);
+  margin-top: 0;
 }
 
 .resize-handle {
   position: absolute;
   top: 0;
-  right: -5px;
-  width: 10px;
+  right: -7px;
+  width: 5px;
   height: 100%;
   padding: 0;
   border: none;
@@ -33,13 +35,12 @@
   height: 100%;
   border-radius: var(--radius-full);
   background: transparent;
-  transition: background var(--transition-fast), box-shadow var(--transition-fast);
+  transition: var(--transition-fast);
 }
 
 .resize-handle:hover::after,
 .sidebar.resizing .resize-handle::after {
-  background: var(--accent);
-  box-shadow: 0 0 8px var(--accent-glow);
+  background: var(--accent-glow);
 }
 
 .sidebar-header {
@@ -47,20 +48,17 @@
   align-items: center;
   justify-content: space-between;
   padding: 8px 8px 8px 12px;
-  position: relative;
-  min-height: 50px;
   flex-shrink: 0;
 }
 
-.header-drag {
-  position: absolute;
-  inset: 0;
-  z-index: 0;
+.section-label {
+  font-size: 14px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  color: var(--text-secondary);
 }
 
 .icon-btn {
-  position: relative;
-  z-index: 1;
   width: 34px;
   height: 34px;
   border-radius: var(--radius-sm);
@@ -74,13 +72,6 @@
 .icon-btn:hover {
   color: var(--accent);
   background: var(--accent-soft);
-}
-
-.section-label {
-  font-size: 14px;
-  font-weight: 500;
-  letter-spacing: 0.08em;
-  color: var(--text-secondary);
 }
 
 .playlist-list {

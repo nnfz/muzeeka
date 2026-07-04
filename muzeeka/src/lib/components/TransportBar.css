@@ -6,8 +6,9 @@
   height: var(--transport-height);
   display: flex;
   flex-direction: column;
+  border-radius: var(--radius-sm);
+  margin: var(--margin);
   z-index: 100;
-  border-top: 1px solid var(--border-subtle);
 }
 
 .transport-progress {
@@ -67,7 +68,7 @@
 .transport-controls {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
 }
 
 .control-btn {
@@ -93,6 +94,33 @@
 .control-btn:disabled {
   opacity: 0.3;
   cursor: default;
+}
+
+.mode-btn {
+  width: 34px;
+  height: 34px;
+}
+
+.mode-btn.active {
+  color: var(--accent);
+}
+
+.mode-btn.active:hover:not(:disabled) {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.mode-btn.repeat-one {
+  position: relative;
+}
+
+.repeat-one-badge {
+  position: absolute;
+  right: 5px;
+  bottom: 5px;
+  font-size: 8px;
+  font-weight: 700;
+  line-height: 1;
 }
 
 .play-btn {

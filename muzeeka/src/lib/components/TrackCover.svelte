@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { invoke } from '@tauri-apps/api/core';
+  import { getCoverSrc } from '$lib/coverCache';
   import type { MusicFile } from '$lib/stores/player.svelte';
 
 
@@ -9,52 +9,12 @@
 
   let { track }: Props = $props();
 
-  const coverCache = new Map<string, string>();
-
-  let src = $state<string | null>(null);
-
-  async function resolveCover(path: string): Promise<string | null> {
-    const cached = coverCache.get(path);
-    if (cached) return cached;
-
-    const url = await invoke<string | null>('library_cover_data_url', { path });
-    if (url) coverCache.set(path, url);
-    return url;
-  }
-
-  $effect(() => {
-    const path = track?.cover_path?.trim();
-    if (!path) {
-      src = null;
-      return;
-    }
-
-    const cached = coverCache.get(path);
-    if (cached) {
-      src = cached;
-      return;
-    }
-
-    let cancelled = false;
-    src = null;
-
-    resolveCover(path)
-      .then((url) => {
-        if (!cancelled) src = url;
-      })
-      .catch(() => {
-        if (!cancelled) src = null;
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  });
+  let src = $derived(getCoverSrc(track?.cover_path));
 </script>
 
 <div class="track-cover">
   {#if src}
-    <img {src} alt="" loading="lazy" />
+    <img {src} alt="" loading="lazy" decoding="async" />
   {:else}
     <div class="cover-placeholder" aria-hidden="true">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">

@@ -12,6 +12,7 @@
 
   let isDragging = $state(false);
   let dragValue = $state(0);
+  let pendingValue = $state<number | null>(null);
   let trackEl = $state<HTMLDivElement | null>(null);
   let previousVolume = $state(0.8);
 
@@ -20,19 +21,32 @@
     isMuted ? 'muted' : player.volume > 0.5 ? 'high' : player.volume > 0 ? 'low' : 'muted'
   );
 
+  let activeRatio = $derived(
+    isDragging
+      ? dragValue
+      : pendingValue !== null
+        ? pendingValue
+        : variant === 'progress'
+          ? player.progress
+          : player.volume
+  );
+
   let displayTime = $derived(
-    isDragging && variant === 'progress'
-      ? formatTime(dragValue * player.duration)
+    variant === 'progress'
+      ? formatTime(activeRatio * player.duration)
       : player.formattedPosition
   );
 
-  let fillRatio = $derived(
-    variant === 'progress'
-      ? isDragging
-        ? dragValue
-        : player.progress
-      : player.volume
-  );
+  let fillRatio = $derived(activeRatio);
+
+  $effect(() => {
+    if (pendingValue === null) return;
+
+    const actual = variant === 'progress' ? player.progress : player.volume;
+    if (Math.abs(actual - pendingValue) < 0.01) {
+      pendingValue = null;
+    }
+  });
 
   function formatTime(seconds: number): string {
     const mins = Math.floor(seconds / 60);
@@ -40,36 +54,61 @@
     return `${mins}:${secs.toString().padStart(2, '0')}`;
   }
 
-  function updateDragValue(e: MouseEvent) {
+  function updateDragValue(clientX: number) {
     if (!trackEl) return;
     const rect = trackEl.getBoundingClientRect();
-    dragValue = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    if (rect.width <= 0) return;
+    dragValue = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+  }
 
-    if (variant === 'volume') {
-      player.setVolume(dragValue);
+  function applyVolumeDrag() {
+    player.setVolume(dragValue);
+  }
+
+  function commitDragValue() {
+    if (variant === 'progress') {
+      pendingValue = dragValue;
+      void player.seek(dragValue * player.duration);
+    } else {
+      applyVolumeDrag();
     }
   }
 
-  function handleTrackMouseDown(e: MouseEvent) {
+  function handleTrackPointerDown(e: PointerEvent) {
+    if (e.button !== 0) return;
+
     isDragging = true;
-    updateDragValue(e);
-    window.addEventListener('mousemove', handleTrackMouseMove);
-    window.addEventListener('mouseup', handleTrackMouseUp);
+    updateDragValue(e.clientX);
+    if (variant === 'volume') applyVolumeDrag();
+    trackEl?.setPointerCapture(e.pointerId);
+    e.preventDefault();
   }
 
-  function handleTrackMouseMove(e: MouseEvent) {
-    if (isDragging) {
-      updateDragValue(e);
-    }
+  function handleTrackPointerMove(e: PointerEvent) {
+    if (!isDragging) return;
+    updateDragValue(e.clientX);
+    if (variant === 'volume') applyVolumeDrag();
   }
 
-  function handleTrackMouseUp() {
-    if (isDragging && variant === 'progress') {
-      player.seek(dragValue * player.duration);
-    }
+  function handleTrackPointerUp(e: PointerEvent) {
+    if (!isDragging) return;
+
+    updateDragValue(e.clientX);
+    commitDragValue();
     isDragging = false;
-    window.removeEventListener('mousemove', handleTrackMouseMove);
-    window.removeEventListener('mouseup', handleTrackMouseUp);
+
+    if (trackEl?.hasPointerCapture(e.pointerId)) {
+      trackEl.releasePointerCapture(e.pointerId);
+    }
+  }
+
+  function handleTrackPointerCancel(e: PointerEvent) {
+    if (!isDragging) return;
+    isDragging = false;
+
+    if (trackEl?.hasPointerCapture(e.pointerId)) {
+      trackEl.releasePointerCapture(e.pointerId);
+    }
   }
 
   function toggleMute() {
@@ -141,8 +180,13 @@
 
   <div
     class="slider-track"
+    class:is-dragging={isDragging}
+    class:is-pending={pendingValue !== null}
     bind:this={trackEl}
-    onmousedown={handleTrackMouseDown}
+    onpointerdown={handleTrackPointerDown}
+    onpointermove={handleTrackPointerMove}
+    onpointerup={handleTrackPointerUp}
+    onpointercancel={handleTrackPointerCancel}
     role="slider"
     tabindex="0"
     aria-label={variant === 'progress' ? 'Seek position' : 'Volume'}

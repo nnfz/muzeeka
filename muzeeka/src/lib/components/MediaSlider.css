@@ -34,6 +34,7 @@
   cursor: pointer;
   position: relative;
   transition: height var(--transition-fast);
+  touch-action: none;
 }
 
 .media-slider.progress .slider-track {
@@ -73,6 +74,11 @@
   max-width: 100%;
 }
 
+.slider-track.is-dragging .slider-fill,
+.slider-track.is-pending .slider-fill {
+  transition: none;
+}
+
 .slider-thumb {
   position: absolute;
   right: -6px;
@@ -86,6 +92,12 @@
   box-shadow: 0 0 8px var(--accent-glow), 0 2px 4px rgba(0, 0, 0, 0.3);
   opacity: 0;
   transition: opacity var(--transition-fast), transform var(--transition-fast);
+}
+
+.slider-track.is-dragging .slider-thumb {
+  transition: none;
+  opacity: 1;
+  transform: scale(1.2);
 }
 
 .volume-btn {

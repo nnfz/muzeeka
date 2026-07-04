@@ -5,7 +5,6 @@
 use tauri::{AppHandle, State};
 
 use crate::library;
-use crate::metadata;
 use crate::player::{Player, PlayerStateSnapshot};
 use crate::playlists::{self, PlaylistsData};
 
@@ -84,12 +83,6 @@ pub fn library_scan_paths(paths: Vec<String>) -> Result<Vec<library::MusicFile>,
 #[tauri::command]
 pub fn library_fetch_metadata(paths: Vec<String>) -> Result<Vec<library::MusicFile>, String> {
     library::fetch_metadata(&paths)
-}
-
-/// Return cover art as a data URL for webview display.
-#[tauri::command]
-pub fn library_cover_data_url(path: String) -> Option<String> {
-    metadata::cover_data_url(&path)
 }
 
 // ── Playlist persistence ──────────────────────────────────────────────────────
