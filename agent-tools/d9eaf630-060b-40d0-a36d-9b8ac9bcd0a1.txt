@@ -1,0 +1,173 @@
+
+muzeeka\build\_app\immutable\nodes\2.CiR2_Y0H.js:2:\r\f�\v\uFEFF`];function Na(t,e,i){var a=t==null?"":""+t;if(i){for(v
+ar r of Object.keys(i))if(i[r])a=a?a+" "+r:r;else if(a.length)for(var s=r.length,o=0;(o=a.indexOf(r,o))>=0;){var c=o+s;
+(o===0||Xt.includes(a[o-1]))&&(c===a.length||Xt.includes(a[c]))?a=(o===0?"":a.substring(0,o))+a.substring(c+1):o=c}}ret
+urn a===""?null:a}function Jt(t,e=!1){var i=e?" !important;":";",a="";for(var r of Object.keys(t)){var s=t[r];s!=null&&
+s!==""&&(a+=" "+r+": "+s+i)}return a}function kt(t){return t[0]!=="-"||t[1]!=="-"?t.toLowerCase():t}function Ia(t,e){if
+(e){var i="",a,r;if(Array.isArray(e)?(a=e[0],r=e[1]):a=e,t){t=String(t).replaceAll(/\s*\/\*.*?\*\/\s*/g,"").trim();var 
+s=!1,o=0,c=!1,f=[];a&&f.push(...Object.keys(a).map(kt)),r&&f.push(...Object.keys(r).map(kt));var h=0,D=-1;const S=t.len
+gth;for(var y=0;y<S;y++){var b=t[y];if(c?b==="/"&&t[y-1]==="*"&&(c=!1):s?s===b&&(s=!1):b==="/"&&t[y+1]==="*"?c=!0:b==='
+"'||b==="'"?s=b:b==="("?o++:b===")"&&o--,!c&&s===!1&&o===0){if(b===":"&&D===-1)D=y;else if(b===";"||y===S-1){if(D!==-1)
+{var A=kt(t.substring(h,D).trim());if(!f.includes(A)){b!==";"&&y++;var v=t.substring(h,y).trim();i+=" "+v+";"}}h=y+1,D=
+-1}}}}return a&&(i+=Jt(a)),r&&(i+=Jt(r,!0)),i=i.trim(),i===""?null:i}return t==null?null:String(t)}function Ke(t,e,i,a,
+r,s){var o=t[jt];if(re||o!==i||o===void 0){var c=Na(i,a,s);(!re||c!==t.getAttribute("class"))&&(c==null?t.removeAttribu
+te("class"):t.className=c),t[jt]=i}else if(s&&r!==s)for(var f in s){var h=!!s[f];(r==null||h!==!!r[f])&&t.classList.tog
+gle(f,h)}return s}function xt(t,e={},i,a){for(var r in i){var s=i[r];e[r]!==s&&(i[r]==null?t.style.removeProperty(r):t.
+style.setProperty(r,s,a))}}function Ye(t,e,i,a){var r=t[qt];if(re||r!==e){var s=Ia(e,a);(!re||s!==t.getAttribute("style
+"))&&(s==null?t.removeAttribute("style"):t.style.cssText=s),t[qt]=e}else a&&(Array.isArray(a)?(xt(t,i==null?void 0:i[0]
+,a[0]),xt(t,i==null?void 0:i[1],a[1],"important")):xt(t,i,a));return a}const La=Symbol("is custom element"),Oa=Symbol("
+is html"),Ra=di?"link":"LINK",Wa=di?"progress":"PROGRESS";function Ot(t){if(re){var e=!1,i=()=>{if(!e){if(e=!0,t.hasAtt
+ribute("value")){var a=t.value;j(t,"value",null),t.value=a}if(t.hasAttribute("checked")){var r=t.checked;j(t,"checked",
+null),t.checked=r}}};t[da]=i,ha(i),va()}}function Fa(t,e){var i=fi(t);i.value===(i.value=e??void 0)||t.value===e&&(e!==
+0||t.nodeName!==Wa)||(t.value=e??"")}function j(t,e,i,a){var r=fi(t);re&&(r[e]=t.getAttribute(e),e==="src"||e==="srcset
+"||e==="href"&&t.nodeName===Ra)||r[e]!==(r[e]=i)&&(e==="loading"&&(t[pa]=i),i==null?t.removeAttribute(e):typeof i!="str
+ing"&&Ba(t).includes(e)?t[e]=i:t.setAttribute(e,i))}function fi(t){var e;return t[e=sa]??(t[e]={[La]:t.nodeName.include
+s("-"),[Oa]:t.namespaceURI===oa})}var Zt=new Map;function Ba(t){var e=t.getAttribute("is")||t.nodeName,i=Zt.get(e);if(i
+)return i;Zt.set(e,i=[]);for(var a,r=t,s=Element.prototype;s!==r;){a=ca(r);for(var o in a)a[o].set&&o!=="innerHTML"&&o!
+=="textContent"&&o!=="innerText"&&i.push(o);r=ua(r)}return i}function wi(t,e,i=e){var a=new WeakSet;fa(t,"input",async 
+r=>{var s=r?t.defaultValue:t.value;if(s=Dt(t)?Et(s):s,i(s),Ie!==null&&a.add(Ie),await wa(),s!==(s=e())){var o=t.selecti
+onStart,c=t.selectionEnd,f=t.value.length;if(t.value=s??"",c!==null){var h=t.value.length;o===c&&c===f&&h>f?(t.selectio
+nStart=h,t.selectionEnd=h):(t.selectionStart=o,t.selectionEnd=Math.min(c,h))}}}),(re&&t.defaultValue!==t.value||Lt(e)==
+null&&t.value)&&(i(Dt(t)?Et(t.value):t.value),Ie!==null&&a.add(Ie)),ga(()=>{var r=e();if(t===document.activeElement){va
+r s=Ie;if(a.has(s))return}Dt(t)&&r===Et(t.value)||t.type==="date"&&!r&&!t.value||r!==t.value&&(t.value=r??"")})}functio
+n Dt(t){var e=t.type;return e==="number"||e==="range"}function Et(t){return t===""?null:+t}function Ha(t=!1){const e=ya
+,i=e.l.u;if(!i)return;let a=()=>ma(e.s);if(t){let r=0,s={};const o=ka(()=>{let c=!1;const f=e.s;for(const h in f)f[h]!=
+=s[h]&&(s[h]=f[h],c=!0);return c&&r++,r});a=()=>n(o)}i.b.length&&ba(()=>{Qt(e,a),Kt(i.b)}),qe(()=>{const r=Lt(()=>i.m.m
+ap(_a));return()=>{for(const s of r)typeof s=="function"&&s()}}),i.a.length&&qe(()=>{Qt(e,a),Kt(i.a)})}function Qt(t,e)
+{if(t.l.s)for(const i of t.l.s)n(i);e()}xa();function Va(t,e,i,a){if(typeof e=="function"?t!==e||!a:!e.has(t))throw new
+ TypeError("Cannot read private member from an object whose class did not declare it");return i==="m"?a:i==="a"?a.call(
+t):a?a.value:e.get(t)}function Ua(t,e,i,a,r){if(typeof e=="function"?t!==e||!0:!e.has(t))throw new TypeError("Cannot wr
+ite private member to an object whose class did not declare it");return e.set(t,i),i}var ot;const se="__TAURI_TO_IPC_KE
+Y__";function $a(t,e=!1){return window.__TAURI_INTERNALS__.transformCallback(t,e)}async function l(t,e={},i){return win
+dow.__TAURI_INTERNALS__.invoke(t,e,i)}class Ga{get rid(){return Va(this,ot,"f")}constructor(e){ot.set(this,void 0),Ua(t
+his,ot,e)}async close(){return l("plugin:resources|close",{rid:this.rid})}}ot=new WeakMap;function ja(){return!!(global
+This||window).isTauri}var G;(function(t){t.WINDOW_RESIZED="tauri://resize",t.WINDOW_MOVED="tauri://move",t.WINDOW_CLOSE
+_REQUESTED="tauri://close-requested",t.WINDOW_DESTROYED="tauri://destroyed",t.WINDOW_FOCUS="tauri://focus",t.WINDOW_BLU
+R="tauri://blur",t.WINDOW_SCALE_FACTOR_CHANGED="tauri://scale-change",t.WINDOW_THEME_CHANGED="tauri://theme-changed",t.
+WINDOW_CREATED="tauri://window-created",t.WINDOW_SUSPENDED="tauri://suspended",t.WINDOW_RESUMED="tauri://resumed",t.WEB
+VIEW_CREATED="tauri://webview-created",t.DRAG_ENTER="tauri://drag-enter",t.DRAG_OVER="tauri://drag-over",t.DRAG_DROP="t
+auri://drag-drop",t.DRAG_LEAVE="tauri://drag-leave"})(G||(G={}));async function gi(t,e){window.__TAURI_EVENT_PLUGIN_INT
+ERNALS__.unregisterListener(t,e),await l("plugin:event|unlisten",{event:t,eventId:e})}async function Te(t,e,i){var a;co
+nst r=typeof(i==null?void 0:i.target)=="string"?{kind:"AnyLabel",label:i.target}:(a=i==null?void 0:i.target)!==null&&a!
+==void 0?a:{kind:"Any"};return l("plugin:event|listen",{event:t,target:r,handler:$a(e)}).then(s=>async()=>gi(t,s))}asyn
+c function Rt(t,e,i){return Te(t,a=>{gi(t,a.id),e(a)},i)}async function yi(t,e){await l("plugin:event|emit",{event:t,pa
+yload:e})}async function bi(t,e,i){await l("plugin:event|emit_to",{target:typeof t=="string"?{kind:"AnyLabel",label:t}:
+t,event:e,payload:i})}let me=L(!1),ke=L(!1),xe=L(0),Xe=L(0),Re=L(.8),Ze=L(null),_i=L(null),V=L(Ge([])),Z=L(null),we=L(-
+1),ei=L(!1),mi=L(!1),st=null,de=$(()=>{var t;return n(Z)?((t=n(V).find(e=>e.id===n(Z)))==null?void 0:t.tracks)??[]:[]})
+,qa=$(()=>n(V).find(t=>t.id===n(Z))??null),Ka=$(()=>n(Xe)>0?n(xe)/n(Xe):0),Ya=$(()=>n(Ze)!==null),zt=$(()=>n(de).length
+>0),Xa=$(()=>n(V).length>0),Wt=$(()=>n(we)<n(de).length-1),ki=$(()=>n(we)>0),Ja=$(()=>xi(n(xe))),Za=$(()=>xi(n(Xe)));fu
+nction xi(t){const e=Math.floor(t/60),i=Math.floor(t%60);return`${e}:${i.toString().padStart(2,"0")}`}function ut(t){va
+r i;const e=(i=t.title)==null?void 0:i.trim();return e||t.file_name.replace(/\.[^/.]+$/,"")}function ct(t){var e;return
+((e=t.artist)==null?void 0:e.trim())||"Unknown Artist"}function Qa(t){return[ut(t),ct(t),t.album,t.file_name,t.genre].f
+ilter(Boolean).join(" ").toLowerCase()}function en(t){return t.duration_secs==null||!t.cover_path}function tn(t){if(t.l
+ength===0)return;const e=new Map(t.map(i=>[i.path,i]));u(V,n(V).map(i=>({...i,tracks:i.tracks.map(a=>e.get(a.path)??a)}
+)),!0)}async function an(){const t=[...new Set(n(V).flatMap(e=>e.tracks.filter(en).map(i=>i.path)))];if(t.length!==0)tr
+y{const e=await l("library_fetch_metadata",{paths:t});tn(e),Se()}catch(e){console.error("Failed to fetch track metadata
+:",e)}}function Qe(){u(we,n(de).findIndex(t=>t.path===n(Ze)),!0)}function nn(){let t=n(V).length+1,e=`Playlist ${t}`;fo
+r(;n(V).some(i=>i.name===e);)t+=1,e=`Playlist ${t}`;return e}function rn(){return{playlists:n(V),active_playlist_id:n(Z
+),volume:n(Re)}}function Se(){n(mi)&&(st&&clearTimeout(st),st=setTimeout(()=>{st=null,l("playlists_save",{data:rn()}).c
+atch(t=>{console.error("Failed to save playlists:",t)})},250))}async function ln(){var t;try{const e=await l("playlists
+_load");u(V,e.playlists??[],!0),u(Z,e.active_playlist_id??((t=n(V)[0])==null?void 0:t.id)??null,!0),typeof e.volume=="n
+umber"&&u(Re,e.volume,!0),Qe(),an()}catch(e){console.error("Failed to load playlists:",e)}finally{u(mi,!0)}}function Di
+(t){const e={id:crypto.randomUUID(),name:(t==null?void 0:t.trim())||nn(),tracks:[]};return u(V,[...n(V),e],!0),u(Z,e.id
+,!0),Qe(),Se(),e.id}function sn(t){n(V).some(e=>e.id===t)&&(u(Z,t,!0),Qe(),Se())}function on(t){var i;const e=n(V).filt
+er(a=>a.id!==t);u(V,e,!0),n(Z)===t&&(u(Z,((i=e[0])==null?void 0:i.id)??null,!0),Qe(),Se())}function un(t,e){const i=e.t
+rim();i&&(u(V,n(V).map(a=>a.id===t?{...a,name:i}:a),!0),Se())}function Ei(t,e){var r;const i=new Set(((r=n(V).find(s=>s
+.id===t))==null?void 0:r.tracks.map(s=>s.path))??[]),a=e.filter(s=>!i.has(s.path));return a.length===0?0:(u(V,n(V).map(
+s=>s.id===t?{...s,tracks:[...s.tracks,...a]}:s),!0),Qe(),Se(),a.length)}function Ai(t,e){if(t.length===0)return 0;let i
+=e??n(Z);if(!i)i=Di();else if(!n(V).some(a=>a.id===i))return 0;return u(Z,i,!0),Ei(i,t)}async function cn(t){if(n(Z))tr
+y{const e=await l("library_scan",{directory:t});Ei(n(Z),e)}catch(e){console.error("Failed to add folder to playlist:",e
+)}}async function dn(t,e){const i=t.map(a=>a.trim()).filter(Boolean);if(i.length===0)return 0;try{const a=await l("libr
+ary_scan_paths",{paths:i});return Ai(a,e)}catch(a){return console.error("Failed to add dropped paths:",a),0}}async func
+tion Ti(){if(!n(ei))try{await l("player_init"),await l("player_set_volume",{volume:n(Re)}),u(ei,!0)}catch(t){console.er
+ror("Failed to initialize player:",t)}}async function hn(){await ln(),await Ti()}async function Je(t){var e;try{await l
+("player_play",{filePath:t}),u(Ze,t,!0);const i=n(de).find(a=>a.path===t);u(
+
+... (output truncated) ...
+
+ill="currentColor"><path d="M6
+ 18l8.5-6L6 6v12zM16 6v12h2V6h-2z"></path></svg></button> <button class="control-btn" aria-label="Stop"><svg width="16"
+ height="16" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"></rect></svg></but
+ton></div> <div class="transport-right"><!></div></div></div>');function ar(t,e){ge(e,!0);const i=Me();let a=$(()=>i.tr
+acks.find(p=>p.path===i.currentFile)??null);var r=ir(),s=k(r),o=k(s);jn(o,{}),x(s);var c=C(s,2),f=k(c),h=k(f);{var D=p=
+>{var d=Qn(),_=ht(d);zi(_,{get track(){return n(a)},size:40});var w=C(_,2),E=k(w),W=k(E,!0);x(E);var z=C(E,2);{var F=q=
+>{var Q=Zn(),De=k(Q,!0);x(Q),X(ee=>le(De,ee),[()=>ct(n(a))]),P(q,Q)};Y(z,q=>{n(a)&&q(F)})}x(w),X(()=>le(W,i.currentFile
+Name??"")),P(p,d)};Y(h,p=>{i.hasTrack&&p(D)})}x(f);var y=C(f,2),b=k(y),A=C(b,2);let v;var S=k(A);{var O=p=>{var d=er();
+P(p,d)},N=p=>{var d=tr();P(p,d)};Y(S,p=>{i.isPlaying?p(O):p(N,-1)})}x(A);var I=C(A,2),m=C(I,2);x(y);var T=C(y,2),g=k(T)
+;Jn(g,{}),x(T),x(c),x(r),X(()=>{b.disabled=!i.hasTrack,v=Ke(A,1,"control-btn play-btn",null,v,{playing:i.isPlaying}),A.
+disabled=!i.hasTracks,j(A,"aria-label",i.isPlaying?"Pause":"Play"),I.disabled=!i.hasNext,m.disabled=!i.hasTrack}),H("cl
+ick",b,()=>i.prevTrack()),H("click",A,()=>i.togglePlayPause()),H("click",I,()=>i.nextTrack()),H("click",m,()=>i.stop())
+,P(t,r),ye()}We(["click"]);function Li(){return new Ft(vt(),window.__TAURI_INTERNALS__.metadata.currentWebview.label,{s
+kip:!0})}async function li(){return l("plugin:webview|get_all_webviews").then(t=>t.map(e=>new Ft(new pt(e.windowLabel,{
+skip:!0}),e.label,{skip:!0})))}const St=["tauri://created","tauri://error"];class Ft{constructor(e,i,a){this.window=e,t
+his.label=i,this.listeners=Object.create(null),a!=null&&a.skip||l("plugin:webview|create_webview",{windowLabel:e.label,
+options:{...a,label:i}}).then(async()=>this.emit("tauri://created")).catch(async r=>this.emit("tauri://error",r))}stati
+c async getByLabel(e){var i;return(i=(await li()).find(a=>a.label===e))!==null&&i!==void 0?i:null}static getCurrent(){r
+eturn Li()}static async getAll(){return li()}async listen(e,i){return this._handleTauriEvent(e,i)?()=>{const a=this.lis
+teners[e];a.splice(a.indexOf(i),1)}:Te(e,i,{target:{kind:"Webview",label:this.label}})}async once(e,i){return this._han
+dleTauriEvent(e,i)?()=>{const a=this.listeners[e];a.splice(a.indexOf(i),1)}:Rt(e,i,{target:{kind:"Webview",label:this.l
+abel}})}async emit(e,i){if(St.includes(e)){for(const a of this.listeners[e]||[])a({event:e,id:-1,payload:i});return}ret
+urn yi(e,i)}async emitTo(e,i,a){if(St.includes(i)){for(const r of this.listeners[i]||[])r({event:i,id:-1,payload:a});re
+turn}return bi(e,i,a)}_handleTauriEvent(e,i){return St.includes(e)?(e in this.listeners?this.listeners[e].push(i):this.
+listeners[e]=[i],!0):!1}async position(){return l("plugin:webview|webview_position",{label:this.label}).then(e=>new ne(
+e))}async size(){return l("plugin:webview|webview_size",{label:this.label}).then(e=>new Oe(e))}async close(){return l("
+plugin:webview|webview_close",{label:this.label})}async setSize(e){return l("plugin:webview|set_webview_size",{label:th
+is.label,value:e instanceof _e?e:new _e(e)})}async setPosition(e){return l("plugin:webview|set_webview_position",{label
+:this.label,value:e instanceof Le?e:new Le(e)})}async setFocus(){return l("plugin:webview|set_webview_focus",{label:thi
+s.label})}async setAutoResize(e){return l("plugin:webview|set_webview_auto_resize",{label:this.label,value:e})}async hi
+de(){return l("plugin:webview|webview_hide",{label:this.label})}async show(){return l("plugin:webview|webview_show",{la
+bel:this.label})}async setZoom(e){return l("plugin:webview|set_webview_zoom",{label:this.label,value:e})}async reparent
+(e){return l("plugin:webview|reparent",{label:this.label,window:typeof e=="string"?e:e.label})}async clearAllBrowsingDa
+ta(){return l("plugin:webview|clear_all_browsing_data")}async setBackgroundColor(e){return l("plugin:webview|set_webvie
+w_background_color",{color:e})}async onDragDropEvent(e){const i=await this.listen(G.DRAG_ENTER,o=>{e({...o,payload:{typ
+e:"enter",paths:o.payload.paths,position:new ne(o.payload.position)}})}),a=await this.listen(G.DRAG_OVER,o=>{e({...o,pa
+yload:{type:"over",position:new ne(o.payload.position)}})}),r=await this.listen(G.DRAG_DROP,o=>{e({...o,payload:{type:"
+drop",paths:o.payload.paths,position:new ne(o.payload.position)}})}),s=await this.listen(G.DRAG_LEAVE,o=>{e({...o,paylo
+ad:{type:"leave"}})});return()=>{i(),r(),a(),s()}}}function Oi(){const t=Li();return new et(t.label,{skip:!0})}async fu
+nction si(){return l("plugin:window|get_all_windows").then(t=>t.map(e=>new et(e,{skip:!0})))}class et{constructor(e,i={
+}){var a;this.label=e,this.listeners=Object.create(null),i!=null&&i.skip||l("plugin:webview|create_webview_window",{opt
+ions:{...i,parent:typeof i.parent=="string"?i.parent:(a=i.parent)===null||a===void 0?void 0:a.label,label:e}}).then(asy
+nc()=>this.emit("tauri://created")).catch(async r=>this.emit("tauri://error",r))}static async getByLabel(e){var i;const
+ a=(i=(await si()).find(r=>r.label===e))!==null&&i!==void 0?i:null;return a?new et(a.label,{skip:!0}):null}static getCu
+rrent(){return Oi()}static async getAll(){return si()}async listen(e,i){return this._handleTauriEvent(e,i)?()=>{const a
+=this.listeners[e];a.splice(a.indexOf(i),1)}:Te(e,i,{target:{kind:"WebviewWindow",label:this.label}})}async once(e,i){r
+eturn this._handleTauriEvent(e,i)?()=>{const a=this.listeners[e];a.splice(a.indexOf(i),1)}:Rt(e,i,{target:{kind:"Webvie
+wWindow",label:this.label}})}async setBackgroundColor(e){return l("plugin:window|set_background_color",{color:e}).then(
+()=>l("plugin:webview|set_webview_background_color",{color:e}))}}nr(et,[pt,Ft]);function nr(t,e){(Array.isArray(e)?e:[e
+]).forEach(i=>{Object.getOwnPropertyNames(i.prototype).forEach(a=>{var r;typeof t.prototype=="object"&&t.prototype&&a i
+n t.prototype||Object.defineProperty(t.prototype,a,(r=Object.getOwnPropertyDescriptor(i.prototype,a))!==null&&r!==void 
+0?r:Object.create(null))})})}var rr=R('<div class="drop-overlay" aria-hidden="true"><div class="drop-card"><svg width="
+32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-
+linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline
+><line x1="12" y1="3" x2="12" y2="15"></line></svg> <p class="drop-title"><!></p> <p class="drop-hint">Drop files or fo
+lders here</p></div></div>'),lr=R('<div class="drop-toast" role="status"> </div>'),sr=R("<!> <!>",1);function or(t,e){g
+e(e,!0);const i=Me();let a=L(!1),r=L(null),s=L(1),o=L(Ge([])),c=null,f=0;function h(g){u(r,g,!0),c&&clearTimeout(c),c=s
+etTimeout(()=>{u(r,null),c=null},3200)}function D(g){return Array.isArray(g)?g.map(p=>typeof p=="string"?p:String(p)).m
+ap(p=>p.trim()).filter(Boolean):[]}function y(g,p){var _;const d=document.elementFromPoint(g,p);return((_=d==null?void 
+0:d.closest("[data-playlist-id]"))==null?void 0:_.getAttribute("data-playlist-id"))??null}function b(g,p){var _;const d
+=document.elementFromPoint(g,p);return((_=d==null?void 0:d.closest("[data-playlist-name]"))==null?void 0:_.getAttribute
+("data-playlist-name"))??null}function A(){const g=Date.now();return g-f<400?!1:(f=g,!0)}function v(g,p,d){var F;if(!A(
+))return;if(d&&g.length===0){h(d);return}const _=p[0]/n(s),w=p[1]/n(s),E=y(_,w),W=b(_,w),z=i.addScannedTracks(g,E);if(z
+>0){const q=W??((F=i.activePlaylist)==null?void 0:F.name)??"playlist";h(`Added ${z} track${z!==1?"s":""} to ${q}`)}else
+ g.length>0?h("Tracks are already in this playlist"):h(d||"No supported audio files found")}async function S(g,p,d){var
+ E;if(!A())return;const _=y(p/n(s),d/n(s)),w=await i.addDroppedPaths(g,_);if(w>0){const W=b(p/n(s),d/n(s))??((E=i.activ
+ePlaylist)==null?void 0:E.name)??"playlist";h(`Added ${w} track${w!==1?"s":""} to ${W}`)}else g.length>0&&h("No support
+ed audio files found")}Pa(()=>{if(!ja()){h("Drag & drop works only in the desktop app (npm run tauri dev)");return}cons
+t g=[],p=Oi();return vt().scaleFactor().then(d=>{u(s,d,!0)}),p.listen("muzeeka:drag-active",d=>{u(a,d.payload,!0)}).the
+n(d=>g.push(d)),p.listen("muzeeka:dropped-tracks",d=>{const{files:_,position:w,message:E}=d.payload;v(_,w,E)}).then(d=>
+g.push(d)),p.onDragDropEvent(d=>{const _=d.payload;if(_.type==="enter"){u(a,!0),u(o,D(_.paths),!0);return}if(_.type==="
+over"){u(a,!0);return}if(_.type==="leave"){u(a,!1),u(o,[],!0);return}if(_.type==="drop"){u(a,!1);const w=D(_.paths),E=w
+.length>0?w:n(o);if(u(o,[],!0),E.length===0){h("Drop failed: no file paths received");return}S(E,_.position.x,_.positio
+n.y)}}).then(d=>g.push(d)),()=>{for(const d of g)d();c&&clearTimeout(c)}});var O=sr(),N=ht(O);{var I=g=>{var p=rr(),d=k
+(p),_=C(k(d),2),w=k(_);{var E=z=>{var F=Bt();X(()=>le(F,`Add to <${i.activePlaylist.name??""}>`)),P(z,F)},W=z=>{var F=B
+t("Drop to create playlist");P(z,F)};Y(w,z=>{i.activePlaylist?z(E):z(W,-1)})}x(_),Ea(2),x(d),x(p),P(g,p)};Y(N,g=>{n(a)&
+&g(I)})}var m=C(N,2);{var T=g=>{var p=lr(),d=k(p,!0);x(p),X(()=>le(d,n(r))),P(g,p)};Y(m,g=>{n(r)&&g(T)})}P(t,O),ye()}va
+r ur=R('<div class="app-layout"><!> <!> <!> <!></div>');function fr(t,e){ge(e,!1);const i=Me();function a(h){if(!(h.tar
+get instanceof HTMLInputElement||h.target instanceof HTMLTextAreaElement))switch(h.code){case"Space":h.preventDefault()
+,i.togglePlayPause();break;case"ArrowRight":h.shiftKey?i.nextTrack():i.seek(Math.min(i.position+5,i.duration));break;ca
+se"ArrowLeft":h.shiftKey?i.prevTrack():i.seek(Math.max(i.position-5,0));break;case"ArrowUp":h.preventDefault(),i.setVol
+ume(Math.min(i.volume+.05,1));break;case"ArrowDown":h.preventDefault(),i.setVolume(Math.max(i.volume-.05,0));break}}Ha(
+);var r=ur();hi("keydown",Aa,a);var s=k(r);Dn(s,{});var o=C(s,2);$n(o,{});var c=C(o,2);ar(c,{});var f=C(c,2);or(f,{}),x
+(r),P(t,r),ye()}export{fr as component};
+
+

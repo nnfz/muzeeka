@@ -1,0 +1,122 @@
+.transport-bar {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: var(--transport-height);
+  display: flex;
+  flex-direction: column;
+  z-index: 100;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.transport-progress {
+  margin-bottom: 8px;
+  padding: 0 10px;
+}
+
+.transport-content {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 10px;
+  gap: 16px;
+  margin-top: 4px;
+}
+
+.transport-info {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1;
+  min-width: 0;
+  max-width: 280px;
+}
+
+.transport-info :global(.track-cover) {
+  width: 45px;
+  height: 45px;
+}
+
+.now-playing-text {
+  min-width: 0;
+}
+
+.np-title {
+  display: block;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  line-height: 1.3;
+}
+
+.np-artist {
+  display: block;
+  font-size: 10px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  line-height: 1.3;
+}
+
+.transport-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.control-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  color: var(--text-secondary);
+  transition: all var(--transition-fast);
+}
+
+.control-btn:hover:not(:disabled) {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.control-btn:active:not(:disabled) {
+  transform: scale(0.92);
+}
+
+.control-btn:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+
+.play-btn {
+  height: 40px;
+  aspect-ratio: 1;
+  background: var(--accent);
+  color: white;
+  transition: all var(--transition-fast);
+}
+
+.play-btn:hover:not(:disabled) {
+  background: var(--accent);
+  color: white;
+  transform: scale(1.06);
+}
+
+.play-btn:active:not(:disabled) {
+  transform: scale(0.96);
+}
+
+
+.transport-right {
+  flex: 1;
+  display: flex;
+  justify-content: flex-end;
+  max-width: 220px;
+}
