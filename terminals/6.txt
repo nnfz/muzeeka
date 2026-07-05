@@ -1,0 +1,15 @@
+---
+pid: 43156
+cwd: "Z:\code\muzeeka"
+command: "cd Z:\\code\\muzeeka\\muzeeka\\src-tauri; cargo run 2>&1"
+started_at: 2026-07-04T15:39:23.893Z
+running_for_ms: 6015010  
+---
+cargo :     Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.35s
+At line:1 char:39
++ cd Z:\code\muzeeka\muzeeka\src-tauri; cargo run 2>&1
++                                       ~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (    Finished `d...get(s) in 0.35s:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+     Running `target\debug\muzeeka.exe`

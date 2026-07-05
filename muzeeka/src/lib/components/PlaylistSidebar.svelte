@@ -149,7 +149,7 @@
     </button>
   </div>
 
-  <div class="playlist-list">
+  <div class="playlist-list" role={player.hasPlaylists ? 'list' : undefined}>
     {#if !player.hasPlaylists}
       <div class="empty-state" data-tauri-drag-region>
         <div class="empty-icon">
@@ -172,14 +172,19 @@
       {#each player.playlists as playlist (playlist.id)}
         {@const isActive = playlist.id === player.activePlaylistId}
         {@const isPlayingFrom =
-          player.isPlaying &&
+          (player.isPlaying || player.isPaused) &&
           player.currentFile !== null &&
+          playlist.tracks.some((t) => t.path === player.currentFile)}
+        {@const hasCurrentStopped =
+          player.hasCurrentTrack &&
           playlist.tracks.some((t) => t.path === player.currentFile)}
         {@const firstTrack = playlist.tracks[0] ?? null}
         <div
           class="playlist-row"
+          role="listitem"
           class:active={isActive}
           class:playing={isPlayingFrom}
+          class:has-current={hasCurrentStopped}
           data-playlist-id={playlist.id}
           data-playlist-name={playlist.name}
           onmouseenter={() => (hoveredPlaylistId = playlist.id)}

@@ -12,6 +12,7 @@ use std::ptr;
 use super::types::*;
 
 /// Holds the loaded bass.dll and its resolved function pointers.
+#[allow(dead_code)]
 pub struct BassLibrary {
     // Keep the library alive so function pointers remain valid.
     _lib: Library,
@@ -46,6 +47,20 @@ pub struct BassLibrary {
         unsafe extern "system" fn(handle: DWORD, info: *mut BassChannelInfo) -> BOOL,
     bass_channel_is_active: unsafe extern "system" fn(handle: DWORD) -> DWORD,
     bass_channel_get_level: unsafe extern "system" fn(handle: DWORD) -> DWORD,
+
+    // ── Config / DSP ──────────────────────────────────────────────────────────
+    bass_set_config: unsafe extern "system" fn(option: DWORD, value: f32) -> BOOL,
+    bass_channel_set_dsp:
+        unsafe extern "system" fn(handle: DWORD, proc: DspProc, priority: i32, user: *mut std::ffi::c_void) -> HDSP,
+    bass_channel_set_dsp_ex:
+        unsafe extern "system" fn(
+            handle: DWORD,
+            proc: DspProc,
+            user: *mut std::ffi::c_void,
+            priority: i32,
+            flags: DWORD,
+        ) -> HDSP,
+    bass_channel_remove_dsp: unsafe extern "system" fn(handle: DWORD, dsp: HDSP) -> BOOL,
 }
 
 // Safety: BassLibrary is always used behind a parking_lot::Mutex.
@@ -67,6 +82,7 @@ macro_rules! load_fn {
     }};
 }
 
+#[allow(dead_code)]
 impl BassLibrary {
     /// Load bass.dll from the given directory.
     ///
@@ -104,6 +120,10 @@ impl BassLibrary {
                 bass_channel_get_info: load_fn!(lib, b"BASS_ChannelGetInfo\0"),
                 bass_channel_is_active: load_fn!(lib, b"BASS_ChannelIsActive\0"),
                 bass_channel_get_level: load_fn!(lib, b"BASS_ChannelGetLevel\0"),
+                bass_set_config: load_fn!(lib, b"BASS_SetConfig\0"),
+                bass_channel_set_dsp: load_fn!(lib, b"BASS_ChannelSetDSP\0"),
+                bass_channel_set_dsp_ex: load_fn!(lib, b"BASS_ChannelSetDSPEx\0"),
+                bass_channel_remove_dsp: load_fn!(lib, b"BASS_ChannelRemoveDSP\0"),
                 _lib: lib,
             })
         }
@@ -210,6 +230,56 @@ impl BassLibrary {
 
     pub fn channel_get_level(&self, handle: DWORD) -> DWORD {
         unsafe { (self.bass_channel_get_level)(handle) }
+    }
+
+    pub fn set_config(&self, option: DWORD, value: f32) -> Result<(), String> {
+        let ok = unsafe { (self.bass_set_config)(option, value) };
+        if ok == 0 {
+            Err(self.last_error_string())
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn channel_set_dsp(
+        &self,
+        handle: DWORD,
+        proc: DspProc,
+        priority: i32,
+        user: *mut std::ffi::c_void,
+    ) -> Result<HDSP, String> {
+        let dsp = unsafe { (self.bass_channel_set_dsp)(handle, proc, priority, user) };
+        if dsp == 0 {
+            Err(self.last_error_string())
+        } else {
+            Ok(dsp)
+        }
+    }
+
+    pub fn channel_set_dsp_ex(
+        &self,
+        handle: DWORD,
+        proc: DspProc,
+        user: *mut std::ffi::c_void,
+        priority: i32,
+        flags: DWORD,
+    ) -> Result<HDSP, String> {
+        let dsp =
+            unsafe { (self.bass_channel_set_dsp_ex)(handle, proc, user, priority, flags) };
+        if dsp == 0 {
+            Err(self.last_error_string())
+        } else {
+            Ok(dsp)
+        }
+    }
+
+    pub fn channel_remove_dsp(&self, handle: DWORD, dsp: HDSP) -> Result<(), String> {
+        let ok = unsafe { (self.bass_channel_remove_dsp)(handle, dsp) };
+        if ok == 0 {
+            Err(self.last_error_string())
+        } else {
+            Ok(())
+        }
     }
 
     // ── Error helpers ─────────────────────────────────────────────────────

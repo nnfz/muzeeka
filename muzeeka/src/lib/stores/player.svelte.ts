@@ -38,6 +38,7 @@ export interface Playlist {
 interface PlaylistsData {
   playlists: Playlist[];
   active_playlist_id: string | null;
+  current_file: string | null;
   volume: number | null;
 }
 
@@ -58,6 +59,7 @@ let shuffleOrder = $state<number[]>([]);
 let shufflePosition = $state(0);
 let repeatMode = $state<'off' | 'all' | 'one'>('off');
 let isInitialized = $state(false);
+let initPromise: Promise<void> | null = null;
 let persistReady = $state(false);
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -72,8 +74,20 @@ let activePlaylist = $derived(
   playlists.find((p) => p.id === activePlaylistId) ?? null
 );
 
+// Search across ALL playlists so metadata survives playlist switches
+let currentTrack = $derived.by(() => {
+  if (!currentFile) return null;
+  for (const playlist of playlists) {
+    const found = playlist.tracks.find((t) => t.path === currentFile);
+    if (found) return found;
+  }
+  return null;
+});
+
 let progress = $derived(duration > 0 ? position / duration : 0);
 let hasTrack = $derived(currentFile !== null);
+// hasCurrentTrack: track is remembered but player is fully stopped (e.g. after app restart)
+let hasCurrentTrack = $derived(currentFile !== null && !isPlaying && !isPaused);
 let hasTracks = $derived(tracks.length > 0);
 let hasPlaylists = $derived(playlists.length > 0);
 let hasNext = $derived(
@@ -223,6 +237,7 @@ function buildSaveData(): PlaylistsData {
   return {
     playlists,
     active_playlist_id: activePlaylistId,
+    current_file: currentFile,
     volume,
   };
 }
@@ -245,6 +260,18 @@ async function loadPlaylists() {
     activePlaylistId = data.active_playlist_id ?? playlists[0]?.id ?? null;
     if (typeof data.volume === 'number') {
       volume = data.volume;
+    }
+    // Restore last playing track so metadata/status survive Ctrl+R
+    if (data.current_file) {
+      const exists = playlists.some((p) => p.tracks.some((t) => t.path === data.current_file));
+      if (exists) {
+        currentFile = data.current_file;
+        const track = playlists
+          .flatMap((p) => p.tracks)
+          .find((t) => t.path === data.current_file);
+        currentFileName = track ? trackDisplayTitle(track) : data.current_file.split(/[\\/]/).pop()?.replace(/\.[^/.]+$/, '') ?? null;
+        // Note: isPaused stays false — player is freshly started, track is just "remembered"
+      }
     }
     syncTrackIndex();
     prefetchCoverPaths(
@@ -364,22 +391,52 @@ async function addDroppedPaths(paths: string[], playlistId?: string | null) {
 
 async function init() {
   if (isInitialized) return;
-  try {
+  if (initPromise) {
+    await initPromise;
+    return;
+  }
+
+  initPromise = (async () => {
     await invoke('player_init');
     await invoke('player_set_volume', { volume });
     isInitialized = true;
+  })();
+
+  try {
+    await initPromise;
   } catch (e) {
+    initPromise = null;
     console.error('Failed to initialize player:', e);
+    throw e;
   }
+}
+
+function ensureInit() {
+  return init();
 }
 
 async function bootstrap() {
   await loadPlaylists();
   await init();
+  // Sync frontend state with backend after reload (Ctrl+R).
+  // The backend may still be playing audio, but the frontend starts
+  // with isPlaying=false / isPaused=false. Query the actual state.
+  try {
+    const state = await invoke<PlayerState>('player_get_state');
+    if (state.is_playing || state.is_paused) {
+      isPlaying = state.is_playing;
+      isPaused = state.is_paused;
+      position = state.position;
+      duration = state.duration;
+    }
+  } catch (e) {
+    console.error('Failed to sync player state after init:', e);
+  }
 }
 
 async function play(filePath: string) {
   try {
+    await ensureInit();
     await invoke('player_play', { filePath });
     currentFile = filePath;
     const file = tracks.find((t) => t.path === filePath);
@@ -390,6 +447,7 @@ async function play(filePath: string) {
     syncShufflePosition();
     isPlaying = true;
     isPaused = false;
+    scheduleSave(); // persist current_file so it survives restart
   } catch (e) {
     console.error('Failed to play:', e);
   }
@@ -411,7 +469,13 @@ async function resume() {
     isPaused = false;
     isPlaying = true;
   } catch (e) {
-    console.error('Failed to resume:', e);
+    // Backend has no audio loaded (e.g. after app restart) — fall back to playing from start
+    if (currentFile) {
+      isPaused = false;
+      await play(currentFile);
+    } else {
+      console.error('Failed to resume:', e);
+    }
   }
 }
 
@@ -590,6 +654,7 @@ export function createPlayerStore() {
     get volume() { return volume; },
     get currentFile() { return currentFile; },
     get currentFileName() { return currentFileName; },
+    get currentTrack() { return currentTrack; },
     get tracks() { return tracks; },
     get playlists() { return playlists; },
     get activePlaylistId() { return activePlaylistId; },
@@ -601,6 +666,7 @@ export function createPlayerStore() {
     // Derived (getters)
     get progress() { return progress; },
     get hasTrack() { return hasTrack; },
+    get hasCurrentTrack() { return hasCurrentTrack; },
     get hasTracks() { return hasTracks; },
     get hasPlaylists() { return hasPlaylists; },
     get hasNext() { return hasNext; },
@@ -630,6 +696,7 @@ export function createPlayerStore() {
     toggleShuffle,
     toggleRepeat,
     init,
+    ensureInit,
   };
 }
 

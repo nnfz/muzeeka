@@ -3,7 +3,7 @@ pid: 29436
 cwd: "Z:\code\muzeeka"
 command: "cd Z:\\code\\muzeeka\\muzeeka\\src-tauri; cargo check 2>&1"
 started_at: 2026-07-04T11:23:43.146Z
-running_for_ms: 13345001 
+running_for_ms: 21355001 
 ---
 cargo :     Blocking waiting for file lock on build directory
 At line:1 char:39

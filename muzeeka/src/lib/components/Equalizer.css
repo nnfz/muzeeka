@@ -1,0 +1,326 @@
+.equalizer {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.eq-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.eq-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.eq-toggle input {
+  accent-color: var(--accent);
+}
+
+.eq-badge {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+  background: rgba(255, 255, 255, 0.06);
+  padding: 4px 8px;
+  border-radius: var(--radius-sm);
+}
+
+.eq-badge--active {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.eq-reset {
+  margin-left: auto;
+  padding: 6px 12px;
+  border-radius: var(--radius-sm);
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  background: rgba(255, 255, 255, 0.06);
+  transition: color var(--transition-fast), background var(--transition-fast);
+}
+
+.eq-reset:hover {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.eq-presets {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 8px;
+}
+
+.eq-presets-label {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+/* Custom preset dropdown - matches app glass style */
+.preset-dropdown {
+  position: relative;
+}
+
+.preset-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 96px;
+  padding: 4px 10px;
+  font-size: 11px;
+  font-weight: 500;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-subtle);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-primary);
+  cursor: pointer;
+  transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
+}
+
+.preset-trigger:hover {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: var(--border-accent);
+}
+
+.preset-trigger.custom {
+  color: var(--text-secondary);
+  font-style: italic;
+}
+
+.preset-label {
+  max-width: 110px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.preset-chevron {
+  font-size: 9px;
+  opacity: 0.6;
+  margin-left: 2px;
+}
+
+.preset-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 200;
+  min-width: 168px;
+  max-height: 240px;
+  overflow-y: auto;
+  padding: 4px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-glass);
+  backdrop-filter: blur(16px) saturate(1.2);
+  -webkit-backdrop-filter: blur(16px) saturate(1.2);
+  border: 1px solid var(--border-subtle);
+  box-shadow: var(--shadow-md);
+  animation: fade-in 0.1s ease;
+}
+
+.preset-menu-item,
+.preset-menu-item.save {
+  display: block;
+  width: 100%;
+  padding: 7px 10px;
+  font-size: 12px;
+  text-align: left;
+  color: var(--text-primary);
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-mini);
+  cursor: pointer;
+  transition: background var(--transition-fast);
+}
+
+.preset-menu-item:hover {
+  background: rgba(255, 255, 255, 0.07);
+}
+
+.preset-menu-item.save {
+  color: var(--accent);
+  font-weight: 500;
+}
+
+.preset-menu-item.save:hover {
+  background: var(--accent-soft);
+}
+
+.preset-divider {
+  height: 1px;
+  background: var(--border-subtle);
+  margin: 4px 4px;
+}
+
+.preset-row {
+  display: flex;
+  align-items: center;
+}
+
+.preset-row .preset-menu-item {
+  flex: 1;
+  padding-right: 4px;
+}
+
+.preset-delete-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  margin-right: 4px;
+  font-size: 14px;
+  line-height: 1;
+  color: var(--text-muted);
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-mini);
+  cursor: pointer;
+  transition: color var(--transition-fast), background var(--transition-fast);
+}
+
+.preset-delete-btn:hover {
+  color: #f87171;
+  background: rgba(248, 113, 113, 0.1);
+}
+
+/* Save mode inside dropdown */
+.preset-save {
+  padding: 6px 4px 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.preset-save-input {
+  width: 100%;
+  font-size: 12px;
+  padding: 6px 8px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-primary);
+  outline: none;
+  font-family: var(--font-family);
+}
+
+.preset-save-input:focus {
+  border-color: var(--border-accent);
+}
+
+.preset-save-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.preset-action-btn {
+  flex: 1;
+  padding: 4px 8px;
+  font-size: 11px;
+  font-weight: 500;
+  border-radius: var(--radius-mini);
+  border: 1px solid var(--border-subtle);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.preset-action-btn:hover {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.preset-action-btn.cancel {
+  color: var(--text-muted);
+}
+
+.preset-action-btn.cancel:hover {
+  color: #f87171;
+}
+
+.eq-sliders {
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+  height: 220px;
+  padding: 12px 8px;
+  border-radius: var(--radius-md);
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid var(--border-subtle);
+  overflow-x: auto;
+}
+
+.eq-band {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  min-width: 36px;
+  height: 100%;
+}
+
+.preamp-band {
+  min-width: 44px;
+  padding-right: 8px;
+  margin-right: 4px;
+  border-right: 1px solid var(--border-subtle);
+}
+
+.eq-slider {
+  flex: 1;
+  width: 4px;
+  margin: 0;
+  appearance: none;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: var(--radius-full);
+  cursor: pointer;
+  writing-mode: vertical-lr;
+  direction: rtl;
+}
+
+.eq-slider::-webkit-slider-thumb {
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 0 8px var(--accent-glow), 0 2px 4px rgba(0, 0, 0, 0.4);
+  border: 2px solid var(--accent);
+}
+
+.eq-slider::-webkit-slider-runnable-track {
+  width: 4px;
+  border-radius: var(--radius-full);
+  background: linear-gradient(
+    to top,
+    var(--accent) 0%,
+    rgba(255, 255, 255, 0.12) 50%,
+    var(--accent) 100%
+  );
+}
+
+.eq-gain {
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+  min-height: 12px;
+}
+
+.eq-freq {
+  font-size: 9px;
+  color: var(--text-secondary);
+  font-weight: 500;
+}

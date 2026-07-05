@@ -59,8 +59,8 @@
 }
 
 .icon-btn {
-  width: 34px;
-  height: 34px;
+  aspect-ratio: 1;
+  height: 28px;
   border-radius: var(--radius-sm);
   display: flex;
   align-items: center;
@@ -79,14 +79,13 @@
   min-height: 0;
   overflow-x: hidden;
   overflow-y: auto;
-  padding: 4px 8px 12px;
+  padding: 0 8px 8px;
 }
 
 .playlist-row {
   display: flex;
   align-items: center;
   gap: 2px;
-  margin-bottom: 2px;
   border-radius: var(--radius-sm);
   transition: background var(--transition-fast);
 }
@@ -142,6 +141,11 @@
 
 .playlist-row.playing .playlist-name {
   color: var(--accent);
+}
+
+.playlist-row.has-current .playlist-name {
+  color: var(--accent);
+  opacity: 0.55;
 }
 
 .playlist-count {

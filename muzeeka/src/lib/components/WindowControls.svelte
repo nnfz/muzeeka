@@ -1,8 +1,19 @@
 <script lang="ts">
   import { getCurrentWindow } from '@tauri-apps/api/window';
 
-
   const appWindow = getCurrentWindow();
+
+  // Props to control which buttons are shown
+  let {
+    showMinimize = true,
+    showMaximize = true,
+    showClose = true,
+  }: {
+    showMinimize?: boolean;
+    showMaximize?: boolean;
+    showClose?: boolean;
+  } = $props();
+
   let isMaximized = $state(false);
 
   $effect(() => {
@@ -40,28 +51,34 @@
 </script>
 
 <div class="window-controls">
-  <button class="win-btn" onclick={minimize} aria-label="Minimize" title="Minimize">
-    <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
-      <rect x="1" y="4.5" width="8" height="1" fill="currentColor"/>
-    </svg>
-  </button>
-  <button class="win-btn" onclick={toggleMaximize} aria-label={isMaximized ? 'Restore' : 'Maximize'} title={isMaximized ? 'Restore' : 'Maximize'}>
-    {#if isMaximized}
+  {#if showMinimize}
+    <button class="win-btn" onclick={minimize} aria-label="Minimize" title="Minimize">
       <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
-        <rect x="2.5" y="0.5" width="6" height="6" fill="none" stroke="currentColor" stroke-width="1"/>
-        <rect x="0.5" y="2.5" width="6" height="6" fill="var(--bg-deep)" stroke="currentColor" stroke-width="1"/>
+        <rect x="1" y="4.5" width="8" height="1" fill="currentColor"/>
       </svg>
-    {:else}
+    </button>
+  {/if}
+  {#if showMaximize}
+    <button class="win-btn" onclick={toggleMaximize} aria-label={isMaximized ? 'Restore' : 'Maximize'} title={isMaximized ? 'Restore' : 'Maximize'}>
+      {#if isMaximized}
+        <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
+          <rect x="2.5" y="0.5" width="6" height="6" fill="none" stroke="currentColor" stroke-width="1"/>
+          <rect x="0.5" y="2.5" width="6" height="6" fill="var(--bg-deep)" stroke="currentColor" stroke-width="1"/>
+        </svg>
+      {:else}
+        <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
+          <rect x="1.5" y="1.5" width="7" height="7" fill="none" stroke="currentColor" stroke-width="1"/>
+        </svg>
+      {/if}
+    </button>
+  {/if}
+  {#if showClose}
+    <button class="win-btn close" onclick={close} aria-label="Close" title="Close">
       <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
-        <rect x="1.5" y="1.5" width="7" height="7" fill="none" stroke="currentColor" stroke-width="1"/>
+        <path d="M1.5 1.5 8.5 8.5M8.5 1.5 1.5 8.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
       </svg>
-    {/if}
-  </button>
-  <button class="win-btn close" onclick={close} aria-label="Close" title="Close">
-    <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
-      <path d="M1.5 1.5 8.5 8.5M8.5 1.5 1.5 8.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
-    </svg>
-  </button>
+    </button>
+  {/if}
 </div>
 
 <style>

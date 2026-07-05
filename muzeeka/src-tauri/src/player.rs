@@ -4,16 +4,17 @@
 // playback state, and emits Tauri events for position updates.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc, Mutex as StdMutex};
 use std::thread;
 use std::time::Duration;
 
 use libloading::Library;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 
 use crate::bass::{self, BassLibrary};
+use crate::equalizer::{eq_dsp_callback, EqDspContext, EqualizerSettings};
 
 // ── Playback state enum ───────────────────────────────────────────────────────
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -49,6 +50,14 @@ pub struct PlayerStateSnapshot {
     pub current_file_name: Option<String>,
 }
 
+// ── Equalizer diagnostics ─────────────────────────────────────────────────────
+#[derive(Debug, Clone, Serialize)]
+pub struct EqualizerStatus {
+    pub settings: EqualizerSettings,
+    pub dsp_attached: bool,
+    pub process_count: u64,
+}
+
 // ── Position event payload ────────────────────────────────────────────────────
 #[derive(Debug, Clone, Serialize)]
 pub struct PositionPayload {
@@ -62,8 +71,10 @@ struct PlayerInner {
     bass: Option<BassLibrary>,
     bass_dir: PathBuf,
     current_handle: u32,
+    dsp_handle: u32,
     current_file: Option<String>,
     volume: f32,
+    eq_context: &'static EqDspContext,
     /// Loaded addon DLLs — kept alive so the plugins stay registered.
     _addons: Vec<Library>,
 }
@@ -72,6 +83,8 @@ struct PlayerInner {
 #[derive(Clone)]
 pub struct Player {
     inner: Arc<Mutex<PlayerInner>>,
+    app: Arc<RwLock<Option<AppHandle>>>,
+    bass_thread: Arc<RwLock<Option<thread::ThreadId>>>,
 }
 
 impl Player {
@@ -82,50 +95,253 @@ impl Player {
                 bass: None,
                 bass_dir,
                 current_handle: 0,
+                dsp_handle: 0,
                 current_file: None,
                 volume: 1.0,
+                eq_context: Box::leak(Box::new(EqDspContext::new())),
                 _addons: Vec::new(),
             })),
+            app: Arc::new(RwLock::new(None)),
+            bass_thread: Arc::new(RwLock::new(None)),
         }
+    }
+
+    pub fn set_app_handle(&self, app: AppHandle) {
+        *self.app.write() = Some(app);
+    }
+
+    fn on_bass_thread(&self) -> bool {
+        self.bass_thread
+            .read()
+            .is_some_and(|id| id == thread::current().id())
+    }
+
+    fn run_on_bass_thread<F, T>(&self, f: F) -> Result<T, String>
+    where
+        F: FnOnce(&mut PlayerInner) -> Result<T, String> + Send + 'static,
+        T: Send + 'static,
+    {
+        if self.on_bass_thread() {
+            return f(&mut self.inner.lock());
+        }
+
+        let app = self
+            .app
+            .read()
+            .clone()
+            .ok_or("Player is not ready")?;
+        let inner = Arc::clone(&self.inner);
+        let (tx, rx) = mpsc::sync_channel(1);
+
+        app.run_on_main_thread(move || {
+            let mut guard = inner.lock();
+            let _ = tx.send(f(&mut guard));
+        })
+        .map_err(|e| format!("Failed to dispatch to BASS thread: {e}"))?;
+
+        rx.recv()
+            .map_err(|_| "BASS thread did not respond".to_string())?
     }
 
     /// Initialize the BASS audio system. Must be called before any playback.
     pub fn init(&self) -> Result<(), String> {
-        let mut inner = self.inner.lock();
+        self.run_on_bass_thread(|inner| Self::init_inner(inner))
+    }
+
+    fn init_inner(inner: &mut PlayerInner) -> Result<(), String> {
         if inner.bass.is_some() {
-            return Ok(()); // already initialized
+            return Ok(());
         }
+
         let bass = BassLibrary::load(&inner.bass_dir)?;
-        bass.init(-1, 44100)?;
+
+        // FLOATDSP must be configured before BASS_Init.
+        let float_dsp_ok = bass.set_config(bass::BASS_CONFIG_FLOATDSP, 1.0).is_ok();
+
+        match bass.init(-1, 44100) {
+            Ok(()) => {}
+            Err(e) => {
+                if bass.last_error() != bass::BASS_ERROR_ALREADY {
+                    return Err(e);
+                }
+            }
+        }
+
+        inner.eq_context.set_float_dsp_enabled(float_dsp_ok);
+        Self::load_bass_addons(inner);
         inner.bass = Some(bass);
+        Ok(())
+    }
+
+    fn load_bass_addons(inner: &mut PlayerInner) {
+        let Ok(entries) = std::fs::read_dir(&inner.bass_dir) else {
+            return;
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+                continue;
+            };
+            if !ext.eq_ignore_ascii_case("dll") {
+                continue;
+            }
+
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if name.eq_ignore_ascii_case("bass.dll") {
+                continue;
+            }
+
+            if let Ok(lib) = bass::load_addon(&path) {
+                inner._addons.push(lib);
+            }
+        }
+    }
+
+    pub fn get_equalizer(&self) -> EqualizerSettings {
+        if self.on_bass_thread() {
+            return self.inner.lock().eq_context.get_settings();
+        }
+        self.run_on_bass_thread(|inner| Ok(inner.eq_context.get_settings()))
+            .unwrap_or_default()
+    }
+
+    pub fn get_equalizer_status(&self) -> EqualizerStatus {
+        if self.on_bass_thread() {
+            return Self::equalizer_status_inner(&self.inner.lock());
+        }
+        self.run_on_bass_thread(|inner| Ok(Self::equalizer_status_inner(inner)))
+            .unwrap_or(EqualizerStatus {
+                settings: EqualizerSettings::default(),
+                dsp_attached: false,
+                process_count: 0,
+            })
+    }
+
+    fn equalizer_status_inner(inner: &PlayerInner) -> EqualizerStatus {
+        EqualizerStatus {
+            settings: inner.eq_context.get_settings(),
+            dsp_attached: inner.dsp_handle != 0,
+            process_count: inner.eq_context.process_count(),
+        }
+    }
+
+    pub fn set_equalizer(&self, settings: EqualizerSettings) -> Result<(), String> {
+        self.run_on_bass_thread(move |inner| Self::set_equalizer_inner(inner, settings))
+    }
+
+    fn set_equalizer_inner(
+        inner: &mut PlayerInner,
+        settings: EqualizerSettings,
+    ) -> Result<(), String> {
+        let enabled = settings.enabled;
+        inner.eq_context.set_settings(settings);
+
+        if inner.current_handle == 0 {
+            return Ok(());
+        }
+
+        if enabled {
+            let handle = inner.current_handle;
+            if inner.dsp_handle == 0 {
+                Self::attach_dsp(inner, handle)?;
+            }
+        } else if inner.dsp_handle != 0 {
+            Self::detach_dsp(inner);
+        }
+        Ok(())
+    }
+
+    fn detach_dsp(inner: &mut PlayerInner) {
+        if inner.dsp_handle == 0 || inner.current_handle == 0 {
+            inner.dsp_handle = 0;
+            inner.eq_context.set_dsp_float_forced(false);
+            return;
+        }
+        if let Some(bass) = inner.bass.as_ref() {
+            let _ = bass.channel_remove_dsp(inner.current_handle, inner.dsp_handle);
+        }
+        inner.dsp_handle = 0;
+        inner.eq_context.set_dsp_float_forced(false);
+    }
+
+    fn attach_dsp(inner: &mut PlayerInner, handle: u32) -> Result<(), String> {
+        Self::detach_dsp(inner);
+
+        let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
+        let info = bass.channel_get_info(handle)?;
+        let sample_rate = if info.freq > 0 {
+            info.freq
+        } else {
+            bass.channel_get_attribute(handle, bass::BASS_ATTRIB_FREQ)
+                .unwrap_or(44100.0) as u32
+        };
+        let sample_rate = if sample_rate > 0 { sample_rate } else { 44100 };
+
+        inner.eq_context.set_dsp_float_forced(true);
+        inner
+            .eq_context
+            .configure_stream(sample_rate, info.chans, info.flags);
+
+        let user = (inner.eq_context as *const EqDspContext) as *mut std::ffi::c_void;
+        let dsp = match bass.channel_set_dsp_ex(
+            handle,
+            eq_dsp_callback,
+            user,
+            bass::BASS_DSP_PRIORITY_FIRST,
+            bass::BASS_DSP_FLOAT,
+        ) {
+            Ok(dsp) => dsp,
+            Err(_) => {
+                inner.eq_context.set_dsp_float_forced(
+                    info.flags & bass::BASS_SAMPLE_FLOAT != 0,
+                );
+                bass.channel_set_dsp(
+                    handle,
+                    eq_dsp_callback,
+                    bass::BASS_DSP_PRIORITY_FIRST,
+                    user,
+                )?
+            }
+        };
+        inner.dsp_handle = dsp;
         Ok(())
     }
 
     /// Play a file. Stops the current stream first if any.
     pub fn play(&self, path: &str) -> Result<(), String> {
-        let mut inner = self.inner.lock();
+        let path = path.to_string();
+        self.run_on_bass_thread(move |inner| Self::play_inner(inner, &path))
+    }
 
-        // Stop previous stream before taking a long-lived borrow of `bass`
+    fn play_inner(inner: &mut PlayerInner, path: &str) -> Result<(), String> {
         let prev_handle = inner.current_handle;
         if prev_handle != 0 {
+            Self::detach_dsp(inner);
             if let Some(bass) = inner.bass.as_ref() {
                 let _ = bass.channel_stop(prev_handle);
             }
             inner.current_handle = 0;
         }
 
+        let flags = bass::BASS_STREAM_PRESCAN | bass::BASS_SAMPLE_FLOAT;
+
+        let handle = {
+            let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
+            bass.stream_create_file(path, flags)?
+        };
+
         let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
-
-        let flags = bass::BASS_STREAM_PRESCAN
-            | bass::BASS_STREAM_AUTOFREE
-            | bass::BASS_SAMPLE_FLOAT;
-
-        let handle = bass.stream_create_file(path, flags)?;
-
-        // Apply current volume
         let _ = bass.channel_set_attribute(handle, bass::BASS_ATTRIB_VOL, inner.volume);
-
         bass.channel_play(handle, true)?;
+
+        if inner.eq_context.get_settings().enabled {
+            Self::attach_dsp(inner, handle)?;
+        } else {
+            inner.dsp_handle = 0;
+        }
 
         inner.current_handle = handle;
         inner.current_file = Some(path.to_string());
@@ -133,69 +349,116 @@ impl Player {
     }
 
     pub fn pause(&self) -> Result<(), String> {
-        let inner = self.inner.lock();
-        let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
-        if inner.current_handle != 0 {
-            bass.channel_pause(inner.current_handle)
-        } else {
-            Err("Nothing is playing".into())
-        }
+        self.run_on_bass_thread(|inner| {
+            let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
+            if inner.current_handle != 0 {
+                bass.channel_pause(inner.current_handle)
+            } else {
+                Err("Nothing is playing".into())
+            }
+        })
     }
 
     pub fn resume(&self) -> Result<(), String> {
-        let inner = self.inner.lock();
-        let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
-        if inner.current_handle != 0 {
-            bass.channel_play(inner.current_handle, false)
-        } else {
-            Err("Nothing is playing".into())
-        }
+        self.run_on_bass_thread(|inner| {
+            let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
+            if inner.current_handle != 0 {
+                bass.channel_play(inner.current_handle, false)
+            } else {
+                Err("Nothing is playing".into())
+            }
+        })
     }
 
     pub fn stop(&self) -> Result<(), String> {
-        let mut inner = self.inner.lock();
-        let handle = inner.current_handle;
-        if handle != 0 {
-            if let Some(bass) = inner.bass.as_ref() {
-                let _ = bass.channel_stop(handle);
+        self.run_on_bass_thread(|inner| {
+            let handle = inner.current_handle;
+            if handle != 0 {
+                Self::detach_dsp(inner);
+                if let Some(bass) = inner.bass.as_ref() {
+                    let _ = bass.channel_stop(handle);
+                }
+                inner.current_handle = 0;
+                inner.current_file = None;
             }
-            inner.current_handle = 0;
-            inner.current_file = None;
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Seek to a position in seconds.
     pub fn seek(&self, position_secs: f64) -> Result<(), String> {
-        let inner = self.inner.lock();
-        let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
-        if inner.current_handle == 0 {
-            return Err("Nothing is playing".into());
-        }
-        // Convert seconds back to bytes — BASS doesn't have a seconds2bytes,
-        // so we use channel info to calculate.
-        let info = bass.channel_get_info(inner.current_handle)?;
-        let bytes_per_sample = if info.flags & bass::BASS_SAMPLE_FLOAT != 0 { 4 } else { 2 };
-        let block_align = bytes_per_sample * info.chans;
-        let byte_pos = (position_secs * info.freq as f64) as u64 * block_align as u64;
-        bass.channel_set_position(inner.current_handle, byte_pos, bass::BASS_POS_BYTE)
+        self.run_on_bass_thread(move |inner| {
+            let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
+            if inner.current_handle == 0 {
+                return Err("Nothing is playing".into());
+            }
+            let info = bass.channel_get_info(inner.current_handle)?;
+            let bytes_per_sample = if info.flags & bass::BASS_SAMPLE_FLOAT != 0 { 4 } else { 2 };
+            let block_align = bytes_per_sample * info.chans;
+            let byte_pos = (position_secs * info.freq as f64) as u64 * block_align as u64;
+            bass.channel_set_position(inner.current_handle, byte_pos, bass::BASS_POS_BYTE)
+        })
     }
 
     /// Set volume (0.0 — 1.0).
     pub fn set_volume(&self, vol: f32) -> Result<(), String> {
-        let mut inner = self.inner.lock();
-        inner.volume = vol.clamp(0.0, 1.0);
-        if let Some(bass) = inner.bass.as_ref() {
-            if inner.current_handle != 0 {
-                bass.channel_set_attribute(inner.current_handle, bass::BASS_ATTRIB_VOL, inner.volume)?;
+        self.run_on_bass_thread(move |inner| {
+            inner.volume = vol.clamp(0.0, 1.0);
+            if let Some(bass) = inner.bass.as_ref() {
+                if inner.current_handle != 0 {
+                    bass.channel_set_attribute(
+                        inner.current_handle,
+                        bass::BASS_ATTRIB_VOL,
+                        inner.volume,
+                    )?;
+                }
             }
+            Ok(())
+        })
+    }
+
+    /// Release a stream that finished playing (must run before AUTOFREE-style invalidation).
+    pub fn release_ended_stream(&self) {
+        if self.on_bass_thread() {
+            Self::release_ended_stream_inner(&mut self.inner.lock());
+            return;
         }
-        Ok(())
+        let _ = self.run_on_bass_thread(|inner| {
+            Self::release_ended_stream_inner(inner);
+            Ok(())
+        });
+    }
+
+    fn release_ended_stream_inner(inner: &mut PlayerInner) {
+        if inner.current_handle == 0 {
+            return;
+        }
+        Self::detach_dsp(inner);
+        if let Some(bass) = inner.bass.as_ref() {
+            let _ = bass.channel_stop(inner.current_handle);
+        }
+        inner.current_handle = 0;
     }
 
     /// Get a snapshot of the current player state.
     pub fn get_state(&self) -> PlayerStateSnapshot {
-        let inner = self.inner.lock();
+        if self.on_bass_thread() {
+            return Self::get_state_inner(&mut self.inner.lock());
+        }
+        self.run_on_bass_thread(|inner| Ok(Self::get_state_inner(inner)))
+            .unwrap_or(PlayerStateSnapshot {
+                state: PlaybackState::Stopped,
+                is_playing: false,
+                is_paused: false,
+                volume: 1.0,
+                position: 0.0,
+                duration: 0.0,
+                current_file: None,
+                current_file_name: None,
+            })
+    }
+
+    fn get_state_inner(inner: &mut PlayerInner) -> PlayerStateSnapshot {
         if inner.current_handle == 0 || inner.bass.is_none() {
             let file_name = inner.current_file.as_ref().map(|f| {
                 std::path::Path::new(f)
@@ -215,8 +478,39 @@ impl Player {
                 current_file_name: file_name,
             };
         }
+        let active_raw = {
+            let bass = inner.bass.as_ref().unwrap();
+            bass.channel_is_active(inner.current_handle)
+        };
+        let active: PlaybackState = active_raw.into();
+
+        if active == PlaybackState::Stopped {
+            let handle = inner.current_handle;
+            Self::detach_dsp(inner);
+            if let Some(bass) = inner.bass.as_ref() {
+                let _ = bass.channel_stop(handle);
+            }
+            inner.current_handle = 0;
+            let file_name = inner.current_file.as_ref().map(|f| {
+                std::path::Path::new(f)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_string()
+            });
+            return PlayerStateSnapshot {
+                state: PlaybackState::Stopped,
+                is_playing: false,
+                is_paused: false,
+                volume: inner.volume,
+                position: 0.0,
+                duration: 0.0,
+                current_file: inner.current_file.clone(),
+                current_file_name: file_name,
+            };
+        }
+
         let bass = inner.bass.as_ref().unwrap();
-        let active: PlaybackState = bass.channel_is_active(inner.current_handle).into();
         let pos_bytes = bass.channel_get_position(inner.current_handle, bass::BASS_POS_BYTE);
         let len_bytes = bass.channel_get_length(inner.current_handle, bass::BASS_POS_BYTE);
         let position = bass.channel_bytes2seconds(inner.current_handle, pos_bytes);
@@ -244,52 +538,76 @@ impl Player {
 
     /// Load a BASS addon DLL by path.
     pub fn load_addon(&self, path: &str) -> Result<(), String> {
-        let mut inner = self.inner.lock();
-        let addon_path = Path::new(path);
-        // If relative, resolve against bass_dir
-        let full_path = if addon_path.is_absolute() {
-            addon_path.to_path_buf()
-        } else {
-            inner.bass_dir.join(addon_path)
-        };
-        let lib = bass::load_addon(&full_path)?;
-        inner._addons.push(lib);
-        Ok(())
+        let path = path.to_string();
+        self.run_on_bass_thread(move |inner| {
+            let addon_path = Path::new(&path);
+            let full_path = if addon_path.is_absolute() {
+                addon_path.to_path_buf()
+            } else {
+                inner.bass_dir.join(addon_path)
+            };
+            let lib = bass::load_addon(&full_path)?;
+            inner._addons.push(lib);
+            Ok(())
+        })
     }
 
-    /// Start a background thread that emits position updates via Tauri events.
+    pub fn mark_bass_thread(&self) {
+        *self.bass_thread.write() = Some(thread::current().id());
+    }
+
+    /// Poll playback on the main thread and emit position / track-ended events.
     ///
-    /// Fires `player:position` events ~10 times per second while playing.
-    /// Also detects when a track ends and emits `player:track-ended`.
+    /// BASS must only be called from the thread that invoked `BASS_Init`.
     pub fn start_position_emitter(&self, app: AppHandle) {
         let player = self.clone();
+        let was_playing = Arc::new(StdMutex::new(false));
+        Self::schedule_position_poll(app, player, was_playing);
+    }
+
+    fn schedule_position_poll(
+        app: AppHandle,
+        player: Player,
+        was_playing: Arc<StdMutex<bool>>,
+    ) {
+        let app_for_sleep = app.clone();
+        let player_for_main = player.clone();
+        let was_for_main = was_playing.clone();
+        let app_for_next = app.clone();
+        let player_for_next = player;
+        let was_for_next = was_playing;
+
         thread::spawn(move || {
-            let mut was_playing = false;
-            loop {
-                thread::sleep(Duration::from_millis(100));
+            thread::sleep(Duration::from_millis(100));
+            let app_emit = app_for_sleep.clone();
+            let _ = app_for_sleep.run_on_main_thread(move || {
+                let snapshot = player_for_main.get_state();
 
-                let snapshot = player.get_state();
-
+                let mut was = was_for_main.lock().unwrap_or_else(|e| e.into_inner());
                 match snapshot.state {
                     PlaybackState::Playing => {
-                        was_playing = true;
+                        *was = true;
                         let payload = PositionPayload {
                             position: snapshot.position,
                             duration: snapshot.duration,
                             state: snapshot.state,
                         };
-                        let _ = app.emit("player:position", &payload);
+                        let _ = app_emit.emit("player:position", &payload);
                     }
-                    PlaybackState::Stopped if was_playing => {
-                        // Track just ended — emit event for auto-advance
-                        was_playing = false;
-                        let _ = app.emit("player:track-ended", serde_json::json!({}));
+                    PlaybackState::Stopped if *was => {
+                        player_for_main.release_ended_stream();
+                        *was = false;
+                        let _ = app_emit.emit("player:track-ended", serde_json::json!({}));
                     }
                     _ => {
-                        was_playing = snapshot.state == PlaybackState::Paused && was_playing;
+                        if snapshot.state != PlaybackState::Paused {
+                            *was = false;
+                        }
                     }
                 }
-            }
+
+                Self::schedule_position_poll(app_for_next, player_for_next, was_for_next);
+            });
         });
     }
 }

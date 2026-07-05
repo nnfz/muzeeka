@@ -5,10 +5,12 @@
 mod bass;
 mod commands;
 mod drop_handler;
+mod equalizer;
 mod library;
 mod metadata;
 mod player;
 mod playlists;
+mod settings;
 
 use drop_handler::{handle_window_event, DropState};
 
@@ -58,7 +60,12 @@ pub fn run() {
                 );
             }
 
-            // Start position emitter in a background thread
+            player.set_app_handle(app.handle().clone());
+            player.mark_bass_thread();
+            player.init().map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::Other, e)
+            })?;
+
             player.start_position_emitter(app.handle().clone());
             Ok(())
         })
@@ -71,7 +78,12 @@ pub fn run() {
             commands::player_seek,
             commands::player_set_volume,
             commands::player_get_state,
+            commands::player_get_equalizer,
+            commands::player_get_equalizer_status,
+            commands::player_set_equalizer,
             commands::load_addon,
+            commands::settings_load,
+            commands::settings_save,
             commands::library_scan,
             commands::library_scan_paths,
             commands::library_fetch_metadata,

@@ -4,9 +4,11 @@
 
 use tauri::{AppHandle, State};
 
+use crate::equalizer::EqualizerSettings;
 use crate::library;
-use crate::player::{Player, PlayerStateSnapshot};
+use crate::player::{EqualizerStatus, Player, PlayerStateSnapshot};
 use crate::playlists::{self, PlaylistsData};
+use crate::settings::{self, AppSettings};
 
 // ── Player commands ───────────────────────────────────────────────────────────
 
@@ -63,6 +65,36 @@ pub fn player_get_state(player: State<'_, Player>) -> PlayerStateSnapshot {
 #[tauri::command]
 pub fn load_addon(player: State<'_, Player>, path: String) -> Result<(), String> {
     player.load_addon(&path)
+}
+
+/// Get the current equalizer settings.
+#[tauri::command]
+pub fn player_get_equalizer(player: State<'_, Player>) -> EqualizerSettings {
+    player.get_equalizer()
+}
+
+/// Equalizer diagnostics — whether DSP is attached and processing audio.
+#[tauri::command]
+pub fn player_get_equalizer_status(player: State<'_, Player>) -> EqualizerStatus {
+    player.get_equalizer_status()
+}
+
+/// Update equalizer settings (applied live to the DSP chain).
+#[tauri::command]
+pub fn player_set_equalizer(player: State<'_, Player>, settings: EqualizerSettings) -> Result<(), String> {
+    player.set_equalizer(settings)
+}
+
+// ── App settings ──────────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub fn settings_load(app: AppHandle) -> Result<AppSettings, String> {
+    settings::load_settings(&app)
+}
+
+#[tauri::command]
+pub fn settings_save(app: AppHandle, data: AppSettings) -> Result<(), String> {
+    settings::save_settings(&app, &data)
 }
 
 // ── Library commands ──────────────────────────────────────────────────────────

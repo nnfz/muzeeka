@@ -5,21 +5,17 @@
 
 
   const player = getPlayerStore();
-
-  let currentTrack = $derived(
-    player.tracks.find((t) => t.path === player.currentFile) ?? null
-  );
 </script>
 
 <div class="transport-bar glass">
   <div class="transport-content">
     <div class="transport-info">
       {#if player.hasTrack}
-        <TrackCover track={currentTrack} />
+        <TrackCover track={player.currentTrack} />
         <div class="now-playing-text">
           <span class="np-title">{player.currentFileName ?? ''}</span>
-          {#if currentTrack}
-            <span class="np-artist">{trackDisplayArtist(currentTrack)}</span>
+          {#if player.currentTrack}
+            <span class="np-artist">{trackDisplayArtist(player.currentTrack)}</span>
           {/if}
         </div>
       {/if}
@@ -55,7 +51,7 @@
         class:playing={player.isPlaying}
         onclick={() => player.togglePlayPause()}
         disabled={!player.hasTracks}
-        aria-label={player.isPlaying ? 'Pause' : 'Play'}
+        aria-label={player.isPlaying ? 'Pause' : player.isPaused ? 'Resume' : 'Play'}
       >
         {#if player.isPlaying}
           <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor">

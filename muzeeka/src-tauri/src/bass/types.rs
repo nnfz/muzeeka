@@ -71,6 +71,24 @@ pub const BASS_ATTRIB_FREQ: DWORD = 1;
 pub const BASS_ATTRIB_VOL: DWORD = 2;
 pub const BASS_ATTRIB_PAN: DWORD = 3;
 
+// ── Config options ────────────────────────────────────────────────────────────
+pub const BASS_CONFIG_FLOATDSP: DWORD = 46;
+
+// ── DSP ───────────────────────────────────────────────────────────────────────
+pub type HDSP = DWORD;
+pub type DspProc = unsafe extern "system" fn(
+    handle: DWORD,
+    channel: DWORD,
+    buffer: *mut std::ffi::c_void,
+    length: DWORD,
+    user: *mut std::ffi::c_void,
+);
+
+pub const BASS_DSP_PRIORITY_USER: i32 = 0;
+pub const BASS_DSP_PRIORITY_FIRST: i32 = 2147483647;
+
+pub const BASS_DSP_FLOAT: DWORD = 0x400;
+
 // ── BASS_CHANNELINFO ──────────────────────────────────────────────────────────
 #[repr(C)]
 #[derive(Debug, Clone)]

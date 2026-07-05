@@ -383,12 +383,14 @@
       </div>
     {:else}
       <div
-        class="track-grid"
+        class="track-table"
         class:is-resizing={resizingPair !== null}
         bind:this={gridEl}
-        style="grid-template-columns: {gridTemplate}"
       >
-        <div class="track-table-header">
+        <div
+          class="track-table-header"
+          style="grid-template-columns: {gridTemplate}"
+        >
           {#each visibleColumns as column, i (column)}
             <div
               class="header-cell"
@@ -442,12 +444,14 @@
           {/each}
         </div>
 
+        <div class="track-rows">
         {#each displayedTracks as track, i (track.path)}
           {@const isActive = track.path === player.currentFile}
           <button
             class="track-row"
             class:active={isActive}
             class:playing={isActive && player.isPlaying}
+            style="grid-template-columns: {gridTemplate}"
             onclick={() => handleTrackClick(track)}
             title={`${trackDisplayTitle(track)} — ${trackDisplayArtist(track)}`}
           >
@@ -483,6 +487,7 @@
             {/each}
           </button>
         {/each}
+        </div>
       </div>
     {/if}
   </div>
