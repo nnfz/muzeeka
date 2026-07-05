@@ -420,19 +420,27 @@ impl Player {
             })?
         };
 
+        let target_volume = inner.volume;
+
+        // Silent while we seek (CUE) and wire up DSP so the first audible buffers use EQ.
         {
             let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
-            bass.channel_set_attribute(handle, bass::BASS_ATTRIB_VOL, inner.volume)?;
+            bass.channel_set_attribute(handle, bass::BASS_ATTRIB_VOL, 0.0)?;
         }
 
         Self::wait_for_stream_length(inner, handle)?;
-        Self::start_stream_playback(inner, handle, cue_start)?;
 
-        // Attach EQ after the stream is at the CUE offset so APE seeking stays accurate.
         if inner.eq_context.get_settings().enabled {
             Self::attach_dsp(inner, handle)?;
         } else {
             inner.dsp_handle = 0;
+        }
+
+        Self::start_stream_playback(inner, handle, cue_start)?;
+
+        {
+            let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
+            bass.channel_set_attribute(handle, bass::BASS_ATTRIB_VOL, target_volume)?;
         }
 
         inner.current_handle = handle;
