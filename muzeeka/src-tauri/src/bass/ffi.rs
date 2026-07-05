@@ -43,6 +43,8 @@ pub struct BassLibrary {
         unsafe extern "system" fn(handle: DWORD, attrib: DWORD, value: f32) -> BOOL,
     bass_channel_get_attribute:
         unsafe extern "system" fn(handle: DWORD, attrib: DWORD, value: *mut f32) -> BOOL,
+    bass_channel_slide_attribute:
+        unsafe extern "system" fn(handle: DWORD, attrib: DWORD, value: f32, time: DWORD) -> BOOL,
     bass_channel_get_info:
         unsafe extern "system" fn(handle: DWORD, info: *mut BassChannelInfo) -> BOOL,
     bass_channel_is_active: unsafe extern "system" fn(handle: DWORD) -> DWORD,
@@ -117,6 +119,7 @@ impl BassLibrary {
                 bass_channel_bytes2seconds: load_fn!(lib, b"BASS_ChannelBytes2Seconds\0"),
                 bass_channel_set_attribute: load_fn!(lib, b"BASS_ChannelSetAttribute\0"),
                 bass_channel_get_attribute: load_fn!(lib, b"BASS_ChannelGetAttribute\0"),
+                bass_channel_slide_attribute: load_fn!(lib, b"BASS_ChannelSlideAttribute\0"),
                 bass_channel_get_info: load_fn!(lib, b"BASS_ChannelGetInfo\0"),
                 bass_channel_is_active: load_fn!(lib, b"BASS_ChannelIsActive\0"),
                 bass_channel_get_level: load_fn!(lib, b"BASS_ChannelGetLevel\0"),
@@ -216,6 +219,21 @@ impl BassLibrary {
         let mut value: f32 = 0.0;
         let ok = unsafe { (self.bass_channel_get_attribute)(handle, attrib, &mut value) };
         if ok == 0 { Err(self.last_error_string()) } else { Ok(value) }
+    }
+
+    pub fn channel_slide_attribute(
+        &self,
+        handle: DWORD,
+        attrib: DWORD,
+        value: f32,
+        time_ms: DWORD,
+    ) -> Result<(), String> {
+        let ok = unsafe { (self.bass_channel_slide_attribute)(handle, attrib, value, time_ms) };
+        if ok == 0 {
+            Err(self.last_error_string())
+        } else {
+            Ok(())
+        }
     }
 
     pub fn channel_get_info(&self, handle: DWORD) -> Result<BassChannelInfo, String> {

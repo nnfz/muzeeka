@@ -16,6 +16,15 @@ use tauri::{AppHandle, Emitter};
 use crate::bass::{self, BassLibrary};
 use crate::equalizer::{eq_dsp_callback, EqDspContext, EqualizerSettings};
 
+// Spotify-like short musical fades (not on track changes)
+const PAUSE_FADE_MS: u32 = 220;
+const RESUME_FADE_MS: u32 = 180;
+
+// For seek: shallow dip (not to zero) + fast restore to feel like "наложение" / overlap
+const SEEK_DIP_MS: u32 = 40;
+const SEEK_RESTORE_MS: u32 = 60;
+const SEEK_DIP_LEVEL: f32 = 0.22;
+
 // ── Playback state enum ───────────────────────────────────────────────────────
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -356,21 +365,61 @@ impl Player {
     }
 
     pub fn pause(&self) -> Result<(), String> {
-        self.run_on_bass_thread(|inner| {
-            let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
+        // Start the fade-out immediately (Spotify-style smooth tail)
+        let fade_started = self.run_on_bass_thread(|inner| {
             if inner.current_handle != 0 {
-                bass.channel_pause(inner.current_handle)
+                if let Some(bass) = inner.bass.as_ref() {
+                    let _ = bass.channel_slide_attribute(
+                        inner.current_handle,
+                        bass::BASS_ATTRIB_VOL,
+                        0.0,
+                        PAUSE_FADE_MS,
+                    );
+                }
+                Ok(true)
             } else {
-                Err("Nothing is playing".into())
+                Ok(false)
             }
-        })
+        })?;
+
+        if fade_started {
+            // Schedule the actual pause after the fade has played out.
+            // This lets the full musical fade be heard (like Spotify).
+            let this = self.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(PAUSE_FADE_MS as u64 + 10));
+                let _ = this.run_on_bass_thread(|inner| {
+                    if inner.current_handle != 0 {
+                        if let Some(bass) = inner.bass.as_ref() {
+                            let _ = bass.channel_pause(inner.current_handle);
+                        }
+                    }
+                    Ok(())
+                });
+            });
+        }
+
+        Ok(())
     }
 
     pub fn resume(&self) -> Result<(), String> {
         self.run_on_bass_thread(|inner| {
             let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
             if inner.current_handle != 0 {
-                bass.channel_play(inner.current_handle, false)
+                let target = inner.volume;
+                // Force start from silence, play, then musical fade-in (Spotify style)
+                let _ = bass.channel_set_attribute(
+                    inner.current_handle,
+                    bass::BASS_ATTRIB_VOL,
+                    0.0,
+                );
+                bass.channel_play(inner.current_handle, false)?;
+                bass.channel_slide_attribute(
+                    inner.current_handle,
+                    bass::BASS_ATTRIB_VOL,
+                    target,
+                    RESUME_FADE_MS,
+                )
             } else {
                 Err("Nothing is playing".into())
             }
@@ -393,17 +442,37 @@ impl Player {
     }
 
     /// Seek to a position in seconds.
+    /// "Наложение" (overlap) style, not full затухание:
+    /// Quick shallow volume dip (not to zero), immediate seek, quick restore.
+    /// Feels like a smooth blend/transition during scrub, similar to Spotify.
+    /// No full silence, short times. Not used on track changes.
     pub fn seek(&self, position_secs: f64) -> Result<(), String> {
         self.run_on_bass_thread(move |inner| {
-            let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
             if inner.current_handle == 0 {
                 return Err("Nothing is playing".into());
             }
-            let info = bass.channel_get_info(inner.current_handle)?;
+            let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
+            let handle = inner.current_handle;
+            let target = inner.volume;
+
+            // Shallow quick dip — not full fade out. This gives "наложение" perception
+            // (brief lower volume + position change + restore) instead of clear silence.
+            let _ = bass.channel_slide_attribute(
+                handle,
+                bass::BASS_ATTRIB_VOL,
+                SEEK_DIP_LEVEL,
+                SEEK_DIP_MS,
+            );
+
+            // Seek immediately while volume is dipped
+            let info = bass.channel_get_info(handle)?;
             let bytes_per_sample = if info.flags & bass::BASS_SAMPLE_FLOAT != 0 { 4 } else { 2 };
             let block_align = bytes_per_sample * info.chans;
             let byte_pos = (position_secs * info.freq as f64) as u64 * block_align as u64;
-            bass.channel_set_position(inner.current_handle, byte_pos, bass::BASS_POS_BYTE)
+            let _ = bass.channel_set_position(handle, byte_pos, bass::BASS_POS_BYTE);
+
+            // Quick restore — the short dip + fast ramp back feels like overlap/blend
+            bass.channel_slide_attribute(handle, bass::BASS_ATTRIB_VOL, target, SEEK_RESTORE_MS)
         })
     }
 
