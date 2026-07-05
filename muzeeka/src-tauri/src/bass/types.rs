@@ -72,9 +72,12 @@ pub const BASS_ACTIVE_PAUSED_DEVICE: DWORD = 4;
 pub const BASS_ATTRIB_FREQ: DWORD = 1;
 pub const BASS_ATTRIB_VOL: DWORD = 2;
 pub const BASS_ATTRIB_PAN: DWORD = 3;
+pub const BASS_ATTRIB_BUFFER: DWORD = 13;
 
 // ── Config options ────────────────────────────────────────────────────────────
 pub const BASS_CONFIG_FLOATDSP: DWORD = 46;
+pub const BASS_CONFIG_BUFFER: DWORD = 0;
+pub const BASS_CONFIG_UPDATEPERIOD: DWORD = 1;
 
 // ── DSP ───────────────────────────────────────────────────────────────────────
 pub type HDSP = DWORD;

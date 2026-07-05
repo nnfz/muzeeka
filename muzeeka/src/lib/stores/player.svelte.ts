@@ -570,6 +570,14 @@ function orderedTracksFrom(filePath: string): MusicFile[] {
 }
 
 function buildGaplessQueue(filePath: string) {
+  if (repeatMode === 'one') {
+    const track = playingTracks.find((t) => t.path === filePath) ??
+      playlists.flatMap((p) => p.tracks).find((t) => t.path === filePath);
+    if (track) {
+      return [gaplessArgsForTrack(track, filePath)];
+    }
+    return [];
+  }
   return orderedTracksFrom(filePath).map((track) =>
     gaplessArgsForTrack(track, track.path)
   );
@@ -745,6 +753,11 @@ function toggleShuffle() {
 
 function toggleRepeat() {
   repeatMode = repeatMode === 'off' ? 'all' : repeatMode === 'all' ? 'one' : 'off';
+  // Rebuild gapless queue so backend respects the new repeat mode (esp. 'one' to avoid unwanted advance)
+  if (currentFile && (isPlaying || isPaused)) {
+    const q = buildGaplessQueue(currentFile);
+    void invoke('player_prepare_next', { queue: q }).catch(() => {});
+  }
 }
 
 // --- Event Listeners ---

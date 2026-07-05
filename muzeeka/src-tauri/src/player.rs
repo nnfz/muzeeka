@@ -34,14 +34,13 @@ pub struct TrackChangedPayload {
 const PAUSE_FADE_MS: u32 = 220;
 const RESUME_FADE_MS: u32 = 180;
 
-// For seek: shallow dip (not to zero) + fast restore to feel like "наложение" / overlap
-const SEEK_DIP_MS: u32 = 40;
-const SEEK_RESTORE_MS: u32 = 60;
-const SEEK_DIP_LEVEL: f32 = 0.22;
+// For seek: we want it instant.
+// Very short hard mute only during the flush to hide any restart artifact.
+const SEEK_DIP_LEVEL: f32 = 0.0;
 
 // Gapless: switch at the real segment boundary (tight tolerance avoids early cuts).
-const GAPLESS_END_EPSILON_SECS: f64 = 0.004;
-const POLL_INTERVAL_MS: u64 = 15;
+const GAPLESS_END_EPSILON_SECS: f64 = 0.008;
+const POLL_INTERVAL_MS: u64 = 50;
 
 // ── Playback state enum ───────────────────────────────────────────────────────
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -243,6 +242,11 @@ impl Player {
             }
         }
 
+        // Low latency config for fast manual switching and seeking (like Foobar).
+        // Smaller buffer = position changes and new tracks are heard quicker.
+        let _ = bass.set_config(bass::BASS_CONFIG_BUFFER, 100.0);      // ~100ms playback buffer
+        let _ = bass.set_config(bass::BASS_CONFIG_UPDATEPERIOD, 10.0); // update more often
+
         inner.eq_context.set_float_dsp_enabled(float_dsp_ok);
         inner.bass = Some(bass);
         Self::load_bass_addons(inner);
@@ -307,6 +311,8 @@ impl Player {
         // NONSTOP so it doesn't stall between tracks (we control via queue).
         let flags = bass::BASS_MIXER_QUEUE | bass::BASS_MIXER_NONSTOP | bass::BASS_SAMPLE_FLOAT;
         let mixer = bass.mixer_stream_create(44100, 2, flags)?;
+        // Match the low latency buffer on the mixer itself for fast seeks/switches.
+        let _ = bass.channel_set_attribute(mixer, bass::BASS_ATTRIB_BUFFER, 0.1);
         // Start the mixer (it will output silence until sources added, or play when first added).
         bass.channel_play(mixer, false)?;
         // Set initial volume on mixer
@@ -512,6 +518,14 @@ impl Player {
                 .is_some_and(|current| Self::same_audio_path(current, audio_path))
     }
 
+    fn can_use_preloaded(inner: &PlayerInner, audio_path: &str) -> bool {
+        inner.preloaded_source != 0
+            && inner
+                .preloaded_audio_path
+                .as_ref()
+                .is_some_and(|p| Self::same_audio_path(p, audio_path))
+    }
+
     fn clear_preload(inner: &mut PlayerInner) {
         if inner.preloaded_source != 0 {
             if let Some(bass) = inner.bass.as_ref() {
@@ -582,13 +596,25 @@ impl Player {
         audio_path: &str,
         cue_start: Option<f64>,
     ) -> Result<u32, String> {
-        let flags = bass::BASS_STREAM_PRESCAN | bass::BASS_SAMPLE_FLOAT | bass::BASS_STREAM_DECODE;
+        // No PRESCAN: much faster track start and manual switching.
+        // Prescan is only useful for accurate seeking in VBR MP3 without good headers.
+        // For speed (like Foobar) we skip it. Duration comes from metadata or later.
+        let flags = bass::BASS_SAMPLE_FLOAT | bass::BASS_STREAM_DECODE;
         let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
         let source = bass
             .stream_create_file(audio_path, flags)
             .map_err(|error| format!("{error} — file: {}", audio_path))?;
         Self::ensure_original_playback_rate(bass, source);
-        Self::wait_for_stream_length(inner, source)?;
+
+        // Very short wait so length becomes available quickly, but we don't block long.
+        // This is critical for fast manual play.
+        for _ in 0..8 {
+            if bass.channel_get_length(source, bass::BASS_POS_BYTE) > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
         if let Some(start) = cue_start {
             Self::seek_channel_to_seconds(bass, source, start)?;
         }
@@ -611,42 +637,32 @@ impl Player {
         track_path: &str,
         playback: &PlaybackTarget,
     ) -> Result<(), String> {
-        // For new audio, teardown old source. Also clear preloads and restart mixer to drop any queued sources from previous playlist segment.
+        // Teardown previous source (remove from mixer). Do NOT stop the mixer itself — keeps audio pipeline running for smoother transitions.
         Self::teardown_current(inner);
         Self::clear_preload(inner);
-        if let Some(bass) = inner.bass.as_ref() {
-            if inner.mixer_handle != 0 {
-                let _ = bass.channel_stop(inner.mixer_handle);
-                // restart to flush any lingering queued sources
-                let _ = bass.channel_play(inner.mixer_handle, true);
-                let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_VOL, inner.volume);
-            }
-        }
 
         let source = Self::create_decode_source(inner, &playback.audio_path, playback.cue_start)?;
 
         Self::add_source_to_mixer(inner, source)?;
 
-        // Apply volume to mixer 
         if let Some(bass) = inner.bass.as_ref() {
             let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_VOL, inner.volume);
-            // Ensure mixer is playing
+            // Start mixer if it was stopped (e.g. after full stop at end of playlist)
             if bass.channel_is_active(inner.mixer_handle) != bass::BASS_ACTIVE_PLAYING {
                 let _ = bass.channel_play(inner.mixer_handle, false);
             }
+            let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_BUFFER, 0.1);
         }
 
         inner.current_source = source;
         Self::apply_segment_metadata(inner, track_path, playback);
 
-        // Re-attach EQ to mixer after possible restart
+        // Ensure EQ on mixer
         let eq_enabled = inner.eq_context.get_settings().enabled;
         if eq_enabled {
             let _ = Self::attach_dsp_to_mixer(inner);
-        } else {
-            if inner.dsp_handle != 0 {
-                Self::detach_dsp(inner);
-            }
+        } else if inner.dsp_handle != 0 {
+            Self::detach_dsp(inner);
         }
         Ok(())
     }
@@ -719,6 +735,7 @@ impl Player {
             if bass.channel_is_active(inner.mixer_handle) != bass::BASS_ACTIVE_PLAYING {
                 let _ = bass.channel_play(inner.mixer_handle, false);
             }
+            let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_BUFFER, 0.1);
         }
 
         inner.preloaded_source = 0;
@@ -772,6 +789,10 @@ impl Player {
 
         if Self::can_gapless_reuse(inner, &playback.audio_path) {
             Self::apply_segment(inner, track_path, &playback)?;
+        } else if Self::can_use_preloaded(inner, &playback.audio_path) {
+            // Fast path for manual next/prev when the track was preloaded for gapless.
+            // This makes "hand switching" to the next track nearly instant.
+            Self::activate_preloaded(inner, track_path, &playback)?;
         } else {
             Self::teardown_current(inner);
             Self::open_stream(inner, track_path, &playback)?;
@@ -817,17 +838,6 @@ impl Player {
     /// Keep the stream at its native sample rate (BASS attrib 0 = original).
     fn ensure_original_playback_rate(bass: &BassLibrary, handle: u32) {
         let _ = bass.channel_set_attribute(handle, bass::BASS_ATTRIB_FREQ, 0.0);
-    }
-
-    fn wait_for_stream_length(inner: &PlayerInner, handle: u32) -> Result<(), String> {
-        let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
-        for _ in 0..100 {
-            if bass.channel_get_length(handle, bass::BASS_POS_BYTE) > 0 {
-                return Ok(());
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-        Err("Audio stream is not ready (length unavailable)".to_string())
     }
 
     fn stream_duration_secs(bass: &BassLibrary, handle: u32) -> f64 {
@@ -918,7 +928,6 @@ impl Player {
             Self::clear_preload(inner);
             if let Some(bass) = inner.bass.as_ref() {
                 if inner.mixer_handle != 0 {
-                    // Stop mixer output too
                     let _ = bass.channel_stop(inner.mixer_handle);
                 }
             }
@@ -943,22 +952,22 @@ impl Player {
             let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
             let target = inner.volume;
 
-            // Shallow quick dip — not full fade out. This gives "наложение" perception
-            // (brief lower volume + position change + restore) instead of clear silence.
-            let _ = bass.channel_slide_attribute(
-                inner.mixer_handle,
-                bass::BASS_ATTRIB_VOL,
-                SEEK_DIP_LEVEL,
-                SEEK_DIP_MS,
-            );
+            // Instant seek: hard jump + flush. No long animation.
+            // Dip only for the flush moment to avoid click, then immediate restore.
+            let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_VOL, SEEK_DIP_LEVEL);
 
-            // Seek on the source
             let absolute_secs = Self::absolute_seek_position(inner, position_secs);
             let byte = bass.channel_seconds2bytes(inner.current_source, absolute_secs);
             let _ = bass.mixer_channel_set_position(inner.current_source, byte, bass::BASS_POS_BYTE);
 
-            // Quick restore on mixer
-            bass.channel_slide_attribute(inner.mixer_handle, bass::BASS_ATTRIB_VOL, target, SEEK_RESTORE_MS)
+            // This flush makes the seek actually happen right now (discards old ~100ms buffer).
+            let _ = bass.channel_play(inner.mixer_handle, true);
+            let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_BUFFER, 0.1);
+
+            // Restore volume hard for maximum speed.
+            let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_VOL, target);
+
+            Ok(())
         })
     }
 
@@ -993,6 +1002,8 @@ impl Player {
 
     fn release_ended_stream_inner(inner: &mut PlayerInner) {
         Self::teardown_current(inner);
+        // Do not stop the mixer here — it allows smoother resume / next play.
+        // Full stop() command will handle explicit stop.
     }
 
     /// Get a snapshot of the current player state.
@@ -1033,14 +1044,17 @@ impl Player {
                 current_file_name: file_name,
             };
         }
-        let active_raw = {
-            let bass = inner.bass.as_ref().unwrap();
-            bass.channel_is_active(inner.mixer_handle)
-        };
-        let active: PlaybackState = active_raw.into();
 
-        if active == PlaybackState::Stopped {
-            let bass = inner.bass.as_ref().unwrap();
+        let bass = inner.bass.as_ref().unwrap();
+        let src_active_raw = bass.channel_is_active(inner.current_source);
+        let mixer_active_raw = bass.channel_is_active(inner.mixer_handle);
+        let src_active: PlaybackState = src_active_raw.into();
+        let mixer_active: PlaybackState = mixer_active_raw.into();
+
+        // Mixer with NONSTOP keeps PLAYING (silence) after last source ends.
+        // Report Stopped based on the *source* being gone or ended.
+        let source_ended = src_active == PlaybackState::Stopped || inner.current_source == 0;
+        if source_ended || mixer_active == PlaybackState::Stopped {
             let pos_bytes = bass.mixer_channel_get_position(inner.current_source, bass::BASS_POS_BYTE);
             let len_bytes = bass.channel_get_length(inner.current_source, bass::BASS_POS_BYTE);
             let absolute_position = bass.channel_bytes2seconds(inner.current_source, pos_bytes);
@@ -1066,7 +1080,9 @@ impl Player {
             };
         }
 
-        let bass = inner.bass.as_ref().unwrap();
+        let active_raw = mixer_active_raw;
+        let active: PlaybackState = active_raw.into();
+
         let pos_bytes = bass.mixer_channel_get_position(inner.current_source, bass::BASS_POS_BYTE);
         let len_bytes = bass.channel_get_length(inner.current_source, bass::BASS_POS_BYTE);
         let absolute_position = bass.channel_bytes2seconds(inner.current_source, pos_bytes);
@@ -1147,15 +1163,21 @@ impl Player {
                         return Ok((None, POLL_INTERVAL_MS));
                     }
                     let bass = inner.bass.as_ref().unwrap();
-                    let active = bass.channel_is_active(inner.mixer_handle);
+                    let mixer_active = bass.channel_is_active(inner.mixer_handle);
+                    let src_active = if inner.current_source != 0 {
+                        bass.channel_is_active(inner.current_source)
+                    } else {
+                        bass::BASS_ACTIVE_STOPPED
+                    };
                     let pos_bytes =
                         bass.mixer_channel_get_position(inner.current_source, bass::BASS_POS_BYTE);
                     let absolute =
                         bass.channel_bytes2seconds(inner.current_source, pos_bytes);
 
-                    let ending = active == bass::BASS_ACTIVE_PLAYING
-                        && Self::track_ending(inner, bass, absolute);
-                    let stream_done = active == bass::BASS_ACTIVE_STOPPED;
+                    let playing = mixer_active == bass::BASS_ACTIVE_PLAYING;
+                    let ending = playing && Self::track_ending(inner, bass, absolute);
+                    // Source ended (or no source) means the track is done, even if mixer is still "playing" silence (NONSTOP)
+                    let stream_done = src_active == bass::BASS_ACTIVE_STOPPED || mixer_active == bass::BASS_ACTIVE_STOPPED;
 
                     if Self::has_next_in_gapless_queue(inner) && (ending || stream_done) {
                         return Self::try_advance_gapless(inner)
@@ -1166,9 +1188,12 @@ impl Player {
                             });
                     }
 
-                    if ending && !Self::has_next_in_gapless_queue(inner) {
-                        // For last track, stop the source (mixer may continue or we stop)
-                        let _ = bass.mixer_channel_remove(inner.current_source);
+                    if (ending || stream_done) && !Self::has_next_in_gapless_queue(inner) {
+                        // End of playlist: ensure source is gone (AUTOFREE usually handles it).
+                        // Do not stop the mixer — keep it running (silent) so next playback starts without device hiccup.
+                        if inner.current_source != 0 {
+                            let _ = bass.mixer_channel_remove(inner.current_source);
+                        }
                     }
 
                     Ok((None, POLL_INTERVAL_MS))
