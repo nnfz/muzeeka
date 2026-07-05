@@ -6,7 +6,24 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 
+use crate::cue;
 use crate::library::MusicFile;
+
+fn repair_playlist_tracks(tracks: &mut Vec<MusicFile>) {
+    let mut repaired = Vec::with_capacity(tracks.len());
+
+    for mut track in tracks.drain(..) {
+        if cue::is_cue_sheet_path(&track.path) {
+            repaired.extend(cue::expand_cue_file(std::path::Path::new(&track.path)));
+            continue;
+        }
+
+        cue::repair_track(&mut track);
+        repaired.push(track);
+    }
+
+    *tracks = repaired;
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SavedPlaylist {
@@ -38,7 +55,8 @@ fn playlists_path(app: &AppHandle) -> Result<PathBuf, String> {
 
 fn prune_missing_tracks(data: &mut PlaylistsData) {
     for playlist in &mut data.playlists {
-        playlist.tracks.retain(|track| std::path::Path::new(&track.path).exists());
+        repair_playlist_tracks(&mut playlist.tracks);
+        playlist.tracks.retain(cue::track_file_exists);
     }
 }
 

@@ -27,6 +27,9 @@ export interface MusicFile {
   track_number?: number | null;
   genre?: string | null;
   cover_path?: string | null;
+  audio_path?: string | null;
+  cue_start_secs?: number | null;
+  cue_end_secs?: number | null;
 }
 
 export interface Playlist {
@@ -53,6 +56,7 @@ let currentFile = $state<string | null>(null);
 let currentFileName = $state<string | null>(null);
 let playlists = $state<Playlist[]>([]);
 let activePlaylistId = $state<string | null>(null);
+let playingPlaylistId = $state<string | null>(null);
 let currentTrackIndex = $state(-1);
 let shuffleEnabled = $state(false);
 let shuffleOrder = $state<number[]>([]);
@@ -74,6 +78,17 @@ let activePlaylist = $derived(
   playlists.find((p) => p.id === activePlaylistId) ?? null
 );
 
+let playingPlaylist = $derived(
+  playingPlaylistId
+    ? (playlists.find((p) => p.id === playingPlaylistId) ?? null)
+    : null
+);
+
+let playingTracks = $derived.by(() => {
+  if (!playingPlaylistId) return [];
+  return playlists.find((p) => p.id === playingPlaylistId)?.tracks ?? [];
+});
+
 // Search across ALL playlists so metadata survives playlist switches
 let currentTrack = $derived.by(() => {
   if (!currentFile) return null;
@@ -89,13 +104,15 @@ let hasTrack = $derived(currentFile !== null);
 // hasCurrentTrack: track is remembered but player is fully stopped (e.g. after app restart)
 let hasCurrentTrack = $derived(currentFile !== null && !isPlaying && !isPaused);
 let hasTracks = $derived(tracks.length > 0);
+let hasPlayingTracks = $derived(playingTracks.length > 0);
+let hasAnyTracks = $derived(playlists.some((p) => p.tracks.length > 0));
 let hasPlaylists = $derived(playlists.length > 0);
 let hasNext = $derived(
-  repeatMode === 'all' && hasTracks
+  repeatMode === 'all' && hasPlayingTracks
     ? true
     : shuffleEnabled
       ? shufflePosition < shuffleOrder.length - 1
-      : currentTrackIndex < tracks.length - 1
+      : currentTrackIndex < playingTracks.length - 1
 );
 let hasPrev = $derived(
   shuffleEnabled
@@ -172,8 +189,17 @@ async function enrichTrackMetadata() {
   }
 }
 
+function findPlaylistForTrack(path: string): string | null {
+  for (const playlist of playlists) {
+    if (playlist.tracks.some((track) => track.path === path)) {
+      return playlist.id;
+    }
+  }
+  return null;
+}
+
 function syncTrackIndex() {
-  currentTrackIndex = tracks.findIndex((t) => t.path === currentFile);
+  currentTrackIndex = playingTracks.findIndex((t) => t.path === currentFile);
   syncShufflePosition();
 }
 
@@ -187,13 +213,13 @@ function shuffleIndices(count: number): number[] {
 }
 
 function rebuildShuffleOrder(keepCurrent = true) {
-  if (tracks.length === 0) {
+  if (playingTracks.length === 0) {
     shuffleOrder = [];
     shufflePosition = 0;
     return;
   }
 
-  const indices = shuffleIndices(tracks.length);
+  const indices = shuffleIndices(playingTracks.length);
   if (keepCurrent && currentTrackIndex >= 0) {
     const at = indices.indexOf(currentTrackIndex);
     if (at > 0) {
@@ -215,8 +241,8 @@ function syncShufflePosition() {
 function ensureShuffleOrder() {
   if (!shuffleEnabled) return;
   if (
-    shuffleOrder.length !== tracks.length ||
-    shuffleOrder.some((index) => index < 0 || index >= tracks.length)
+    shuffleOrder.length !== playingTracks.length ||
+    shuffleOrder.some((index) => index < 0 || index >= playingTracks.length)
   ) {
     rebuildShuffleOrder(currentTrackIndex >= 0);
     syncShufflePosition();
@@ -256,7 +282,7 @@ function scheduleSave() {
 async function loadPlaylists() {
   try {
     const data = await invoke<PlaylistsData>('playlists_load');
-    playlists = data.playlists ?? [];
+    playlists = (data.playlists ?? []).map(repairPlaylistTracks);
     activePlaylistId = data.active_playlist_id ?? playlists[0]?.id ?? null;
     if (typeof data.volume === 'number') {
       volume = data.volume;
@@ -270,6 +296,7 @@ async function loadPlaylists() {
           .flatMap((p) => p.tracks)
           .find((t) => t.path === data.current_file);
         currentFileName = track ? trackDisplayTitle(track) : data.current_file.split(/[\\/]/).pop()?.replace(/\.[^/.]+$/, '') ?? null;
+        playingPlaylistId = findPlaylistForTrack(data.current_file);
         // Note: isPaused stays false — player is freshly started, track is just "remembered"
       }
     }
@@ -303,8 +330,6 @@ function createPlaylist(name?: string): string {
 function selectPlaylist(id: string) {
   if (!playlists.some((p) => p.id === id)) return;
   activePlaylistId = id;
-  syncTrackIndex();
-  if (shuffleEnabled) rebuildShuffleOrder(currentTrackIndex >= 0);
   prefetchCoverPaths(
     playlists.find((p) => p.id === id)?.tracks.map((track) => track.cover_path) ?? []
   );
@@ -315,10 +340,52 @@ function deletePlaylist(id: string) {
   const nextPlaylists = playlists.filter((p) => p.id !== id);
   playlists = nextPlaylists;
 
-  if (activePlaylistId !== id) return;
+  if (playingPlaylistId === id) {
+    void stop();
+    currentFile = null;
+    currentFileName = null;
+    currentTrackIndex = -1;
+    playingPlaylistId = null;
+    shuffleOrder = [];
+    shufflePosition = 0;
+  }
 
-  activePlaylistId = nextPlaylists[0]?.id ?? null;
-  syncTrackIndex();
+  if (activePlaylistId === id) {
+    activePlaylistId = nextPlaylists[0]?.id ?? null;
+  }
+
+  scheduleSave();
+}
+
+function removeTrack(path: string, playlistId?: string | null) {
+  const targetId = playlistId ?? activePlaylistId;
+  if (!targetId) return;
+
+  const playlist = playlists.find((p) => p.id === targetId);
+  if (!playlist?.tracks.some((track) => track.path === path)) return;
+
+  playlists = playlists.map((p) =>
+    p.id === targetId ? { ...p, tracks: p.tracks.filter((track) => track.path !== path) } : p
+  );
+
+  if (currentFile === path) {
+    void stop();
+    currentFile = null;
+    currentFileName = null;
+    currentTrackIndex = -1;
+    if (targetId === playingPlaylistId) {
+      playingPlaylistId = null;
+    }
+    shuffleOrder = [];
+    shufflePosition = 0;
+  } else if (targetId === playingPlaylistId) {
+    syncTrackIndex();
+    if (shuffleEnabled) {
+      rebuildShuffleOrder(currentTrackIndex >= 0);
+      syncShufflePosition();
+    }
+  }
+
   scheduleSave();
 }
 
@@ -434,22 +501,68 @@ async function bootstrap() {
   }
 }
 
+function repairCueTrack(track: MusicFile): MusicFile {
+  if (!track.path.includes('#cue:')) return track;
+
+  const marker = '#cue:';
+  const markerPos = track.path.lastIndexOf(marker);
+  if (markerPos <= 0) return track;
+
+  const audioPath = track.path.slice(0, markerPos);
+  return {
+    ...track,
+    audio_path: track.audio_path ?? audioPath,
+  };
+}
+
+function repairPlaylistTracks(playlist: Playlist): Playlist {
+  const repaired: MusicFile[] = [];
+
+  for (const track of playlist.tracks) {
+    if (track.path.toLowerCase().endsWith('.cue')) {
+      continue;
+    }
+    repaired.push(repairCueTrack(track));
+  }
+
+  return { ...playlist, tracks: repaired };
+}
+
+function playOptionsForTrack(track: MusicFile | undefined, filePath: string) {
+  // CUE segment times are resolved on the Rust side from the virtual path (#cue:N).
+  return {
+    filePath,
+    audioPath: track?.audio_path ?? undefined,
+    cueStart: track?.cue_start_secs ?? undefined,
+    cueEnd: track?.cue_end_secs ?? undefined,
+  };
+}
+
 async function play(filePath: string) {
   try {
     await ensureInit();
-    await invoke('player_play', { filePath });
+    const track = playlists
+      .flatMap((p) => p.tracks)
+      .find((t) => t.path === filePath);
+    const playlistId = findPlaylistForTrack(filePath);
+    if (playlistId) {
+      playingPlaylistId = playlistId;
+    }
+    await invoke('player_play', playOptionsForTrack(track, filePath));
     currentFile = filePath;
-    const file = tracks.find((t) => t.path === filePath);
+    const file = track;
     currentFileName = file
       ? trackDisplayTitle(file)
       : filePath.split(/[\\/]/).pop()?.replace(/\.[^/.]+$/, '') ?? null;
-    currentTrackIndex = tracks.findIndex((t) => t.path === filePath);
-    syncShufflePosition();
+    syncTrackIndex();
     isPlaying = true;
     isPaused = false;
     scheduleSave(); // persist current_file so it survives restart
   } catch (e) {
-    console.error('Failed to play:', e);
+    const message = typeof e === 'string' ? e : String(e);
+    console.error('Failed to play:', message);
+    isPlaying = false;
+    isPaused = false;
   }
 }
 
@@ -520,10 +633,12 @@ async function togglePlayPause() {
     await pause();
   } else if (isPaused) {
     await resume();
-  } else if (hasTracks && currentTrackIndex >= 0) {
-    await play(tracks[currentTrackIndex].path);
-  } else if (hasTracks) {
-    await play(tracks[0].path);
+  } else if (currentFile) {
+    await play(currentFile);
+  } else if (hasPlayingTracks && currentTrackIndex >= 0) {
+    await play(playingTracks[currentTrackIndex].path);
+  } else if (hasPlayingTracks) {
+    await play(playingTracks[0].path);
   }
 }
 
@@ -537,14 +652,14 @@ async function nextTrack() {
     } else {
       return;
     }
-    await play(tracks[shuffleOrder[shufflePosition]].path);
+    await play(playingTracks[shuffleOrder[shufflePosition]].path);
     return;
   }
 
-  if (currentTrackIndex < tracks.length - 1) {
-    await play(tracks[currentTrackIndex + 1].path);
-  } else if (repeatMode === 'all' && tracks.length > 0) {
-    await play(tracks[0].path);
+  if (currentTrackIndex < playingTracks.length - 1) {
+    await play(playingTracks[currentTrackIndex + 1].path);
+  } else if (repeatMode === 'all' && playingTracks.length > 0) {
+    await play(playingTracks[0].path);
   }
 }
 
@@ -558,13 +673,13 @@ async function prevTrack() {
     ensureShuffleOrder();
     if (shufflePosition > 0) {
       shufflePosition -= 1;
-      await play(tracks[shuffleOrder[shufflePosition]].path);
+      await play(playingTracks[shuffleOrder[shufflePosition]].path);
     }
     return;
   }
 
   if (hasPrev) {
-    await play(tracks[currentTrackIndex - 1].path);
+    await play(playingTracks[currentTrackIndex - 1].path);
   }
 }
 
@@ -623,18 +738,18 @@ function setupListeners() {
       ensureShuffleOrder();
       if (shufflePosition < shuffleOrder.length - 1) {
         shufflePosition += 1;
-        void play(tracks[shuffleOrder[shufflePosition]].path);
+        void play(playingTracks[shuffleOrder[shufflePosition]].path);
       } else if (repeatMode === 'all') {
         shufflePosition = 0;
-        void play(tracks[shuffleOrder[0]].path);
+        void play(playingTracks[shuffleOrder[0]].path);
       }
       return;
     }
 
-    if (currentTrackIndex < tracks.length - 1) {
+    if (currentTrackIndex < playingTracks.length - 1) {
       void nextTrack();
-    } else if (repeatMode === 'all' && tracks.length > 0) {
-      void play(tracks[0].path);
+    } else if (repeatMode === 'all' && playingTracks.length > 0) {
+      void play(playingTracks[0].path);
     }
   });
 }
@@ -659,6 +774,9 @@ export function createPlayerStore() {
     get playlists() { return playlists; },
     get activePlaylistId() { return activePlaylistId; },
     get activePlaylist() { return activePlaylist; },
+    get playingPlaylistId() { return playingPlaylistId; },
+    get playingPlaylist() { return playingPlaylist; },
+    get playingTracks() { return playingTracks; },
     get currentTrackIndex() { return currentTrackIndex; },
     get shuffleEnabled() { return shuffleEnabled; },
     get repeatMode() { return repeatMode; },
@@ -668,6 +786,8 @@ export function createPlayerStore() {
     get hasTrack() { return hasTrack; },
     get hasCurrentTrack() { return hasCurrentTrack; },
     get hasTracks() { return hasTracks; },
+    get hasPlayingTracks() { return hasPlayingTracks; },
+    get hasAnyTracks() { return hasAnyTracks; },
     get hasPlaylists() { return hasPlaylists; },
     get hasNext() { return hasNext; },
     get hasPrev() { return hasPrev; },
@@ -679,6 +799,7 @@ export function createPlayerStore() {
     selectPlaylist,
     deletePlaylist,
     renamePlaylist,
+    removeTrack,
     addFolderToActivePlaylist,
     addDroppedPaths,
     addScannedTracks,

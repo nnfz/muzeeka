@@ -218,8 +218,14 @@
                       class="preset-delete-btn"
                       title="Delete preset"
                       role="button"
-                      tabindex="-1"
+                      tabindex="0"
                       onclick={(e) => {
+                        e.stopPropagation();
+                        void settings.deletePreset(preset.name);
+                      }}
+                      onkeydown={(e) => {
+                        if (e.key !== 'Enter' && e.key !== ' ') return;
+                        e.preventDefault();
                         e.stopPropagation();
                         void settings.deletePreset(preset.name);
                       }}

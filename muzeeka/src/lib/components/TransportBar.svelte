@@ -26,7 +26,7 @@
         class="control-btn mode-btn"
         class:active={player.shuffleEnabled}
         onclick={() => player.toggleShuffle()}
-        disabled={!player.hasTracks}
+        disabled={!player.hasPlayingTracks}
         aria-label={player.shuffleEnabled ? 'Disable shuffle' : 'Enable shuffle'}
         title={player.shuffleEnabled ? 'Shuffle on' : 'Shuffle'}
       >
@@ -50,7 +50,7 @@
         class="control-btn play-btn"
         class:playing={player.isPlaying}
         onclick={() => player.togglePlayPause()}
-        disabled={!player.hasTracks}
+        disabled={!player.hasPlayingTracks && !player.hasTrack}
         aria-label={player.isPlaying ? 'Pause' : player.isPaused ? 'Resume' : 'Play'}
       >
         {#if player.isPlaying}
@@ -81,7 +81,7 @@
         class:active={player.repeatMode !== 'off'}
         class:repeat-one={player.repeatMode === 'one'}
         onclick={() => player.toggleRepeat()}
-        disabled={!player.hasTracks}
+        disabled={!player.hasPlayingTracks}
         aria-label={
           player.repeatMode === 'one'
             ? 'Disable repeat'

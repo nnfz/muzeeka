@@ -8,12 +8,12 @@ use std::sync::{mpsc, Arc, Mutex as StdMutex};
 use std::thread;
 use std::time::Duration;
 
-use libloading::Library;
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 
 use crate::bass::{self, BassLibrary};
+use crate::cue;
 use crate::equalizer::{eq_dsp_callback, EqDspContext, EqualizerSettings};
 
 // Spotify-like short musical fades (not on track changes)
@@ -83,10 +83,26 @@ struct PlayerInner {
     dsp_handle: u32,
     current_file: Option<String>,
     volume: f32,
+    cue_start: Option<f64>,
+    cue_end: Option<f64>,
     eq_context: &'static EqDspContext,
-    /// Loaded addon DLLs — kept alive so the plugins stay registered.
-    _addons: Vec<Library>,
+    /// Handles returned by BASS_PluginLoad — keep plugins registered.
+    _plugin_handles: Vec<u32>,
 }
+
+/// BASS format plugins loaded via `BASS_PluginLoad` (not bass_fx / bassmix / etc.).
+const BASS_FORMAT_PLUGINS: &[&str] = &[
+    "bassflac.dll",
+    "bassape.dll",
+    "basswv.dll",
+    "bassopus.dll",
+    "basswma.dll",
+    "bassalac.dll",
+    "basshls.dll",
+    "bassmidi.dll",
+    "basscd.dll",
+    "basszxtune.dll",
+];
 
 // ── Public player handle ──────────────────────────────────────────────────────
 #[derive(Clone)]
@@ -97,18 +113,19 @@ pub struct Player {
 }
 
 impl Player {
-    /// Create a new Player. `bass_dir` is the folder containing bass.dll.
-    pub fn new(bass_dir: PathBuf) -> Self {
+    pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(PlayerInner {
                 bass: None,
-                bass_dir,
+                bass_dir: PathBuf::new(),
                 current_handle: 0,
                 dsp_handle: 0,
                 current_file: None,
                 volume: 1.0,
+                cue_start: None,
+                cue_end: None,
                 eq_context: Box::leak(Box::new(EqDspContext::new())),
-                _addons: Vec::new(),
+                _plugin_handles: Vec::new(),
             })),
             app: Arc::new(RwLock::new(None)),
             bass_thread: Arc::new(RwLock::new(None)),
@@ -117,6 +134,13 @@ impl Player {
 
     pub fn set_app_handle(&self, app: AppHandle) {
         *self.app.write() = Some(app);
+    }
+
+    pub fn set_bass_dir(&self, bass_dir: PathBuf) {
+        let mut inner = self.inner.lock();
+        if inner.bass.is_none() {
+            inner.bass_dir = bass_dir;
+        }
     }
 
     fn on_bass_thread(&self) -> bool {
@@ -162,6 +186,13 @@ impl Player {
             return Ok(());
         }
 
+        if !inner.bass_dir.join("bass.dll").is_file() {
+            return Err(format!(
+                "BASS directory is invalid: {}",
+                inner.bass_dir.display()
+            ));
+        }
+
         let bass = BassLibrary::load(&inner.bass_dir)?;
 
         // FLOATDSP must be configured before BASS_Init.
@@ -177,13 +208,21 @@ impl Player {
         }
 
         inner.eq_context.set_float_dsp_enabled(float_dsp_ok);
-        Self::load_bass_addons(inner);
         inner.bass = Some(bass);
+        Self::load_bass_addons(inner);
         Ok(())
     }
 
     fn load_bass_addons(inner: &mut PlayerInner) {
+        let Some(bass) = inner.bass.as_ref() else {
+            return;
+        };
+
         let Ok(entries) = std::fs::read_dir(&inner.bass_dir) else {
+            eprintln!(
+                "BASS addons: directory not found at {}",
+                inner.bass_dir.display()
+            );
             return;
         };
 
@@ -202,9 +241,22 @@ impl Player {
             if name.eq_ignore_ascii_case("bass.dll") {
                 continue;
             }
+            if !BASS_FORMAT_PLUGINS
+                .iter()
+                .any(|plugin| name.eq_ignore_ascii_case(plugin))
+            {
+                continue;
+            }
 
-            if let Ok(lib) = bass::load_addon(&path) {
-                inner._addons.push(lib);
+            let path_str = path.to_string_lossy().to_string();
+            match bass.plugin_load(&path_str) {
+                Ok(handle) => {
+                    eprintln!("BASS plugin loaded: {name}");
+                    inner._plugin_handles.push(handle);
+                }
+                Err(error) => {
+                    eprintln!("BASS plugin failed ({name}): {error}");
+                }
             }
         }
     }
@@ -320,12 +372,27 @@ impl Player {
     }
 
     /// Play a file. Stops the current stream first if any.
-    pub fn play(&self, path: &str) -> Result<(), String> {
-        let path = path.to_string();
-        self.run_on_bass_thread(move |inner| Self::play_inner(inner, &path))
+    pub fn play(
+        &self,
+        track_path: &str,
+        audio_path: Option<&str>,
+        cue_start: Option<f64>,
+        cue_end: Option<f64>,
+    ) -> Result<(), String> {
+        let track_path = track_path.to_string();
+        let audio_path = audio_path.map(str::to_string);
+        self.run_on_bass_thread(move |inner| {
+            Self::play_inner(inner, &track_path, audio_path.as_deref(), cue_start, cue_end)
+        })
     }
 
-    fn play_inner(inner: &mut PlayerInner, path: &str) -> Result<(), String> {
+    fn play_inner(
+        inner: &mut PlayerInner,
+        track_path: &str,
+        audio_path: Option<&str>,
+        cue_start: Option<f64>,
+        cue_end: Option<f64>,
+    ) -> Result<(), String> {
         let prev_handle = inner.current_handle;
         if prev_handle != 0 {
             Self::detach_dsp(inner);
@@ -335,33 +402,127 @@ impl Player {
             inner.current_handle = 0;
         }
 
+        let playback = cue::resolve_playback(track_path, audio_path, cue_start, cue_end)
+            .map_err(|error| format!("{error} (track: {track_path})"))?;
+        let playback_path = playback.audio_path;
+        let cue_start = playback.cue_start;
+        let cue_end = playback.cue_end;
+
+        eprintln!(
+            "[muzeeka] play: track={track_path} audio={playback_path} cue={cue_start:?}-{cue_end:?}"
+        );
         let flags = bass::BASS_STREAM_PRESCAN | bass::BASS_SAMPLE_FLOAT;
 
         let handle = {
             let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
-            bass.stream_create_file(path, flags)?
+            bass.stream_create_file(&playback_path, flags).map_err(|error| {
+                format!("{error} — file: {playback_path}")
+            })?
         };
 
         {
             let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
-            let _ = bass.channel_set_attribute(handle, bass::BASS_ATTRIB_VOL, inner.volume);
+            bass.channel_set_attribute(handle, bass::BASS_ATTRIB_VOL, inner.volume)?;
         }
 
-        // Attach DSP *before* starting playback so the first audio buffers go through EQ.
+        Self::wait_for_stream_length(inner, handle)?;
+        Self::start_stream_playback(inner, handle, cue_start)?;
+
+        // Attach EQ after the stream is at the CUE offset so APE seeking stays accurate.
         if inner.eq_context.get_settings().enabled {
             Self::attach_dsp(inner, handle)?;
         } else {
             inner.dsp_handle = 0;
         }
 
-        {
-            let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
-            bass.channel_play(handle, true)?;
+        inner.current_handle = handle;
+        inner.current_file = Some(track_path.to_string());
+        inner.cue_start = cue_start;
+        inner.cue_end = cue_end;
+        Ok(())
+    }
+
+    fn cue_relative_position(inner: &PlayerInner, absolute_secs: f64) -> f64 {
+        match inner.cue_start {
+            Some(start) => (absolute_secs - start).max(0.0),
+            None => absolute_secs,
+        }
+    }
+
+    fn cue_segment_duration(inner: &PlayerInner, absolute_duration: f64) -> f64 {
+        match (inner.cue_start, inner.cue_end) {
+            (Some(start), Some(end)) => (end - start).max(0.0),
+            (Some(start), None) => (absolute_duration - start).max(0.0),
+            _ => absolute_duration,
+        }
+    }
+
+    fn absolute_seek_position(inner: &PlayerInner, relative_secs: f64) -> f64 {
+        let start = inner.cue_start.unwrap_or(0.0);
+        let mut absolute = start + relative_secs.max(0.0);
+        if let (Some(start), Some(end)) = (inner.cue_start, inner.cue_end) {
+            absolute = absolute.clamp(start, end);
+        }
+        absolute
+    }
+
+    fn seek_channel_to_seconds(
+        bass: &BassLibrary,
+        handle: u32,
+        seconds: f64,
+    ) -> Result<(), String> {
+        let byte_pos = bass.channel_seconds2bytes(handle, seconds);
+        bass.channel_set_position(handle, byte_pos, bass::BASS_POS_BYTE)
+    }
+
+    fn wait_for_stream_length(inner: &PlayerInner, handle: u32) -> Result<(), String> {
+        let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
+        for _ in 0..100 {
+            if bass.channel_get_length(handle, bass::BASS_POS_BYTE) > 0 {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        Err("Audio stream is not ready (length unavailable)".to_string())
+    }
+
+    fn stream_position_secs(bass: &BassLibrary, handle: u32) -> f64 {
+        let pos_bytes = bass.channel_get_position(handle, bass::BASS_POS_BYTE);
+        bass.channel_bytes2seconds(handle, pos_bytes)
+    }
+
+    fn start_stream_playback(
+        inner: &PlayerInner,
+        handle: u32,
+        cue_start: Option<f64>,
+    ) -> Result<(), String> {
+        let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
+        bass.channel_play(handle, false)?;
+
+        let Some(start) = cue_start else {
+            return Ok(());
+        };
+
+        Self::seek_channel_to_seconds(bass, handle, start)?;
+        let actual = Self::stream_position_secs(bass, handle);
+        if (actual - start).abs() > 2.0 {
+            bass.channel_play(handle, false)?;
+            Self::seek_channel_to_seconds(bass, handle, start)?;
+            let retry = Self::stream_position_secs(bass, handle);
+            if (retry - start).abs() > 2.0 {
+                return Err(format!(
+                    "CUE seek failed: wanted {start:.1}s, at {retry:.1}s"
+                ));
+            }
         }
 
-        inner.current_handle = handle;
-        inner.current_file = Some(path.to_string());
         Ok(())
+    }
+
+    fn cue_segment_finished(inner: &PlayerInner, absolute_secs: f64) -> bool {
+        inner
+            .cue_end
+            .is_some_and(|end| absolute_secs >= end - 0.05)
     }
 
     pub fn pause(&self) -> Result<(), String> {
@@ -436,6 +597,8 @@ impl Player {
                 }
                 inner.current_handle = 0;
                 inner.current_file = None;
+                inner.cue_start = None;
+                inner.cue_end = None;
             }
             Ok(())
         })
@@ -465,11 +628,8 @@ impl Player {
             );
 
             // Seek immediately while volume is dipped
-            let info = bass.channel_get_info(handle)?;
-            let bytes_per_sample = if info.flags & bass::BASS_SAMPLE_FLOAT != 0 { 4 } else { 2 };
-            let block_align = bytes_per_sample * info.chans;
-            let byte_pos = (position_secs * info.freq as f64) as u64 * block_align as u64;
-            let _ = bass.channel_set_position(handle, byte_pos, bass::BASS_POS_BYTE);
+            let absolute_secs = Self::absolute_seek_position(inner, position_secs);
+            Self::seek_channel_to_seconds(bass, handle, absolute_secs)?;
 
             // Quick restore — the short dip + fast ramp back feels like overlap/blend
             bass.channel_slide_attribute(handle, bass::BASS_ATTRIB_VOL, target, SEEK_RESTORE_MS)
@@ -589,8 +749,10 @@ impl Player {
         let bass = inner.bass.as_ref().unwrap();
         let pos_bytes = bass.channel_get_position(inner.current_handle, bass::BASS_POS_BYTE);
         let len_bytes = bass.channel_get_length(inner.current_handle, bass::BASS_POS_BYTE);
-        let position = bass.channel_bytes2seconds(inner.current_handle, pos_bytes);
-        let duration = bass.channel_bytes2seconds(inner.current_handle, len_bytes);
+        let absolute_position = bass.channel_bytes2seconds(inner.current_handle, pos_bytes);
+        let absolute_duration = bass.channel_bytes2seconds(inner.current_handle, len_bytes);
+        let position = Self::cue_relative_position(inner, absolute_position);
+        let duration = Self::cue_segment_duration(inner, absolute_duration);
 
         let file_name = inner.current_file.as_ref().map(|f| {
             std::path::Path::new(f)
@@ -622,8 +784,10 @@ impl Player {
             } else {
                 inner.bass_dir.join(addon_path)
             };
-            let lib = bass::load_addon(&full_path)?;
-            inner._addons.push(lib);
+            let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
+            let path_str = full_path.to_string_lossy().to_string();
+            let handle = bass.plugin_load(&path_str)?;
+            inner._plugin_handles.push(handle);
             Ok(())
         })
     }
@@ -657,7 +821,26 @@ impl Player {
             thread::sleep(Duration::from_millis(100));
             let app_emit = app_for_sleep.clone();
             let _ = app_for_sleep.run_on_main_thread(move || {
-                let snapshot = player_for_main.get_state();
+                let mut snapshot = player_for_main.get_state();
+                let cue_finished = player_for_main.run_on_bass_thread(|inner| {
+                    if inner.current_handle == 0 || inner.bass.is_none() {
+                        return Ok(false);
+                    }
+                    let bass = inner.bass.as_ref().unwrap();
+                    let pos_bytes =
+                        bass.channel_get_position(inner.current_handle, bass::BASS_POS_BYTE);
+                    let absolute =
+                        bass.channel_bytes2seconds(inner.current_handle, pos_bytes);
+                    Ok(Self::cue_segment_finished(inner, absolute))
+                }).unwrap_or(false);
+
+                if cue_finished && snapshot.state == PlaybackState::Playing {
+                    let _ = player_for_main.stop();
+                    snapshot.state = PlaybackState::Stopped;
+                    snapshot.is_playing = false;
+                    snapshot.is_paused = false;
+                    snapshot.position = snapshot.duration;
+                }
 
                 let mut was = was_for_main.lock().unwrap_or_else(|e| e.into_inner());
                 match snapshot.state {

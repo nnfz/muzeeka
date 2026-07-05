@@ -20,8 +20,19 @@ pub fn player_init(player: State<'_, Player>) -> Result<(), String> {
 
 /// Start playing a file by its full path.
 #[tauri::command]
-pub fn player_play(player: State<'_, Player>, file_path: String) -> Result<(), String> {
-    player.play(&file_path)
+pub fn player_play(
+    player: State<'_, Player>,
+    file_path: String,
+    audio_path: Option<String>,
+    cue_start: Option<f64>,
+    cue_end: Option<f64>,
+) -> Result<(), String> {
+    player.play(
+        &file_path,
+        audio_path.as_deref(),
+        cue_start,
+        cue_end,
+    )
 }
 
 /// Pause the current playback.

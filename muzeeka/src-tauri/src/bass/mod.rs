@@ -6,5 +6,5 @@
 pub mod ffi;
 pub mod types;
 
-pub use ffi::{BassLibrary, load_addon};
+pub use ffi::BassLibrary;
 pub use types::*;

@@ -7,6 +7,7 @@
 /// BASS stream / channel handle (HSTREAM, HCHANNEL, etc.)
 pub type HSTREAM = u32;
 pub type HCHANNEL = u32;
+pub type HPLUGIN = u32;
 pub type DWORD = u32;
 pub type BOOL = i32;
 pub type QWORD = u64;

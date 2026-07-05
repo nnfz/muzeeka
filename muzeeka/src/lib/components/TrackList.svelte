@@ -1,4 +1,5 @@
 <script lang="ts">
+  import ContextMenu from './ContextMenu.svelte';
   import {
     getPlayerStore,
     trackDisplayArtist,
@@ -6,6 +7,7 @@
     trackSearchText,
     type MusicFile,
   } from '$lib/stores/player.svelte';
+  import { openContextMenuFromEvent, type ContextMenuItem } from '$lib/contextMenu';
   import { open } from '@tauri-apps/plugin-dialog';
   import TrackCover from './TrackCover.svelte';
 
@@ -16,6 +18,12 @@
 
   type ColumnId = 'index' | 'title' | 'album' | 'duration';
   type SortDirection = 'asc' | 'desc';
+
+  interface ListedTrack {
+    track: MusicFile;
+    playlistId: string;
+    playlistName: string;
+  }
 
   let { searchQuery = $bindable('') }: Props = $props();
 
@@ -134,14 +142,47 @@
   let columnLayout = $state<ColumnLayout>(loadColumnLayout());
   let sortColumn = $state<ColumnId | null>(initialSort.column);
   let sortDirection = $state<SortDirection>(initialSort.direction);
+  let contextMenu = $state<{ item: ListedTrack; x: number; y: number } | null>(null);
 
-  let filteredTracks = $derived(
-    searchQuery.trim()
-      ? player.tracks.filter((t) =>
-          trackSearchText(t).includes(searchQuery.toLowerCase())
-        )
-      : player.tracks
-  );
+  let trackMenuItems = $derived.by((): ContextMenuItem[] => {
+    const target = contextMenu?.item;
+    if (!target) return [];
+
+    return [
+      {
+        id: 'delete',
+        label: 'Delete',
+        icon: 'delete',
+        danger: true,
+        onSelect: () => player.removeTrack(target.track.path, target.playlistId),
+      },
+    ];
+  });
+
+  let isGlobalSearch = $derived(searchQuery.trim().length > 0);
+
+  let listedTracks = $derived.by((): ListedTrack[] => {
+    if (isGlobalSearch) {
+      const query = searchQuery.toLowerCase();
+      return player.playlists.flatMap((playlist) =>
+        playlist.tracks
+          .filter((track) => trackSearchText(track).includes(query))
+          .map((track) => ({
+            track,
+            playlistId: playlist.id,
+            playlistName: playlist.name,
+          }))
+      );
+    }
+
+    if (!player.activePlaylistId) return [];
+
+    return player.tracks.map((track) => ({
+      track,
+      playlistId: player.activePlaylistId!,
+      playlistName: player.activePlaylist?.name ?? '',
+    }));
+  });
 
   let visibleColumns = $derived(
     isNarrow ? COLUMN_ORDER.filter((id) => id !== 'album') : COLUMN_ORDER
@@ -199,11 +240,11 @@
   );
 
   let displayedTracks = $derived.by(() => {
-    const tracks = [...filteredTracks];
-    if (!sortColumn) return tracks;
+    const items = [...listedTracks];
+    if (!sortColumn) return items;
 
     const dir = sortDirection === 'asc' ? 1 : -1;
-    return tracks.sort((a, b) => compareTracks(a, b, sortColumn!) * dir);
+    return items.sort((a, b) => compareTracks(a, b, sortColumn!) * dir);
   });
 
   $effect(() => {
@@ -229,23 +270,23 @@
     );
   }
 
-  function compareTracks(a: MusicFile, b: MusicFile, column: ColumnId): number {
+  function compareTracks(a: ListedTrack, b: ListedTrack, column: ColumnId): number {
     switch (column) {
       case 'index': {
-        const ai = player.tracks.findIndex((t) => t.path === a.path);
-        const bi = player.tracks.findIndex((t) => t.path === b.path);
+        const ai = listedTracks.findIndex((item) => item.track.path === a.track.path);
+        const bi = listedTracks.findIndex((item) => item.track.path === b.track.path);
         return ai - bi;
       }
       case 'title':
-        return trackDisplayTitle(a).localeCompare(trackDisplayTitle(b), undefined, {
+        return trackDisplayTitle(a.track).localeCompare(trackDisplayTitle(b.track), undefined, {
           sensitivity: 'base',
         });
       case 'album':
-        return (a.album ?? '').localeCompare(b.album ?? '', undefined, {
+        return (a.track.album ?? '').localeCompare(b.track.album ?? '', undefined, {
           sensitivity: 'base',
         });
       case 'duration':
-        return (a.duration_secs ?? -1) - (b.duration_secs ?? -1);
+        return (a.track.duration_secs ?? -1) - (b.track.duration_secs ?? -1);
     }
   }
 
@@ -336,8 +377,18 @@
     }
   }
 
-  function handleTrackClick(track: MusicFile) {
-    player.play(track.path);
+  function closeContextMenu() {
+    contextMenu = null;
+  }
+
+  function openTrackContextMenu(e: MouseEvent, item: ListedTrack) {
+    const position = openContextMenuFromEvent(e);
+    contextMenu = { item, ...position };
+  }
+
+  function handleTrackClick(item: ListedTrack) {
+    closeContextMenu();
+    player.play(item.track.path);
   }
 
   function formatDuration(seconds: number | null | undefined): string {
@@ -368,7 +419,7 @@
         <p class="empty-title">Select a playlist</p>
         <p class="empty-hint">Choose a playlist or drop music files here</p>
       </div>
-    {:else if !player.hasTracks}
+    {:else if !isGlobalSearch && !player.hasTracks}
       <div class="empty-state" data-tauri-drag-region>
         <p class="empty-title">Playlist is empty</p>
         <p class="empty-hint">Drop files or folders here</p>
@@ -376,7 +427,7 @@
           Add Tracks
         </button>
       </div>
-    {:else if filteredTracks.length === 0}
+    {:else if listedTracks.length === 0}
       <div class="empty-state" data-tauri-drag-region>
         <p class="empty-title">No matches</p>
         <p class="empty-hint">Try a different search term</p>
@@ -445,15 +496,18 @@
         </div>
 
         <div class="track-rows">
-        {#each displayedTracks as track, i (track.path)}
+        {#each displayedTracks as item, i (item.track.path)}
+          {@const track = item.track}
           {@const isActive = track.path === player.currentFile}
           <button
             class="track-row"
             class:active={isActive}
             class:playing={isActive && player.isPlaying}
+            class:paused={isActive && player.isPaused && !player.isPlaying}
             style="grid-template-columns: {gridTemplate}"
-            onclick={() => handleTrackClick(track)}
-            title={`${trackDisplayTitle(track)} — ${trackDisplayArtist(track)}`}
+            onclick={() => handleTrackClick(item)}
+            oncontextmenu={(e) => openTrackContextMenu(e, item)}
+            title={`${trackDisplayTitle(track)} — ${trackDisplayArtist(track)}${isGlobalSearch ? ` (${item.playlistName})` : ''}`}
           >
             {#each visibleColumns as column (column)}
               {#if column === 'index'}
@@ -461,6 +515,13 @@
                   {#if isActive && player.isPlaying}
                     <span class="mini-eq" aria-label="Playing">
                       <span></span><span></span><span></span>
+                    </span>
+                  {:else if isActive && player.isPaused}
+                    <span class="paused-icon" aria-label="Paused">
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
+                        <rect x="6" y="5" width="4" height="14" rx="1"/>
+                        <rect x="14" y="5" width="4" height="14" rx="1"/>
+                      </svg>
                     </span>
                   {:else}
                     <span class="track-num">{i + 1}</span>
@@ -476,7 +537,12 @@
                   <TrackCover track={track} />
                   <span class="title-group">
                     <span class="track-name">{trackDisplayTitle(track)}</span>
-                    <span class="track-artist">{trackDisplayArtist(track)}</span>
+                    <span class="track-artist">
+                      {trackDisplayArtist(track)}
+                      {#if isGlobalSearch}
+                        <span class="track-playlist"> · {item.playlistName}</span>
+                      {/if}
+                    </span>
                   </span>
                 </span>
               {:else if column === 'album'}
@@ -492,6 +558,14 @@
     {/if}
   </div>
 </section>
+
+<ContextMenu
+  open={contextMenu !== null}
+  x={contextMenu?.x ?? 0}
+  y={contextMenu?.y ?? 0}
+  items={trackMenuItems}
+  onclose={closeContextMenu}
+/>
 
 <style>
   @import './TrackList.css';

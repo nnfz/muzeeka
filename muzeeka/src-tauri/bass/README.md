@@ -7,6 +7,7 @@ Place the BASS library files here:
 
 ## Optional Addons  
 - `bassflac.dll` — FLAC support
+- `bassape.dll` — APE (Monkey's Audio) support
 - `bassopus.dll` — Opus support  
 - `basswma.dll` — WMA support
 - `bass_aac.dll` — AAC/M4A support

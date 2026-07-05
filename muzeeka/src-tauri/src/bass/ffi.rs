@@ -39,6 +39,8 @@ pub struct BassLibrary {
         unsafe extern "system" fn(handle: DWORD, mode: DWORD) -> QWORD,
     bass_channel_bytes2seconds:
         unsafe extern "system" fn(handle: DWORD, pos: QWORD) -> f64,
+    bass_channel_seconds2bytes:
+        unsafe extern "system" fn(handle: DWORD, pos: f64) -> QWORD,
     bass_channel_set_attribute:
         unsafe extern "system" fn(handle: DWORD, attrib: DWORD, value: f32) -> BOOL,
     bass_channel_get_attribute:
@@ -63,6 +65,10 @@ pub struct BassLibrary {
             flags: DWORD,
         ) -> HDSP,
     bass_channel_remove_dsp: unsafe extern "system" fn(handle: DWORD, dsp: HDSP) -> BOOL,
+
+    // ── Plugins ─────────────────────────────────────────────────────────────
+    bass_plugin_load:
+        unsafe extern "system" fn(file: *const u16, flags: DWORD) -> HPLUGIN,
 }
 
 // Safety: BassLibrary is always used behind a parking_lot::Mutex.
@@ -117,6 +123,7 @@ impl BassLibrary {
                 bass_channel_get_position: load_fn!(lib, b"BASS_ChannelGetPosition\0"),
                 bass_channel_get_length: load_fn!(lib, b"BASS_ChannelGetLength\0"),
                 bass_channel_bytes2seconds: load_fn!(lib, b"BASS_ChannelBytes2Seconds\0"),
+                bass_channel_seconds2bytes: load_fn!(lib, b"BASS_ChannelSeconds2Bytes\0"),
                 bass_channel_set_attribute: load_fn!(lib, b"BASS_ChannelSetAttribute\0"),
                 bass_channel_get_attribute: load_fn!(lib, b"BASS_ChannelGetAttribute\0"),
                 bass_channel_slide_attribute: load_fn!(lib, b"BASS_ChannelSlideAttribute\0"),
@@ -127,8 +134,23 @@ impl BassLibrary {
                 bass_channel_set_dsp: load_fn!(lib, b"BASS_ChannelSetDSP\0"),
                 bass_channel_set_dsp_ex: load_fn!(lib, b"BASS_ChannelSetDSPEx\0"),
                 bass_channel_remove_dsp: load_fn!(lib, b"BASS_ChannelRemoveDSP\0"),
+                bass_plugin_load: load_fn!(lib, b"BASS_PluginLoad\0"),
                 _lib: lib,
             })
+        }
+    }
+
+    /// Load a BASS format plugin (bassflac.dll, bassape.dll, etc.).
+    pub fn plugin_load(&self, path: &str) -> Result<HPLUGIN, String> {
+        let wide: Vec<u16> = OsStr::new(path)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let handle = unsafe { (self.bass_plugin_load)(wide.as_ptr(), BASS_UNICODE) };
+        if handle == 0 {
+            Err(self.last_error_string())
+        } else {
+            Ok(handle)
         }
     }
 
@@ -208,6 +230,10 @@ impl BassLibrary {
 
     pub fn channel_bytes2seconds(&self, handle: DWORD, pos: QWORD) -> f64 {
         unsafe { (self.bass_channel_bytes2seconds)(handle, pos) }
+    }
+
+    pub fn channel_seconds2bytes(&self, handle: DWORD, seconds: f64) -> QWORD {
+        unsafe { (self.bass_channel_seconds2bytes)(handle, seconds) }
     }
 
     pub fn channel_set_attribute(&self, handle: DWORD, attrib: DWORD, value: f32) -> Result<(), String> {
@@ -309,20 +335,6 @@ impl BassLibrary {
     pub fn last_error_string(&self) -> String {
         let code = self.last_error();
         format!("BASS error {}: {}", code, bass_error_to_string(code))
-    }
-}
-
-/// Load a BASS addon DLL (e.g. bassflac.dll, bassopus.dll).
-///
-/// Addons register themselves with BASS automatically when loaded, so we just
-/// need to keep the `Library` handle alive for the lifetime of the application.
-pub fn load_addon(path: &Path) -> Result<Library, String> {
-    if !path.exists() {
-        return Err(format!("Addon not found: {}", path.display()));
-    }
-    unsafe {
-        Library::new(path)
-            .map_err(|e| format!("Failed to load addon {}: {}", path.display(), e))
     }
 }
 

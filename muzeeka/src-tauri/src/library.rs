@@ -10,11 +10,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
+use crate::cue;
 use crate::metadata;
 
 /// Supported audio file extensions (lowercase).
 const AUDIO_EXTENSIONS: &[&str] = &[
-    "mp3", "flac", "ogg", "wav", "aac", "m4a", "wma", "opus",
+    "mp3", "flac", "ogg", "wav", "aac", "m4a", "wma", "opus", "ape",
 ];
 
 /// A discovered music file with embedded metadata when available.
@@ -52,6 +53,15 @@ pub struct MusicFile {
     /// Cached cover art path on disk.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cover_path: Option<String>,
+    /// Underlying audio file for CUE sheet tracks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_path: Option<String>,
+    /// Start offset in seconds for CUE sheet tracks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cue_start_secs: Option<f64>,
+    /// End offset in seconds for CUE sheet tracks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cue_end_secs: Option<f64>,
 }
 
 fn clean_path_string(path_str: &str) -> String {
@@ -92,6 +102,19 @@ fn resolve_dropped_path(path_str: &str) -> Option<PathBuf> {
 
 fn is_audio_extension(ext: &str) -> bool {
     AUDIO_EXTENSIONS.contains(&ext.to_lowercase().as_str())
+}
+
+fn is_cue_extension(ext: &str) -> bool {
+    ext.eq_ignore_ascii_case("cue")
+}
+
+fn is_covered_audio(path: &Path, covered: &[String]) -> bool {
+    let canonical = fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .to_string();
+
+    covered.iter().any(|entry| path_key(entry) == path_key(&canonical))
 }
 
 fn is_directory(path: &Path) -> bool {
@@ -163,6 +186,9 @@ fn music_file_from_path(path: &Path, read_tags: bool) -> Option<MusicFile> {
         track_number: None,
         genre: None,
         cover_path: None,
+        audio_path: None,
+        cue_start_secs: None,
+        cue_end_secs: None,
     };
 
     if read_tags {
@@ -196,11 +222,67 @@ fn collect_paths_from_directory(root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+fn companion_cue_path(audio_path: &Path) -> Option<PathBuf> {
+    let stem = audio_path.file_stem()?;
+    let cue_path = audio_path.with_file_name(format!("{}.cue", stem.to_string_lossy()));
+    if cue_path.is_file() {
+        Some(cue_path)
+    } else {
+        None
+    }
+}
+
+fn collect_cue_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut cue_paths: Vec<PathBuf> = paths
+        .iter()
+        .filter(|path| {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(is_cue_extension)
+        })
+        .cloned()
+        .collect();
+
+    for path in paths {
+        let Some(ext) = path.extension().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !is_audio_extension(ext) {
+            continue;
+        }
+        if let Some(cue_path) = companion_cue_path(path) {
+            if !cue_paths.iter().any(|existing| existing == &cue_path) {
+                cue_paths.push(cue_path);
+            }
+        }
+    }
+
+    cue_paths
+}
+
 fn build_files_from_paths(paths: Vec<PathBuf>, read_tags: bool) -> Vec<MusicFile> {
-    paths
+    let cue_paths = collect_cue_paths(&paths);
+    let covered = cue::covered_audio_paths(&cue_paths);
+    let mut files: Vec<MusicFile> = paths
         .par_iter()
+        .filter(|path| {
+            let Some(ext) = path.extension().and_then(|value| value.to_str()) else {
+                return false;
+            };
+            is_audio_extension(ext) && !is_covered_audio(path, &covered)
+        })
         .filter_map(|path| music_file_from_path(path, read_tags))
-        .collect()
+        .collect();
+
+    for cue_path in cue_paths {
+        files.extend(cue::expand_cue_file(&cue_path));
+    }
+
+    for file in &mut files {
+        cue::repair_track(file);
+    }
+
+    files
 }
 
 fn collect_from_directory(root: &Path, results: &mut Vec<MusicFile>, seen: &mut HashSet<String>) {
@@ -242,12 +324,42 @@ pub fn scan_paths(paths: &[String]) -> Result<Vec<MusicFile>, String> {
             continue;
         }
 
-        if let Some(file) = music_file_from_path(&path, true) {
-            let key = path_key(&file.path);
-            if seen.insert(key) {
-                results.push(file);
+        if path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(is_cue_extension)
+        {
+            for file in cue::expand_cue_file(&path) {
+                let key = path_key(&file.path);
+                if seen.insert(key) {
+                    results.push(file);
+                }
             }
             continue;
+        }
+
+        if path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(is_audio_extension)
+        {
+            if let Some(cue_path) = companion_cue_path(&path) {
+                for file in cue::expand_cue_file(&cue_path) {
+                    let key = path_key(&file.path);
+                    if seen.insert(key) {
+                        results.push(file);
+                    }
+                }
+                continue;
+            }
+
+            if let Some(file) = music_file_from_path(&path, true) {
+                let key = path_key(&file.path);
+                if seen.insert(key) {
+                    results.push(file);
+                }
+                continue;
+            }
         }
 
         // Fallback: some Windows folder drops may not report as directories via metadata.
@@ -263,6 +375,7 @@ pub fn scan_paths(paths: &[String]) -> Result<Vec<MusicFile>, String> {
 pub fn fetch_metadata(paths: &[String]) -> Result<Vec<MusicFile>, String> {
     let resolved: Vec<PathBuf> = paths
         .iter()
+        .filter(|path_str| !cue::is_cue_track_path(path_str))
         .filter_map(|path_str| resolve_dropped_path(path_str))
         .collect();
 

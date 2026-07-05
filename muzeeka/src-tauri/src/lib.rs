@@ -4,6 +4,7 @@
 
 mod bass;
 mod commands;
+mod cue;
 mod drop_handler;
 mod equalizer;
 mod library;
@@ -15,31 +16,47 @@ mod settings;
 use drop_handler::{handle_window_event, DropState};
 
 use player::Player;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use tauri::path::BaseDirectory;
 use tauri::Manager;
 
-/// Resolve the directory where bass.dll lives.
-///
-/// In dev mode we look relative to the src-tauri directory;
-/// in production we look next to the executable.
-fn resolve_bass_dir() -> PathBuf {
-    // Try next to the executable first (production builds)
+fn bass_dir_is_valid(dir: &Path) -> bool {
+    dir.join("bass.dll").is_file()
+}
+
+/// Resolve the directory where bass.dll and format plugins live.
+fn resolve_bass_dir(app: Option<&tauri::AppHandle>) -> PathBuf {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
     if let Ok(exe) = std::env::current_exe() {
-        let beside_exe = exe.parent().unwrap_or_else(|| std::path::Path::new(".")).join("bass");
-        if beside_exe.exists() {
-            return beside_exe;
+        if let Some(parent) = exe.parent() {
+            candidates.push(parent.join("bass"));
         }
     }
 
-    // Fallback: src-tauri/bass/ (development)
-    let dev_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bass");
-    dev_dir
+    if let Some(app) = app {
+        if let Ok(resource_bass) = app.path().resolve("bass", BaseDirectory::Resource) {
+            candidates.push(resource_bass);
+        }
+    }
+
+    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bass"));
+
+    for dir in candidates {
+        if bass_dir_is_valid(&dir) {
+            eprintln!("BASS directory: {}", dir.display());
+            return dir;
+        }
+    }
+
+    let fallback = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bass");
+    eprintln!("BASS directory (fallback): {}", fallback.display());
+    fallback
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let bass_dir = resolve_bass_dir();
-    let player = Player::new(bass_dir);
+    let player = Player::new();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -60,6 +77,7 @@ pub fn run() {
                 );
             }
 
+            player.set_bass_dir(resolve_bass_dir(Some(app.handle())));
             player.set_app_handle(app.handle().clone());
             player.mark_bass_thread();
             player.init().map_err(|e| {

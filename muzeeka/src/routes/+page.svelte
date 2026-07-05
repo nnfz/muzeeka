@@ -36,16 +36,6 @@
   const settings = createSettingsStore(ensurePlayerReady);
   setSettingsStore(settings);
   let searchQuery = $state('');
-  let lastSearchPlaylistId = $state<string | null>(null);
-
-  $effect(() => {
-    if (isSettingsWindow || !player) return;
-    const playlistId = player.activePlaylistId;
-    if (playlistId !== lastSearchPlaylistId) {
-      searchQuery = '';
-      lastSearchPlaylistId = playlistId;
-    }
-  });
 
   async function openSettingsWindow() {
     const label = 'settings';
@@ -215,7 +205,7 @@
 {:else}
   <div class="app-layout">
     <header class="app-header glass">
-      {#if player!.activePlaylist && player!.hasTracks}
+      {#if player!.hasAnyTracks}
         <div class="search-container">
           <svg class="search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <circle cx="11" cy="11" r="8"/>
