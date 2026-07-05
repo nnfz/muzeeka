@@ -132,9 +132,12 @@
 
 .preset-menu-item,
 .preset-menu-item.save {
-  display: block;
+  position: relative;
+  display: flex;
+  align-items: center;
   width: 100%;
   padding: 7px 10px;
+  padding-right: 26px;
   font-size: 12px;
   text-align: left;
   color: var(--text-primary);
@@ -164,36 +167,43 @@
   margin: 4px 4px;
 }
 
-.preset-row {
-  display: flex;
-  align-items: center;
-}
-
-.preset-row .preset-menu-item {
+.preset-name {
   flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   padding-right: 4px;
 }
 
 .preset-delete-btn {
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 22px;
-  height: 22px;
-  margin-right: 4px;
-  font-size: 14px;
+  width: 18px;
+  height: 18px;
+  font-size: 13px;
   line-height: 1;
   color: var(--text-muted);
   background: transparent;
   border: none;
-  border-radius: var(--radius-mini);
+  border-radius: 3px;
   cursor: pointer;
-  transition: color var(--transition-fast), background var(--transition-fast);
+  opacity: 0;
+  transition: opacity 0.1s ease, color 0.1s ease, background 0.1s ease;
+}
+
+.preset-menu-item:hover .preset-delete-btn {
+  opacity: 1;
 }
 
 .preset-delete-btn:hover {
   color: #f87171;
-  background: rgba(248, 113, 113, 0.1);
+  background: rgba(248, 113, 113, 0.12);
 }
 
 /* Save mode inside dropdown */

@@ -131,12 +131,6 @@
     closeDropdown();
   }
 
-  async function deleteAndRefresh(name: string, e: MouseEvent) {
-    e.stopPropagation();
-    await settings.deletePreset(name);
-    // dropdown stays open
-  }
-
   // Close dropdown on outside click / escape
   function handleGlobalClick(e: MouseEvent) {
     if (!dropdownOpen) return;
@@ -214,23 +208,25 @@
                 <div class="preset-divider"></div>
 
                 {#each settings.customPresets as preset (preset.name)}
-                  <div class="preset-row">
-                    <button
-                      type="button"
-                      class="preset-menu-item"
-                      onclick={() => applyPresetAndClose(preset.name)}
-                    >
-                      {preset.name}
-                    </button>
-                    <button
-                      type="button"
+                  <button
+                    type="button"
+                    class="preset-menu-item"
+                    onclick={() => applyPresetAndClose(preset.name)}
+                  >
+                    <span class="preset-name">{preset.name}</span>
+                    <span
                       class="preset-delete-btn"
                       title="Delete preset"
-                      onclick={(e) => deleteAndRefresh(preset.name, e)}
+                      role="button"
+                      tabindex="-1"
+                      onclick={(e) => {
+                        e.stopPropagation();
+                        void settings.deletePreset(preset.name);
+                      }}
                     >
                       ×
-                    </button>
-                  </div>
+                    </span>
+                  </button>
                 {/each}
               {/if}
             {/if}
