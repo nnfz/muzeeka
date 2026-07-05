@@ -66,6 +66,7 @@ let isInitialized = $state(false);
 let initPromise: Promise<void> | null = null;
 let persistReady = $state(false);
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
+let lastGaplessChangeAt = 0;
 
 // --- Derived ---
 
@@ -528,14 +529,59 @@ function repairPlaylistTracks(playlist: Playlist): Playlist {
   return { ...playlist, tracks: repaired };
 }
 
-function playOptionsForTrack(track: MusicFile | undefined, filePath: string) {
-  // CUE segment times are resolved on the Rust side from the virtual path (#cue:N).
+function audioPathForTrack(track: MusicFile, filePath: string): string {
+  if (track.audio_path) return track.audio_path;
+  const cueMarker = '#cue:';
+  const markerPos = filePath.lastIndexOf(cueMarker);
+  if (markerPos > 0) return filePath.slice(0, markerPos);
+  return filePath;
+}
+
+function gaplessArgsForTrack(track: MusicFile, filePath: string) {
   return {
     filePath,
-    audioPath: track?.audio_path ?? undefined,
-    cueStart: track?.cue_start_secs ?? undefined,
-    cueEnd: track?.cue_end_secs ?? undefined,
+    audioPath: audioPathForTrack(track, filePath),
+    cueStart: track.cue_start_secs ?? undefined,
+    cueEnd: track.cue_end_secs ?? undefined,
   };
+}
+
+function playOptionsForTrack(track: MusicFile | undefined, filePath: string) {
+  const resolved =
+    track ?? ({ path: filePath, file_name: '', extension: '', size: 0 } as MusicFile);
+  return gaplessArgsForTrack(resolved, filePath);
+}
+
+function orderedTracksFrom(filePath: string): MusicFile[] {
+  if (!hasPlayingTracks) return [];
+
+  if (shuffleEnabled) {
+    ensureShuffleOrder();
+    const trackIdx = playingTracks.findIndex((t) => t.path === filePath);
+    if (trackIdx < 0) return [];
+    const orderPos = shuffleOrder.indexOf(trackIdx);
+    if (orderPos < 0) return [];
+    return shuffleOrder.slice(orderPos).map((index) => playingTracks[index]);
+  }
+
+  const index = playingTracks.findIndex((t) => t.path === filePath);
+  if (index < 0) return [];
+  return playingTracks.slice(index);
+}
+
+function buildGaplessQueue(filePath: string) {
+  return orderedTracksFrom(filePath).map((track) =>
+    gaplessArgsForTrack(track, track.path)
+  );
+}
+
+async function prepareGaplessNext(filePath: string) {
+  const queue = buildGaplessQueue(filePath);
+  try {
+    await invoke('player_prepare_next', { queue });
+  } catch (e) {
+    console.error('Failed to prepare gapless queue:', e);
+  }
 }
 
 async function play(filePath: string) {
@@ -548,7 +594,10 @@ async function play(filePath: string) {
     if (playlistId) {
       playingPlaylistId = playlistId;
     }
-    await invoke('player_play', playOptionsForTrack(track, filePath));
+    await invoke('player_play', {
+      ...playOptionsForTrack(track, filePath),
+      queue: buildGaplessQueue(filePath),
+    });
     currentFile = filePath;
     const file = track;
     currentFileName = file
@@ -701,6 +750,25 @@ function toggleRepeat() {
 // --- Event Listeners ---
 
 function setupListeners() {
+  listen<{ path: string }>('player:track-changed', (event) => {
+    const path = event.payload.path;
+    currentFile = path;
+    const track = playlists.flatMap((p) => p.tracks).find((t) => t.path === path);
+    currentFileName = track
+      ? trackDisplayTitle(track)
+      : path.split(/[\\/]/).pop()?.replace(/\.[^/.]+$/, '') ?? null;
+    const playlistId = findPlaylistForTrack(path);
+    if (playlistId) {
+      playingPlaylistId = playlistId;
+    }
+    syncTrackIndex();
+    isPlaying = true;
+    isPaused = false;
+    scheduleSave();
+    lastGaplessChangeAt = Date.now();
+    void prepareGaplessNext(path);
+  });
+
   listen<{ position: number; duration: number }>('player:position', (event) => {
     const newPos = event.payload.position;
     duration = event.payload.duration;
@@ -725,6 +793,9 @@ function setupListeners() {
   });
 
   listen('player:track-ended', () => {
+    // Gapless advance emits track-changed; ignore a stale ended right after it.
+    if (Date.now() - lastGaplessChangeAt < 400) return;
+
     isPlaying = false;
     isPaused = false;
     position = 0;

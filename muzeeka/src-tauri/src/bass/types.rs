@@ -54,6 +54,7 @@ pub const BASS_ERROR_UNKNOWN: i32 = -1;
 // ── Stream flags ──────────────────────────────────────────────────────────────
 pub const BASS_STREAM_PRESCAN: DWORD = 0x20000;
 pub const BASS_STREAM_AUTOFREE: DWORD = 0x40000;
+pub const BASS_STREAM_DECODE: DWORD = 0x200000;
 pub const BASS_UNICODE: DWORD = 0x80000000;
 pub const BASS_SAMPLE_FLOAT: DWORD = 256;
 
@@ -89,6 +90,15 @@ pub const BASS_DSP_PRIORITY_USER: i32 = 0;
 pub const BASS_DSP_PRIORITY_FIRST: i32 = 2147483647;
 
 pub const BASS_DSP_FLOAT: DWORD = 0x400;
+
+// ── Mixer (bassmix) ─────────────────────────────────────────────────────────
+pub const BASS_MIXER_END: DWORD = 0x10000;
+pub const BASS_MIXER_NONSTOP: DWORD = 0x200;
+pub const BASS_MIXER_QUEUE: DWORD = 0x8000;
+pub const BASS_MIXER_RESUME: DWORD = 0x1000;
+pub const BASS_MIXER_CHAN_NORAMPIN: DWORD = 0x800000;
+pub const BASS_MIXER_CHAN_BUFFER: DWORD = 0x2000;
+pub const BASS_MIXER_CHAN_PAUSE: DWORD = 0x20000;
 
 // ── BASS_CHANNELINFO ──────────────────────────────────────────────────────────
 #[repr(C)]

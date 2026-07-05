@@ -2,11 +2,40 @@
 //
 // Each `#[tauri::command]` becomes callable from JS via `invoke("command_name", { args })`.
 
+use serde::Deserialize;
 use tauri::{AppHandle, State};
 
 use crate::equalizer::EqualizerSettings;
 use crate::library;
-use crate::player::{EqualizerStatus, Player, PlayerStateSnapshot};
+use crate::player::{EqualizerStatus, GaplessTrack, Player, PlayerStateSnapshot};
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct NextTrackInput {
+    file_path: Option<String>,
+    audio_path: Option<String>,
+    cue_start: Option<f64>,
+    cue_end: Option<f64>,
+}
+
+fn parse_gapless_track(input: NextTrackInput) -> Option<GaplessTrack> {
+    let track_path = input.file_path.filter(|value| !value.is_empty())?;
+    let audio_path = input.audio_path.filter(|value| !value.is_empty())?;
+    Some(GaplessTrack {
+        track_path,
+        audio_path,
+        cue_start: input.cue_start,
+        cue_end: input.cue_end,
+    })
+}
+
+fn parse_gapless_queue(queue: Option<Vec<NextTrackInput>>) -> Vec<GaplessTrack> {
+    queue
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(parse_gapless_track)
+        .collect()
+}
 use crate::playlists::{self, PlaylistsData};
 use crate::settings::{self, AppSettings};
 
@@ -26,13 +55,24 @@ pub fn player_play(
     audio_path: Option<String>,
     cue_start: Option<f64>,
     cue_end: Option<f64>,
+    queue: Option<Vec<NextTrackInput>>,
 ) -> Result<(), String> {
     player.play(
         &file_path,
         audio_path.as_deref(),
         cue_start,
         cue_end,
+        parse_gapless_queue(queue),
     )
+}
+
+/// Refresh the gapless queue from the current track onward.
+#[tauri::command]
+pub fn player_prepare_next(
+    player: State<'_, Player>,
+    queue: Option<Vec<NextTrackInput>>,
+) -> Result<(), String> {
+    player.prepare_next(parse_gapless_queue(queue))
 }
 
 /// Pause the current playback.

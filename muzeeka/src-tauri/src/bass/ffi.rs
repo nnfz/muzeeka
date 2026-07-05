@@ -69,6 +69,20 @@ pub struct BassLibrary {
     // ── Plugins ─────────────────────────────────────────────────────────────
     bass_plugin_load:
         unsafe extern "system" fn(file: *const u16, flags: DWORD) -> HPLUGIN,
+
+    // ── Mixer (bassmix) ───────────────────────────────────────────────────────
+    _mixer_lib: Option<Library>,
+    bass_mixer_stream_create:
+        unsafe extern "system" fn(freq: DWORD, chans: DWORD, flags: DWORD) -> HSTREAM,
+    bass_mixer_stream_add_channel:
+        unsafe extern "system" fn(handle: DWORD, channel: DWORD, flags: DWORD) -> BOOL,
+    bass_mixer_channel_remove: unsafe extern "system" fn(channel: DWORD) -> BOOL,
+    bass_mixer_channel_set_position:
+        unsafe extern "system" fn(channel: DWORD, pos: QWORD, mode: DWORD) -> BOOL,
+    bass_mixer_channel_get_position:
+        unsafe extern "system" fn(channel: DWORD, mode: DWORD) -> QWORD,
+    bass_mixer_channel_flags:
+        unsafe extern "system" fn(channel: DWORD, flags: DWORD, mask: DWORD) -> DWORD,
 }
 
 // Safety: BassLibrary is always used behind a parking_lot::Mutex.
@@ -110,6 +124,34 @@ impl BassLibrary {
                 .map_err(|e| format!("Failed to load bass.dll: {}", e))?
         };
 
+        // Load bassmix for proper gapless (BASS_Mixer_*)
+        let mixer_lib = unsafe { Library::new(bass_dir.join("bassmix.dll")).ok() };
+        let (mixer_create, mixer_add, mixer_remove, mixer_set_pos, mixer_get_pos, mixer_flags) =
+            if let Some(ref mlib) = mixer_lib {
+                unsafe {
+                    (
+                        load_fn!(mlib, b"BASS_Mixer_StreamCreate\0"),
+                        load_fn!(mlib, b"BASS_Mixer_StreamAddChannel\0"),
+                        load_fn!(mlib, b"BASS_Mixer_ChannelRemove\0"),
+                        load_fn!(mlib, b"BASS_Mixer_ChannelSetPosition\0"),
+                        load_fn!(mlib, b"BASS_Mixer_ChannelGetPosition\0"),
+                        load_fn!(mlib, b"BASS_Mixer_ChannelFlags\0"),
+                    )
+                }
+            } else {
+                // Provide dummy fns; will error if used without bassmix
+                unsafe {
+                    (
+                        std::mem::transmute::<*const (), _>(ptr::null::<()> as *const ()),
+                        std::mem::transmute::<*const (), _>(ptr::null::<()> as *const ()),
+                        std::mem::transmute::<*const (), _>(ptr::null::<()> as *const ()),
+                        std::mem::transmute::<*const (), _>(ptr::null::<()> as *const ()),
+                        std::mem::transmute::<*const (), _>(ptr::null::<()> as *const ()),
+                        std::mem::transmute::<*const (), _>(ptr::null::<()> as *const ()),
+                    )
+                }
+            };
+
         unsafe {
             Ok(Self {
                 bass_init: load_fn!(lib, b"BASS_Init\0"),
@@ -136,6 +178,13 @@ impl BassLibrary {
                 bass_channel_remove_dsp: load_fn!(lib, b"BASS_ChannelRemoveDSP\0"),
                 bass_plugin_load: load_fn!(lib, b"BASS_PluginLoad\0"),
                 _lib: lib,
+                _mixer_lib: mixer_lib,
+                bass_mixer_stream_create: mixer_create,
+                bass_mixer_stream_add_channel: mixer_add,
+                bass_mixer_channel_remove: mixer_remove,
+                bass_mixer_channel_set_position: mixer_set_pos,
+                bass_mixer_channel_get_position: mixer_get_pos,
+                bass_mixer_channel_flags: mixer_flags,
             })
         }
     }
@@ -324,6 +373,60 @@ impl BassLibrary {
         } else {
             Ok(())
         }
+    }
+
+    // ── Mixer wrappers (require bassmix.dll) ────────────────────────────────
+
+    pub fn mixer_stream_create(&self, freq: u32, chans: u32, flags: DWORD) -> Result<HSTREAM, String> {
+        if self._mixer_lib.is_none() {
+            return Err("bassmix.dll not found/loaded — gapless uses mixer".to_string());
+        }
+        let handle = unsafe { (self.bass_mixer_stream_create)(freq, chans, flags) };
+        if handle == 0 {
+            Err(self.last_error_string())
+        } else {
+            Ok(handle)
+        }
+    }
+
+    pub fn mixer_stream_add_channel(&self, mixer: DWORD, channel: DWORD, flags: DWORD) -> Result<(), String> {
+        if self._mixer_lib.is_none() {
+            return Err("bassmix.dll not loaded".to_string());
+        }
+        let ok = unsafe { (self.bass_mixer_stream_add_channel)(mixer, channel, flags) };
+        if ok == 0 {
+            Err(self.last_error_string())
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn mixer_channel_remove(&self, channel: DWORD) -> Result<(), String> {
+        if self._mixer_lib.is_none() { return Err("bassmix.dll not loaded".to_string()); }
+        let ok = unsafe { (self.bass_mixer_channel_remove)(channel) };
+        if ok == 0 {
+            Err(self.last_error_string())
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn mixer_channel_set_position(&self, channel: DWORD, pos: QWORD, mode: DWORD) -> Result<(), String> {
+        if self._mixer_lib.is_none() { return Err("bassmix.dll not loaded".to_string()); }
+        let ok = unsafe { (self.bass_mixer_channel_set_position)(channel, pos, mode) };
+        if ok == 0 {
+            Err(self.last_error_string())
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn mixer_channel_get_position(&self, channel: DWORD, mode: DWORD) -> QWORD {
+        unsafe { (self.bass_mixer_channel_get_position)(channel, mode) }
+    }
+
+    pub fn mixer_channel_flags(&self, channel: DWORD, flags: DWORD, mask: DWORD) -> DWORD {
+        unsafe { (self.bass_mixer_channel_flags)(channel, flags, mask) }
     }
 
     // ── Error helpers ─────────────────────────────────────────────────────

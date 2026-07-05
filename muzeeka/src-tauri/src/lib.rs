@@ -96,6 +96,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::player_init,
             commands::player_play,
+            commands::player_prepare_next,
             commands::player_pause,
             commands::player_resume,
             commands::player_stop,

@@ -1,0 +1,39 @@
+---
+pid: 24800
+cwd: "Z:\code\muzeeka"
+command: "Set-Location Z:\\code\\muzeeka\\muzeeka\\src-tauri; cargo build; cargo test"
+started_at: 2026-07-05T18:28:57.565Z
+running_for_ms: 14460011 
+---
+warning: muzeeka@0.1.0: Copied 14 BASS DLL(s) to \\?\Z:\code\muzeeka\muzeeka\src-tauri\target\debug\bass
+   Compiling muzeeka v0.1.0 (Z:\code\muzeeka\muzeeka\src-tauri)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 14.60s
+warning: muzeeka@0.1.0: Copied 14 BASS DLL(s) to \\?\Z:\code\muzeeka\muzeeka\src-tauri\target\debug\bass
+   Compiling muzeeka v0.1.0 (Z:\code\muzeeka\muzeeka\src-tauri)
+
+running 8 tests
+    Finishedtest metadata::tests::find_nearby_cover_falls_back_to_folder_art ... ok
+test metadata::tests::find_nearby_cover_prefers_sidecar_image ... ok
+test library::tests::scan_paths_accepts_directory_with_trailing_separator ... ok
+test library::tests::scan_paths_accepts_directory_with_nested_audio ... ok
+test cue::tests::resolve_playback_uses_cue_sheet_when_times_missing ... ok
+test cue::tests::resolve_real_glyantseviy_when_present ... ok
+test cue::tests::expand_cue_file_splits_tracks ... ok
+test cue::tests::expand_glyantseviy_cue_splits_ten_tracks ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+ `test` profile [unoptimized + debuginfo] target(s) in 4.43s
+     Running unittests src\lib.rs (target\debug\deps\muzeeka_lib-75475cf55e6a1f9a.exe)
+     Running unittests src\main.rs (target\debug\deps\muzeeka-d0a6f98ae918d8b5.exe)
+   Doc-tests muzeeka_lib
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
