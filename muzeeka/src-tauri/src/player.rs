@@ -333,14 +333,21 @@ impl Player {
             bass.stream_create_file(path, flags)?
         };
 
-        let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
-        let _ = bass.channel_set_attribute(handle, bass::BASS_ATTRIB_VOL, inner.volume);
-        bass.channel_play(handle, true)?;
+        {
+            let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
+            let _ = bass.channel_set_attribute(handle, bass::BASS_ATTRIB_VOL, inner.volume);
+        }
 
+        // Attach DSP *before* starting playback so the first audio buffers go through EQ.
         if inner.eq_context.get_settings().enabled {
             Self::attach_dsp(inner, handle)?;
         } else {
             inner.dsp_handle = 0;
+        }
+
+        {
+            let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
+            bass.channel_play(handle, true)?;
         }
 
         inner.current_handle = handle;

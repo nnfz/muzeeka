@@ -66,6 +66,12 @@ pub fn run() {
                 std::io::Error::new(std::io::ErrorKind::Other, e)
             })?;
 
+            // Apply saved equalizer settings as early as possible (before any playback)
+            // so the first seconds of audio are processed by DSP.
+            if let Ok(app_settings) = settings::load_settings(&app.handle()) {
+                let _ = player.set_equalizer(app_settings.equalizer);
+            }
+
             player.start_position_emitter(app.handle().clone());
             Ok(())
         })
