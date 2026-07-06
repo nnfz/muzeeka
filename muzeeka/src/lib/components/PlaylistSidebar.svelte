@@ -96,24 +96,37 @@
     contextMenu = { playlist, ...position };
   }
 
+  /**
+   * Focus the rename input and place the caret at the END of the text.
+   * Uses multiple passes (immediate + rAF + setTimeout) to ensure the caret
+   * is visible even after Svelte conditional rendering and value binding.
+   */
+  function focusRenameInput(node: HTMLInputElement) {
+    const placeCaretAtEnd = () => {
+      node.focus();
+      const len = node.value ? node.value.length : 0;
+      // Place caret at the very end (no text selection)
+      try {
+        node.setSelectionRange(len, len);
+      } catch {}
+      node.selectionStart = node.selectionEnd = len;
+    };
+
+    // Immediate attempt
+    placeCaretAtEnd();
+
+    // After DOM updates / value binding
+    requestAnimationFrame(() => {
+      placeCaretAtEnd();
+      // Extra pass for timing in webview / Tauri
+      setTimeout(placeCaretAtEnd, 0);
+    });
+  }
+
   function startRename(playlist: Playlist) {
     editingId = playlist.id;
     editingName = playlist.name;
   }
-
-  let renameInput: HTMLInputElement | null = $state(null);
-
-  $effect(() => {
-    if (editingId && renameInput) {
-      // Use timeout to ensure the input is in DOM and ready
-      setTimeout(() => {
-        if (renameInput) {
-          renameInput.focus();
-          renameInput.select();  // force selection on the name for easy overwrite
-        }
-      }, 0);
-    }
-  });
 
   function commitRename() {
     if (editingId) {
@@ -218,10 +231,9 @@
 
             <div class="playlist-details">
               {#if editingId === playlist.id}
-                <!-- svelte-ignore a11y_autofocus -->
                 <input
                   class="rename-input"
-                  bind:this={renameInput}
+                  use:focusRenameInput
                   bind:value={editingName}
                   onblur={commitRename}
                   onkeydown={handleRenameKeydown}
