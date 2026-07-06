@@ -116,6 +116,8 @@ struct PlayerInner {
     pending_next: Option<GaplessTrack>,
     preloaded_source: u32,
     preloaded_audio_path: Option<String>,
+    /// Used to invalidate stale scheduled pause actions when user quickly plays new track.
+    pause_generation: u64,
 }
 
 /// BASS format plugins loaded via `BASS_PluginLoad` (not bass_fx / bassmix / etc.).
@@ -161,6 +163,7 @@ impl Player {
                 pending_next: None,
                 preloaded_source: 0,
                 preloaded_audio_path: None,
+                pause_generation: 0,
             })),
             app: Arc::new(RwLock::new(None)),
             bass_thread: Arc::new(RwLock::new(None)),
@@ -639,9 +642,19 @@ impl Player {
         track_path: &str,
         playback: &PlaybackTarget,
     ) -> Result<(), String> {
-        // Teardown previous source (remove from mixer). Do NOT stop the mixer itself — keeps audio pipeline running for smoother transitions.
+        // Teardown previous source (remove from mixer).
         Self::teardown_current(inner);
         Self::clear_preload(inner);
+
+        if let Some(bass) = inner.bass.as_ref() {
+            // When switching from paused/stopped state (e.g. pause then play different track),
+            // fully stop the mixer first. This flushes any buffered tail from the previous track.
+            // Prevents the bug where ~1s of old track leaks after switching.
+            let active = bass.channel_is_active(inner.mixer_handle);
+            if active != bass::BASS_ACTIVE_PLAYING {
+                let _ = bass.channel_stop(inner.mixer_handle);
+            }
+        }
 
         let source = Self::create_decode_source(inner, &playback.audio_path, playback.cue_start)?;
 
@@ -649,10 +662,9 @@ impl Player {
 
         if let Some(bass) = inner.bass.as_ref() {
             let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_VOL, inner.volume);
-            // Start mixer if it was stopped (e.g. after full stop at end of playlist)
-            if bass.channel_is_active(inner.mixer_handle) != bass::BASS_ACTIVE_PLAYING {
-                let _ = bass.channel_play(inner.mixer_handle, false);
-            }
+            // Restart the mixer (true) to flush any remaining buffer from old track/fade.
+            // This prevents old audio leaking for a second when switching from pause or during manual change.
+            let _ = bass.channel_play(inner.mixer_handle, true);
             let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_BUFFER, 0.3);
         }
 
@@ -806,6 +818,9 @@ impl Player {
             Self::open_stream(inner, track_path, &playback)?;
         }
 
+        // Invalidate any pending scheduled pauses from previous pause() calls.
+        inner.pause_generation = inner.pause_generation.wrapping_add(1);
+
         Self::refresh_pending_next(inner);
         Ok(())
     }
@@ -870,8 +885,10 @@ impl Player {
 
     pub fn pause(&self) -> Result<(), String> {
         // Start the fade-out immediately (Spotify-style smooth tail)
-        let fade_started = self.run_on_bass_thread(|inner| {
+        let (fade_started, gen) = self.run_on_bass_thread(|inner| {
             if inner.mixer_handle != 0 {
+                inner.pause_generation = inner.pause_generation.wrapping_add(1);
+                let gen = inner.pause_generation;
                 if let Some(bass) = inner.bass.as_ref() {
                     let _ = bass.channel_slide_attribute(
                         inner.mixer_handle,
@@ -880,20 +897,22 @@ impl Player {
                         PAUSE_FADE_MS,
                     );
                 }
-                Ok(true)
+                Ok((true, gen))
             } else {
-                Ok(false)
+                Ok((false, 0))
             }
         })?;
 
         if fade_started {
             // Schedule the actual pause after the fade has played out.
             // This lets the full musical fade be heard (like Spotify).
+            // We pass the generation so that if user plays a new track in the meantime,
+            // the stale pause does nothing.
             let this = self.clone();
             std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_millis(PAUSE_FADE_MS as u64 + 10));
-                let _ = this.run_on_bass_thread(|inner| {
-                    if inner.mixer_handle != 0 {
+                let _ = this.run_on_bass_thread(move |inner| {
+                    if inner.mixer_handle != 0 && inner.pause_generation == gen {
                         if let Some(bass) = inner.bass.as_ref() {
                             let _ = bass.channel_pause(inner.mixer_handle);
                         }

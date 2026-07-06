@@ -101,6 +101,20 @@
     editingName = playlist.name;
   }
 
+  let renameInput: HTMLInputElement | null = $state(null);
+
+  $effect(() => {
+    if (editingId && renameInput) {
+      // Use timeout to ensure the input is in DOM and ready
+      setTimeout(() => {
+        if (renameInput) {
+          renameInput.focus();
+          renameInput.select();  // force selection on the name for easy overwrite
+        }
+      }, 0);
+    }
+  });
+
   function commitRename() {
     if (editingId) {
       player.renamePlaylist(editingId, editingName);
@@ -207,10 +221,10 @@
                 <!-- svelte-ignore a11y_autofocus -->
                 <input
                   class="rename-input"
+                  bind:this={renameInput}
                   bind:value={editingName}
                   onblur={commitRename}
                   onkeydown={handleRenameKeydown}
-                  autofocus
                 />
               {:else}
                 <span

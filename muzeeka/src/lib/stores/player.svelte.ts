@@ -67,6 +67,8 @@ let initPromise: Promise<void> | null = null;
 let persistReady = $state(false);
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
 let lastGaplessChangeAt = 0;
+let lastManualPlayAt = 0;
+let lastPlayedFile = '';
 
 // --- Derived ---
 
@@ -552,6 +554,10 @@ function playOptionsForTrack(track: MusicFile | undefined, filePath: string) {
   return gaplessArgsForTrack(resolved, filePath);
 }
 
+// Limit sent to backend to keep manual switches fast even on huge playlists.
+// We only need the next couple for gapless anyway (refresh happens on advance).
+const MAX_GAPLESS_FOLLOWING = 4;
+
 function orderedTracksFrom(filePath: string): MusicFile[] {
   if (!hasPlayingTracks) return [];
 
@@ -561,12 +567,12 @@ function orderedTracksFrom(filePath: string): MusicFile[] {
     if (trackIdx < 0) return [];
     const orderPos = shuffleOrder.indexOf(trackIdx);
     if (orderPos < 0) return [];
-    return shuffleOrder.slice(orderPos).map((index) => playingTracks[index]);
+    return shuffleOrder.slice(orderPos, orderPos + MAX_GAPLESS_FOLLOWING).map((index) => playingTracks[index]);
   }
 
   const index = playingTracks.findIndex((t) => t.path === filePath);
   if (index < 0) return [];
-  return playingTracks.slice(index);
+  return playingTracks.slice(index, index + MAX_GAPLESS_FOLLOWING);
 }
 
 function buildGaplessQueue(filePath: string) {
@@ -595,6 +601,16 @@ async function prepareGaplessNext(filePath: string) {
 async function play(filePath: string) {
   try {
     await ensureInit();
+    lastManualPlayAt = Date.now();
+    lastPlayedFile = filePath;
+
+    // If coming from pause, hard stop the old to prevent any tail of previous track
+    // leaking for a second when starting the new one.
+    if (isPaused) {
+      try { await invoke('player_stop'); } catch {}
+      isPaused = false;
+    }
+
     const track = playlists
       .flatMap((p) => p.tracks)
       .find((t) => t.path === filePath);
@@ -602,9 +618,29 @@ async function play(filePath: string) {
     if (playlistId) {
       playingPlaylistId = playlistId;
     }
+
+    // Compute queue using explicit tracks from the playlist at click time to avoid stale derived
+    // playingTracks / currentTrackIndex. This fixes random jumps and wrong UI track after clicking
+    // different tracks in the playing ("que") list.
+    let queueToSend: any[];
+    if (repeatMode === 'one') {
+      queueToSend = [gaplessArgsForTrack(track || ({ path: filePath } as any), filePath)];
+    } else if (playlistId) {
+      const pl = playlists.find((p) => p.id === playlistId);
+      if (pl) {
+        const idx = pl.tracks.findIndex((t) => t.path === filePath);
+        const slice = (idx >= 0) ? pl.tracks.slice(idx, idx + MAX_GAPLESS_FOLLOWING) : [track || {path: filePath} as any];
+        queueToSend = slice.map((t) => gaplessArgsForTrack(t, t.path || filePath));
+      } else {
+        queueToSend = buildGaplessQueue(filePath);
+      }
+    } else {
+      queueToSend = buildGaplessQueue(filePath);
+    }
+
     await invoke('player_play', {
       ...playOptionsForTrack(track, filePath),
-      queue: buildGaplessQueue(filePath),
+      queue: queueToSend,
     });
     currentFile = filePath;
     const file = track;
@@ -765,6 +801,14 @@ function toggleRepeat() {
 function setupListeners() {
   listen<{ path: string }>('player:track-changed', (event) => {
     const path = event.payload.path;
+
+    // Protect recent manual plays from stale track-changed events
+    // (e.g. old gapless poll deciding to advance right after user clicked a different track in the que list).
+    // This fixes UI showing wrong track (9) while playing the manually chosen one (4), and random jumps.
+    if (Date.now() - lastManualPlayAt < 400 && lastPlayedFile && path !== lastPlayedFile) {
+      return;
+    }
+
     currentFile = path;
     const track = playlists.flatMap((p) => p.tracks).find((t) => t.path === path);
     currentFileName = track
