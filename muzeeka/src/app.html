@@ -9,7 +9,25 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
     <title>Muzeeka</title>
+
+    <!-- Prevent white flash on window show (especially settings window) -->
+    <style>
+      html, body {
+        background-color: #0a0a0f !important;
+        margin: 0;
+        padding: 0;
+      }
+    </style>
+
     <script>
+      // Force dark background as early as possible to avoid white flash when window is shown
+      (function() {
+        try {
+          document.documentElement.style.backgroundColor = '#0a0a0f';
+          if (document.body) document.body.style.backgroundColor = '#0a0a0f';
+        } catch(e) {}
+      })();
+
       document.addEventListener(
         'contextmenu',
         (event) => event.preventDefault(),

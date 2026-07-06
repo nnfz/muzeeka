@@ -9,9 +9,17 @@
   const settings = getSettingsStore();
 
   let activeSection: 'equalizer' = $state('equalizer');
+
+  // Prevent white flash when the window becomes visible
+  if (typeof document !== 'undefined') {
+    document.documentElement.style.setProperty('background-color', '#0a0a0f', 'important');
+    if (document.body) {
+      document.body.style.setProperty('background-color', '#0a0a0f', 'important');
+    }
+  }
 </script>
 
-<div class="settings-window">
+<div class="settings-window" style="background-color: #0a0a0f;">
   <header class="app-header glass" data-tauri-drag-region>
     <div class="settings-win-title" data-tauri-drag-region>Settings</div>
     <div class="app-header-spacer" data-tauri-drag-region></div>

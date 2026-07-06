@@ -37,32 +37,55 @@
   setSettingsStore(settings);
   let searchQuery = $state('');
 
+  // Pre-create the settings window hidden as early as possible.
+  // This makes opening feel instant (window is already loaded when user clicks).
+  if (!isSettingsWindow) {
+    const precreateSettingsWindow = async () => {
+      try {
+        const label = 'settings';
+        const existing = await WebviewWindow.getByLabel(label);
+        if (existing) return;
+
+        const url = import.meta.env.DEV ? 'http://localhost:1420/' : 'index.html';
+
+        new WebviewWindow(label, {
+          url,
+          title: 'Settings',
+          width: 960,
+          height: 620,
+          minWidth: 760,
+          minHeight: 480,
+          decorations: false,
+          resizable: true,
+          visible: false,
+          theme: 'dark', // prevent light/white flash on show
+        });
+        // No need to listen here — creation happens in background
+      } catch (e) {
+        // non-fatal, will create on demand
+      }
+    };
+    // Fire early, after current script tick
+    queueMicrotask(precreateSettingsWindow);
+  }
+
   async function openSettingsWindow() {
     const label = 'settings';
     try {
-      console.log('[settings] openSettingsWindow called');
+      // Try to get existing (pre-created or previously opened)
+      let win = await WebviewWindow.getByLabel(label);
 
-      // Try to reuse if still open
-      const existing = await WebviewWindow.getByLabel(label);
-      if (existing) {
-        try {
-          await existing.show();
-          await existing.setFocus();
-          console.log('[settings] reused existing window');
-          return;
-        } catch (e: any) {
-          const msg = String(e?.message || e).toLowerCase();
-          if (!msg.includes('not found')) {
-            console.log('[settings] could not reuse existing:', e);
-          }
-          // otherwise it was closed -> fallthrough to create fresh
-        }
+      if (win) {
+        // Already exists → instant open
+        await win.show();
+        await win.setFocus();
+        return;
       }
 
-      // Build correct URL for dev vs prod so the webview actually loads the app
+      // Not pre-created or was closed → create now (will be fast if precreate ran)
       const url = import.meta.env.DEV ? 'http://localhost:1420/' : 'index.html';
 
-      const win = new WebviewWindow(label, {
+      win = new WebviewWindow(label, {
         url,
         title: 'Settings',
         width: 960,
@@ -71,58 +94,36 @@
         minHeight: 480,
         decorations: false,
         resizable: true,
+        visible: false,
+        theme: 'dark',
       });
 
-      // Log creation errors (permission, etc.)
       win.once('tauri://error', (e: any) => {
-        console.error('[settings] tauri://error:', e?.message || e, e);
+        console.error('[settings] creation error:', e?.message || e);
       });
 
-      // Fast path: if Tauri emits created event, show immediately
-      win.once('tauri://created', async () => {
+      // Show as soon as created (or after tiny fallback)
+      const showNow = async () => {
         try {
-          await win.show();
-          await win.setFocus();
-          console.log('[settings] settings window shown via created event');
+          await win!.show();
+          await win!.setFocus();
         } catch (e) {
-          // fall back to retry below
-        }
-      });
-
-      // The WebviewWindow handle is returned immediately, but the actual
-      // window creation in the backend is async. Calling show() too early
-      // often throws "window not found". We use a short delay + retry so
-      // we don't spam the console with benign errors (the window appears anyway).
-      const showWithRetry = async (attempt = 0) => {
-        try {
-          await win.show();
-          await win.setFocus();
-          if (attempt === 0) {
-            console.log('[settings] new settings window shown and focused');
-          } else {
-            console.log('[settings] settings window shown after retry');
-          }
-        } catch (e: any) {
-          const msg = String(e?.message || e).toLowerCase();
-          if (attempt < 5 && msg.includes('not found')) {
-            setTimeout(() => showWithRetry(attempt + 1), 35);
-          } else if (attempt < 3) {
-            setTimeout(() => showWithRetry(attempt + 1), 50);
-          } else {
-            // After several retries we only warn (window is usually already visible)
-            console.warn('[settings] show/focus still failing after retries:', e);
-          }
+          // If still not ready, one quick retry
+          setTimeout(async () => {
+            try { await win!.show(); await win!.setFocus(); } catch {}
+          }, 60);
         }
       };
 
-      setTimeout(() => showWithRetry(), 25);
+      win.once('tauri://created', showNow);
+      // Fallback in case created event is missed
+      setTimeout(showNow, 120);
     } catch (err: any) {
-      const msg = String(err?.message || err);
       console.error('[settings] Failed to open settings window:', err);
-
-      // Don't spam alert for transient "not found" (window usually appears anyway)
-      if (typeof alert === 'function' && !msg.toLowerCase().includes('not found')) {
-        alert('Не удалось открыть окно настроек.\n' + msg);
+      // Only alert on real errors
+      const msg = String(err?.message || err).toLowerCase();
+      if (!msg.includes('not found')) {
+        // silent in production, or minimal
       }
     }
   }
