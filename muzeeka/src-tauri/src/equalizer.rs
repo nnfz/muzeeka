@@ -153,6 +153,7 @@ fn process_frame(
 /// Thread-safe EQ context passed as BASS DSP user data.
 pub struct EqDspContext {
     settings: RwLock<EqualizerSettings>,
+    enabled: AtomicBool,  // fast path check, updated on set_settings
     coeffs_dirty: AtomicBool,
     sample_rate: RwLock<f64>,
     channels: RwLock<usize>,
@@ -173,6 +174,7 @@ impl EqDspContext {
     pub fn new() -> Self {
         Self {
             settings: RwLock::new(EqualizerSettings::default()),
+            enabled: AtomicBool::new(false),
             coeffs_dirty: AtomicBool::new(true),
             sample_rate: RwLock::new(44100.0),
             channels: RwLock::new(2),
@@ -206,7 +208,9 @@ impl EqDspContext {
     }
 
     pub fn set_settings(&self, settings: EqualizerSettings) {
-        *self.settings.write() = settings.clamp();
+        let s = settings.clamp();
+        self.enabled.store(s.enabled, Ordering::Release);
+        *self.settings.write() = s;
         self.coeffs_dirty.store(true, Ordering::Release);
     }
 
@@ -262,8 +266,8 @@ impl EqDspContext {
     /// Process interleaved 32-bit float PCM.
     /// Samples are promoted to f64 for processing, then truncated back to f32.
     pub fn process_buffer_f32(&self, samples: &mut [f32]) {
-        let settings = self.settings.read().clone();
-        if !settings.enabled {
+        // Fast path: avoid heavy locking if EQ off
+        if !self.enabled.load(Ordering::Acquire) {
             return;
         }
 
@@ -292,8 +296,8 @@ impl EqDspContext {
     /// Process interleaved 16-bit PCM.
     /// Samples are promoted to f64 for processing, then quantized back to i16.
     pub fn process_buffer_i16(&self, samples: &mut [i16]) {
-        let settings = self.settings.read().clone();
-        if !settings.enabled {
+        // Fast path: avoid heavy locking if EQ off
+        if !self.enabled.load(Ordering::Acquire) {
             return;
         }
 
