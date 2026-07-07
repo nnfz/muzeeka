@@ -268,12 +268,3 @@
   color: white;
   border-color: var(--accent);
 }
-
-.rate-actions {
-  margin-top: 12px;
-}
-
-.action-btn.small {
-  font-size: 11px;
-  padding: 6px 12px;
-}

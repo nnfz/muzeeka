@@ -37,8 +37,9 @@
 
   const COLUMN_ORDER: ColumnId[] = ['index', 'title', 'album', 'duration'];
   const COL_GAP = 16;
+  const FIXED_INDEX_WIDTH = 28;
   const DEFAULT_LAYOUT: ColumnLayout = {
-    index: 24,
+    index: FIXED_INDEX_WIDTH,
     duration: 64,
     titleShare: 320 / (320 + 200),
   };
@@ -66,28 +67,21 @@
     return Math.max(min, Math.min(max, value));
   }
 
-  function normalizeIndexWidth(width: number): number {
-    return Math.max(MIN_COLUMN_WIDTHS.index, Math.round(width));
-  }
-
   function loadColumnLayout(): ColumnLayout {
     try {
       const raw = localStorage.getItem(STORAGE_COLUMN_LAYOUT_KEY);
-      if (!raw) return { ...DEFAULT_LAYOUT };
+      if (!raw) return { ...DEFAULT_LAYOUT, index: FIXED_INDEX_WIDTH };
       const parsed: unknown = JSON.parse(raw);
 
       if (parsed && typeof parsed === 'object') {
         const data = parsed as Record<string, unknown>;
 
         if (
-          typeof data.index === 'number' &&
           typeof data.duration === 'number' &&
           typeof data.titleShare === 'number'
         ) {
-          const index =
-            data.index >= 28 ? DEFAULT_LAYOUT.index : normalizeIndexWidth(data.index);
           return {
-            index,
+            index: FIXED_INDEX_WIDTH,
             duration: Math.max(MIN_COLUMN_WIDTHS.duration, Math.round(data.duration)),
             titleShare: clamp(data.titleShare, 0.05, 0.95),
           };
@@ -95,10 +89,8 @@
 
         if (typeof data.title === 'number' && typeof data.album === 'number') {
           const middle = data.title + data.album;
-          const storedIndex =
-            typeof data.index === 'number' ? Math.round(data.index) : DEFAULT_LAYOUT.index;
           return {
-            index: storedIndex >= 28 ? DEFAULT_LAYOUT.index : normalizeIndexWidth(storedIndex),
+            index: FIXED_INDEX_WIDTH,
             duration:
               typeof data.duration === 'number'
                 ? Math.max(MIN_COLUMN_WIDTHS.duration, Math.round(data.duration))
@@ -110,7 +102,7 @@
     } catch {
       /* ignore */
     }
-    return { ...DEFAULT_LAYOUT };
+    return { ...DEFAULT_LAYOUT, index: FIXED_INDEX_WIDTH };
   }
 
   function loadSort(): { column: ColumnId | null; direction: SortDirection } {
@@ -218,12 +210,10 @@
     const available = availableWidth(columns);
     const middleMin = minMiddleWidth(columns);
 
-    let index = layout.index;
+    const index = FIXED_INDEX_WIDTH;
     let duration = layout.duration;
 
-    const maxIndex = available - duration - middleMin;
     const maxDuration = available - index - middleMin;
-    index = clamp(index, MIN_COLUMN_WIDTHS.index, Math.max(MIN_COLUMN_WIDTHS.index, maxIndex));
     duration = clamp(duration, MIN_COLUMN_WIDTHS.duration, Math.max(MIN_COLUMN_WIDTHS.duration, maxDuration));
 
     const middle = available - index - duration;
@@ -319,6 +309,7 @@
   }
 
   function startColumnResize(left: ColumnId, right: ColumnId, e: PointerEvent) {
+    if (left === 'index') return;
     e.preventDefault();
     e.stopPropagation();
     resizingPair = { left, right };
@@ -331,15 +322,6 @@
 
     function onMove(moveEvent: PointerEvent) {
       const delta = moveEvent.clientX - startX;
-
-      if (left === 'index' && right === 'title') {
-        const maxIndex = available - startLayout.duration - middleMin;
-        columnLayout = {
-          ...startLayout,
-          index: clamp(startLayout.index + delta, MIN_COLUMN_WIDTHS.index, maxIndex),
-        };
-        return;
-      }
 
       if (left === 'title' && right === 'album') {
         const middle = available - startLayout.index - startLayout.duration;
@@ -375,9 +357,8 @@
   }
 
   function resetColumnPair(left: ColumnId, right: ColumnId) {
-    if (left === 'index' && right === 'title') {
-      columnLayout = { ...columnLayout, index: DEFAULT_LAYOUT.index };
-    } else if (left === 'title' && right === 'album') {
+    if (left === 'index') return;
+    if (left === 'title' && right === 'album') {
       columnLayout = { ...columnLayout, titleShare: DEFAULT_LAYOUT.titleShare };
     } else if (right === 'duration') {
       columnLayout = { ...columnLayout, duration: DEFAULT_LAYOUT.duration };
@@ -495,7 +476,7 @@
                 {/if}
               </button>
 
-              {#if i < visibleColumns.length - 1}
+              {#if i < visibleColumns.length - 1 && column !== 'index'}
                 {@const rightColumn = visibleColumns[i + 1]}
                 <button
                   type="button"
