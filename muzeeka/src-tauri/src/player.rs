@@ -105,6 +105,7 @@ struct PlayerInner {
     /// Resolved on-disk audio path for the active source (gapless detection).
     current_audio_path: Option<String>,
     volume: f32,
+    playback_rate: f32,
     cue_start: Option<f64>,
     cue_end: Option<f64>,
     eq_context: &'static EqDspContext,
@@ -154,6 +155,7 @@ impl Player {
                 current_file: None,
                 current_audio_path: None,
                 volume: 1.0,
+                playback_rate: 1.0,
                 cue_start: None,
                 cue_end: None,
                 eq_context: Box::leak(Box::new(EqDspContext::new())),
@@ -609,7 +611,7 @@ impl Player {
         let source = bass
             .stream_create_file(audio_path, flags)
             .map_err(|error| format!("{error} — file: {}", audio_path))?;
-        Self::ensure_original_playback_rate(bass, source);
+        Self::apply_playback_rate(inner, bass, source);
 
         // Very short wait so length becomes available quickly, but we don't block long.
         // This is critical for fast manual play.
@@ -858,9 +860,23 @@ impl Player {
         bass.channel_set_position(handle, byte_pos, bass::BASS_POS_BYTE)
     }
 
-    /// Keep the stream at its native sample rate (BASS attrib 0 = original).
-    fn ensure_original_playback_rate(bass: &BassLibrary, handle: u32) {
-        let _ = bass.channel_set_attribute(handle, bass::BASS_ATTRIB_FREQ, 0.0);
+    /// Apply playback rate (or native when 1.0).
+    fn apply_playback_rate(inner: &PlayerInner, bass: &BassLibrary, handle: u32) {
+        let rate = inner.playback_rate;
+        if (rate - 1.0).abs() < 0.001 {
+            let _ = bass.channel_set_attribute(handle, bass::BASS_ATTRIB_FREQ, 0.0);
+            return;
+        }
+        if let Ok(info) = bass.channel_get_info(handle) {
+            if info.freq > 0 {
+                let target = (info.freq as f64) * (rate as f64);
+                let _ = bass.channel_set_attribute(handle, bass::BASS_ATTRIB_FREQ, target as f32);
+            } else {
+                let _ = bass.channel_set_attribute(handle, bass::BASS_ATTRIB_FREQ, (44100.0 * rate as f64) as f32);
+            }
+        } else {
+            let _ = bass.channel_set_attribute(handle, bass::BASS_ATTRIB_FREQ, 0.0);
+        }
     }
 
     fn stream_duration_secs(bass: &BassLibrary, handle: u32) -> f64 {
@@ -1013,6 +1029,33 @@ impl Player {
             }
             Ok(())
         })
+    }
+
+    /// Set playback rate (0.25 — 2.0). Affects speed (+ pitch for simple scaling).
+    pub fn set_playback_rate(&self, rate: f32) -> Result<(), String> {
+        let rate = rate.clamp(0.25, 2.0);
+        self.run_on_bass_thread(move |inner| {
+            inner.playback_rate = rate;
+            if let Some(bass) = inner.bass.as_ref() {
+                // Apply to current source if active
+                if inner.current_source != 0 {
+                    Self::apply_playback_rate(inner, bass, inner.current_source);
+                }
+                // Apply to preloaded for upcoming gapless
+                if inner.preloaded_source != 0 {
+                    Self::apply_playback_rate(inner, bass, inner.preloaded_source);
+                }
+            }
+            Ok(())
+        })
+    }
+
+    #[allow(dead_code)]
+    pub fn get_playback_rate(&self) -> f32 {
+        if self.on_bass_thread() {
+            return self.inner.lock().playback_rate;
+        }
+        self.run_on_bass_thread(|inner| Ok(inner.playback_rate)).unwrap_or(1.0)
     }
 
     /// Release a stream that finished playing (must run before AUTOFREE-style invalidation).

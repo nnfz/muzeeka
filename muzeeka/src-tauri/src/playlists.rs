@@ -39,6 +39,8 @@ pub struct PlaylistsData {
     #[serde(default)]
     pub current_file: Option<String>,
     pub volume: Option<f32>,
+    #[serde(default)]
+    pub liked_paths: Vec<String>,
 }
 
 fn playlists_path(app: &AppHandle) -> Result<PathBuf, String> {

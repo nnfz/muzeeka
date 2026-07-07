@@ -1,16 +1,14 @@
 <script lang="ts">
-  import { getSettingsStore } from '$lib/stores/settings.svelte';
+  export type Section = 'general' | 'audio' | 'about';
 
-  const settings = getSettingsStore();
-
-  type Section = 'equalizer';
-
-  let { activeSection = $bindable<'equalizer'>('equalizer') }: {
+  let { activeSection = $bindable<Section>('general') }: {
     activeSection?: Section;
   } = $props();
 
   const sections: { id: Section; label: string; desc?: string }[] = [
-    { id: 'equalizer', label: 'Equalizer', desc: 'Graphic EQ presets & bands' },
+    { id: 'general', label: 'General', desc: 'App info & behavior' },
+    { id: 'audio', label: 'Audio', desc: 'Equalizer + playback speed' },
+    { id: 'about', label: 'About', desc: 'Muzeeka & credits' },
   ];
 
   function select(id: Section) {
@@ -39,7 +37,7 @@
   </div>
 
   <div class="sidebar-footer">
-    <div class="hint">EQ changes apply live</div>
+    <div class="hint">Changes apply live • Settings auto-save</div>
   </div>
 </aside>
 

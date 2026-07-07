@@ -318,12 +318,19 @@
 /* Duration column */
 
 .col-duration {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  justify-content: flex-end;
   font-size: 13px;
   color: var(--text-muted);
   font-variant-numeric: tabular-nums;
-  text-align: right;
-  padding-right: 22px;
+  padding-right: 18px;
   box-sizing: border-box;
+}
+
+.duration-text {
+  flex-shrink: 0;
 }
 
 /* --- Empty state --- */
@@ -368,4 +375,51 @@
 .empty-btn:hover {
   transform: translateY(-1px);
   box-shadow: var(--shadow-glow);
+}
+
+/* Like button in track rows */
+.like-btn {
+  padding: 1px;
+  border-radius: 3px;
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  opacity: 0.55;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all var(--transition-fast);
+  line-height: 0;
+}
+
+.track-row:hover .like-btn {
+  opacity: 0.8;
+}
+
+.like-btn:hover {
+  opacity: 1;
+  color: #e25555;
+  background: rgba(226, 85, 85, 0.1);
+}
+
+.like-btn.liked {
+  color: #e25555;
+  opacity: 0.95;
+}
+
+.like-btn.liked:hover {
+  color: #c93f3f;
+  background: rgba(226, 85, 85, 0.15);
+}
+
+/* Positioned left of duration */
+.like-duration {
+  margin-right: 2px;
+  opacity: 0.5;
+}
+
+.track-row:hover .like-duration {
+  opacity: 0.75;
 }

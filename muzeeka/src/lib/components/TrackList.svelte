@@ -5,6 +5,8 @@
     trackDisplayArtist,
     trackDisplayTitle,
     trackSearchText,
+    VIRTUAL_ALL_ID,
+    VIRTUAL_LIKED_ID,
     type MusicFile,
   } from '$lib/stores/player.svelte';
   import { openContextMenuFromEvent, type ContextMenuItem } from '$lib/contextMenu';
@@ -148,15 +150,28 @@
     const target = contextMenu?.item;
     if (!target) return [];
 
-    return [
-      {
+    const items: ContextMenuItem[] = [];
+    const path = target.track.path;
+    const isLiked = player.isLiked(path);
+    items.push({
+      id: 'like',
+      label: isLiked ? 'Remove from Liked' : 'Add to Liked',
+      icon: 'heart',
+      onSelect: () => player.toggleLike(path),
+    });
+
+    const pid = target.playlistId;
+    const isRealPlaylist = pid && pid !== VIRTUAL_ALL_ID && pid !== VIRTUAL_LIKED_ID;
+    if (isRealPlaylist) {
+      items.push({
         id: 'delete',
         label: 'Delete',
         icon: 'delete',
         danger: true,
-        onSelect: () => player.removeTrack(target.track.path, target.playlistId),
-      },
-    ];
+        onSelect: () => player.removeTrack(path, pid),
+      });
+    }
+    return items;
   });
 
   let isGlobalSearch = $derived(searchQuery.trim().length > 0);
@@ -414,7 +429,7 @@
 
 <section class="track-panel">
   <div class="track-list">
-    {#if !player.activePlaylist}
+    {#if !player.activePlaylistId}
       <div class="empty-state" data-tauri-drag-region>
         <p class="empty-title">Select a playlist</p>
         <p class="empty-hint">Choose a playlist or drop music files here</p>
@@ -548,7 +563,23 @@
               {:else if column === 'album'}
                 <span class="col-album">{track.album ?? '—'}</span>
               {:else}
-                <span class="col-duration">{formatDuration(track.duration_secs)}</span>
+                <span class="col-duration">
+                  <span
+                    role="button"
+                    tabindex="0"
+                    class="like-btn like-duration"
+                    class:liked={player.isLiked(track.path)}
+                    onclick={(e) => { e.stopPropagation(); player.toggleLike(track.path); }}
+                    onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.stopPropagation(); e.preventDefault(); player.toggleLike(track.path); } }}
+                    title={player.isLiked(track.path) ? 'Remove from Liked' : 'Add to Liked'}
+                    aria-label={player.isLiked(track.path) ? 'Unlike track' : 'Like track'}
+                  >
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill={player.isLiked(track.path) ? 'currentColor' : 'none'} stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z" />
+                    </svg>
+                  </span>
+                  <span class="duration-text">{formatDuration(track.duration_secs)}</span>
+                </span>
               {/if}
             {/each}
           </button>

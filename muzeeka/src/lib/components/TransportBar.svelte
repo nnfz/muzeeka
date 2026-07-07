@@ -18,6 +18,20 @@
             <span class="np-artist">{trackDisplayArtist(player.currentTrack)}</span>
           {/if}
         </div>
+
+        {#if player.hasTrack && player.currentFile}
+          <button
+            class="like-btn-transport"
+            class:liked={player.isLiked(player.currentFile)}
+            onclick={() => { if (player.currentFile) player.toggleLike(player.currentFile); }}
+            title={player.isLiked(player.currentFile) ? 'Remove from Liked' : 'Add to Liked'}
+            aria-label={player.isLiked(player.currentFile) ? 'Unlike current track' : 'Like current track'}
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill={player.isLiked(player.currentFile) ? 'currentColor' : 'none'} stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z" />
+            </svg>
+          </button>
+        {/if}
       {/if}
     </div>
 

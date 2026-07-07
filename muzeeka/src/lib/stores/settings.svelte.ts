@@ -15,6 +15,7 @@ export interface EqualizerSettings {
 
 export interface AppSettings {
   equalizer: EqualizerSettings;
+  playback_rate?: number;
   custom_presets?: EQPreset[];
 }
 
@@ -33,6 +34,7 @@ const DEFAULT_EQUALIZER: EqualizerSettings = {
 
 let equalizer = $state<EqualizerSettings>({ ...DEFAULT_EQUALIZER, bands_db: [...DEFAULT_EQUALIZER.bands_db] });
 let customPresets = $state<EQPreset[]>([]);
+let playbackRate = $state(1.0);
 let isReady = $state(false);
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -51,6 +53,7 @@ function scheduleSave() {
     saveTimer = null;
     const payload: AppSettings = {
       equalizer: clampEqualizer(equalizer),
+      playback_rate: playbackRate,
       custom_presets: customPresets.map((p) => ({
         name: p.name,
         preamp_db: p.preamp_db,
@@ -79,6 +82,17 @@ async function applyEqualizer(settings: EqualizerSettings) {
   scheduleSave();
 }
 
+async function applyPlaybackRate(rate: number) {
+  const clamped = Math.max(0.25, Math.min(2, rate));
+  playbackRate = clamped;
+  try {
+    await invoke('player_set_playback_rate', { rate: clamped });
+  } catch (e) {
+    console.error('Failed to set playback rate:', e);
+  }
+  scheduleSave();
+}
+
 export function createSettingsStore(ensurePlayerReady: () => Promise<void>) {
   async function bootstrap() {
     try {
@@ -101,8 +115,16 @@ export function createSettingsStore(ensurePlayerReady: () => Promise<void>) {
           };
         });
       }
+      if (typeof data.playback_rate === 'number' && data.playback_rate > 0) {
+        playbackRate = Math.max(0.25, Math.min(2, data.playback_rate));
+      } else {
+        playbackRate = 1.0;
+      }
       await ensurePlayerReady();
       await invoke('player_set_equalizer', { settings: equalizer });
+      if (playbackRate !== 1.0) {
+        await invoke('player_set_playback_rate', { rate: playbackRate }).catch(() => {});
+      }
     } catch (e) {
       console.error('Failed to load settings:', e);
     } finally {
@@ -115,6 +137,9 @@ export function createSettingsStore(ensurePlayerReady: () => Promise<void>) {
   return {
     get equalizer() {
       return equalizer;
+    },
+    get playbackRate() {
+      return playbackRate;
     },
     get customPresets() {
       return [...customPresets];
@@ -160,6 +185,10 @@ export function createSettingsStore(ensurePlayerReady: () => Promise<void>) {
     async deletePreset(name: string) {
       customPresets = customPresets.filter((p) => p.name !== name);
       scheduleSave();
+    },
+
+    async setPlaybackRate(rate: number) {
+      await applyPlaybackRate(rate);
     },
   };
 }

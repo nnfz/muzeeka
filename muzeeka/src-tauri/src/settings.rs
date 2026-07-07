@@ -20,6 +20,9 @@ pub struct AppSettings {
     pub equalizer: EqualizerSettings,
     #[serde(default)]
     pub custom_presets: Vec<CustomPreset>,
+    /// Playback rate multiplier. 1.0 = normal. Persisted so it survives restarts.
+    #[serde(default)]
+    pub playback_rate: f32,
 }
 
 fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {

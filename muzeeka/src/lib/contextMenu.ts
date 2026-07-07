@@ -3,7 +3,7 @@ export interface ContextMenuItem {
   label: string;
   danger?: boolean;
   disabled?: boolean;
-  icon?: 'rename' | 'delete';
+  icon?: 'rename' | 'delete' | 'heart';
   onSelect: () => void;
 }
 

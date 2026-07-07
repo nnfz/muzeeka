@@ -5,10 +5,15 @@
   import SettingsSidebar from './SettingsSidebar.svelte';
   import Equalizer from './Equalizer.svelte';
   import { getSettingsStore } from '$lib/stores/settings.svelte';
+  type Section = 'general' | 'audio' | 'about';
+  import { getVersion, getName } from '@tauri-apps/api/app';
+  import { onMount } from 'svelte';
 
   const settings = getSettingsStore();
 
-  let activeSection: 'equalizer' = $state('equalizer');
+  let activeSection = $state<Section>('general');
+  let appVersion = $state('0.1.0');
+  let appName = $state('muzeeka');
 
   // Prevent white flash when the window becomes visible
   if (typeof document !== 'undefined') {
@@ -17,6 +22,15 @@
       document.body.style.setProperty('background-color', '#0a0a0f', 'important');
     }
   }
+
+  onMount(async () => {
+    try {
+      appVersion = await getVersion();
+      appName = await getName();
+    } catch {
+      // fallback already set
+    }
+  });
 </script>
 
 <div class="settings-window" style="background-color: #0a0a0f;">
@@ -30,13 +44,132 @@
     <SettingsSidebar bind:activeSection />
 
     <div class="settings-content">
-      {#if activeSection === 'equalizer'}
+      {#if activeSection === 'general'}
         <div class="settings-section">
-          <h2 class="section-title">Equalizer</h2>
+          <h2 class="section-title">General</h2>
+          <p class="section-desc">
+            Application behavior and preferences. Most settings are saved automatically.
+          </p>
+
+          <div class="settings-card">
+            <div class="card-row">
+              <div>
+                <div class="card-label">Playlists &amp; library</div>
+                <div class="card-value">Stored locally in app data</div>
+              </div>
+              <div class="card-badge">Auto-saved</div>
+            </div>
+            <div class="card-row">
+              <div>
+                <div class="card-label">Volume level</div>
+                <div class="card-value">Persisted across restarts</div>
+              </div>
+              <div class="card-badge">Auto-saved</div>
+            </div>
+            <div class="card-row">
+              <div>
+                <div class="card-label">Playback speed / rate</div>
+                <div class="card-value">Persisted in Audio settings</div>
+              </div>
+              <div class="card-badge">Auto-saved</div>
+            </div>
+          </div>
+
+          <div class="settings-info">
+            Keyboard shortcuts and mouse controls are available in the main window.
+            Use Alt + scroll to adjust volume.
+          </div>
+
+          <div class="quick-actions">
+            <button
+              class="action-btn"
+              onclick={() => settings.resetEqualizer()}
+            >
+              Reset Equalizer to flat
+            </button>
+          </div>
+        </div>
+      {:else if activeSection === 'audio'}
+        <div class="settings-section">
+          <h2 class="section-title">Audio</h2>
           <p class="section-desc">
             15-band 1/3-octave graphic EQ with 32-bit floating-point DSP processing.
           </p>
           <Equalizer />
+
+          <!-- Playback Rate -->
+          <div class="settings-card rate-card">
+            <div class="card-header">
+              <div>
+                <div class="card-label">Playback speed</div>
+                <div class="card-value">Adjusts playback rate (affects pitch with simple scaling)</div>
+              </div>
+              <div class="rate-display">
+                <span class="rate-value-big">{settings.playbackRate.toFixed(2)}×</span>
+              </div>
+            </div>
+
+            <div class="rate-slider-row">
+              <input
+                type="range"
+                min="0.25"
+                max="2"
+                step="0.01"
+                value={settings.playbackRate}
+                oninput={(e) => settings.setPlaybackRate(parseFloat((e.target as HTMLInputElement).value))}
+              />
+              <div class="rate-bounds">
+                <span>0.25×</span>
+                <span>2.00×</span>
+              </div>
+            </div>
+
+            <div class="rate-presets">
+              {#each [0.75, 0.85, 1.0, 1.25, 1.5] as r}
+                <button
+                  class="preset-btn"
+                  class:active={Math.abs(settings.playbackRate - r) < 0.01}
+                  onclick={() => settings.setPlaybackRate(r)}
+                >
+                  {r.toFixed(r === 1 ? 1 : 2)}×
+                </button>
+              {/each}
+            </div>
+          </div>
+        </div>
+      {:else if activeSection === 'about'}
+        <div class="settings-section about-section">
+          <div class="about-header">
+            <div class="about-logo">♪</div>
+            <div>
+              <div class="about-name">{appName}</div>
+              <div class="about-version">Version {appVersion}</div>
+            </div>
+          </div>
+
+          <p class="about-desc">
+            A lightweight, high-quality desktop music player.<br />
+            Built for clean playback and fast browsing.
+          </p>
+
+          <div class="about-meta">
+            <div class="meta-item">
+              <span class="meta-key">Built with</span>
+              <span class="meta-val">Tauri 2 • Svelte 5 • Rust</span>
+            </div>
+            <div class="meta-item">
+              <span class="meta-key">Audio engine</span>
+              <span class="meta-val">BASS by Un4seen Developments</span>
+            </div>
+            <div class="meta-item">
+              <span class="meta-key">Metadata</span>
+              <span class="meta-val">Lofty</span>
+            </div>
+          </div>
+
+          <div class="about-footer">
+            Settings and user data are stored in your system app data directory.
+          </div>
         </div>
       {/if}
     </div>

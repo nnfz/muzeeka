@@ -29,10 +29,10 @@
 .transport-info {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   flex: 1;
   min-width: 0;
-  max-width: 280px;
+  max-width: 310px;
 }
 
 .transport-info :global(.track-cover) {
@@ -147,4 +147,38 @@
   display: flex;
   justify-content: flex-end;
   max-width: 220px;
+}
+
+/* Like button at the bottom (TransportBar) */
+.like-btn-transport {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  margin-left: 2px;
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  opacity: 0.65;
+  border-radius: 5px;
+  cursor: pointer;
+  transition: all var(--transition-fast);
+  flex-shrink: 0;
+}
+
+.like-btn-transport:hover {
+  opacity: 1;
+  color: #e25555;
+  background: rgba(226, 85, 85, 0.1);
+}
+
+.like-btn-transport.liked {
+  color: #e25555;
+  opacity: 0.95;
+}
+
+.like-btn-transport.liked:hover {
+  color: #c93f3f;
+  background: rgba(226, 85, 85, 0.16);
 }

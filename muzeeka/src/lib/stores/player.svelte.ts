@@ -43,7 +43,13 @@ interface PlaylistsData {
   active_playlist_id: string | null;
   current_file: string | null;
   volume: number | null;
+  liked_paths?: string[];
 }
+
+// --- Virtual Playlist IDs ---
+
+export const VIRTUAL_ALL_ID = '__all__';
+export const VIRTUAL_LIKED_ID = '__liked__';
 
 // --- Reactive State ---
 
@@ -62,6 +68,8 @@ let shuffleEnabled = $state(false);
 let shuffleOrder = $state<number[]>([]);
 let shufflePosition = $state(0);
 let repeatMode = $state<'off' | 'all' | 'one'>('off');
+let playbackRate = $state(1.0);
+let likedPaths = $state<Set<string>>(new Set());
 let isInitialized = $state(false);
 let initPromise: Promise<void> | null = null;
 let persistReady = $state(false);
@@ -72,7 +80,37 @@ let lastPlayedFile = '';
 
 // --- Derived ---
 
+let allTracks = $derived.by(() => {
+  const seen = new Set<string>();
+  const result: MusicFile[] = [];
+  for (const playlist of playlists) {
+    for (const track of playlist.tracks) {
+      if (!seen.has(track.path)) {
+        seen.add(track.path);
+        result.push(track);
+      }
+    }
+  }
+  return result;
+});
+
+let likedTracks = $derived.by(() => {
+  const seen = new Set<string>();
+  const result: MusicFile[] = [];
+  for (const playlist of playlists) {
+    for (const track of playlist.tracks) {
+      if (likedPaths.has(track.path) && !seen.has(track.path)) {
+        seen.add(track.path);
+        result.push(track);
+      }
+    }
+  }
+  return result;
+});
+
 let tracks = $derived.by(() => {
+  if (activePlaylistId === VIRTUAL_ALL_ID) return allTracks;
+  if (activePlaylistId === VIRTUAL_LIKED_ID) return likedTracks;
   if (!activePlaylistId) return [];
   return playlists.find((p) => p.id === activePlaylistId)?.tracks ?? [];
 });
@@ -80,6 +118,12 @@ let tracks = $derived.by(() => {
 let activePlaylist = $derived(
   playlists.find((p) => p.id === activePlaylistId) ?? null
 );
+
+let activePlaylistName = $derived.by(() => {
+  if (activePlaylistId === VIRTUAL_ALL_ID) return 'All tracks';
+  if (activePlaylistId === VIRTUAL_LIKED_ID) return 'Liked';
+  return playlists.find((p) => p.id === activePlaylistId)?.name ?? null;
+});
 
 let playingPlaylist = $derived(
   playingPlaylistId
@@ -89,6 +133,8 @@ let playingPlaylist = $derived(
 
 let playingTracks = $derived.by(() => {
   if (!playingPlaylistId) return [];
+  if (playingPlaylistId === VIRTUAL_ALL_ID) return allTracks;
+  if (playingPlaylistId === VIRTUAL_LIKED_ID) return likedTracks;
   return playlists.find((p) => p.id === playingPlaylistId)?.tracks ?? [];
 });
 
@@ -268,6 +314,7 @@ function buildSaveData(): PlaylistsData {
     active_playlist_id: activePlaylistId,
     current_file: currentFile,
     volume,
+    liked_paths: [...likedPaths],
   };
 }
 
@@ -289,6 +336,9 @@ async function loadPlaylists() {
     activePlaylistId = data.active_playlist_id ?? playlists[0]?.id ?? null;
     if (typeof data.volume === 'number') {
       volume = data.volume;
+    }
+    if (Array.isArray(data.liked_paths)) {
+      likedPaths = new Set(data.liked_paths.filter((p: any) => typeof p === 'string' && p));
     }
     // Restore last playing track so metadata/status survive Ctrl+R
     if (data.current_file) {
@@ -331,6 +381,11 @@ function createPlaylist(name?: string): string {
 }
 
 function selectPlaylist(id: string) {
+  if (id === VIRTUAL_ALL_ID || id === VIRTUAL_LIKED_ID) {
+    activePlaylistId = id;
+    scheduleSave();
+    return;
+  }
   if (!playlists.some((p) => p.id === id)) return;
   activePlaylistId = id;
   prefetchCoverPaths(
@@ -469,6 +524,17 @@ async function init() {
   initPromise = (async () => {
     await invoke('player_init');
     await invoke('player_set_volume', { volume });
+
+    // Restore persisted playback rate from settings (so rate survives app restart)
+    try {
+      const s = await invoke<{ playback_rate?: number }>('settings_load');
+      if (typeof s?.playback_rate === 'number' && s.playback_rate > 0 && s.playback_rate !== 1) {
+        const r = Math.max(0.25, Math.min(2, s.playback_rate));
+        playbackRate = r;
+        await invoke('player_set_playback_rate', { rate: r }).catch(() => {});
+      }
+    } catch {}
+
     isInitialized = true;
   })();
 
@@ -614,7 +680,12 @@ async function play(filePath: string) {
     const track = playlists
       .flatMap((p) => p.tracks)
       .find((t) => t.path === filePath);
-    const playlistId = findPlaylistForTrack(filePath);
+    // Prefer the currently viewed playlist (incl. virtual All/Liked) so that next/prev
+    // operate over the collected list when playing from All or Liked views.
+    let playlistId = activePlaylistId;
+    if (!playlistId || (playlistId !== VIRTUAL_ALL_ID && playlistId !== VIRTUAL_LIKED_ID)) {
+      playlistId = findPlaylistForTrack(filePath);
+    }
     if (playlistId) {
       playingPlaylistId = playlistId;
     }
@@ -721,6 +792,35 @@ function setVolume(vol: number) {
   scheduleSave();
 }
 
+function setPlaybackRate(rate: number) {
+  playbackRate = Math.max(0.25, Math.min(2, rate));
+  void invoke('player_set_playback_rate', { rate: playbackRate }).catch((e) => {
+    console.error('Failed to set playback rate:', e);
+  });
+  // Persist to settings (without clobbering EQ etc)
+  void (async () => {
+    try {
+      const current = await invoke<any>('settings_load');
+      await invoke('settings_save', { data: { ...current, playback_rate: playbackRate } });
+    } catch {}
+  })();
+}
+
+function toggleLike(path: string) {
+  const next = new Set(likedPaths);
+  if (next.has(path)) {
+    next.delete(path);
+  } else {
+    next.add(path);
+  }
+  likedPaths = next;
+  scheduleSave();
+}
+
+function isLiked(path: string): boolean {
+  return likedPaths.has(path);
+}
+
 async function togglePlayPause() {
   if (isPlaying) {
     await pause();
@@ -815,7 +915,7 @@ function setupListeners() {
       ? trackDisplayTitle(track)
       : path.split(/[\\/]/).pop()?.replace(/\.[^/.]+$/, '') ?? null;
     const playlistId = findPlaylistForTrack(path);
-    if (playlistId) {
+    if (playlistId && playingPlaylistId !== VIRTUAL_ALL_ID && playingPlaylistId !== VIRTUAL_LIKED_ID) {
       playingPlaylistId = playlistId;
     }
     syncTrackIndex();
@@ -902,6 +1002,7 @@ export function createPlayerStore() {
     get playlists() { return playlists; },
     get activePlaylistId() { return activePlaylistId; },
     get activePlaylist() { return activePlaylist; },
+    get activePlaylistName() { return activePlaylistName; },
     get playingPlaylistId() { return playingPlaylistId; },
     get playingPlaylist() { return playingPlaylist; },
     get playingTracks() { return playingTracks; },
@@ -919,6 +1020,9 @@ export function createPlayerStore() {
     get hasPlaylists() { return hasPlaylists; },
     get hasNext() { return hasNext; },
     get hasPrev() { return hasPrev; },
+    get allCount() { return allTracks.length; },
+    get likedCount() { return likedTracks.length; },
+    get playbackRate() { return playbackRate; },
     get formattedPosition() { return formattedPosition; },
     get formattedDuration() { return formattedDuration; },
 
@@ -944,6 +1048,9 @@ export function createPlayerStore() {
     prevTrack,
     toggleShuffle,
     toggleRepeat,
+    setPlaybackRate,
+    toggleLike,
+    isLiked,
     init,
     ensureInit,
   };

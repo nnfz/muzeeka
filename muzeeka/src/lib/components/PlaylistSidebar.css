@@ -215,3 +215,43 @@
   transform: translateY(-1px);
   box-shadow: var(--shadow-glow);
 }
+
+/* Virtual playlists (All / Liked) */
+.playlist-row.virtual {
+  margin-bottom: 2px;
+}
+
+.playlist-item.virtual-item {
+  gap: 8px;
+  padding: 6px 8px;
+}
+
+.playlist-icon.virtual-icon {
+  height: 28px;
+  width: 28px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.06);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  color: var(--text-secondary);
+}
+
+.playlist-row.virtual.active .playlist-icon.virtual-icon {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.liked-icon {
+  color: #e25555;
+}
+
+.playlist-row.virtual .playlist-name {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.playlist-row.virtual .playlist-count {
+  font-size: 9px;
+}

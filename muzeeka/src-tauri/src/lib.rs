@@ -102,6 +102,7 @@ pub fn run() {
             commands::player_stop,
             commands::player_seek,
             commands::player_set_volume,
+            commands::player_set_playback_rate,
             commands::player_get_state,
             commands::player_get_equalizer,
             commands::player_get_equalizer_status,

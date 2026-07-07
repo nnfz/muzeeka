@@ -2,7 +2,7 @@
   import ContextMenu from './ContextMenu.svelte';
   import TrackCover from './TrackCover.svelte';
   import { openContextMenuFromEvent, type ContextMenuItem } from '$lib/contextMenu';
-  import { getPlayerStore, type Playlist } from '$lib/stores/player.svelte';
+  import { getPlayerStore, type Playlist, VIRTUAL_ALL_ID, VIRTUAL_LIKED_ID } from '$lib/stores/player.svelte';
 
   const player = getPlayerStore();
 
@@ -176,7 +176,63 @@
     </button>
   </div>
 
-  <div class="playlist-list" role={player.hasPlaylists ? 'list' : undefined}>
+  <div class="playlist-list" role="list">
+    <!-- Virtual special playlists: All and Liked -->
+    <div
+      class="playlist-row virtual"
+      role="listitem"
+      class:active={player.activePlaylistId === VIRTUAL_ALL_ID}
+      onmouseenter={() => (hoveredPlaylistId = VIRTUAL_ALL_ID)}
+      onmouseleave={() => {
+        if (hoveredPlaylistId === VIRTUAL_ALL_ID) hoveredPlaylistId = null;
+      }}
+    >
+      <button
+        class="playlist-item virtual-item"
+        onclick={() => player.selectPlaylist(VIRTUAL_ALL_ID)}
+        title="All tracks from every playlist"
+      >
+        <div class="playlist-icon virtual-icon">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="3" width="7" height="7" />
+            <rect x="14" y="3" width="7" height="7" />
+            <rect x="3" y="14" width="7" height="7" />
+            <rect x="14" y="14" width="7" height="7" />
+          </svg>
+        </div>
+        <div class="playlist-details">
+          <span class="playlist-name">All tracks</span>
+          <span class="playlist-count">{player.allCount} track{player.allCount !== 1 ? 's' : ''}</span>
+        </div>
+      </button>
+    </div>
+
+    <div
+      class="playlist-row virtual"
+      role="listitem"
+      class:active={player.activePlaylistId === VIRTUAL_LIKED_ID}
+      onmouseenter={() => (hoveredPlaylistId = VIRTUAL_LIKED_ID)}
+      onmouseleave={() => {
+        if (hoveredPlaylistId === VIRTUAL_LIKED_ID) hoveredPlaylistId = null;
+      }}
+    >
+      <button
+        class="playlist-item virtual-item"
+        onclick={() => player.selectPlaylist(VIRTUAL_LIKED_ID)}
+        title="Liked tracks"
+      >
+        <div class="playlist-icon virtual-icon liked-icon">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z" />
+          </svg>
+        </div>
+        <div class="playlist-details">
+          <span class="playlist-name">Liked</span>
+          <span class="playlist-count">{player.likedCount} track{player.likedCount !== 1 ? 's' : ''}</span>
+        </div>
+      </button>
+    </div>
+
     {#if !player.hasPlaylists}
       <div class="empty-state" data-tauri-drag-region>
         <div class="empty-icon">
