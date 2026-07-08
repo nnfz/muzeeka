@@ -714,6 +714,15 @@ async function play(filePath: string) {
       queueToSend = buildGaplessQueue(filePath);
     }
 
+    // Block stale position events BEFORE the invoke so they can't flash
+    // the seekbar. This is critical for CUE tracks: when switching backward
+    // in the same audio file, the backend buffer still holds the old absolute
+    // position (e.g. 130s), but cue_start gets updated to 0 → relative
+    // position = 130 → seekbar jumps to max for a frame before resetting.
+    seekGuardPosition = 0;
+    seekGuardUntil = Date.now() + 600;
+    position = 0;
+
     await invoke('player_play', {
       ...playOptionsForTrack(track, filePath),
       queue: queueToSend,
@@ -734,6 +743,7 @@ async function play(filePath: string) {
     lastGaplessChangeAt = Date.now();
     scheduleSave(); // persist current_file so it survives restart
   } catch (e) {
+    seekGuardUntil = 0;
     const message = typeof e === 'string' ? e : String(e);
     console.error('Failed to play:', message);
     isPlaying = false;
