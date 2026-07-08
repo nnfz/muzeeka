@@ -251,9 +251,9 @@ impl Player {
             }
         }
 
-        // Balanced buffer for long playback stability (prevents crackling after long sessions)
-        // while keeping seek and manual track switches reasonably responsive.
-        let _ = bass.set_config(bass::BASS_CONFIG_BUFFER, 300.0);       // ~300ms for long playback stability
+        // 200ms buffer: 100ms faster than original 300ms for responsive switching,
+        // while leaving 150ms margin over the 50ms gapless poll interval.
+        let _ = bass.set_config(bass::BASS_CONFIG_BUFFER, 200.0);
         let _ = bass.set_config(bass::BASS_CONFIG_UPDATEPERIOD, 20.0);
 
         inner.eq_context.set_float_dsp_enabled(float_dsp_ok);
@@ -322,8 +322,7 @@ impl Player {
         // contribute to crackling/underruns over time).
         let flags = bass::BASS_MIXER_NONSTOP | bass::BASS_SAMPLE_FLOAT;
         let mixer = bass.mixer_stream_create(44100, 2, flags)?;
-        // Balanced buffer on mixer for stability during long playback (avoids crackling).
-        let _ = bass.channel_set_attribute(mixer, bass::BASS_ATTRIB_BUFFER, 0.3);
+        let _ = bass.channel_set_attribute(mixer, bass::BASS_ATTRIB_BUFFER, 0.2);
         // Start the mixer (it will output silence until sources added, or play when first added).
         bass.channel_play(mixer, false)?;
         // Set initial volume on mixer
@@ -680,7 +679,7 @@ impl Player {
                 // and the new source is now the only one feeding the mixer.
                 let _ = bass.channel_play(inner.mixer_handle, false);
             }
-            let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_BUFFER, 0.3);
+            let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_BUFFER, 0.2);
         }
 
         inner.current_source = source;
@@ -770,7 +769,7 @@ impl Player {
             if bass.channel_is_active(inner.mixer_handle) != bass::BASS_ACTIVE_PLAYING {
                 let _ = bass.channel_play(inner.mixer_handle, false);
             }
-            let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_BUFFER, 0.3);
+            let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_BUFFER, 0.2);
         }
 
         inner.preloaded_source = 0;
@@ -825,16 +824,14 @@ impl Player {
         if Self::can_gapless_reuse(inner, &playback.audio_path) {
             // CUE same-file: seek within the already-open stream (instant, no reopening).
             Self::apply_segment(inner, track_path, &playback)?;
-            // If mixer was paused (user was paused then clicked a different CUE track),
-            // we must flush the mixer buffer and resume, otherwise old audio leaks.
+            // Always flush the mixer buffer on a manual track switch.
+            // Even if the mixer is playing, it holds up to buffer_size ms of old audio.
+            // For gapless auto-advance we skip this (seamless), but for manual switches
+            // the user wants the new segment to start immediately.
             if let Some(bass) = inner.bass.as_ref() {
-                let active = bass.channel_is_active(inner.mixer_handle);
-                if active != bass::BASS_ACTIVE_PLAYING {
-                    // Hard restart flushes buffered old-track data.
-                    let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_VOL, inner.volume);
-                    let _ = bass.channel_play(inner.mixer_handle, true);
-                    let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_BUFFER, 0.3);
-                }
+                let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_VOL, inner.volume);
+                let _ = bass.channel_play(inner.mixer_handle, true);
+                let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_BUFFER, 0.2);
             }
         } else if Self::can_use_preloaded(inner, &playback.audio_path) {
             // Fast path for manual next/prev when the track was preloaded for gapless.
@@ -851,6 +848,7 @@ impl Player {
         Self::refresh_pending_next(inner);
         Ok(())
     }
+
 
     fn cue_relative_position(inner: &PlayerInner, absolute_secs: f64) -> f64 {
         match inner.cue_start {
@@ -1030,7 +1028,7 @@ impl Player {
 
             // This flush makes the seek actually happen right now (discards stale buffer data).
             let _ = bass.channel_play(inner.mixer_handle, true);
-            let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_BUFFER, 0.3);
+            let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_BUFFER, 0.2);
 
             // Restore volume hard for maximum speed.
             let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_VOL, target);
