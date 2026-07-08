@@ -119,6 +119,9 @@ struct PlayerInner {
     preloaded_audio_path: Option<String>,
     /// Used to invalidate stale scheduled pause actions when user quickly plays new track.
     pause_generation: u64,
+    /// Timestamp (millis since UNIX epoch) when current track play started (for manual plays).
+    /// Prevents spurious early gapless advance right after clicking a track in the current que.
+    current_track_start_time: u64,
 }
 
 /// BASS format plugins loaded via `BASS_PluginLoad` (not bass_fx / bassmix / etc.).
@@ -166,6 +169,7 @@ impl Player {
                 preloaded_source: 0,
                 preloaded_audio_path: None,
                 pause_generation: 0,
+                current_track_start_time: 0,
             })),
             app: Arc::new(RwLock::new(None)),
             bass_thread: Arc::new(RwLock::new(None)),
@@ -467,7 +471,13 @@ impl Player {
         self.run_on_bass_thread(move |inner| {
             Self::set_gapless_queue(inner, queue);
             Self::sync_gapless_index(inner, &track_path);
-            Self::play_inner(inner, &track_path, audio_path.as_deref(), cue_start, cue_end)
+            Self::play_inner(inner, &track_path, audio_path.as_deref(), cue_start, cue_end)?;
+            // Record start time for this track (used to guard against early advance after manual que click)
+            inner.current_track_start_time = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            Ok(())
         })
     }
 
@@ -648,15 +658,12 @@ impl Player {
         Self::teardown_current(inner);
         Self::clear_preload(inner);
 
-        if let Some(bass) = inner.bass.as_ref() {
-            // When switching from paused/stopped state (e.g. pause then play different track),
-            // fully stop the mixer first. This flushes any buffered tail from the previous track.
-            // Prevents the bug where ~1s of old track leaks after switching.
+        let was_paused_or_stopped = if let Some(bass) = inner.bass.as_ref() {
             let active = bass.channel_is_active(inner.mixer_handle);
-            if active != bass::BASS_ACTIVE_PLAYING {
-                let _ = bass.channel_stop(inner.mixer_handle);
-            }
-        }
+            active != bass::BASS_ACTIVE_PLAYING
+        } else {
+            false
+        };
 
         let source = Self::create_decode_source(inner, &playback.audio_path, playback.cue_start)?;
 
@@ -664,9 +671,15 @@ impl Player {
 
         if let Some(bass) = inner.bass.as_ref() {
             let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_VOL, inner.volume);
-            // Restart the mixer (true) to flush any remaining buffer from old track/fade.
-            // This prevents old audio leaking for a second when switching from pause or during manual change.
-            let _ = bass.channel_play(inner.mixer_handle, true);
+            if was_paused_or_stopped {
+                // Hard restart to flush any old buffer from previous track/fade.
+                let _ = bass.channel_play(inner.mixer_handle, true);
+            } else {
+                // Mixer is already playing — just ensure it keeps going.
+                // No hard restart needed; the old source was already removed
+                // and the new source is now the only one feeding the mixer.
+                let _ = bass.channel_play(inner.mixer_handle, false);
+            }
             let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_BUFFER, 0.3);
         }
 
@@ -810,7 +823,19 @@ impl Player {
             .map_err(|error| format!("{error} (track: {track_path})"))?;
 
         if Self::can_gapless_reuse(inner, &playback.audio_path) {
+            // CUE same-file: seek within the already-open stream (instant, no reopening).
             Self::apply_segment(inner, track_path, &playback)?;
+            // If mixer was paused (user was paused then clicked a different CUE track),
+            // we must flush the mixer buffer and resume, otherwise old audio leaks.
+            if let Some(bass) = inner.bass.as_ref() {
+                let active = bass.channel_is_active(inner.mixer_handle);
+                if active != bass::BASS_ACTIVE_PLAYING {
+                    // Hard restart flushes buffered old-track data.
+                    let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_VOL, inner.volume);
+                    let _ = bass.channel_play(inner.mixer_handle, true);
+                    let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_BUFFER, 0.3);
+                }
+            }
         } else if Self::can_use_preloaded(inner, &playback.audio_path) {
             // Fast path for manual next/prev when the track was preloaded for gapless.
             // This makes "hand switching" to the next track nearly instant.
@@ -1250,12 +1275,20 @@ impl Player {
                     let stream_done = src_active == bass::BASS_ACTIVE_STOPPED || mixer_active == bass::BASS_ACTIVE_STOPPED;
 
                     if Self::has_next_in_gapless_queue(inner) && (ending || stream_done) {
-                        return Self::try_advance_gapless(inner)
-                            .map(|path| (Some(path), POLL_INTERVAL_MS))
-                            .map_err(|error| {
-                                eprintln!("Gapless advance failed: {error}");
-                                error
-                            });
+                        // Guard against spurious early advance after manual click in que (new track can briefly appear done).
+                        // Use time since this track started (set in play()), not just pos (which can be small at legit end in recovery).
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        if now.saturating_sub(inner.current_track_start_time) > 1500 {
+                            return Self::try_advance_gapless(inner)
+                                .map(|path| (Some(path), POLL_INTERVAL_MS))
+                                .map_err(|error| {
+                                    eprintln!("Gapless advance failed: {error}");
+                                    error
+                                });
+                        }
                     }
 
                     if (ending || stream_done) && !Self::has_next_in_gapless_queue(inner) {
@@ -1321,10 +1354,18 @@ impl Player {
                                 if !Self::has_next_in_gapless_queue(inner) {
                                     return Ok(None);
                                 }
-                                Self::try_advance_gapless(inner).map(Some).map_err(|error| {
-                                    eprintln!("Gapless recovery failed: {error}");
-                                    error
-                                })
+                                let now = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as u64)
+                                    .unwrap_or(0);
+                                if now.saturating_sub(inner.current_track_start_time) > 1500 {
+                                    Self::try_advance_gapless(inner).map(Some).map_err(|error| {
+                                        eprintln!("Gapless recovery failed: {error}");
+                                        error
+                                    })
+                                } else {
+                                    Ok(None)
+                                }
                             })
                             .ok()
                             .flatten();

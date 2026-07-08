@@ -239,6 +239,10 @@ async function enrichTrackMetadata() {
 }
 
 function findPlaylistForTrack(path: string): string | null {
+  // Prefer the current playing playlist if the track exists in it (important for "que" clicks and gapless).
+  if (playingPlaylistId && playingTracks.some((t) => t.path === path)) {
+    return playingPlaylistId;
+  }
   for (const playlist of playlists) {
     if (playlist.tracks.some((track) => track.path === path)) {
       return playlist.id;
@@ -670,12 +674,13 @@ async function play(filePath: string) {
     lastManualPlayAt = Date.now();
     lastPlayedFile = filePath;
 
-    // If coming from pause, hard stop the old to prevent any tail of previous track
-    // leaking for a second when starting the new one.
-    if (isPaused) {
-      try { await invoke('player_stop'); } catch {}
-      isPaused = false;
-    }
+    // DON'T call player_stop before player_play!
+    // The backend's play_inner handles transitions properly:
+    //   - CUE tracks in the same audio file → seek within the open stream (instant)
+    //   - Preloaded next track → activate preloaded source (fast)
+    //   - Different file → teardown + open new stream
+    // Calling stop() first destroys the current_source and current_audio_path,
+    // which prevents the CUE reuse optimization and causes glitches/delays.
 
     const track = playlists
       .flatMap((p) => p.tracks)
@@ -718,9 +723,15 @@ async function play(filePath: string) {
     currentFileName = file
       ? trackDisplayTitle(file)
       : filePath.split(/[\\/]/).pop()?.replace(/\.[^/.]+$/, '') ?? null;
+    position = 0;
+    const meta = track || playlists.flatMap((p) => p.tracks).find((t) => t.path === filePath);
+    if (meta?.duration_secs != null) {
+      duration = meta.duration_secs;
+    }
     syncTrackIndex();
     isPlaying = true;
     isPaused = false;
+    lastGaplessChangeAt = Date.now();
     scheduleSave(); // persist current_file so it survives restart
   } catch (e) {
     const message = typeof e === 'string' ? e : String(e);
@@ -845,12 +856,18 @@ async function nextTrack() {
     } else {
       return;
     }
-    await play(playingTracks[shuffleOrder[shufflePosition]].path);
+    const idx = shuffleOrder[shufflePosition];
+    if (idx >= 0 && idx < playingTracks.length) {
+      await play(playingTracks[idx].path);
+    }
     return;
   }
 
-  if (currentTrackIndex < playingTracks.length - 1) {
-    await play(playingTracks[currentTrackIndex + 1].path);
+  // Use a fresh index lookup to avoid stale currentTrackIndex after rapid switches.
+  const idx = playingTracks.findIndex((t) => t.path === currentFile);
+  if (idx >= 0 && idx < playingTracks.length - 1) {
+    const targetPath = playingTracks[idx + 1].path;
+    await play(targetPath);
   } else if (repeatMode === 'all' && playingTracks.length > 0) {
     await play(playingTracks[0].path);
   }
@@ -866,13 +883,20 @@ async function prevTrack() {
     ensureShuffleOrder();
     if (shufflePosition > 0) {
       shufflePosition -= 1;
-      await play(playingTracks[shuffleOrder[shufflePosition]].path);
+      const idx = shuffleOrder[shufflePosition];
+      if (idx >= 0 && idx < playingTracks.length) {
+        await play(playingTracks[idx].path);
+      }
     }
     return;
   }
 
-  if (hasPrev) {
-    await play(playingTracks[currentTrackIndex - 1].path);
+  // Capture the target path before calling play() which may mutate state.
+  // Use a fresh index lookup to avoid stale currentTrackIndex.
+  const idx = playingTracks.findIndex((t) => t.path === currentFile);
+  if (idx > 0) {
+    const targetPath = playingTracks[idx - 1].path;
+    await play(targetPath);
   }
 }
 
@@ -905,7 +929,7 @@ function setupListeners() {
     // Protect recent manual plays from stale track-changed events
     // (e.g. old gapless poll deciding to advance right after user clicked a different track in the que list).
     // This fixes UI showing wrong track (9) while playing the manually chosen one (4), and random jumps.
-    if (Date.now() - lastManualPlayAt < 400 && lastPlayedFile && path !== lastPlayedFile) {
+    if (Date.now() - lastManualPlayAt < 600 && lastPlayedFile && path !== lastPlayedFile) {
       return;
     }
 
@@ -914,8 +938,16 @@ function setupListeners() {
     currentFileName = track
       ? trackDisplayTitle(track)
       : path.split(/[\\/]/).pop()?.replace(/\.[^/.]+$/, '') ?? null;
+    position = 0;
+    if (track?.duration_secs != null) {
+      duration = track.duration_secs;
+    }
     const playlistId = findPlaylistForTrack(path);
-    if (playlistId && playingPlaylistId !== VIRTUAL_ALL_ID && playingPlaylistId !== VIRTUAL_LIKED_ID) {
+    // Prefer to keep the current playingPlaylistId if the track is already in the current que/playing list.
+    // This prevents findPlaylistForTrack (which returns the *first* matching playlist) from
+    // switching us to a different playlist on manual clicks or gapless advances within the que.
+    const isInCurrentPlaying = playingPlaylistId && playingTracks.some((t) => t.path === path);
+    if (!isInCurrentPlaying && playlistId && playingPlaylistId !== VIRTUAL_ALL_ID && playingPlaylistId !== VIRTUAL_LIKED_ID) {
       playingPlaylistId = playlistId;
     }
     syncTrackIndex();
@@ -951,7 +983,7 @@ function setupListeners() {
 
   listen('player:track-ended', () => {
     // Gapless advance emits track-changed; ignore a stale ended right after it.
-    if (Date.now() - lastGaplessChangeAt < 400) return;
+    if (Date.now() - lastGaplessChangeAt < 600) return;
 
     isPlaying = false;
     isPaused = false;
