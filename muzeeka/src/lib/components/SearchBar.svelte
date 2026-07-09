@@ -18,10 +18,9 @@
 
   let downloadLabel = $derived.by(() => {
     if (successMsg) return successMsg;
-    if (download.isDownloading && download.progress?.percent != null) {
-      return `${Math.round(download.progress.percent)}%`;
+    if (download.isDownloading) {
+      return `${download.downloadPercent ?? 0}%`;
     }
-    if (download.isDownloading) return '…';
     if (download.isProbing) return 'Checking…';
     return 'Download';
   });

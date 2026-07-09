@@ -212,18 +212,24 @@ pub fn ytdlp_ffmpeg_available(app: AppHandle) -> bool {
 
 /// Probe a URL for title/metadata without downloading.
 #[tauri::command]
-pub fn ytdlp_probe(app: AppHandle, url: String) -> Result<YtdlpProbeResult, String> {
-    ytdlp::probe(&app, &url)
+pub async fn ytdlp_probe(app: AppHandle, url: String) -> Result<YtdlpProbeResult, String> {
+    tauri::async_runtime::spawn_blocking(move || ytdlp::probe(&app, &url))
+        .await
+        .map_err(|_| "Probe task failed".to_string())?
 }
 
 /// Download audio from a URL. Emits `ytdlp:progress` events during download.
 #[tauri::command]
-pub fn ytdlp_download(
+pub async fn ytdlp_download(
     app: AppHandle,
     url: String,
     output_dir: Option<String>,
 ) -> Result<YtdlpDownloadResult, String> {
-    ytdlp::download(&app, &url, output_dir.as_deref())
+    tauri::async_runtime::spawn_blocking(move || {
+        ytdlp::download(&app, &url, output_dir.as_deref())
+    })
+    .await
+    .map_err(|_| "Download task failed".to_string())?
 }
 
 /// Cancel an in-progress download.

@@ -6,6 +6,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::thread;
+
+use rayon::prelude::*;
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
@@ -326,7 +329,7 @@ pub fn download(
         ));
     }
 
-    emit_progress(app, trimmed, "Starting download…", None);
+    emit_progress(app, trimmed, "Starting download…", Some(0.0));
 
     let mut cmd_args = build_ytdlp_args(app, &[]);
     cmd_args.extend([
@@ -375,22 +378,25 @@ pub fn download(
                 if let Some(pct) = parse_progress_line(&line) {
                     emit_progress(&app_stderr, &url_stderr, "Downloading…", Some(pct));
                 } else if line.contains("ExtractAudio") || line.contains("ffmpeg") {
-                    emit_progress(&app_stderr, &url_stderr, "Converting to MP3…", None);
+                    emit_progress(&app_stderr, &url_stderr, "Converting to MP3…", Some(99.0));
                 }
             }
         })
     });
 
-    let mut downloaded_paths: Vec<String> = Vec::new();
-    if let Some(stdout) = stdout {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines().map_while(Result::ok) {
-            let path = line.trim().to_string();
-            if !path.is_empty() && Path::new(&path).is_file() {
-                downloaded_paths.push(path);
+    let stdout_handle = stdout.map(|stdout| {
+        thread::spawn(move || {
+            let mut paths = Vec::new();
+            let reader = BufReader::new(stdout);
+            for line in reader.lines().map_while(Result::ok) {
+                let path = line.trim().to_string();
+                if !path.is_empty() && Path::new(&path).is_file() {
+                    paths.push(path);
+                }
             }
-        }
-    }
+            paths
+        })
+    });
 
     if let Some(handle) = stderr_handle {
         let _ = handle.join();
@@ -416,6 +422,12 @@ pub fn download(
         return Err("yt-dlp download failed".to_string());
     }
 
+    let mut downloaded_paths = stdout_handle
+        .map(|handle| handle.join())
+        .transpose()
+        .map_err(|_| "Failed to read yt-dlp output".to_string())?
+        .unwrap_or_default();
+
     // Fallback: scan output dir for new mp3 files if --print didn't yield paths
     if downloaded_paths.is_empty() {
         if let Ok(entries) = fs::read_dir(&dir) {
@@ -432,10 +444,12 @@ pub fn download(
         return Err("Download finished but no audio files were found".to_string());
     }
 
-    emit_progress(app, trimmed, "Done", Some(100.0));
+    emit_progress(app, trimmed, "Processing files…", Some(100.0));
 
     let mut files = library::fetch_metadata(&downloaded_paths)?;
     enrich_downloaded_metadata(&mut files);
+
+    emit_progress(app, trimmed, "Done", Some(100.0));
     Ok(YtdlpDownloadResult { files })
 }
 
@@ -509,38 +523,40 @@ fn apply_metadata_to_file(
     file.cover_path = meta.cover_path.or_else(|| file.cover_path.clone());
 }
 
-fn enrich_downloaded_metadata(files: &mut [MusicFile]) {
-    for file in files.iter_mut() {
-        let path = Path::new(&file.path);
-        let mut title = file.title.clone();
-        let mut artist = file.artist.clone();
+fn enrich_downloaded_file(file: &mut MusicFile) {
+    let path = Path::new(&file.path);
+    let mut title = file.title.clone();
+    let mut artist = file.artist.clone();
 
-        if let Some(json_path) = info_json_path(path) {
-            if json_path.is_file() {
-                if let Ok(raw) = fs::read_to_string(&json_path) {
-                    if let Ok(info) = serde_json::from_str::<YtdlpInfoJson>(&raw) {
-                        if let Some(parsed_artist) = pick_artist(&info) {
-                            artist = Some(parsed_artist);
-                        }
-                        if let Some(parsed_title) = info.title.filter(|t| !t.trim().is_empty()) {
-                            title = Some(metadata::strip_ytdlp_id_suffix(&parsed_title));
-                        }
+    if let Some(json_path) = info_json_path(path) {
+        if json_path.is_file() {
+            if let Ok(raw) = fs::read_to_string(&json_path) {
+                if let Ok(info) = serde_json::from_str::<YtdlpInfoJson>(&raw) {
+                    if let Some(parsed_artist) = pick_artist(&info) {
+                        artist = Some(parsed_artist);
+                    }
+                    if let Some(parsed_title) = info.title.filter(|t| !t.trim().is_empty()) {
+                        title = Some(metadata::strip_ytdlp_id_suffix(&parsed_title));
                     }
                 }
-                let _ = fs::remove_file(&json_path);
             }
+            let _ = fs::remove_file(&json_path);
         }
-
-        if artist.is_none() {
-            if let Some(ref current_title) = title {
-                if let Some((parsed_artist, parsed_title)) = parse_artist_title(current_title) {
-                    artist = Some(parsed_artist);
-                    title = Some(parsed_title);
-                }
-            }
-        }
-
-        apply_metadata_to_file(file, title, artist);
     }
+
+    if artist.is_none() {
+        if let Some(ref current_title) = title {
+            if let Some((parsed_artist, parsed_title)) = parse_artist_title(current_title) {
+                artist = Some(parsed_artist);
+                title = Some(parsed_title);
+            }
+        }
+    }
+
+    apply_metadata_to_file(file, title, artist);
+}
+
+fn enrich_downloaded_metadata(files: &mut [MusicFile]) {
+    files.par_iter_mut().for_each(enrich_downloaded_file);
 }
 

@@ -49,6 +49,7 @@ const DOWNLOAD_WINDOW_OPTIONS = {
 let url = $state('');
 let probe = $state<YtdlpProbeResult | null>(null);
 let progress = $state<YtdlpProgress | null>(null);
+let downloadPercent = $state<number | null>(null);
 let error = $state<string | null>(null);
 let isProbing = $state(false);
 let isDownloading = $state(false);
@@ -61,6 +62,9 @@ async function ensureProgressListener() {
   if (unlistenProgress) return;
   unlistenProgress = await listen<YtdlpProgress>('ytdlp:progress', (event) => {
     progress = event.payload;
+    if (event.payload.percent != null) {
+      downloadPercent = Math.max(0, Math.min(100, Math.round(event.payload.percent)));
+    }
   });
 }
 
@@ -81,6 +85,7 @@ function resetState() {
   url = '';
   probe = null;
   progress = null;
+  downloadPercent = null;
   error = null;
 }
 
@@ -160,6 +165,7 @@ export function createDownloadStore() {
     get url() { return url; },
     get probe() { return probe; },
     get progress() { return progress; },
+    get downloadPercent() { return downloadPercent; },
     get error() { return error; },
     get isProbing() { return isProbing; },
     get isDownloading() { return isDownloading; },
@@ -196,6 +202,7 @@ export function createDownloadStore() {
       probe = null;
       error = null;
       progress = null;
+      downloadPercent = null;
     },
 
     async probeUrl(targetUrl?: string) {
@@ -229,7 +236,8 @@ export function createDownloadStore() {
 
       isDownloading = true;
       error = null;
-      progress = { status: 'Starting…', percent: null, url: normalized };
+      downloadPercent = 0;
+      progress = { status: 'Starting…', percent: 0, url: normalized };
 
       try {
         const { downloadFolder, downloadPlaylistId } = readDownloadSettings();
@@ -244,6 +252,7 @@ export function createDownloadStore() {
         });
 
         progress = null;
+        downloadPercent = null;
         return result.files.length;
       } catch (e) {
         error = typeof e === 'string' ? e : String(e);
@@ -259,6 +268,7 @@ export function createDownloadStore() {
       } catch { /* ignore */ }
       isDownloading = false;
       progress = null;
+      downloadPercent = null;
       error = 'Download cancelled';
     },
   };
