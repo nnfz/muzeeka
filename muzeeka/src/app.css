@@ -2,6 +2,16 @@
    Muzeeka — Global Design System
    ============================================ */
 
+/* Self-hosted Inter (via @fontsource) so that dev and production builds
+   use *exactly* the same font files and rendering. External Google Fonts
+   were being blocked (or not available) in the Tauri production bundle
+   because of CSP and offline packaging. */
+@import '@fontsource/inter/300.css';
+@import '@fontsource/inter/400.css';
+@import '@fontsource/inter/500.css';
+@import '@fontsource/inter/600.css';
+@import '@fontsource/inter/700.css';
+
 /* --- CSS Custom Properties --- */
 :root {
   /* Background palette */
