@@ -136,6 +136,11 @@
   let columnLayout = $state<ColumnLayout>(loadColumnLayout());
   let sortColumn = $state<ColumnId | null>(initialSort.column);
   let sortDirection = $state<SortDirection>(initialSort.direction);
+  // --- Multi-selection state ---
+  let selectedPaths = $state<Set<string>>(new Set());
+  // Anchor index (in displayedTracks) for range selection.
+  let selectionAnchor = $state<number | null>(null);
+
   let contextMenu = $state<{ item: ListedTrack; x: number; y: number } | null>(null);
 
   let trackMenuItems = $derived.by((): ContextMenuItem[] => {
@@ -143,24 +148,40 @@
     if (!target) return [];
 
     const items: ContextMenuItem[] = [];
-    const path = target.track.path;
-    const isLiked = player.isLiked(path);
+
+    // Multi-selection: determine which paths the menu applies to.
+    const affectedPaths = selectedPaths.size > 0 && selectedPaths.has(target.track.path)
+      ? [...selectedPaths]
+      : [target.track.path];
+    const multi = affectedPaths.length > 1;
+
+    // Like / Unlike
+    const allLiked = affectedPaths.every((p) => player.isLiked(p));
     items.push({
       id: 'like',
-      label: isLiked ? 'Remove from Liked' : 'Add to Liked',
+      label: allLiked
+        ? (multi ? `Remove ${affectedPaths.length} from Liked` : 'Remove from Liked')
+        : (multi ? `Add ${affectedPaths.length} to Liked` : 'Add to Liked'),
       icon: 'heart',
-      onSelect: () => player.toggleLike(path),
+      onSelect: () => affectedPaths.forEach((p) => {
+        if (allLiked ? player.isLiked(p) : !player.isLiked(p)) player.toggleLike(p);
+      }),
     });
 
+    // Delete — only for real playlists; only if all selected are from the same playlist
     const pid = target.playlistId;
     const isRealPlaylist = pid && pid !== VIRTUAL_ALL_ID && pid !== VIRTUAL_LIKED_ID;
-    if (isRealPlaylist) {
+    const allSamePlaylist = isRealPlaylist && affectedPaths.every((p) => {
+      const lt = listedTracks.find((l) => l.track.path === p);
+      return lt && lt.playlistId === pid;
+    });
+    if (allSamePlaylist) {
       items.push({
         id: 'delete',
-        label: 'Delete',
+        label: multi ? `Delete ${affectedPaths.length} tracks` : 'Delete',
         icon: 'delete',
         danger: true,
-        onSelect: () => player.removeTrack(path, pid),
+        onSelect: () => affectedPaths.forEach((p) => player.removeTrack(p, pid)),
       });
     }
     return items;
@@ -377,14 +398,50 @@
     contextMenu = null;
   }
 
-  function openTrackContextMenu(e: MouseEvent, item: ListedTrack) {
+  function openTrackContextMenu(e: MouseEvent, item: ListedTrack, index: number) {
+    e.preventDefault();
+    // If right-clicking an unselected track, focus only that track.
+    if (!selectedPaths.has(item.track.path)) {
+      selectedPaths = new Set();
+      selectionAnchor = index;
+    }
     const position = openContextMenuFromEvent(e);
     contextMenu = { item, ...position };
   }
 
-  function handleTrackClick(item: ListedTrack) {
+  function handleTrackClick(item: ListedTrack, index: number, e: MouseEvent) {
     closeContextMenu();
-    player.play(item.track.path);
+
+    const ctrl = e.ctrlKey || e.metaKey;
+    const shift = e.shiftKey;
+
+    if (ctrl && shift && selectionAnchor !== null) {
+      // Ctrl+Shift: add range from anchor to current to existing selection.
+      e.preventDefault();
+      const start = Math.min(selectionAnchor, index);
+      const end = Math.max(selectionAnchor, index);
+      const next = new Set(selectedPaths);
+      for (let i = start; i <= end; i++) {
+        next.add(displayedTracks[i].track.path);
+      }
+      selectedPaths = next;
+    } else if (ctrl) {
+      // Ctrl: toggle individual track selection.
+      e.preventDefault();
+      const next = new Set(selectedPaths);
+      if (next.has(item.track.path)) {
+        next.delete(item.track.path);
+      } else {
+        next.add(item.track.path);
+        selectionAnchor = index;
+      }
+      selectedPaths = next;
+    } else {
+      // Regular click: clear selection and play.
+      selectedPaths = new Set();
+      selectionAnchor = index;
+      player.play(item.track.path);
+    }
   }
 
   function formatDuration(seconds: number | null | undefined): string {
@@ -495,14 +552,16 @@
         {#each displayedTracks as item, i (item.track.path)}
           {@const track = item.track}
           {@const isActive = track.path === player.currentFile}
+          {@const isSelected = selectedPaths.has(track.path)}
           <button
             class="track-row"
             class:active={isActive}
             class:playing={isActive && player.isPlaying}
             class:paused={isActive && player.isPaused && !player.isPlaying}
+            class:selected={isSelected}
             style="grid-template-columns: {gridTemplate}"
-            onclick={() => handleTrackClick(item)}
-            oncontextmenu={(e) => openTrackContextMenu(e, item)}
+            onclick={(e) => handleTrackClick(item, i, e)}
+            oncontextmenu={(e) => openTrackContextMenu(e, item, i)}
             title={`${trackDisplayTitle(track)} — ${trackDisplayArtist(track)}${isGlobalSearch ? ` (${item.playlistName})` : ''}`}
           >
             {#each visibleColumns as column (column)}

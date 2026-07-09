@@ -172,6 +172,19 @@
   background: rgba(255, 255, 255, 0.03);
 }
 
+.track-row.selected {
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.track-row.selected:hover {
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+}
+
+.track-row.selected.playing {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
 .track-row.playing {
   background: var(--accent-soft);
 }
