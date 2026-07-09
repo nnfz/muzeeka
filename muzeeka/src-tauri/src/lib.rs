@@ -18,7 +18,7 @@ use drop_handler::{handle_window_event, DropState};
 use player::Player;
 use std::path::{Path, PathBuf};
 use tauri::path::BaseDirectory;
-use tauri::Manager;
+use tauri::{Manager, WindowEvent};
 
 fn bass_dir_is_valid(dir: &Path) -> bool {
     dir.join("bass.dll").is_file()
@@ -57,14 +57,21 @@ fn resolve_bass_dir(app: Option<&tauri::AppHandle>) -> PathBuf {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let player = Player::new();
+    let player_for_close = player.clone();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(DropState::default())
         .manage(player.clone())
-        .on_window_event(|window, event| {
+        .on_window_event(move |window, event| {
             handle_window_event(window, event);
+
+            if let WindowEvent::CloseRequested { .. } = event {
+                // Ensure audio is stopped and BASS device is freed when the window/app closes.
+                // Without this, if playback was active, the sound can continue after the app exits.
+                let _ = player_for_close.shutdown();
+            }
         })
         .setup(move |app| {
             if let Ok(app_data) = app.path().app_data_dir() {

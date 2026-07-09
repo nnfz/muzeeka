@@ -1005,6 +1005,33 @@ impl Player {
         })
     }
 
+    /// Stop playback and free the BASS audio device.
+    /// Called on window close so that audio does not continue playing after the app has exited.
+    pub fn shutdown(&self) -> Result<(), String> {
+        self.run_on_bass_thread(|inner| {
+            Self::teardown_current(inner);
+            Self::clear_preload(inner);
+            if let Some(bass) = inner.bass.as_ref() {
+                if inner.mixer_handle != 0 {
+                    let _ = bass.channel_stop(inner.mixer_handle);
+                }
+                // Free releases the output device and stops any background audio threads.
+                let _ = bass.free();
+            }
+            inner.mixer_handle = 0;
+            inner.bass = None;
+            inner.dsp_handle = 0;
+            inner.current_file = None;
+            inner.current_audio_path = None;
+            inner.cue_start = None;
+            inner.cue_end = None;
+            inner.gapless_queue.clear();
+            inner.gapless_queue_index = 0;
+            inner.pending_next = None;
+            Ok(())
+        })
+    }
+
     /// Seek to a position in seconds.
     /// "Наложение" (overlap) style, not full затухание:
     /// Quick shallow volume dip (not to zero), immediate seek, quick restore.
