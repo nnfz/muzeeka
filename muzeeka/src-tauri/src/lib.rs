@@ -68,9 +68,14 @@ pub fn run() {
             handle_window_event(window, event);
 
             if let WindowEvent::CloseRequested { .. } = event {
-                // Ensure audio is stopped and BASS device is freed when the window/app closes.
-                // Without this, if playback was active, the sound can continue after the app exits.
-                let _ = player_for_close.shutdown();
+                // Only shut down BASS when the *main* window is closed.
+                // The settings window (label "settings") and other secondary windows
+                // must not stop playback or free the audio device.
+                if window.label() == "main" {
+                    // Ensure audio is stopped and BASS device is freed when the main player window closes.
+                    // Without this, sound could continue after the app exits.
+                    let _ = player_for_close.shutdown();
+                }
             }
         })
         .setup(move |app| {
