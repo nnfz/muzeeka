@@ -9,11 +9,6 @@
 
 .download-header {
   flex-shrink: 0;
-  cursor: grab;
-}
-
-.download-header:active {
-  cursor: grabbing;
 }
 
 .download-win-title {

@@ -4,6 +4,7 @@
   import WindowControls from './WindowControls.svelte';
   import { getDownloadStore } from '$lib/stores/download.svelte';
   import { looksLikeMediaUrl } from '$lib/urlUtils';
+  import { LogicalSize } from '@tauri-apps/api/dpi';
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { listen } from '@tauri-apps/api/event';
   import { onMount } from 'svelte';
@@ -45,13 +46,6 @@
     }
   }
 
-  function startDrag(e: PointerEvent) {
-    if (e.button !== 0) return;
-    const target = e.target as HTMLElement | null;
-    if (target?.closest('button, input, a, select, textarea')) return;
-    void getCurrentWindow().startDragging();
-  }
-
   function handleKeydown(e: KeyboardEvent) {
     if (e.key === 'Escape' && !download.isDownloading) {
       void download.closeWindow();
@@ -65,9 +59,30 @@
     }
   }
 
+  function blockMaximize(e: MouseEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+  }
+
   onMount(() => {
     let unlistenOpen: (() => void) | undefined;
     let unlistenClose: (() => void) | undefined;
+    let unlistenResize: (() => void) | undefined;
+
+    const win = getCurrentWindow();
+    void win.setResizable(false);
+    void win.setMaximizable(false);
+    const fixedSize = new LogicalSize(400, 280);
+    void win.setSize(fixedSize);
+
+    void win.onResized(async () => {
+      if (await win.isMaximized()) {
+        await win.unmaximize();
+        await win.setSize(fixedSize);
+      }
+    }).then((fn) => {
+      unlistenResize = fn;
+    });
 
     void listen<{ url?: string }>('download:open', (event) => {
       successMsg = null;
@@ -87,6 +102,7 @@
     return () => {
       unlistenOpen?.();
       unlistenClose?.();
+      unlistenResize?.();
     };
   });
 </script>
@@ -94,14 +110,9 @@
 <svelte:window onkeydown={handleKeydown} />
 
 <div class="download-window" style="background-color: #0a0a0f;">
-  <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <header
-    class="app-header glass download-header"
-    data-tauri-drag-region
-    onpointerdown={startDrag}
-  >
-    <div class="download-win-title" data-tauri-drag-region>Download</div>
-    <div class="app-header-spacer" data-tauri-drag-region></div>
+  <header class="app-header glass download-header">
+    <div class="download-win-title" data-tauri-drag-region ondblclick={blockMaximize}>Download</div>
+    <div class="app-header-spacer" data-tauri-drag-region ondblclick={blockMaximize}></div>
     <WindowControls showMinimize={false} showMaximize={false} />
   </header>
 

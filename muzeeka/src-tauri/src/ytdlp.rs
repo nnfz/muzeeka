@@ -41,6 +41,7 @@ struct YtdlpInfoJson {
     title: Option<String>,
     uploader: Option<String>,
     artist: Option<String>,
+    album_artist: Option<String>,
     channel: Option<String>,
     creator: Option<String>,
 }
@@ -339,7 +340,7 @@ pub fn download(
         "--embed-thumbnail".to_string(),
         "--embed-metadata".to_string(),
         "--parse-metadata".to_string(),
-        "artist:%(uploader)s".to_string(),
+        "%(artist,album_artist,uploader,channel,creator)s:%(artist)s".to_string(),
         "--write-info-json".to_string(),
         "-o".to_string(),
         output_template,
@@ -444,27 +445,85 @@ fn info_json_path(audio_path: &Path) -> Option<PathBuf> {
 }
 
 fn pick_artist(info: &YtdlpInfoJson) -> Option<String> {
-    [&info.uploader, &info.artist, &info.channel, &info.creator]
-        .into_iter()
-        .filter_map(|value| value.as_ref())
-        .map(|s| s.trim())
-        .find(|s| !s.is_empty())
-        .map(|s| s.to_string())
+    [
+        &info.artist,
+        &info.album_artist,
+        &info.uploader,
+        &info.channel,
+        &info.creator,
+    ]
+    .into_iter()
+    .filter_map(|value| value.as_ref())
+    .map(|s| s.trim())
+    .find(|s| !s.is_empty())
+    .map(|s| s.to_string())
+}
+
+fn parse_artist_title(title: &str) -> Option<(String, String)> {
+    let clean = metadata::strip_ytdlp_id_suffix(title);
+
+    for sep in [" - ", " — ", " – ", " | "] {
+        let Some(pos) = clean.find(sep) else {
+            continue;
+        };
+
+        let artist = clean[..pos].trim();
+        let song = clean[pos + sep.len()..].trim();
+        if artist.is_empty() || song.is_empty() || artist.len() > 120 {
+            continue;
+        }
+
+        return Some((artist.to_string(), song.to_string()));
+    }
+
+    None
+}
+
+fn apply_metadata_to_file(
+    file: &mut MusicFile,
+    title: Option<String>,
+    artist: Option<String>,
+) {
+    let path = Path::new(&file.path);
+    let title = title
+        .map(|value| metadata::strip_ytdlp_id_suffix(&value))
+        .filter(|value| !value.is_empty());
+    let artist = artist
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    if artist.is_some() || title.is_some() {
+        if let Err(err) = metadata::write_track_tags(path, title.as_deref(), artist.as_deref()) {
+            eprintln!("Failed to write tags to {}: {}", file.path, err);
+        }
+    }
+
+    let meta = metadata::read_metadata(path, &file.file_name);
+    file.title = meta.title.or(title);
+    file.artist = meta.artist.or(artist);
+    file.album = meta.album.or_else(|| file.album.clone());
+    file.duration_secs = meta.duration_secs.or(file.duration_secs);
+    file.year = meta.year.or(file.year);
+    file.track_number = meta.track_number.or(file.track_number);
+    file.genre = meta.genre.or_else(|| file.genre.clone());
+    file.cover_path = meta.cover_path.or_else(|| file.cover_path.clone());
 }
 
 fn enrich_downloaded_metadata(files: &mut [MusicFile]) {
     for file in files.iter_mut() {
         let path = Path::new(&file.path);
+        let mut title = file.title.clone();
+        let mut artist = file.artist.clone();
 
         if let Some(json_path) = info_json_path(path) {
             if json_path.is_file() {
                 if let Ok(raw) = fs::read_to_string(&json_path) {
                     if let Ok(info) = serde_json::from_str::<YtdlpInfoJson>(&raw) {
-                        if let Some(artist) = pick_artist(&info) {
-                            file.artist = Some(artist);
+                        if let Some(parsed_artist) = pick_artist(&info) {
+                            artist = Some(parsed_artist);
                         }
-                        if let Some(title) = info.title.filter(|t| !t.trim().is_empty()) {
-                            file.title = Some(metadata::strip_ytdlp_id_suffix(&title));
+                        if let Some(parsed_title) = info.title.filter(|t| !t.trim().is_empty()) {
+                            title = Some(metadata::strip_ytdlp_id_suffix(&parsed_title));
                         }
                     }
                 }
@@ -472,9 +531,16 @@ fn enrich_downloaded_metadata(files: &mut [MusicFile]) {
             }
         }
 
-        if let Some(title) = file.title.as_ref() {
-            file.title = Some(metadata::strip_ytdlp_id_suffix(title));
+        if artist.is_none() {
+            if let Some(ref current_title) = title {
+                if let Some((parsed_artist, parsed_title)) = parse_artist_title(current_title) {
+                    artist = Some(parsed_artist);
+                    title = Some(parsed_title);
+                }
+            }
         }
+
+        apply_metadata_to_file(file, title, artist);
     }
 }
 

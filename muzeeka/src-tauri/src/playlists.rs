@@ -41,6 +41,11 @@ pub struct PlaylistsData {
     pub volume: Option<f32>,
     #[serde(default)]
     pub liked_paths: Vec<String>,
+    #[serde(default)]
+    pub shuffle_enabled: bool,
+    /// `off`, `all`, or `one`
+    #[serde(default)]
+    pub repeat_mode: Option<String>,
 }
 
 fn playlists_path(app: &AppHandle) -> Result<PathBuf, String> {

@@ -2,10 +2,11 @@
 
 use image::imageops::FilterType;
 use image::{GenericImageView, ImageFormat};
+use lofty::config::WriteOptions;
 use lofty::file::{AudioFile, TaggedFile, TaggedFileExt};
 use lofty::picture::PictureType;
 use lofty::read_from_path;
-use lofty::tag::{Accessor, Tag};
+use lofty::tag::{Accessor, Tag, TagType};
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -294,6 +295,53 @@ pub fn read_metadata(path: &Path, file_name: &str) -> TrackMetadata {
     }
 
     meta
+}
+
+/// Write title and/or artist into the file's primary tag (creates ID3v2 for MP3 when missing).
+pub fn write_track_tags(
+    path: &Path,
+    title: Option<&str>,
+    artist: Option<&str>,
+) -> Result<(), String> {
+    let title = title
+        .map(strip_ytdlp_id_suffix)
+        .filter(|s| !s.is_empty());
+    let artist = artist
+        .map(clean_tag_value)
+        .filter(|s| !s.is_empty());
+
+    if title.is_none() && artist.is_none() {
+        return Ok(());
+    }
+
+    let mut tagged_file = read_from_path(path)
+        .map_err(|e| format!("Failed to read audio file for tagging: {}", e))?;
+
+    if tagged_file.primary_tag_mut().is_none() {
+        let tag_type = tagged_file
+            .primary_tag()
+            .or_else(|| tagged_file.first_tag())
+            .map(|tag| tag.tag_type())
+            .unwrap_or(TagType::Id3v2);
+        tagged_file.insert_tag(Tag::new(tag_type));
+    }
+
+    let tag = tagged_file
+        .primary_tag_mut()
+        .ok_or_else(|| "No writable tag slot".to_string())?;
+
+    if let Some(title) = title {
+        tag.set_title(title);
+    }
+    if let Some(artist) = artist {
+        tag.set_artist(artist);
+    }
+
+    tagged_file
+        .save_to_path(path, WriteOptions::default())
+        .map_err(|e| format!("Failed to save tags: {}", e))?;
+
+    Ok(())
 }
 
 #[cfg(test)]

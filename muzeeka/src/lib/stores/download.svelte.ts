@@ -40,6 +40,8 @@ const DOWNLOAD_WINDOW_OPTIONS = {
   maxHeight: 280,
   decorations: false,
   resizable: false,
+  maximizable: false,
+  minimizable: false,
   visible: false,
   theme: 'dark' as const,
 };
@@ -82,15 +84,24 @@ function resetState() {
   error = null;
 }
 
+async function lockDownloadWindowSize(win: WebviewWindow) {
+  await win.setResizable(false);
+  await win.setMaximizable(false);
+  if (await win.isMaximized()) {
+    await win.unmaximize();
+  }
+  await win.setSize(DOWNLOAD_WINDOW_SIZE);
+}
+
 async function showDownloadWindow(win: WebviewWindow) {
   try {
-    await win.setSize(DOWNLOAD_WINDOW_SIZE);
+    await lockDownloadWindowSize(win);
     await win.show();
     await win.setFocus();
   } catch {
     setTimeout(async () => {
       try {
-        await win.setSize(DOWNLOAD_WINDOW_SIZE);
+        await lockDownloadWindowSize(win);
         await win.show();
         await win.setFocus();
       } catch { /* ignore */ }
@@ -180,13 +191,22 @@ export function createDownloadStore() {
       error = null;
     },
 
-    async probeUrl() {
-      const normalized = normalizeMediaUrl(url);
+    clearProbeState() {
+      if (isDownloading) return;
+      probe = null;
+      error = null;
+      progress = null;
+    },
+
+    async probeUrl(targetUrl?: string) {
+      const normalized = normalizeMediaUrl(targetUrl ?? url);
       if (!normalized) {
         error = 'Enter a valid media URL';
+        probe = null;
         return;
       }
 
+      url = normalized;
       isProbing = true;
       error = null;
       probe = null;
@@ -223,10 +243,8 @@ export function createDownloadStore() {
           playlistId: downloadPlaylistId ?? null,
         });
 
-        const added = result.files.length;
-        resetState();
-        setTimeout(() => void this.closeWindow(), added > 0 ? 900 : 0);
-        return added;
+        progress = null;
+        return result.files.length;
       } catch (e) {
         error = typeof e === 'string' ? e : String(e);
         return 0;

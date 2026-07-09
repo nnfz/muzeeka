@@ -155,6 +155,16 @@ body.track-table-resizing {
 /* --- Frameless window drag regions --- */
 [data-tauri-drag-region] {
   cursor: default;
+  -webkit-app-region: drag;
+}
+
+button,
+input,
+textarea,
+select,
+a,
+.window-controls {
+  -webkit-app-region: no-drag;
 }
 
 body.sidebar-resizing {

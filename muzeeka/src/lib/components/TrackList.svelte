@@ -12,9 +12,7 @@
   import { openContextMenuFromEvent, type ContextMenuItem } from '$lib/contextMenu';
   import { open } from '@tauri-apps/plugin-dialog';
   import TrackCover from './TrackCover.svelte';
-  import { openDownloadWindow } from '$lib/stores/download.svelte';
   import { looksLikeMediaUrl } from '$lib/urlUtils';
-
 
   interface Props {
     searchQuery?: string;
@@ -189,12 +187,11 @@
     return items;
   });
 
-  let isGlobalSearch = $derived(searchQuery.trim().length > 0);
-  let isUrlSearch = $derived(looksLikeMediaUrl(searchQuery));
+  let isGlobalSearch = $derived(
+    searchQuery.trim().length > 0 && !looksLikeMediaUrl(searchQuery)
+  );
 
   let listedTracks = $derived.by((): ListedTrack[] => {
-    if (isUrlSearch) return [];
-
     if (isGlobalSearch) {
       const query = searchQuery.toLowerCase();
       return player.playlists.flatMap((playlist) =>
@@ -472,15 +469,7 @@
 
 <section class="track-panel">
   <div class="track-list">
-    {#if isUrlSearch}
-      <div class="empty-state url-download-state" data-tauri-drag-region>
-        <p class="empty-title">Download from link?</p>
-        <p class="empty-hint">This looks like a media URL</p>
-        <button class="empty-btn" onclick={() => openDownloadWindow(searchQuery)}>
-          Download
-        </button>
-      </div>
-    {:else if !player.activePlaylistId}
+    {#if !player.activePlaylistId}
       <div class="empty-state" data-tauri-drag-region>
         <p class="empty-title">Select a playlist</p>
         <p class="empty-hint">Choose a playlist or drop music files here</p>

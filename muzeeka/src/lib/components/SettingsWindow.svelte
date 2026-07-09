@@ -55,7 +55,7 @@
 </script>
 
 <div class="settings-window" style="background-color: #0a0a0f;">
-  <header class="app-header glass" data-tauri-drag-region>
+  <header class="app-header glass">
     <div class="settings-win-title" data-tauri-drag-region>Settings</div>
     <div class="app-header-spacer" data-tauri-drag-region></div>
     <WindowControls showMinimize={false} showMaximize={false} />

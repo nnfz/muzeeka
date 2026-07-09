@@ -38,12 +38,16 @@ export interface Playlist {
   tracks: MusicFile[];
 }
 
+type RepeatMode = 'off' | 'all' | 'one';
+
 interface PlaylistsData {
   playlists: Playlist[];
   active_playlist_id: string | null;
   current_file: string | null;
   volume: number | null;
   liked_paths?: string[];
+  shuffle_enabled?: boolean;
+  repeat_mode?: RepeatMode;
 }
 
 // --- Virtual Playlist IDs ---
@@ -67,7 +71,7 @@ let currentTrackIndex = $state(-1);
 let shuffleEnabled = $state(false);
 let shuffleOrder = $state<number[]>([]);
 let shufflePosition = $state(0);
-let repeatMode = $state<'off' | 'all' | 'one'>('off');
+let repeatMode = $state<RepeatMode>('off');
 let playbackRate = $state(1.0);
 let likedPaths = $state<Set<string>>(new Set());
 let isInitialized = $state(false);
@@ -304,17 +308,53 @@ function ensureShuffleOrder() {
 
 const DOWNLOADS_PLAYLIST_NAME = 'Downloads';
 
+async function persistDownloadPlaylistId(id: string) {
+  try {
+    const current = await invoke<{ download_playlist_id?: string | null } & Record<string, unknown>>(
+      'settings_load'
+    );
+    if (current.download_playlist_id === id) return;
+    await invoke('settings_save', {
+      data: { ...current, download_playlist_id: id },
+    });
+  } catch (e) {
+    console.error('Failed to persist download playlist id:', e);
+  }
+}
+
+async function syncDownloadPlaylistFromLibrary() {
+  try {
+    const current = await invoke<{ download_playlist_id?: string | null } & Record<string, unknown>>(
+      'settings_load'
+    );
+    const configured = current.download_playlist_id;
+    if (configured && playlists.some((p) => p.id === configured)) return;
+
+    const existing = playlists.find(
+      (p) => p.name.toLowerCase() === DOWNLOADS_PLAYLIST_NAME.toLowerCase()
+    );
+    if (!existing) return;
+
+    await invoke('settings_save', {
+      data: { ...current, download_playlist_id: existing.id },
+    });
+  } catch (e) {
+    console.error('Failed to sync download playlist from library:', e);
+  }
+}
+
 function resolveDownloadPlaylistId(configuredId: string | null | undefined): string {
   if (configuredId && playlists.some((p) => p.id === configuredId)) {
     return configuredId;
   }
 
-  const existing = playlists.find(
-    (p) => p.name.toLowerCase() === DOWNLOADS_PLAYLIST_NAME.toLowerCase()
-  );
-  if (existing) return existing.id;
+  const id = ensurePlaylist(DOWNLOADS_PLAYLIST_NAME, { select: false });
 
-  return createPlaylist(DOWNLOADS_PLAYLIST_NAME);
+  if (!configuredId || configuredId !== id) {
+    void persistDownloadPlaylistId(id);
+  }
+
+  return id;
 }
 
 function nextPlaylistName(): string {
@@ -334,6 +374,8 @@ function buildSaveData(): PlaylistsData {
     current_file: currentFile,
     volume,
     liked_paths: [...likedPaths],
+    shuffle_enabled: shuffleEnabled,
+    repeat_mode: repeatMode,
   };
 }
 
@@ -359,6 +401,12 @@ async function loadPlaylists() {
     if (Array.isArray(data.liked_paths)) {
       likedPaths = new Set(data.liked_paths.filter((p: any) => typeof p === 'string' && p));
     }
+    if (typeof data.shuffle_enabled === 'boolean') {
+      shuffleEnabled = data.shuffle_enabled;
+    }
+    if (data.repeat_mode === 'off' || data.repeat_mode === 'all' || data.repeat_mode === 'one') {
+      repeatMode = data.repeat_mode;
+    }
     // Restore last playing track so metadata/status survive Ctrl+R
     if (data.current_file) {
       const exists = playlists.some((p) => p.tracks.some((t) => t.path === data.current_file));
@@ -373,6 +421,10 @@ async function loadPlaylists() {
       }
     }
     syncTrackIndex();
+    if (shuffleEnabled) {
+      rebuildShuffleOrder(currentTrackIndex >= 0);
+      syncShufflePosition();
+    }
     prefetchCoverPaths(
       playlists.flatMap((playlist) => playlist.tracks.map((track) => track.cover_path))
     );
@@ -386,17 +438,29 @@ async function loadPlaylists() {
 
 // --- Playlist Actions ---
 
-function createPlaylist(name?: string): string {
+function ensurePlaylist(name: string, options?: { select?: boolean }): string {
+  const trimmed = name.trim();
+  const existing = playlists.find(
+    (p) => p.name.toLowerCase() === trimmed.toLowerCase()
+  );
+  if (existing) return existing.id;
+
   const playlist: Playlist = {
     id: crypto.randomUUID(),
-    name: name?.trim() || nextPlaylistName(),
+    name: trimmed,
     tracks: [],
   };
   playlists = [...playlists, playlist];
-  activePlaylistId = playlist.id;
+  if (options?.select) {
+    activePlaylistId = playlist.id;
+  }
   syncTrackIndex();
   scheduleSave();
   return playlist.id;
+}
+
+function createPlaylist(name?: string): string {
+  return ensurePlaylist(name?.trim() || nextPlaylistName(), { select: true });
 }
 
 function selectPlaylist(id: string) {
@@ -572,6 +636,7 @@ function ensureInit() {
 
 async function bootstrap() {
   await loadPlaylists();
+  await syncDownloadPlaylistFromLibrary();
   await init();
   // Sync frontend state with backend after reload (Ctrl+R).
   // The backend may still be playing audio, but the frontend starts
@@ -934,6 +999,7 @@ function toggleShuffle() {
     shuffleOrder = [];
     shufflePosition = 0;
   }
+  scheduleSave();
 }
 
 function toggleRepeat() {
@@ -943,6 +1009,7 @@ function toggleRepeat() {
     const q = buildGaplessQueue(currentFile);
     void invoke('player_prepare_next', { queue: q }).catch(() => {});
   }
+  scheduleSave();
 }
 
 // --- Event Listeners ---
