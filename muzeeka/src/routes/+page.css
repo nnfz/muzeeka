@@ -43,9 +43,11 @@
 
 .search-container {
   position: relative;
-  width: 220px;
+  width: 240px;
   flex-shrink: 0;
 }
+
+
 
 .search-icon {
   position: absolute;

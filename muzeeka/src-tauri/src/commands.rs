@@ -38,6 +38,7 @@ fn parse_gapless_queue(queue: Option<Vec<NextTrackInput>>) -> Vec<GaplessTrack> 
 }
 use crate::playlists::{self, PlaylistsData};
 use crate::settings::{self, AppSettings};
+use crate::ytdlp::{self, YtdlpDownloadResult, YtdlpProbeResult};
 
 // ── Player commands ───────────────────────────────────────────────────────────
 
@@ -187,4 +188,53 @@ pub fn playlists_load(app: AppHandle) -> Result<PlaylistsData, String> {
 #[tauri::command]
 pub fn playlists_save(app: AppHandle, data: PlaylistsData) -> Result<(), String> {
     playlists::save_playlists(&app, &data)
+}
+
+// ── yt-dlp ────────────────────────────────────────────────────────────────────
+
+/// Check whether a string looks like a supported media URL.
+#[tauri::command]
+pub fn ytdlp_is_url(url: String) -> bool {
+    ytdlp::is_supported_url(&url)
+}
+
+/// Check whether the yt-dlp binary is available.
+#[tauri::command]
+pub fn ytdlp_available(app: AppHandle) -> bool {
+    ytdlp::ytdlp_available(&app)
+}
+
+/// Check whether a bundled ffmpeg binary is available in the bin folder.
+#[tauri::command]
+pub fn ytdlp_ffmpeg_available(app: AppHandle) -> bool {
+    ytdlp::ffmpeg_available(&app)
+}
+
+/// Probe a URL for title/metadata without downloading.
+#[tauri::command]
+pub fn ytdlp_probe(app: AppHandle, url: String) -> Result<YtdlpProbeResult, String> {
+    ytdlp::probe(&app, &url)
+}
+
+/// Download audio from a URL. Emits `ytdlp:progress` events during download.
+#[tauri::command]
+pub fn ytdlp_download(
+    app: AppHandle,
+    url: String,
+    output_dir: Option<String>,
+) -> Result<YtdlpDownloadResult, String> {
+    ytdlp::download(&app, &url, output_dir.as_deref())
+}
+
+/// Cancel an in-progress download.
+#[tauri::command]
+pub fn ytdlp_cancel() {
+    ytdlp::cancel_download();
+}
+
+/// Get the default download folder path.
+#[tauri::command]
+pub fn ytdlp_default_download_dir(app: AppHandle) -> Result<String, String> {
+    ytdlp::default_download_dir(&app)
+        .map(|p| p.to_string_lossy().to_string())
 }

@@ -23,6 +23,12 @@ pub struct AppSettings {
     /// Playback rate multiplier. 1.0 = normal. Persisted so it survives restarts.
     #[serde(default)]
     pub playback_rate: f32,
+    /// Custom folder for yt-dlp downloads. Falls back to app_data/downloads.
+    #[serde(default)]
+    pub download_folder: Option<String>,
+    /// Playlist ID to auto-add downloaded tracks. Falls back to "Downloads" playlist.
+    #[serde(default)]
+    pub download_playlist_id: Option<String>,
 }
 
 fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {

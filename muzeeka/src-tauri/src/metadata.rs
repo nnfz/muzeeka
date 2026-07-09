@@ -43,6 +43,25 @@ fn clean_tag_value(value: &str) -> String {
     value.trim().to_string()
 }
 
+/// Strip yt-dlp video id suffix like ` [2351315453]` from titles / filenames.
+pub fn strip_ytdlp_id_suffix(value: &str) -> String {
+    let trimmed = value.trim();
+    let Some(open) = trimmed.rfind(" [") else {
+        return trimmed.to_string();
+    };
+
+    if !trimmed.ends_with(']') {
+        return trimmed.to_string();
+    }
+
+    let inside = &trimmed[open + 2..trimmed.len() - 1];
+    if inside.is_empty() || !inside.chars().all(|c| c.is_ascii_digit()) {
+        return trimmed.to_string();
+    }
+
+    trimmed[..open].trim().to_string()
+}
+
 fn non_empty(value: Option<String>) -> Option<String> {
     value.filter(|s| !s.is_empty())
 }
@@ -251,7 +270,10 @@ pub fn read_metadata(path: &Path, file_name: &str) -> TrackMetadata {
                 .or_else(|| tagged_file.first_tag());
 
             if let Some(tag) = tag {
-                meta.title = non_empty(tag.title().map(|s| clean_tag_value(&s)));
+                meta.title = non_empty(
+                    tag.title()
+                        .map(|s| strip_ytdlp_id_suffix(&clean_tag_value(&s))),
+                );
                 meta.artist = non_empty(tag.artist().map(|s| clean_tag_value(&s)));
                 meta.album = non_empty(tag.album().map(|s| clean_tag_value(&s)));
                 meta.genre = non_empty(tag.genre().map(|s| clean_tag_value(&s)));
@@ -262,13 +284,13 @@ pub fn read_metadata(path: &Path, file_name: &str) -> TrackMetadata {
             meta.cover_path = resolve_cover(path, Some(tagged_file));
         }
         Err(_) => {
-            meta.title = Some(filename_stem(path, file_name));
+            meta.title = Some(strip_ytdlp_id_suffix(&filename_stem(path, file_name)));
             meta.cover_path = resolve_cover(path, None);
         }
     }
 
     if meta.title.is_none() {
-        meta.title = Some(filename_stem(path, file_name));
+        meta.title = Some(strip_ytdlp_id_suffix(&filename_stem(path, file_name)));
     }
 
     meta
@@ -282,6 +304,15 @@ mod tests {
     fn write_bytes(path: &Path, bytes: &[u8]) {
         let mut file = fs::File::create(path).expect("create file");
         file.write_all(bytes).expect("write file");
+    }
+
+    #[test]
+    fn strip_ytdlp_id_suffix_removes_trailing_video_id() {
+        assert_eq!(
+            strip_ytdlp_id_suffix("авиасейлс - на морозе [2351315453]"),
+            "авиасейлс - на морозе"
+        );
+        assert_eq!(strip_ytdlp_id_suffix("plain title"), "plain title");
     }
 
     #[test]

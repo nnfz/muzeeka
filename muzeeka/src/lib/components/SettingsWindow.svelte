@@ -7,6 +7,8 @@
   import { getSettingsStore } from '$lib/stores/settings.svelte';
   type Section = 'general' | 'audio' | 'about';
   import { getVersion, getName } from '@tauri-apps/api/app';
+  import { invoke } from '@tauri-apps/api/core';
+  import { open } from '@tauri-apps/plugin-dialog';
   import { onMount } from 'svelte';
 
   const settings = getSettingsStore();
@@ -14,6 +16,7 @@
   let activeSection = $state<Section>('general');
   let appVersion = $state('0.1.0');
   let appName = $state('muzeeka');
+  let playlists = $state<{ id: string; name: string }[]>([]);
 
   // Prevent white flash when the window becomes visible
   if (typeof document !== 'undefined') {
@@ -30,7 +33,25 @@
     } catch {
       // fallback already set
     }
+
+    try {
+      const data = await invoke<{ playlists: { id: string; name: string }[] }>('playlists_load');
+      playlists = (data.playlists ?? []).map((p) => ({ id: p.id, name: p.name }));
+    } catch {
+      playlists = [];
+    }
   });
+
+  async function pickDownloadFolder() {
+    const selected = await open({ directory: true });
+    if (selected) {
+      settings.setDownloadFolder(selected as string);
+    }
+  }
+
+  function clearDownloadFolder() {
+    settings.setDownloadFolder(null);
+  }
 </script>
 
 <div class="settings-window" style="background-color: #0a0a0f;">
@@ -52,6 +73,43 @@
           </p>
 
           <div class="settings-card">
+            <div class="card-row card-row-stack">
+              <div>
+                <div class="card-label">Download folder</div>
+                <div class="card-value card-value-path">
+                  {settings.downloadFolder ?? (settings.effectiveDownloadFolder || 'App data / downloads')}
+                </div>
+              </div>
+              <div class="card-actions">
+                <button type="button" class="action-btn" onclick={pickDownloadFolder}>
+                  Choose…
+                </button>
+                {#if settings.downloadFolder}
+                  <button type="button" class="action-btn" onclick={clearDownloadFolder}>
+                    Reset
+                  </button>
+                {/if}
+              </div>
+            </div>
+            <div class="card-row card-row-stack">
+              <div>
+                <div class="card-label">Download playlist</div>
+                <div class="card-value">Tracks are added here after download</div>
+              </div>
+              <select
+                class="playlist-select"
+                value={settings.downloadPlaylistId ?? ''}
+                onchange={(e) => {
+                  const val = (e.target as HTMLSelectElement).value;
+                  settings.setDownloadPlaylistId(val || null);
+                }}
+              >
+                <option value="">Downloads (auto-create)</option>
+                {#each playlists as pl (pl.id)}
+                  <option value={pl.id}>{pl.name}</option>
+                {/each}
+              </select>
+            </div>
             <div class="card-row">
               <div>
                 <div class="card-label">Playlists &amp; library</div>
@@ -178,4 +236,36 @@
 
 <style>
   @import './SettingsWindow.css';
+
+  .card-row-stack {
+    flex-wrap: wrap;
+    align-items: flex-start;
+  }
+
+  .card-value-path {
+    word-break: break-all;
+    max-width: 42ch;
+  }
+
+  .card-actions {
+    display: flex;
+    gap: 6px;
+    flex-shrink: 0;
+  }
+
+  .playlist-select {
+    min-width: 180px;
+    height: 32px;
+    padding: 0 10px;
+    font-size: 12px;
+    color: var(--text-primary);
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    outline: none;
+  }
+
+  .playlist-select:focus {
+    border-color: var(--border-accent);
+  }
 </style>

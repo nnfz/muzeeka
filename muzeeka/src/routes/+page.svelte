@@ -6,17 +6,20 @@
   import DragDropHandler from '$lib/components/DragDropHandler.svelte';
   import WindowControls from '$lib/components/WindowControls.svelte';
   import SettingsWindow from '$lib/components/SettingsWindow.svelte';
+  import DownloadWindow from '$lib/components/DownloadWindow.svelte';
+  import { openDownloadWindow, precreateDownloadWindow } from '$lib/stores/download.svelte';
+  import { looksLikeMediaUrl } from '$lib/urlUtils';
   import { invoke } from '@tauri-apps/api/core';
   import { getPlayerStore } from '$lib/stores/player.svelte';
   import { createSettingsStore, setSettingsStore } from '$lib/stores/settings.svelte';
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { WebviewWindow } from '@tauri-apps/api/webviewWindow';
-  // Detect which window we are in. This is stable per webview instance.
+
   const currentWin = getCurrentWindow();
   const isSettingsWindow = currentWin.label === 'settings';
+  const isDownloadWindow = currentWin.label === 'download';
+  const isSecondaryWindow = isSettingsWindow || isDownloadWindow;
 
-  // Avoid full player bootstrap (playlists, listeners, heavy init) in the settings window.
-  // Settings window only needs to be able to apply EQ settings.
   let player = $state<ReturnType<typeof getPlayerStore> | null>(null);
   let ensurePlayerReady: () => Promise<void>;
 
@@ -28,6 +31,8 @@
         // Player may already be initialized by main window
       }
     };
+  } else if (isDownloadWindow) {
+    ensurePlayerReady = async () => {};
   } else {
     player = getPlayerStore();
     ensurePlayerReady = () => player!.ensureInit();
@@ -37,9 +42,7 @@
   setSettingsStore(settings);
   let searchQuery = $state('');
 
-  // Pre-create the settings window hidden as early as possible.
-  // This makes opening feel instant (window is already loaded when user clicks).
-  if (!isSettingsWindow) {
+  if (!isSecondaryWindow) {
     const precreateSettingsWindow = async () => {
       try {
         const label = 'settings';
@@ -58,31 +61,28 @@
           decorations: false,
           resizable: true,
           visible: false,
-          theme: 'dark', // prevent light/white flash on show
+          theme: 'dark',
         });
-        // No need to listen here — creation happens in background
-      } catch (e) {
-        // non-fatal, will create on demand
+      } catch {
+        // non-fatal
       }
     };
-    // Fire early, after current script tick
+
     queueMicrotask(precreateSettingsWindow);
+    precreateDownloadWindow();
   }
 
   async function openSettingsWindow() {
     const label = 'settings';
     try {
-      // Try to get existing (pre-created or previously opened)
       let win = await WebviewWindow.getByLabel(label);
 
       if (win) {
-        // Already exists → instant open
         await win.show();
         await win.setFocus();
         return;
       }
 
-      // Not pre-created or was closed → create now (will be fast if precreate ran)
       const url = import.meta.env.DEV ? 'http://localhost:1420/' : 'index.html';
 
       win = new WebviewWindow(label, {
@@ -102,13 +102,11 @@
         console.error('[settings] creation error:', e?.message || e);
       });
 
-      // Show as soon as created (or after tiny fallback)
       const showNow = async () => {
         try {
           await win!.show();
           await win!.setFocus();
-        } catch (e) {
-          // If still not ready, one quick retry
+        } catch {
           setTimeout(async () => {
             try { await win!.show(); await win!.setFocus(); } catch {}
           }, 60);
@@ -116,15 +114,9 @@
       };
 
       win.once('tauri://created', showNow);
-      // Fallback in case created event is missed
       setTimeout(showNow, 120);
     } catch (err: any) {
       console.error('[settings] Failed to open settings window:', err);
-      // Only alert on real errors
-      const msg = String(err?.message || err).toLowerCase();
-      if (!msg.includes('not found')) {
-        // silent in production, or minimal
-      }
     }
   }
 
@@ -133,7 +125,7 @@
   }
 
   function handleMouseDown(e: MouseEvent) {
-    if (isSettingsWindow || !player) return;
+    if (isSecondaryWindow || !player) return;
     if (e.button !== 3 && e.button !== 4) return;
     if (isTypingTarget(e.target)) return;
 
@@ -146,9 +138,8 @@
     }
   }
 
-  // Keyboard shortcuts (main window only)
   function handleKeydown(e: KeyboardEvent) {
-    if (isSettingsWindow || !player) return;
+    if (isSecondaryWindow || !player) return;
     if (isTypingTarget(e.target)) return;
 
     switch (e.code) {
@@ -182,7 +173,7 @@
   }
 
   $effect(() => {
-    if (isSettingsWindow) return;
+    if (isSecondaryWindow) return;
 
     function handleWheel(e: WheelEvent) {
       if (!e.altKey || !player) return;
@@ -203,31 +194,45 @@
 
 {#if isSettingsWindow}
   <SettingsWindow />
+{:else if isDownloadWindow}
+  <DownloadWindow />
 {:else}
   <div class="app-layout">
     <header class="app-header glass">
-      {#if player!.hasAnyTracks}
-        <div class="search-container">
-          <svg class="search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <circle cx="11" cy="11" r="8"/>
-            <line x1="21" y1="21" x2="16.65" y2="16.65"/>
-          </svg>
-          <input
-            type="text"
-            class="search-input"
-            placeholder="Search tracks..."
-            bind:value={searchQuery}
-          />
-          {#if searchQuery}
-            <button class="search-clear" onclick={() => searchQuery = ''} aria-label="Clear search">
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <line x1="18" y1="6" x2="6" y2="18"/>
-                <line x1="6" y1="6" x2="18" y2="18"/>
-              </svg>
-            </button>
-          {/if}
-        </div>
-      {/if}
+      <div class="search-container">
+        <svg class="search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="11" cy="11" r="8"/>
+          <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+        </svg>
+        <input
+          type="text"
+          class="search-input"
+          placeholder="Search tracks or paste URL…"
+          bind:value={searchQuery}
+        />
+        {#if searchQuery}
+          <button class="search-clear" onclick={() => searchQuery = ''} aria-label="Clear search">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="18" y1="6" x2="6" y2="18"/>
+              <line x1="6" y1="6" x2="18" y2="18"/>
+            </svg>
+          </button>
+        {/if}
+      </div>
+
+      <button
+        type="button"
+        class="header-btn"
+        onclick={() => openDownloadWindow(looksLikeMediaUrl(searchQuery) ? searchQuery : '')}
+        aria-label="Download from URL"
+        title="Download from URL"
+      >
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+          <polyline points="7 10 12 15 17 10"/>
+          <line x1="12" y1="15" x2="12" y2="3"/>
+        </svg>
+      </button>
 
       <div class="app-header-spacer" data-tauri-drag-region></div>
 

@@ -17,6 +17,8 @@ export interface AppSettings {
   equalizer: EqualizerSettings;
   playback_rate?: number;
   custom_presets?: EQPreset[];
+  download_folder?: string | null;
+  download_playlist_id?: string | null;
 }
 
 export interface EQPreset {
@@ -35,6 +37,9 @@ const DEFAULT_EQUALIZER: EqualizerSettings = {
 let equalizer = $state<EqualizerSettings>({ ...DEFAULT_EQUALIZER, bands_db: [...DEFAULT_EQUALIZER.bands_db] });
 let customPresets = $state<EQPreset[]>([]);
 let playbackRate = $state(1.0);
+let downloadFolder = $state<string | null>(null);
+let downloadPlaylistId = $state<string | null>(null);
+let defaultDownloadFolder = $state<string | null>(null);
 let isReady = $state(false);
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -59,6 +64,8 @@ function scheduleSave() {
         preamp_db: p.preamp_db,
         bands_db: [...p.bands_db],
       })),
+      download_folder: downloadFolder,
+      download_playlist_id: downloadPlaylistId,
     };
     invoke('settings_save', { data: payload }).catch((e) => {
       console.error('Failed to save settings:', e);
@@ -120,6 +127,21 @@ export function createSettingsStore(ensurePlayerReady: () => Promise<void>) {
       } else {
         playbackRate = 1.0;
       }
+      if (typeof data.download_folder === 'string' && data.download_folder.trim()) {
+        downloadFolder = data.download_folder.trim();
+      } else {
+        downloadFolder = null;
+      }
+      if (typeof data.download_playlist_id === 'string' && data.download_playlist_id.trim()) {
+        downloadPlaylistId = data.download_playlist_id.trim();
+      } else {
+        downloadPlaylistId = null;
+      }
+      try {
+        defaultDownloadFolder = await invoke<string>('ytdlp_default_download_dir');
+      } catch {
+        defaultDownloadFolder = null;
+      }
       await ensurePlayerReady();
       await invoke('player_set_equalizer', { settings: equalizer });
       if (playbackRate !== 1.0) {
@@ -143,6 +165,23 @@ export function createSettingsStore(ensurePlayerReady: () => Promise<void>) {
     },
     get customPresets() {
       return [...customPresets];
+    },
+    get downloadFolder() {
+      return downloadFolder;
+    },
+    get downloadPlaylistId() {
+      return downloadPlaylistId;
+    },
+    get effectiveDownloadFolder() {
+      return downloadFolder ?? defaultDownloadFolder ?? '';
+    },
+    setDownloadFolder(folder: string | null) {
+      downloadFolder = folder?.trim() || null;
+      scheduleSave();
+    },
+    setDownloadPlaylistId(id: string | null) {
+      downloadPlaylistId = id?.trim() || null;
+      scheduleSave();
     },
     async setEqualizerEnabled(enabled: boolean) {
       await applyEqualizer({ ...equalizer, enabled });
@@ -201,4 +240,15 @@ export function setSettingsStore(store: ReturnType<typeof createSettingsStore>) 
 
 export function getSettingsStore() {
   return getContext<ReturnType<typeof createSettingsStore>>(SETTINGS_KEY);
+}
+
+/** Read download settings without Svelte context (safe from async handlers / stores). */
+export function readDownloadSettings(): {
+  downloadFolder: string | null;
+  downloadPlaylistId: string | null;
+} {
+  return {
+    downloadFolder,
+    downloadPlaylistId,
+  };
 }

@@ -12,6 +12,7 @@ mod metadata;
 mod player;
 mod playlists;
 mod settings;
+mod ytdlp;
 
 use drop_handler::{handle_window_event, DropState};
 
@@ -127,6 +128,13 @@ pub fn run() {
             commands::library_fetch_metadata,
             commands::playlists_load,
             commands::playlists_save,
+            commands::ytdlp_is_url,
+            commands::ytdlp_available,
+            commands::ytdlp_ffmpeg_available,
+            commands::ytdlp_probe,
+            commands::ytdlp_download,
+            commands::ytdlp_cancel,
+            commands::ytdlp_default_download_dir,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

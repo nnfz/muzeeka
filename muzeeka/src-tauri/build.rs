@@ -1,6 +1,37 @@
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+fn copy_bin_tree(src: &Path, dst: &Path) -> usize {
+    if !src.is_dir() {
+        return 0;
+    }
+
+    let _ = fs::create_dir_all(dst);
+    let mut copied = 0usize;
+
+    let entries = match fs::read_dir(src) {
+        Ok(entries) => entries,
+        Err(_) => return 0,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        if name.to_string_lossy().eq_ignore_ascii_case("readme.md") {
+            continue;
+        }
+
+        let target = dst.join(&name);
+        if path.is_dir() {
+            copied += copy_bin_tree(&path, &target);
+        } else if fs::copy(&path, &target).is_ok() {
+            copied += 1;
+        }
+    }
+
+    copied
+}
 
 fn main() {
     tauri_build::build();
@@ -38,4 +69,20 @@ fn main() {
         "cargo:warning=Copied {copied} BASS DLL(s) to {}",
         bass_dst.display()
     );
+
+    // Copy bundled tools (yt-dlp, ffmpeg, etc.) next to the executable.
+    let bin_src = manifest_dir.join("bin");
+    let bin_dst = profile_dir.join("bin");
+
+    if bin_src.is_dir() {
+        let copied_bin = copy_bin_tree(&bin_src, &bin_dst);
+        if copied_bin > 0 {
+            println!(
+                "cargo:warning=Copied {copied_bin} file(s) from bin/ to {}",
+                bin_dst.display()
+            );
+        }
+    }
+
+    println!("cargo:rerun-if-changed={}", bin_src.display());
 }

@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Capability for main and dynamically created windows (settings etc.)",
-  "windows": ["main", "settings"],
+  "windows": ["main", "settings", "download"],
   "permissions": [
     "core:default",
     "core:webview:allow-create-webview-window",
@@ -10,7 +10,9 @@
     "core:window:allow-minimize",
     "core:window:allow-toggle-maximize",
     "core:window:allow-close",
+    "core:window:allow-hide",
     "core:window:allow-set-focus",
+    "core:window:allow-set-size",
     "core:window:allow-show",
     "core:window:allow-start-dragging",
     "opener:default",

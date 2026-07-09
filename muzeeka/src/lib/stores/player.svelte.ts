@@ -302,6 +302,21 @@ function ensureShuffleOrder() {
   }
 }
 
+const DOWNLOADS_PLAYLIST_NAME = 'Downloads';
+
+function resolveDownloadPlaylistId(configuredId: string | null | undefined): string {
+  if (configuredId && playlists.some((p) => p.id === configuredId)) {
+    return configuredId;
+  }
+
+  const existing = playlists.find(
+    (p) => p.name.toLowerCase() === DOWNLOADS_PLAYLIST_NAME.toLowerCase()
+  );
+  if (existing) return existing.id;
+
+  return createPlaylist(DOWNLOADS_PLAYLIST_NAME);
+}
+
 function nextPlaylistName(): string {
   let index = playlists.length + 1;
   let name = `Playlist ${index}`;
@@ -989,6 +1004,13 @@ function setupListeners() {
   listen<{ is_playing: boolean; is_paused: boolean }>('player:state', (event) => {
     isPlaying = event.payload.is_playing;
     isPaused = event.payload.is_paused;
+  });
+
+  listen<{ files: MusicFile[]; playlistId: string | null }>('ytdlp:downloaded', (event) => {
+    const files = event.payload.files ?? [];
+    if (files.length === 0) return;
+    const targetId = resolveDownloadPlaylistId(event.payload.playlistId);
+    addScannedTracks(files, targetId);
   });
 
   listen('player:track-ended', () => {
