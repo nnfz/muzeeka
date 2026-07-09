@@ -117,8 +117,9 @@ pub fn player_get_state(player: State<'_, Player>) -> PlayerStateSnapshot {
     player.get_state()
 }
 
-/// Load a BASS addon DLL (e.g. "bassflac.dll"). Relative paths resolve against
-/// the bass directory.
+/// Load a BASS addon DLL (e.g. "bassflac.dll" or a tracker plugin like "basszxtune.dll").
+/// Relative paths resolve against the bass directory.
+/// Most tracker/chiptune plugins are auto-loaded if present in the folder.
 #[tauri::command]
 pub fn load_addon(player: State<'_, Player>, path: String) -> Result<(), String> {
     player.load_addon(&path)

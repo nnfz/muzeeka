@@ -103,6 +103,12 @@ pub const BASS_MIXER_CHAN_NORAMPIN: DWORD = 0x800000;
 pub const BASS_MIXER_CHAN_BUFFER: DWORD = 0x2000;
 pub const BASS_MIXER_CHAN_PAUSE: DWORD = 0x20000;
 
+// ── Music (modules / trackers) ────────────────────────────────────────────────
+pub const BASS_MUSIC_DECODE: DWORD = 0x200000;
+pub const BASS_MUSIC_RAMPS: DWORD = 0x400;
+pub const BASS_MUSIC_RAMP: DWORD = 0x200;
+pub const BASS_MUSIC_PRESCAN: DWORD = 0x2000;
+
 // ── BASS_CHANNELINFO ──────────────────────────────────────────────────────────
 #[repr(C)]
 #[derive(Debug, Clone)]

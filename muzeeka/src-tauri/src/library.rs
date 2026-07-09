@@ -1,7 +1,8 @@
 // Music library scanner
 //
 // Uses walkdir for fast recursive directory traversal.
-// Filters by common audio file extensions and reads tags via lofty.
+// Filters by common audio file extensions (including tracker/chiptune via plugins)
+// and reads tags via lofty (falls back to filename for formats without tags).
 
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -16,6 +17,9 @@ use crate::metadata;
 /// Supported audio file extensions (lowercase).
 const AUDIO_EXTENSIONS: &[&str] = &[
     "mp3", "flac", "ogg", "wav", "aac", "m4a", "wma", "opus", "ape",
+    // Tracker / chiptune / module formats (supported via BASS plugins like basszxtune or similar)
+    "mod", "s3m", "xm", "it", "ay", "ym", "vgm", "vgz", "nsf", "nsfe",
+    "gbs", "hes", "sap", "kss", "pt2", "pt3", "stc", "stp", "asc", "sqt", "psg",
 ];
 
 /// A discovered music file with embedded metadata when available.

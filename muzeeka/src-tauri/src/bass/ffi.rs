@@ -27,6 +27,10 @@ pub struct BassLibrary {
     bass_stream_create_file:
         unsafe extern "system" fn(mem: BOOL, file: *const u16, offset: QWORD, length: QWORD, flags: DWORD) -> HSTREAM,
 
+    // Music / tracker modules (MOD, XM, IT, S3M etc.)
+    bass_music_load:
+        unsafe extern "system" fn(mem: BOOL, file: *const u16, offset: QWORD, length: DWORD, flags: DWORD, freq: DWORD) -> HSTREAM,
+
     // ── Channel control ───────────────────────────────────────────────────
     bass_channel_play: unsafe extern "system" fn(handle: DWORD, restart: BOOL) -> BOOL,
     bass_channel_pause: unsafe extern "system" fn(handle: DWORD) -> BOOL,
@@ -158,6 +162,7 @@ impl BassLibrary {
                 bass_free: load_fn!(lib, b"BASS_Free\0"),
                 bass_error_get_code: load_fn!(lib, b"BASS_ErrorGetCode\0"),
                 bass_stream_create_file: load_fn!(lib, b"BASS_StreamCreateFile\0"),
+                bass_music_load: load_fn!(lib, b"BASS_MusicLoad\0"),
                 bass_channel_play: load_fn!(lib, b"BASS_ChannelPlay\0"),
                 bass_channel_pause: load_fn!(lib, b"BASS_ChannelPause\0"),
                 bass_channel_stop: load_fn!(lib, b"BASS_ChannelStop\0"),
@@ -240,6 +245,30 @@ impl BassLibrary {
                 0,
                 0,
                 flags | BASS_UNICODE,
+            )
+        };
+        if handle == 0 {
+            Err(self.last_error_string())
+        } else {
+            Ok(handle)
+        }
+    }
+
+    /// Load a tracker/module (e.g. .it, .xm, .mod, .s3m) using BASS_MusicLoad.
+    /// Many tracker plugins work best (or only) through the music API.
+    pub fn music_load(&self, path: &str, flags: DWORD) -> Result<HSTREAM, String> {
+        let wide: Vec<u16> = OsStr::new(path)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let handle = unsafe {
+            (self.bass_music_load)(
+                0, // mem = FALSE
+                wide.as_ptr(),
+                0,
+                0, // length (0 = use all)
+                flags | BASS_UNICODE,
+                0, // freq = 0 (default)
             )
         };
         if handle == 0 {

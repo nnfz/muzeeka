@@ -124,7 +124,9 @@ struct PlayerInner {
     current_track_start_time: u64,
 }
 
-/// BASS format plugins loaded via `BASS_PluginLoad` (not bass_fx / bassmix / etc.).
+/// Official BASS format plugins that are known to work reliably.
+/// Third-party plugins (e.g. basszxtune.dll or other tracker/chiptune addons)
+/// placed in the bass/ folder will also be auto-detected and attempted.
 const BASS_FORMAT_PLUGINS: &[&str] = &[
     "bassflac.dll",
     "bassape.dll",
@@ -135,7 +137,15 @@ const BASS_FORMAT_PLUGINS: &[&str] = &[
     "basshls.dll",
     "bassmidi.dll",
     "basscd.dll",
-    "basszxtune.dll",
+];
+
+/// DLLs that should never be loaded via BASS_PluginLoad (they are for mixing, effects, output etc.).
+const NON_FORMAT_BASS_DLLS: &[&str] = &[
+    "bass.dll",
+    "bassmix.dll",
+    "bass_fx.dll",
+    "bassfx.dll",
+    "basswasapi.dll",
 ];
 
 // ── Public player handle ──────────────────────────────────────────────────────
@@ -276,6 +286,35 @@ impl Player {
             return;
         };
 
+        // Collect names we already successfully loaded so we don't duplicate attempts.
+        let mut attempted: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // 1. Load known official format plugins first (better logging).
+        for &plugin in BASS_FORMAT_PLUGINS {
+            if attempted.contains(&plugin.to_lowercase()) {
+                continue;
+            }
+            let path = inner.bass_dir.join(plugin);
+            if !path.is_file() {
+                continue;
+            }
+            let path_str = path.to_string_lossy().to_string();
+            match bass.plugin_load(&path_str) {
+                Ok(handle) => {
+                    eprintln!("BASS plugin loaded: {plugin}");
+                    inner._plugin_handles.push(handle);
+                    attempted.insert(plugin.to_lowercase());
+                }
+                Err(error) => {
+                    eprintln!("BASS plugin not loaded: {plugin} ({error})");
+                    attempted.insert(plugin.to_lowercase());
+                }
+            }
+        }
+
+        // 2. Auto-detect and load *any* other bass*.dll in the folder.
+        // This allows user-provided tracker / chiptune plugins (e.g. basszxtune.dll
+        // or similar) to be picked up automatically when placed in the bass/ directory.
         for entry in entries.flatten() {
             let path = entry.path();
             let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
@@ -288,13 +327,15 @@ impl Player {
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
-            if name.eq_ignore_ascii_case("bass.dll") {
+            let lower = name.to_lowercase();
+            if attempted.contains(&lower) {
                 continue;
             }
-            if !BASS_FORMAT_PLUGINS
-                .iter()
-                .any(|plugin| name.eq_ignore_ascii_case(plugin))
-            {
+            if NON_FORMAT_BASS_DLLS.iter().any(|&ex| lower == ex) {
+                continue;
+            }
+            // Any remaining bass*.dll is a candidate for format plugin (tracker plugins etc.)
+            if !lower.starts_with("bass") {
                 continue;
             }
 
@@ -303,9 +344,13 @@ impl Player {
                 Ok(handle) => {
                     eprintln!("BASS plugin loaded: {name}");
                     inner._plugin_handles.push(handle);
+                    attempted.insert(lower);
                 }
                 Err(error) => {
-                    eprintln!("BASS plugin failed ({name}): {error}");
+                    // Non-fatal. Many third-party tracker plugins are old and may
+                    // not be compatible with the current bass.dll version.
+                    eprintln!("BASS plugin not loaded: {name} ({error})");
+                    attempted.insert(lower);
                 }
             }
         }
@@ -612,14 +657,49 @@ impl Player {
         audio_path: &str,
         cue_start: Option<f64>,
     ) -> Result<u32, String> {
-        // No PRESCAN: much faster track start and manual switching.
-        // Prescan is only useful for accurate seeking in VBR MP3 without good headers.
-        // For speed (like Foobar) we skip it. Duration comes from metadata or later.
-        let flags = bass::BASS_SAMPLE_FLOAT | bass::BASS_STREAM_DECODE;
+        let ext = std::path::Path::new(audio_path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+
+        let is_tracker = matches!(
+            ext.as_str(),
+            "mod" | "s3m" | "xm" | "it" | "mtm" | "669" | "far" | "okt" |
+            "ay" | "ym" | "vgm" | "vgz" | "nsf" | "nsfe" | "gbs" | "hes" |
+            "sap" | "kss" | "pt2" | "pt3" | "stc" | "stp" | "asc" | "sqt" | "psg"
+        );
+
+        // Tracker files are loaded via BASS_MusicLoad (better compatibility with module plugins).
+        // Regular audio uses StreamCreateFile.
+        let flags = if is_tracker {
+            bass::BASS_SAMPLE_FLOAT | bass::BASS_MUSIC_DECODE | bass::BASS_MUSIC_RAMPS
+        } else {
+            // No PRESCAN: much faster track start and manual switching.
+            // Prescan is only useful for accurate seeking in VBR MP3 without good headers.
+            // For speed (like Foobar) we skip it. Duration comes from metadata or later.
+            bass::BASS_SAMPLE_FLOAT | bass::BASS_STREAM_DECODE
+        };
+
         let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
-        let source = bass
-            .stream_create_file(audio_path, flags)
-            .map_err(|error| format!("{error} — file: {}", audio_path))?;
+
+        // Try the preferred method first. For trackers we prefer MusicLoad because
+        // most module plugins (including many chiptune ones) register via the music API.
+        let source = if is_tracker {
+            bass.music_load(audio_path, flags)
+                .or_else(|e| {
+                    // Fallback: some plugins only work through StreamCreateFile
+                    if e.contains("unsupported file format") {
+                        bass.stream_create_file(audio_path, bass::BASS_SAMPLE_FLOAT | bass::BASS_STREAM_DECODE)
+                    } else {
+                        Err(e)
+                    }
+                })
+        } else {
+            bass.stream_create_file(audio_path, flags)
+        }
+        .map_err(|error| format!("{error} — file: {}", audio_path))?;
+
         Self::apply_playback_rate(inner, bass, source);
 
         // Very short wait so length becomes available quickly, but we don't block long.
@@ -1230,7 +1310,7 @@ impl Player {
         }
     }
 
-    /// Load a BASS addon DLL by path.
+    /// Load a BASS addon DLL by path (useful for additional tracker plugins).
     pub fn load_addon(&self, path: &str) -> Result<(), String> {
         let path = path.to_string();
         self.run_on_bass_thread(move |inner| {
