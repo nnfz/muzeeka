@@ -1,0 +1,41 @@
+---
+pid: 30608
+cwd: "Z:\code\muzeeka"
+command: "cd Z:\\code\\muzeeka\\muzeeka\\src-tauri; cargo build 2>&1"
+started_at: 2026-07-10T11:44:47.172Z
+running_for_ms: 1540013  
+---
+cargo :     Blocking waiting for file lock on build directory
+At line:1 char:39
++ cd Z:\code\muzeeka\muzeeka\src-tauri; cargo build 2>&1
++                                       ~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (    Blocking wa...build directory:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+warning: muzeeka@0.1.0: Copied 14 BASS DLL(s) to \\?\Z:\code\muzeeka\muzeeka\src-tauri\target\debug\bass
+warning: muzeeka@0.1.0: Copied 149 file(s) from bin/ to \\?\Z:\code\muzeeka\muzeeka\src-tauri\target\debug\bin
+warning: fields `track_paths`, `source_playlist_id`, and `is_copy` are never read
+  --> src\drop_handler.rs:25:9
+   |
+24 | pub struct ExportDragContext {
+   |            ----------------- fields in this struct
+25 |     pub track_paths: Vec<String>,
+   |         ^^^^^^^^^^^
+26 |     pub source_playlist_id: Option<String>,
+   |         ^^^^^^^^^^^^^^^^^^
+27 |     pub is_copy: bool,
+   |         ^^^^^^^
+   |
+   = note: `ExportDragContext` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead 
+code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+warning: method `has_track_context` is never used
+  --> src\drop_handler.rs:84:12
+   |
+66 | impl ExportDragState {
+   | -------------------- method in this implementation
+...
+84 |     pub fn has_track_context(&self) -> bool {
+   |            ^^^^^^^^^^^^^^^^^
+warning: `muzeeka` (lib) generated 2 warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 16.64s

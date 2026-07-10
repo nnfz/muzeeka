@@ -4,9 +4,11 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use discord_rich_presence::activity::{Activity, ActivityType, Assets, Timestamps};
+use discord_rich_presence::activity::{
+    Activity, ActivityType, Assets, StatusDisplayType, Timestamps,
+};
 use discord_rich_presence::{DiscordIpc, DiscordIpcClient};
 use parking_lot::Mutex;
 
@@ -31,6 +33,20 @@ struct PresenceInner {
     connected: bool,
     last_track_path: Option<String>,
     last_cover_url: Option<String>,
+    last_sync_key: Option<String>,
+    last_connect_attempt: Option<Instant>,
+    connect_backoff: Duration,
+}
+
+#[derive(Clone)]
+struct ActivityPayload {
+    title: String,
+    artist: String,
+    album: Option<String>,
+    cover_url: Option<String>,
+    position: f64,
+    duration: f64,
+    paused: bool,
 }
 
 impl DiscordPresence {
@@ -42,6 +58,9 @@ impl DiscordPresence {
                 connected: false,
                 last_track_path: None,
                 last_cover_url: None,
+                last_sync_key: None,
+                last_connect_attempt: None,
+                connect_backoff: Duration::from_secs(1),
             })),
             lookup_generation: Arc::new(AtomicU64::new(0)),
         }
@@ -58,10 +77,10 @@ impl DiscordPresence {
         }
 
         if changed {
-            inner.connected = false;
-            inner.client = None;
+            Self::reset_connection(&mut inner);
             inner.last_track_path = None;
             inner.last_cover_url = None;
+            inner.last_sync_key = None;
         }
     }
 
@@ -73,11 +92,13 @@ impl DiscordPresence {
 
         let Some(track_path) = snapshot.current_file.as_ref() else {
             let _ = Self::clear_activity(&mut inner);
+            inner.last_sync_key = None;
             return;
         };
 
         if snapshot.state == PlaybackState::Stopped && !snapshot.is_playing && !snapshot.is_paused {
             let _ = Self::clear_activity(&mut inner);
+            inner.last_sync_key = None;
             return;
         }
 
@@ -105,48 +126,42 @@ impl DiscordPresence {
             .filter(|path| path.as_str() == track_path)
             .and_then(|_| inner.last_cover_url.clone());
 
-        if !Self::ensure_connected(&mut inner) {
+        let payload = ActivityPayload {
+            title: title.clone(),
+            artist: artist.clone(),
+            album: album.clone(),
+            cover_url: cover_url.clone(),
+            position: snapshot.position,
+            duration,
+            paused,
+        };
+        let sync_key = Self::sync_key(track_path, &payload);
+        if inner.last_sync_key.as_deref() == Some(sync_key.as_str()) {
             return;
         }
 
-        if let Err(error) = Self::set_activity(
-            &mut inner,
-            &title,
-            &artist,
-            album.as_deref(),
-            cover_url.as_deref(),
-            snapshot.position,
-            duration,
-            paused,
-        ) {
-            eprintln!("Discord RPC update failed: {error}");
-            inner.connected = false;
-            inner.client = None;
+        match Self::push_activity(&mut inner, &payload) {
+            Ok(()) => {
+                inner.last_sync_key = Some(sync_key);
+                inner.connect_backoff = Duration::from_secs(1);
+            }
+            Err(error) => {
+                eprintln!("Discord RPC update failed: {error}");
+            }
         }
 
         if inner.last_track_path.as_deref() != Some(track_path) {
             inner.last_track_path = Some(track_path.clone());
             inner.last_cover_url = None;
-            self.spawn_cover_lookup(
-                track_path.clone(),
-                artist,
-                title,
-                album,
-                snapshot.position,
-                duration,
-                paused,
-            );
+            self.spawn_cover_lookup(track_path.clone(), artist, title, album, payload);
         }
     }
 
     pub fn shutdown(&self) {
         let mut inner = self.inner.lock();
         let _ = Self::clear_activity(&mut inner);
-        if let Some(client) = inner.client.as_mut() {
-            let _ = client.close();
-        }
-        inner.client = None;
-        inner.connected = false;
+        Self::reset_connection(&mut inner);
+        inner.last_sync_key = None;
     }
 
     fn spawn_cover_lookup(
@@ -155,9 +170,7 @@ impl DiscordPresence {
         artist: String,
         title: String,
         album: Option<String>,
-        position: f64,
-        duration: f64,
-        paused: bool,
+        base_payload: ActivityPayload,
     ) {
         let generation = self.lookup_generation.fetch_add(1, Ordering::SeqCst) + 1;
         let inner = self.inner.clone();
@@ -169,7 +182,7 @@ impl DiscordPresence {
 
             let cover_url = cover_url.unwrap();
             let mut guard = inner.lock();
-            if !guard.enabled || !guard.connected {
+            if !guard.enabled {
                 return;
             }
             if guard.last_track_path.as_deref() != Some(track_path.as_str()) {
@@ -177,21 +190,43 @@ impl DiscordPresence {
             }
 
             guard.last_cover_url = Some(cover_url.clone());
-            if let Err(error) = Self::set_activity(
-                &mut guard,
-                &title,
-                &artist,
-                album.as_deref(),
-                Some(&cover_url),
-                position,
-                duration,
-                paused,
-            ) {
-                eprintln!("Discord RPC cover update failed: {error}");
+            let payload = ActivityPayload {
+                cover_url: Some(cover_url),
+                ..base_payload
+            };
+            let sync_key = Self::sync_key(&track_path, &payload);
+            if guard.last_sync_key.as_deref() == Some(sync_key.as_str()) {
+                return;
+            }
+
+            match Self::push_activity(&mut guard, &payload) {
+                Ok(()) => guard.last_sync_key = Some(sync_key),
+                Err(error) => eprintln!("Discord RPC cover update failed: {error}"),
             }
 
             let _ = generation;
         });
+    }
+
+    fn sync_key(track_path: &str, payload: &ActivityPayload) -> String {
+        format!(
+            "{}|{}|{}|{}|{}|{}|{}|{}",
+            track_path,
+            payload.title,
+            payload.artist,
+            payload.album.as_deref().unwrap_or(""),
+            payload.cover_url.as_deref().unwrap_or(""),
+            payload.paused,
+            payload.position.round() as i64,
+            payload.duration.round() as i64,
+        )
+    }
+
+    fn reset_connection(inner: &mut PresenceInner) {
+        if let Some(mut client) = inner.client.take() {
+            let _ = client.close();
+        }
+        inner.connected = false;
     }
 
     fn ensure_connected(inner: &mut PresenceInner) -> bool {
@@ -199,40 +234,76 @@ impl DiscordPresence {
             return true;
         }
 
-        let mut client = DiscordIpcClient::new(DISCORD_CLIENT_ID);
+        if let Some(last_attempt) = inner.last_connect_attempt {
+            if last_attempt.elapsed() < inner.connect_backoff {
+                return false;
+            }
+        }
 
+        inner.last_connect_attempt = Some(Instant::now());
+
+        let mut client = DiscordIpcClient::new(DISCORD_CLIENT_ID);
         if let Err(error) = client.connect() {
+            inner.connect_backoff = (inner.connect_backoff * 2).min(Duration::from_secs(30));
             eprintln!("Discord RPC connect failed: {error}");
             return false;
         }
 
         inner.client = Some(client);
         inner.connected = true;
+        inner.connect_backoff = Duration::from_secs(1);
         true
+    }
+
+    fn push_activity(inner: &mut PresenceInner, payload: &ActivityPayload) -> Result<(), String> {
+        if !Self::ensure_connected(inner) {
+            return Err("Discord is not running or RPC is unavailable".into());
+        }
+
+        match Self::set_activity(inner, payload) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if !Self::is_ipc_error(&error) {
+                    return Err(error);
+                }
+
+                Self::reset_connection(inner);
+                if !Self::ensure_connected(inner) {
+                    return Err(error);
+                }
+
+                Self::set_activity(inner, payload)
+            }
+        }
+    }
+
+    fn is_ipc_error(error: &str) -> bool {
+        error.contains("IPC socket")
+            || error.contains("failed to write")
+            || error.contains("failed to read")
+            || error.contains("connection")
     }
 
     fn clear_activity(inner: &mut PresenceInner) -> Result<(), String> {
         inner.last_track_path = None;
         inner.last_cover_url = None;
-        if let Some(client) = inner.client.as_mut() {
-            client
-                .clear_activity()
-                .map_err(|error| error.to_string())
-        } else {
-            Ok(())
+        let Some(client) = inner.client.as_mut() else {
+            return Ok(());
+        };
+
+        match client.clear_activity() {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let message = error.to_string();
+                if Self::is_ipc_error(&message) {
+                    Self::reset_connection(inner);
+                }
+                Err(message)
+            }
         }
     }
 
-    fn set_activity(
-        inner: &mut PresenceInner,
-        title: &str,
-        artist: &str,
-        album: Option<&str>,
-        cover_url: Option<&str>,
-        position: f64,
-        duration: f64,
-        paused: bool,
-    ) -> Result<(), String> {
+    fn set_activity(inner: &mut PresenceInner, payload: &ActivityPayload) -> Result<(), String> {
         let client = inner
             .client
             .as_mut()
@@ -240,27 +311,28 @@ impl DiscordPresence {
 
         let mut activity = Activity::new()
             .activity_type(ActivityType::Listening)
-            .details(truncate(title, 128))
-            .state(if paused {
-                format!("⏸ {}", truncate(artist, 120))
+            .status_display_type(StatusDisplayType::Details)
+            .details(truncate(&payload.title, 128))
+            .state(if payload.paused {
+                format!("⏸ {}", truncate(&payload.artist, 120))
             } else {
-                truncate(artist, 128)
+                truncate(&payload.artist, 128)
             });
 
-        if !paused && duration > 0.0 {
+        if !payload.paused && payload.duration > 0.0 {
             let now = unix_now();
-            let start = now - position.round() as i64;
-            let end = start + duration.round() as i64;
+            let start = now - payload.position.round() as i64;
+            let end = start + payload.duration.round() as i64;
             activity = activity.timestamps(Timestamps::new().start(start).end(end));
         }
 
-        if let Some(cover_url) = cover_url {
+        if let Some(cover_url) = payload.cover_url.as_deref() {
             let mut assets = Assets::new().large_image(cover_url);
-            if let Some(album) = album {
+            if let Some(album) = payload.album.as_deref() {
                 assets = assets.large_text(truncate(album, 128));
             }
             activity = activity.assets(assets);
-        } else if let Some(album) = album {
+        } else if let Some(album) = payload.album.as_deref() {
             activity = activity.assets(Assets::new().large_text(truncate(album, 128)));
         }
 
