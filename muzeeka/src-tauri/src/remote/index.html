@@ -1,0 +1,853 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="theme-color" content="#0a0a0f">
+  <title>Muzeeka Remote</title>
+  <style>
+    :root {
+      --bg: #0a0a0f;
+      --surface: #14141f;
+      --surface2: #1c1c2a;
+      --border: rgba(255,255,255,0.08);
+      --text: #f2f2f7;
+      --muted: #8e8e9a;
+      --accent: #7c5cff;
+      --accent2: #a78bfa;
+      --danger: #ff5c7a;
+      --radius: 16px;
+      --safe-bottom: env(safe-area-inset-bottom, 0px);
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+      min-height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      -webkit-tap-highlight-color: transparent;
+      overflow-x: hidden;
+      overflow-y: auto;
+      -webkit-overflow-scrolling: touch;
+      overscroll-behavior-y: contain;
+    }
+
+    .app {
+      min-height: 100dvh;
+      display: flex;
+      flex-direction: column;
+      max-width: 480px;
+      margin: 0 auto;
+      padding-bottom: calc(16px + var(--safe-bottom));
+    }
+
+    .header {
+      padding: 16px 20px 8px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .logo {
+      font-size: 15px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      color: var(--accent2);
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #3dd68c;
+      box-shadow: 0 0 8px #3dd68c88;
+    }
+
+    .now-playing {
+      padding: 8px 20px 16px;
+      text-align: center;
+    }
+
+    .player-section {
+      flex-shrink: 0;
+    }
+
+    .cover-wrap {
+      width: min(56vw, 220px);
+      aspect-ratio: 1;
+      margin: 0 auto 16px;
+      border-radius: 20px;
+      overflow: hidden;
+      background: var(--surface2);
+      box-shadow: 0 20px 60px rgba(0,0,0,0.5), 0 0 0 1px var(--border);
+      position: relative;
+    }
+
+    .cover-wrap img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+    }
+
+    .cover-placeholder {
+      width: 100%;
+      height: 100%;
+      display: grid;
+      place-items: center;
+      font-size: 64px;
+      color: var(--muted);
+      background: linear-gradient(135deg, #1a1a28, #12121c);
+    }
+
+    .track-title {
+      font-size: 22px;
+      font-weight: 700;
+      line-height: 1.2;
+      margin-bottom: 6px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      padding: 0 8px;
+    }
+
+    .track-artist {
+      font-size: 15px;
+      color: var(--muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      padding: 0 8px;
+    }
+
+    .progress {
+      padding: 0 20px;
+      margin-top: 16px;
+    }
+
+    .progress-bar {
+      height: 4px;
+      background: var(--surface2);
+      border-radius: 2px;
+      overflow: hidden;
+      cursor: pointer;
+      touch-action: none;
+    }
+
+    .progress-fill {
+      height: 100%;
+      background: linear-gradient(90deg, var(--accent), var(--accent2));
+      border-radius: 2px;
+      width: 0%;
+      transition: width 0.1s linear;
+    }
+
+    .progress-times {
+      display: flex;
+      justify-content: space-between;
+      margin-top: 8px;
+      font-size: 12px;
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+    }
+
+    .controls {
+      padding: 20px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+    }
+
+    .btn {
+      border: none;
+      background: var(--surface);
+      color: var(--text);
+      border-radius: 50%;
+      cursor: pointer;
+      display: grid;
+      place-items: center;
+      transition: transform 0.1s, background 0.15s;
+      -webkit-user-select: none;
+      user-select: none;
+    }
+
+    .btn:active { transform: scale(0.92); }
+    .btn:disabled { opacity: 0.35; pointer-events: none; }
+
+    .btn-sm { width: 44px; height: 44px; font-size: 18px; }
+    .btn-md { width: 52px; height: 52px; font-size: 22px; }
+    .btn-lg {
+      width: 68px;
+      height: 68px;
+      font-size: 28px;
+      background: var(--accent);
+      box-shadow: 0 8px 24px rgba(124,92,255,0.4);
+    }
+
+    .btn.active { color: var(--accent2); }
+
+    .extra-controls {
+      display: flex;
+      justify-content: center;
+      gap: 8px;
+      padding: 0 20px 12px;
+    }
+
+    .volume-row {
+      padding: 0 20px 16px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .volume-row input[type=range] {
+      flex: 1;
+      accent-color: var(--accent);
+      height: 4px;
+    }
+
+    .playlists-panel {
+      flex: 1;
+      background: var(--surface);
+      border-top: 1px solid var(--border);
+      border-radius: 20px 20px 0 0;
+      display: flex;
+      flex-direction: column;
+      min-height: 280px;
+    }
+
+    .panel-tabs {
+      display: flex;
+      gap: 4px;
+      padding: 12px 12px 0;
+      overflow-x: auto;
+      scrollbar-width: none;
+    }
+
+    .panel-tabs::-webkit-scrollbar { display: none; }
+
+    .tab {
+      flex-shrink: 0;
+      padding: 8px 14px;
+      border-radius: 20px;
+      border: none;
+      background: transparent;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+
+    .tab.active {
+      background: var(--surface2);
+      color: var(--text);
+    }
+
+    .playlist-name {
+      padding: 8px 20px 4px;
+      font-size: 13px;
+      color: var(--muted);
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+
+    .track-list {
+      flex: 1;
+      padding: 4px 8px 16px;
+    }
+
+    .track-item {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+
+    .track-item:active { background: var(--surface2); }
+    .track-item.playing { background: rgba(124,92,255,0.15); }
+
+    .track-thumb {
+      width: 44px;
+      height: 44px;
+      border-radius: 8px;
+      background: var(--surface2);
+      overflow: hidden;
+      flex-shrink: 0;
+      display: grid;
+      place-items: center;
+      font-size: 18px;
+      color: var(--muted);
+    }
+
+    .track-thumb img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+
+    .track-info {
+      min-width: 0;
+      flex: 1;
+    }
+
+    .track-info-title {
+      font-size: 14px;
+      font-weight: 600;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .track-info-artist {
+      font-size: 12px;
+      color: var(--muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .track-dur {
+      font-size: 12px;
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+      flex-shrink: 0;
+    }
+
+    .error-banner {
+      display: none;
+      margin: 0 20px 8px;
+      padding: 10px 14px;
+      background: rgba(255,92,122,0.15);
+      border: 1px solid rgba(255,92,122,0.3);
+      border-radius: 10px;
+      font-size: 13px;
+      color: #ff8fa3;
+    }
+
+    .error-banner.show { display: block; }
+
+    .media-bar {
+      margin: 0 20px 12px;
+      padding: 12px 14px;
+      background: rgba(124,92,255,0.12);
+      border: 1px solid rgba(124,92,255,0.28);
+      border-radius: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .media-bar.enabled {
+      background: rgba(61,214,140,0.1);
+      border-color: rgba(61,214,140,0.28);
+    }
+
+    .media-bar-text {
+      font-size: 12px;
+      color: var(--muted);
+      line-height: 1.4;
+    }
+
+    .media-enable-btn {
+      width: 100%;
+      padding: 12px 16px;
+      border: none;
+      border-radius: 12px;
+      background: var(--accent);
+      color: #fff;
+      font-size: 14px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    .media-enable-btn:disabled {
+      opacity: 0.55;
+      cursor: default;
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <div class="player-section">
+      <div class="header">
+        <div class="logo">MUZEEKA REMOTE</div>
+        <div class="status-dot" id="statusDot"></div>
+      </div>
+
+      <div class="error-banner" id="errorBanner"></div>
+
+      <div class="media-bar" id="mediaBar">
+        <div class="media-bar-text" id="mediaBarText">
+          Нажми кнопку, чтобы плеер появился в шторке и на экране блокировки. Звук по-прежнему идёт с компьютера.
+        </div>
+        <button type="button" class="media-enable-btn" id="btnEnableMedia">
+          Включить плеер в шторке
+        </button>
+      </div>
+
+      <div class="now-playing">
+        <div class="cover-wrap" id="coverWrap">
+          <div class="cover-placeholder" id="coverPlaceholder">♪</div>
+          <img id="coverImg" alt="" style="display:none">
+        </div>
+        <div class="track-title" id="trackTitle">Ничего не играет</div>
+        <div class="track-artist" id="trackArtist">Открой плейлист и выбери трек</div>
+      </div>
+
+      <div class="progress">
+        <div class="progress-bar" id="progressBar">
+          <div class="progress-fill" id="progressFill"></div>
+        </div>
+        <div class="progress-times">
+          <span id="timeCurrent">0:00</span>
+          <span id="timeTotal">0:00</span>
+        </div>
+      </div>
+
+      <div class="controls">
+        <button class="btn btn-sm" id="btnShuffle" title="Shuffle">🔀</button>
+        <button class="btn btn-md" id="btnPrev" title="Previous">⏮</button>
+        <button class="btn btn-lg" id="btnPlay" title="Play/Pause">▶</button>
+        <button class="btn btn-md" id="btnNext" title="Next">⏭</button>
+        <button class="btn btn-sm" id="btnRepeat" title="Repeat">🔁</button>
+      </div>
+
+      <div class="volume-row">
+        <span style="font-size:16px">🔊</span>
+        <input type="range" id="volumeSlider" min="0" max="100" value="80">
+      </div>
+    </div>
+
+    <div class="playlists-panel">
+      <div class="panel-tabs" id="playlistTabs"></div>
+      <div class="playlist-name" id="playlistName">Плейлист</div>
+      <div class="track-list" id="trackList"></div>
+    </div>
+  </div>
+
+  <!-- Silent loop — required by mobile browsers to show OS media controls. -->
+  <audio id="silentKeeper" loop playsinline webkit-playsinline preload="auto" style="display:none"
+    src="/api/silent.wav"></audio>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+
+    const LS_PLAYLIST_KEY = 'muzeeka-remote-active-playlist';
+
+    let state = null;
+    let playlists = [];
+    let activePlaylistId = null;
+    let playlistTracks = [];
+    let volumeDragging = false;
+    let seekDragging = false;
+    let userPickedPlaylist = false;
+    let mediaSessionReady = false;
+    let mediaSessionEnabled = false;
+    let wakeLock = null;
+
+    function fmt(sec) {
+      if (!sec || sec < 0) return '0:00';
+      const m = Math.floor(sec / 60);
+      const s = Math.floor(sec % 60);
+      return `${m}:${s.toString().padStart(2, '0')}`;
+    }
+
+    async function api(path, opts = {}) {
+      const res = await fetch(path, {
+        headers: { 'Content-Type': 'application/json' },
+        ...opts,
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(text || res.statusText);
+      }
+      const ct = res.headers.get('content-type') || '';
+      if (ct.includes('application/json')) return res.json();
+      return null;
+    }
+
+    function showError(msg) {
+      const el = $('errorBanner');
+      el.textContent = msg;
+      el.classList.add('show');
+      setTimeout(() => el.classList.remove('show'), 4000);
+    }
+
+    async function action(path, body) {
+      try {
+        await api(path, { method: 'POST', body: body ? JSON.stringify(body) : undefined });
+        await refreshState();
+      } catch (e) {
+        showError(e.message);
+      }
+    }
+
+    async function mediaAction(path, body) {
+      try {
+        await api(path, { method: 'POST', body: body ? JSON.stringify(body) : undefined });
+        await refreshState();
+      } catch (_) {}
+    }
+
+    function setupMediaSession() {
+      if (!('mediaSession' in navigator)) {
+        $('mediaBarText').textContent = 'Этот браузер не поддерживает Media Session API.';
+        $('btnEnableMedia').disabled = true;
+        return;
+      }
+
+      const bind = (actionName, handler) => {
+        try {
+          navigator.mediaSession.setActionHandler(actionName, handler);
+        } catch (_) {}
+      };
+
+      bind('play', () => {
+        void mediaAction(state?.isPaused ? '/api/resume' : '/api/toggle');
+      });
+      bind('pause', () => { void mediaAction('/api/pause'); });
+      bind('stop', () => { void mediaAction('/api/pause'); });
+      bind('previoustrack', () => { void mediaAction('/api/prev'); });
+      bind('nexttrack', () => { void mediaAction('/api/next'); });
+      bind('seekbackward', () => {
+        const pos = Math.max(0, (state?.position ?? 0) - 10);
+        void mediaAction('/api/seek', { position: pos });
+      });
+      bind('seekforward', () => {
+        const dur = state?.duration ?? 0;
+        const pos = dur > 0 ? Math.min(dur, (state?.position ?? 0) + 10) : (state?.position ?? 0) + 10;
+        void mediaAction('/api/seek', { position: pos });
+      });
+      bind('seekto', (details) => {
+        if (details.seekTime != null) {
+          void mediaAction('/api/seek', { position: details.seekTime });
+        }
+      });
+
+      mediaSessionReady = true;
+    }
+
+    async function requestWakeLock() {
+      if (!('wakeLock' in navigator)) return;
+      try {
+        wakeLock = await navigator.wakeLock.request('screen');
+      } catch (_) {}
+    }
+
+    async function syncSilentKeeper() {
+      const keeper = $('silentKeeper');
+      if (!keeper || !mediaSessionEnabled) return;
+
+      keeper.volume = 0.02;
+      const hasTrack = !!state?.track;
+      const shouldPlay = hasTrack && (state.isPlaying || state.isPaused);
+
+      if (shouldPlay && keeper.paused) {
+        try {
+          await keeper.play();
+        } catch (_) {}
+      } else if (!shouldPlay && !keeper.paused) {
+        keeper.pause();
+      }
+    }
+
+    function setMediaMetadata(track) {
+      if (!mediaSessionReady) return;
+      try {
+        if (track) {
+          const artwork = [];
+          if (track.coverUrl) {
+            const src = new URL(track.coverUrl, location.origin).href;
+            artwork.push({ src, sizes: '512x512', type: 'image/jpeg' });
+            artwork.push({ src, sizes: '256x256', type: 'image/jpeg' });
+            artwork.push({ src, sizes: '96x96', type: 'image/jpeg' });
+          }
+          navigator.mediaSession.metadata = new MediaMetadata({
+            title: track.title || 'Muzeeka',
+            artist: track.artist || 'Unknown Artist',
+            album: track.album || 'Muzeeka',
+            artwork,
+          });
+          document.title = `${track.title || 'Muzeeka'} — Muzeeka`;
+        } else {
+          navigator.mediaSession.metadata = new MediaMetadata({
+            title: 'Muzeeka Remote',
+            artist: 'Ничего не играет',
+            album: 'Muzeeka',
+          });
+          document.title = 'Muzeeka Remote';
+        }
+      } catch (_) {
+        try {
+          navigator.mediaSession.metadata = new MediaMetadata({
+            title: track?.title || 'Muzeeka',
+            artist: track?.artist || 'Unknown Artist',
+          });
+        } catch (_) {}
+      }
+    }
+
+    function updateMediaSession() {
+      if (!mediaSessionReady || !mediaSessionEnabled) return;
+
+      const track = state?.track;
+      const playing = !!state?.isPlaying;
+      const paused = !!state?.isPaused;
+
+      setMediaMetadata(track);
+
+      navigator.mediaSession.playbackState = playing
+        ? 'playing'
+        : paused
+          ? 'paused'
+          : 'none';
+
+      if ('setPositionState' in navigator.mediaSession) {
+        const dur = state?.duration ?? 0;
+        const pos = state?.position ?? 0;
+        if (dur > 0 && Number.isFinite(pos)) {
+          try {
+            navigator.mediaSession.setPositionState({
+              duration: dur,
+              playbackRate: 1,
+              position: Math.min(Math.max(0, pos), dur),
+            });
+          } catch (_) {}
+        }
+      }
+
+      void syncSilentKeeper();
+    }
+
+    async function enableSystemMedia() {
+      if (mediaSessionEnabled) return;
+
+      setupMediaSession();
+      if (!mediaSessionReady) return;
+
+      const keeper = $('silentKeeper');
+      if (keeper) {
+        keeper.src = '/api/silent.wav';
+        keeper.load();
+        keeper.volume = 0.02;
+        keeper.muted = false;
+        try {
+          await keeper.play();
+        } catch (e) {
+          showError('Не удалось активировать медиа-сессию. Попробуй Chrome на Android.');
+          return;
+        }
+      }
+
+      mediaSessionEnabled = true;
+      $('mediaBar').classList.add('enabled');
+      $('btnEnableMedia').textContent = '✓ Плеер в шторке включён';
+      $('btnEnableMedia').disabled = true;
+      $('mediaBarText').textContent =
+        'Готово. Не закрывай вкладку — шторка работает, пока страница открыта. Звук с компьютера.';
+
+      await requestWakeLock();
+      updateMediaSession();
+    }
+
+    function renderNowPlaying() {
+      const track = state?.track;
+      $('trackTitle').textContent = track?.title || 'Ничего не играет';
+      $('trackArtist').textContent = track?.artist || '—';
+
+      const img = $('coverImg');
+      const ph = $('coverPlaceholder');
+      if (track?.coverUrl) {
+        img.src = track.coverUrl;
+        img.style.display = 'block';
+        ph.style.display = 'none';
+      } else {
+        img.style.display = 'none';
+        ph.style.display = 'grid';
+      }
+
+      const dur = state?.duration || 0;
+      const pos = state?.position || 0;
+      const pct = dur > 0 ? (pos / dur) * 100 : 0;
+      $('progressFill').style.width = `${pct}%`;
+      $('timeCurrent').textContent = fmt(pos);
+      $('timeTotal').textContent = fmt(dur);
+
+      const playing = state?.isPlaying;
+      $('btnPlay').textContent = playing ? '⏸' : '▶';
+
+      $('btnShuffle').classList.toggle('active', !!state?.shuffleEnabled);
+      const repeat = state?.repeatMode || 'off';
+      $('btnRepeat').classList.toggle('active', repeat !== 'off');
+      $('btnRepeat').textContent = repeat === 'one' ? '🔂' : '🔁';
+
+      if (!volumeDragging && state?.volume != null) {
+        $('volumeSlider').value = Math.round(state.volume * 100);
+      }
+
+      renderTrackList();
+      updateMediaSession();
+    }
+
+    function renderTabs() {
+      const tabs = $('playlistTabs');
+      tabs.innerHTML = playlists.map((p) =>
+        `<button class="tab${p.id === activePlaylistId ? ' active' : ''}" data-id="${p.id}">${escapeHtml(p.name)}</button>`
+      ).join('');
+
+      tabs.querySelectorAll('.tab').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          activePlaylistId = btn.dataset.id;
+          userPickedPlaylist = true;
+          localStorage.setItem(LS_PLAYLIST_KEY, activePlaylistId);
+          await action('/api/playlist/select', { id: activePlaylistId });
+          await loadPlaylist(activePlaylistId);
+          renderTabs();
+        });
+      });
+    }
+
+    function renderTrackList() {
+      const list = $('trackList');
+      const currentPath = state?.track?.path;
+      list.innerHTML = playlistTracks.map((t) => {
+        const playing = t.path === currentPath;
+        const thumb = t.coverUrl
+          ? `<img src="${t.coverUrl}" alt="">`
+          : '♪';
+        return `<div class="track-item${playing ? ' playing' : ''}" data-path="${escapeAttr(t.path)}">
+          <div class="track-thumb">${thumb}</div>
+          <div class="track-info">
+            <div class="track-info-title">${escapeHtml(t.title)}</div>
+            <div class="track-info-artist">${escapeHtml(t.artist)}</div>
+          </div>
+          <div class="track-dur">${fmt(t.durationSecs)}</div>
+        </div>`;
+      }).join('');
+
+      list.querySelectorAll('.track-item').forEach((el) => {
+        el.addEventListener('click', () => {
+          action('/api/play', { path: el.dataset.path, playlistId: activePlaylistId });
+        });
+      });
+    }
+
+    function escapeHtml(s) {
+      return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    }
+
+    function escapeAttr(s) {
+      return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;');
+    }
+
+    async function refreshState() {
+      try {
+        const next = await api('/api/state');
+        state = next;
+        $('statusDot').style.background = '#3dd68c';
+        renderNowPlaying();
+        if (
+          !userPickedPlaylist &&
+          next?.activePlaylistId &&
+          next.activePlaylistId !== activePlaylistId
+        ) {
+          activePlaylistId = next.activePlaylistId;
+          localStorage.setItem(LS_PLAYLIST_KEY, activePlaylistId);
+          await loadPlaylist(activePlaylistId);
+          renderTabs();
+        }
+      } catch (e) {
+        $('statusDot').style.background = '#ff5c7a';
+      }
+    }
+
+    async function loadPlaylists() {
+      playlists = await api('/api/playlists');
+      renderTabs();
+    }
+
+    function resolveInitialPlaylist() {
+      const saved = localStorage.getItem(LS_PLAYLIST_KEY);
+      if (saved && playlists.some((p) => p.id === saved)) {
+        return saved;
+      }
+      if (state?.activePlaylistId && playlists.some((p) => p.id === state.activePlaylistId)) {
+        return state.activePlaylistId;
+      }
+      return playlists[0]?.id ?? null;
+    }
+
+    async function loadPlaylist(id) {
+      if (!id) return;
+      const view = await api(`/api/playlist?id=${encodeURIComponent(id)}`);
+      playlistTracks = view.tracks || [];
+      $('playlistName').textContent = view.name || 'Плейлист';
+      renderTrackList();
+    }
+
+    async function init() {
+      setupMediaSession();
+      $('btnEnableMedia').addEventListener('click', () => { void enableSystemMedia(); });
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible' && mediaSessionEnabled) {
+          void requestWakeLock();
+          void syncSilentKeeper();
+          updateMediaSession();
+        }
+      });
+      try {
+        await loadPlaylists();
+        await refreshState();
+        activePlaylistId = resolveInitialPlaylist();
+        if (activePlaylistId) {
+          localStorage.setItem(LS_PLAYLIST_KEY, activePlaylistId);
+          await loadPlaylist(activePlaylistId);
+        }
+        renderTabs();
+      } catch (e) {
+        showError('Не удалось подключиться к Muzeeka');
+      }
+    }
+
+    $('btnPlay').addEventListener('click', () => action('/api/toggle'));
+    $('btnPause')?.addEventListener('click', () => action('/api/pause'));
+    $('btnPrev').addEventListener('click', () => action('/api/prev'));
+    $('btnNext').addEventListener('click', () => action('/api/next'));
+    $('btnShuffle').addEventListener('click', () => action('/api/shuffle/toggle'));
+    $('btnRepeat').addEventListener('click', () => action('/api/repeat/toggle'));
+
+    $('volumeSlider').addEventListener('input', (e) => {
+      volumeDragging = true;
+      const vol = e.target.value / 100;
+      action('/api/volume', { volume: vol }).finally(() => {
+        setTimeout(() => { volumeDragging = false; }, 300);
+      });
+    });
+
+    function seekFromEvent(e) {
+      const bar = $('progressBar');
+      const rect = bar.getBoundingClientRect();
+      const x = (e.touches ? e.touches[0].clientX : e.clientX) - rect.left;
+      const ratio = Math.max(0, Math.min(1, x / rect.width));
+      const dur = state?.duration || 0;
+      if (dur > 0) action('/api/seek', { position: ratio * dur });
+    }
+
+    $('progressBar').addEventListener('click', seekFromEvent);
+    $('progressBar').addEventListener('touchstart', (e) => { seekDragging = true; seekFromEvent(e); });
+    $('progressBar').addEventListener('touchmove', (e) => { if (seekDragging) seekFromEvent(e); });
+    $('progressBar').addEventListener('touchend', () => { seekDragging = false; });
+
+    init();
+    setInterval(refreshState, 500);
+  </script>
+</body>
+</html>

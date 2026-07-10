@@ -45,12 +45,26 @@ type RepeatMode = 'off' | 'all' | 'one';
 interface PlaylistsData {
   playlists: Playlist[];
   active_playlist_id: string | null;
+  playing_playlist_id?: string | null;
   current_file: string | null;
   volume: number | null;
   liked_paths?: string[];
   all_paths?: string[];
   shuffle_enabled?: boolean;
   repeat_mode?: RepeatMode;
+}
+
+interface StoreSyncPayload {
+  activePlaylistId?: string | null;
+  playingPlaylistId?: string | null;
+  shuffleEnabled?: boolean;
+  repeatMode?: RepeatMode;
+  volume?: number | null;
+  currentFile?: string | null;
+  isPlaying?: boolean;
+  isPaused?: boolean;
+  position?: number;
+  duration?: number;
 }
 
 // --- Virtual Playlist IDs ---
@@ -85,6 +99,7 @@ let saveTimer: ReturnType<typeof setTimeout> | null = null;
 let lastGaplessChangeAt = 0;
 let lastManualPlayAt = 0;
 let lastPlayedFile = '';
+let applyingExternalSync = false;
 
 // --- Derived ---
 
@@ -467,6 +482,7 @@ function buildSaveData(): PlaylistsData {
   return {
     playlists,
     active_playlist_id: activePlaylistId,
+    playing_playlist_id: playingPlaylistId,
     current_file: currentFile,
     volume,
     liked_paths: likedPaths,
@@ -477,7 +493,7 @@ function buildSaveData(): PlaylistsData {
 }
 
 function scheduleSave() {
-  if (!persistReady) return;
+  if (!persistReady || applyingExternalSync) return;
   if (saveTimer) clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
     saveTimer = null;
@@ -507,6 +523,9 @@ async function loadPlaylists() {
     if (data.repeat_mode === 'off' || data.repeat_mode === 'all' || data.repeat_mode === 'one') {
       repeatMode = data.repeat_mode;
     }
+    if (data.playing_playlist_id) {
+      playingPlaylistId = data.playing_playlist_id;
+    }
     // Restore last playing track so metadata/status survive Ctrl+R
     if (data.current_file) {
       const exists = playlists.some((p) => p.tracks.some((t) => t.path === data.current_file));
@@ -516,7 +535,9 @@ async function loadPlaylists() {
           .flatMap((p) => p.tracks)
           .find((t) => t.path === data.current_file);
         currentFileName = track ? trackDisplayTitle(track) : data.current_file.split(/[\\/]/).pop()?.replace(/\.[^/.]+$/, '') ?? null;
-        playingPlaylistId = findPlaylistForTrack(data.current_file);
+        if (!data.playing_playlist_id) {
+          playingPlaylistId = findPlaylistForTrack(data.current_file);
+        }
         // Note: isPaused stays false — player is freshly started, track is just "remembered"
         syncWindowTitle();
       }
@@ -1253,9 +1274,74 @@ function toggleRepeat() {
   scheduleSave();
 }
 
+function applyStoreSync(payload: StoreSyncPayload) {
+  applyingExternalSync = true;
+  try {
+    if (payload.activePlaylistId !== undefined) {
+      activePlaylistId = payload.activePlaylistId;
+    }
+    if (payload.playingPlaylistId !== undefined) {
+      playingPlaylistId = payload.playingPlaylistId;
+    }
+    if (typeof payload.shuffleEnabled === 'boolean') {
+      shuffleEnabled = payload.shuffleEnabled;
+      if (shuffleEnabled) {
+        rebuildShuffleOrder(currentTrackIndex >= 0);
+        syncShufflePosition();
+      } else {
+        shuffleOrder = [];
+        shufflePosition = 0;
+      }
+    }
+    if (payload.repeatMode === 'off' || payload.repeatMode === 'all' || payload.repeatMode === 'one') {
+      repeatMode = payload.repeatMode;
+    }
+    if (typeof payload.volume === 'number') {
+      volume = payload.volume;
+    }
+    if (payload.currentFile !== undefined) {
+      currentFile = payload.currentFile;
+      if (currentFile) {
+        const track = playlists.flatMap((p) => p.tracks).find((t) => t.path === currentFile);
+        currentFileName = track
+          ? trackDisplayTitle(track)
+          : currentFile.split(/[\\/]/).pop()?.replace(/\.[^/.]+$/, '') ?? null;
+        if (track?.duration_secs != null) {
+          duration = track.duration_secs;
+        }
+      } else {
+        currentFileName = null;
+      }
+      syncTrackIndex();
+      syncWindowTitle();
+    }
+    if (typeof payload.isPlaying === 'boolean') {
+      isPlaying = payload.isPlaying;
+    }
+    if (typeof payload.isPaused === 'boolean') {
+      isPaused = payload.isPaused;
+    }
+    if (typeof payload.position === 'number') {
+      position = payload.position;
+    }
+    if (typeof payload.duration === 'number') {
+      duration = payload.duration;
+    }
+  } finally {
+    applyingExternalSync = false;
+  }
+}
+
 // --- Event Listeners ---
 
 function setupListeners() {
+  listen<StoreSyncPayload>('player:store-sync', (event) => {
+    applyStoreSync(event.payload);
+    if (currentFile && (isPlaying || isPaused)) {
+      void prepareGaplessNext(currentFile);
+    }
+  });
+
   listen<{ path: string }>('player:track-changed', (event) => {
     const path = event.payload.path;
 
@@ -1292,9 +1378,20 @@ function setupListeners() {
     syncWindowTitle();
   });
 
-  listen<{ position: number; duration: number }>('player:position', (event) => {
+  listen<{ position: number; duration: number; state?: string }>('player:position', (event) => {
     const newPos = event.payload.position;
     duration = event.payload.duration;
+
+    if (event.payload.state === 'playing') {
+      isPlaying = true;
+      isPaused = false;
+    } else if (event.payload.state === 'paused') {
+      isPlaying = false;
+      isPaused = true;
+    } else if (event.payload.state === 'stopped') {
+      isPlaying = false;
+      isPaused = false;
+    }
 
     if (
       Date.now() < seekGuardUntil &&

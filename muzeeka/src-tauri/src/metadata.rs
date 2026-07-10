@@ -89,7 +89,7 @@ fn cache_key(path: &Path) -> String {
     format!("{:016x}", hasher.finish())
 }
 
-fn mime_from_path(path: &Path) -> &'static str {
+pub(crate) fn mime_from_path(path: &Path) -> &'static str {
     match path
         .extension()
         .and_then(|ext| ext.to_str())

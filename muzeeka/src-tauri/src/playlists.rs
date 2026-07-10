@@ -37,6 +37,8 @@ pub struct PlaylistsData {
     pub playlists: Vec<SavedPlaylist>,
     pub active_playlist_id: Option<String>,
     #[serde(default)]
+    pub playing_playlist_id: Option<String>,
+    #[serde(default)]
     pub current_file: Option<String>,
     pub volume: Option<f32>,
     #[serde(default)]

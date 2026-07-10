@@ -3,7 +3,7 @@ pid: 30856
 cwd: "Z:\code\muzeeka"
 command: "cd Z:\\code\\muzeeka\\muzeeka\\src-tauri; cargo test lrclib -- --nocapture"
 started_at: 2026-07-10T15:30:26.955Z
-running_for_ms: 7505005  
+running_for_ms: 9510004  
 ---
 warning
 running 2 tests

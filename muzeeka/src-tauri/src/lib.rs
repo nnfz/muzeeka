@@ -19,6 +19,8 @@ mod lyrics;
 mod metadata;
 mod player;
 mod playlists;
+mod remote_control;
+mod remote_server;
 mod settings;
 mod ytdlp;
 
@@ -121,6 +123,11 @@ pub fn run() {
             }
 
             player.start_position_emitter(app.handle().clone());
+            remote_server::start(
+                player.clone(),
+                discord_presence.clone(),
+                app.handle().clone(),
+            );
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
