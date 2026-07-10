@@ -16,12 +16,39 @@
     iconPath: string | null;
     started: boolean;
   } | null>(null);
+  let fileDragCaptureEl = $state<HTMLElement | null>(null);
+  let fileDragPointerId = $state<number | null>(null);
 
-  function clearFileDragSession() {
-    fileDragSession = null;
+  function cleanupFileDragSession() {
     window.removeEventListener('pointermove', onPlayerPointerMove);
     window.removeEventListener('pointerup', onPlayerPointerUp);
     window.removeEventListener('pointercancel', onPlayerPointerUp);
+    window.removeEventListener('blur', onPlayerPointerCancel);
+    document.removeEventListener('visibilitychange', onPlayerFileDragVisibility);
+
+    if (fileDragCaptureEl && fileDragPointerId !== null) {
+      try {
+        if (fileDragCaptureEl.hasPointerCapture(fileDragPointerId)) {
+          fileDragCaptureEl.releasePointerCapture(fileDragPointerId);
+        }
+      } catch {
+        /* pointer may already be released */
+      }
+    }
+
+    fileDragCaptureEl = null;
+    fileDragPointerId = null;
+    fileDragSession = null;
+  }
+
+  function onPlayerPointerCancel() {
+    cleanupFileDragSession();
+  }
+
+  function onPlayerFileDragVisibility() {
+    if (document.visibilityState === 'hidden') {
+      onPlayerPointerCancel();
+    }
   }
 
   function onPlayerPointerDown(e: PointerEvent) {
@@ -32,6 +59,8 @@
     const path = exportAudioPathForTrack(player.currentTrack, player.currentFile);
     if (!path) return;
 
+    cleanupFileDragSession();
+
     fileDragSession = {
       x: e.clientX,
       y: e.clientY,
@@ -39,11 +68,15 @@
       iconPath: player.currentTrack.cover_path ?? null,
       started: false,
     };
+    fileDragCaptureEl = e.currentTarget as HTMLElement;
+    fileDragPointerId = e.pointerId;
+    fileDragCaptureEl.setPointerCapture(e.pointerId);
 
-    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
     window.addEventListener('pointermove', onPlayerPointerMove);
     window.addEventListener('pointerup', onPlayerPointerUp);
     window.addEventListener('pointercancel', onPlayerPointerUp);
+    window.addEventListener('blur', onPlayerPointerCancel);
+    document.addEventListener('visibilitychange', onPlayerFileDragVisibility);
   }
 
   function onPlayerPointerMove(e: PointerEvent) {
@@ -54,17 +87,15 @@
     const dy = e.clientY - session.y;
     if (Math.hypot(dx, dy) < DRAG_THRESHOLD) return;
 
-    fileDragSession = { ...session, started: true };
-    void startFileDrag([session.path], session.iconPath).catch((err) => {
+    const { path, iconPath } = session;
+    cleanupFileDragSession();
+    void startFileDrag([path], iconPath).catch((err) => {
       console.error('Failed to start file drag:', err);
     });
   }
 
-  function onPlayerPointerUp(e: PointerEvent) {
-    if (e.currentTarget instanceof HTMLElement && e.currentTarget.hasPointerCapture(e.pointerId)) {
-      e.currentTarget.releasePointerCapture(e.pointerId);
-    }
-    clearFileDragSession();
+  function onPlayerPointerUp() {
+    cleanupFileDragSession();
   }
 </script>
 

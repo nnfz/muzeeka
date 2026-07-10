@@ -55,6 +55,7 @@
   const player = getPlayerStore();
 
   const DRAG_THRESHOLD = 4;
+  const FILE_EXPORT_EDGE_MARGIN = 14;
 
   let gridEl = $state<HTMLDivElement | null>(null);
   let gridWidth = $state(0);
@@ -161,6 +162,7 @@
 
   let trackDrag = $state<TrackDragState | null>(null);
   let dragCaptureEl = $state<HTMLElement | null>(null);
+  let dragPointerId = $state<number | null>(null);
   let suppressTrackClick = false;
 
   let canReorder = $derived(supportsPlaylistReorder(player.activePlaylistId));
@@ -454,31 +456,77 @@
     };
 
     dragCaptureEl = e.currentTarget as HTMLElement;
+    dragPointerId = e.pointerId;
     dragCaptureEl.setPointerCapture(e.pointerId);
     window.addEventListener('pointermove', onTrackPointerMove);
     window.addEventListener('pointerup', onTrackPointerUp);
     window.addEventListener('pointercancel', onTrackPointerUp);
+    window.addEventListener('blur', onTrackPointerCancel);
+    document.addEventListener('visibilitychange', onTrackDragVisibility);
+  }
+
+  function cleanupTrackPointerDrag() {
+    window.removeEventListener('pointermove', onTrackPointerMove);
+    window.removeEventListener('pointerup', onTrackPointerUp);
+    window.removeEventListener('pointercancel', onTrackPointerUp);
+    window.removeEventListener('blur', onTrackPointerCancel);
+    document.removeEventListener('visibilitychange', onTrackDragVisibility);
+
+    if (dragCaptureEl && dragPointerId !== null) {
+      try {
+        if (dragCaptureEl.hasPointerCapture(dragPointerId)) {
+          dragCaptureEl.releasePointerCapture(dragPointerId);
+        }
+      } catch {
+        /* pointer may already be released */
+      }
+    }
+
+    dragCaptureEl = null;
+    dragPointerId = null;
+    trackDrag = null;
+    resetTrackDrag();
+  }
+
+  function onTrackPointerCancel() {
+    cleanupTrackPointerDrag();
+  }
+
+  function onTrackDragVisibility() {
+    if (document.visibilityState === 'hidden') {
+      onTrackPointerCancel();
+    }
   }
 
   function trackByPath(path: string): MusicFile | undefined {
     return displayedTracks.find((item) => item.track.path === path)?.track;
   }
 
-  function isInAppDropZone(el: Element | null): boolean {
-    if (!el) return false;
-    if (el.closest('[data-playlist-id]')) return true;
-    if (el.closest('.track-rows')) return true;
-    return false;
+  function isNearViewportEdge(clientX: number, clientY: number): boolean {
+    return (
+      clientX <= FILE_EXPORT_EDGE_MARGIN ||
+      clientY <= FILE_EXPORT_EDGE_MARGIN ||
+      clientX >= window.innerWidth - FILE_EXPORT_EDGE_MARGIN ||
+      clientY >= window.innerHeight - FILE_EXPORT_EDGE_MARGIN
+    );
   }
 
-  function tryStartExternalFileDrag(paths: string[]) {
-    const audioPaths = audioPathsForDrag(paths, trackByPath);
-    if (audioPaths.length === 0) return;
+  function shouldStartFileExport(el: Element | null, clientX: number, clientY: number): boolean {
+    if (el?.closest('[data-playlist-id]')) return false;
+    if (el && !el.closest('.track-rows')) return true;
+    if (!el) return true;
+    return isNearViewportEdge(clientX, clientY);
+  }
 
+  function beginExternalFileDrag(paths: string[]) {
     const iconPath = trackByPath(paths[0])?.cover_path ?? null;
-    void startFileDrag(audioPaths, iconPath).catch((err) => {
-      console.error('Failed to start file drag:', err);
-    });
+    const audioPaths = audioPathsForDrag(paths, trackByPath);
+    cleanupTrackPointerDrag();
+    if (audioPaths.length > 0) {
+      void startFileDrag(audioPaths, iconPath).catch((err) => {
+        console.error('Failed to start file drag:', err);
+      });
+    }
   }
 
   function onTrackPointerMove(e: PointerEvent) {
@@ -498,10 +546,9 @@
 
     const el = document.elementFromPoint(e.clientX, e.clientY);
 
-    if (!trackDrag.fileExportStarted && !isInAppDropZone(el)) {
+    if (!trackDrag.fileExportStarted && shouldStartFileExport(el, e.clientX, e.clientY)) {
       trackDrag.fileExportStarted = true;
-      tryStartExternalFileDrag(trackDrag.paths);
-      trackDrag = { ...trackDrag };
+      beginExternalFileDrag(trackDrag.paths);
       return;
     }
     const playlistId = el?.closest('[data-playlist-id]')?.getAttribute('data-playlist-id') ?? null;
@@ -562,32 +609,16 @@
     }
   }
 
-  function onTrackPointerUp(e: PointerEvent) {
-    window.removeEventListener('pointermove', onTrackPointerMove);
-    window.removeEventListener('pointerup', onTrackPointerUp);
-    window.removeEventListener('pointercancel', onTrackPointerUp);
-    resetTrackDrag();
+  function onTrackPointerUp() {
+    const snapshot = trackDrag;
+    const wasActive = snapshot?.active ?? false;
 
-    if (dragCaptureEl?.hasPointerCapture(e.pointerId)) {
-      dragCaptureEl.releasePointerCapture(e.pointerId);
-    }
-    dragCaptureEl = null;
+    cleanupTrackPointerDrag();
 
-    const wasActive = trackDrag?.active ?? false;
-    const fileExportStarted = trackDrag?.fileExportStarted ?? false;
-
-    if (!wasActive) {
-      trackDrag = null;
-      return;
-    }
-
-    if (fileExportStarted) {
-      trackDrag = null;
-      return;
-    }
+    if (!wasActive || !snapshot) return;
 
     suppressTrackClick = true;
-    const { paths, sourcePlaylistId, isCopy, dropIndex, dropPlaylistId } = trackDrag!;
+    const { paths, sourcePlaylistId, isCopy, dropIndex, dropPlaylistId } = snapshot;
 
     if (
       dropPlaylistId &&
@@ -609,8 +640,6 @@
     } else if (!isCopy && canReorder && dropIndex !== null) {
       applyDisplayedReorder(paths, dropIndex, sourcePlaylistId);
     }
-
-    trackDrag = null;
   }
 
   function handleTrackClick(item: ListedTrack, index: number, e: MouseEvent) {
