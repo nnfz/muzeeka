@@ -24,10 +24,7 @@
     box-shadow var(--transition-normal);
 }
 
-.search-area:focus-within .search-row {
-  background: rgba(255, 255, 255, 0.06);
-  box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.08);
-}
+
 
 .search-icon {
   flex-shrink: 0;

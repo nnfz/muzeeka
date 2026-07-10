@@ -73,7 +73,7 @@ let shuffleOrder = $state<number[]>([]);
 let shufflePosition = $state(0);
 let repeatMode = $state<RepeatMode>('off');
 let playbackRate = $state(1.0);
-let likedPaths = $state<Set<string>>(new Set());
+let likedPaths = $state<string[]>([]);
 let isInitialized = $state(false);
 let initPromise: Promise<void> | null = null;
 let persistReady = $state(false);
@@ -99,15 +99,18 @@ let allTracks = $derived.by(() => {
 });
 
 let likedTracks = $derived.by(() => {
-  const seen = new Set<string>();
-  const result: MusicFile[] = [];
+  const trackByPath = new Map<string, MusicFile>();
   for (const playlist of playlists) {
     for (const track of playlist.tracks) {
-      if (likedPaths.has(track.path) && !seen.has(track.path)) {
-        seen.add(track.path);
-        result.push(track);
+      if (!trackByPath.has(track.path)) {
+        trackByPath.set(track.path, track);
       }
     }
+  }
+  const result: MusicFile[] = [];
+  for (const path of likedPaths) {
+    const track = trackByPath.get(path);
+    if (track) result.push(track);
   }
   return result;
 });
@@ -373,7 +376,7 @@ function buildSaveData(): PlaylistsData {
     active_playlist_id: activePlaylistId,
     current_file: currentFile,
     volume,
-    liked_paths: [...likedPaths],
+    liked_paths: likedPaths,
     shuffle_enabled: shuffleEnabled,
     repeat_mode: repeatMode,
   };
@@ -399,7 +402,7 @@ async function loadPlaylists() {
       volume = data.volume;
     }
     if (Array.isArray(data.liked_paths)) {
-      likedPaths = new Set(data.liked_paths.filter((p: any) => typeof p === 'string' && p));
+      likedPaths = data.liked_paths.filter((p: any) => typeof p === 'string' && p);
     }
     if (typeof data.shuffle_enabled === 'boolean') {
       shuffleEnabled = data.shuffle_enabled;
@@ -908,18 +911,17 @@ function setPlaybackRate(rate: number) {
 }
 
 function toggleLike(path: string) {
-  const next = new Set(likedPaths);
-  if (next.has(path)) {
-    next.delete(path);
+  const index = likedPaths.indexOf(path);
+  if (index !== -1) {
+    likedPaths = likedPaths.filter((p) => p !== path);
   } else {
-    next.add(path);
+    likedPaths = [...likedPaths, path];
   }
-  likedPaths = next;
   scheduleSave();
 }
 
 function isLiked(path: string): boolean {
-  return likedPaths.has(path);
+  return likedPaths.includes(path);
 }
 
 async function togglePlayPause() {
