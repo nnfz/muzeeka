@@ -5,9 +5,14 @@
 use serde::Deserialize;
 use tauri::{AppHandle, State};
 
+use crate::discord_rpc::DiscordPresence;
 use crate::equalizer::EqualizerSettings;
 use crate::library;
 use crate::player::{EqualizerStatus, GaplessTrack, Player, PlayerStateSnapshot};
+
+fn sync_discord(player: &Player, discord: &DiscordPresence) {
+    discord.update_from_player(&player.get_state());
+}
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -52,6 +57,7 @@ pub fn player_init(player: State<'_, Player>) -> Result<(), String> {
 #[tauri::command]
 pub fn player_play(
     player: State<'_, Player>,
+    discord: State<'_, DiscordPresence>,
     file_path: String,
     audio_path: Option<String>,
     cue_start: Option<f64>,
@@ -64,7 +70,9 @@ pub fn player_play(
         cue_start,
         cue_end,
         parse_gapless_queue(queue),
-    )
+    )?;
+    sync_discord(&player, &discord);
+    Ok(())
 }
 
 /// Refresh the gapless queue from the current track onward.
@@ -78,26 +86,38 @@ pub fn player_prepare_next(
 
 /// Pause the current playback.
 #[tauri::command]
-pub fn player_pause(player: State<'_, Player>) -> Result<(), String> {
-    player.pause()
+pub fn player_pause(player: State<'_, Player>, discord: State<'_, DiscordPresence>) -> Result<(), String> {
+    player.pause()?;
+    sync_discord(&player, &discord);
+    Ok(())
 }
 
 /// Resume the current playback.
 #[tauri::command]
-pub fn player_resume(player: State<'_, Player>) -> Result<(), String> {
-    player.resume()
+pub fn player_resume(player: State<'_, Player>, discord: State<'_, DiscordPresence>) -> Result<(), String> {
+    player.resume()?;
+    sync_discord(&player, &discord);
+    Ok(())
 }
 
 /// Stop the current playback and discard the stream.
 #[tauri::command]
-pub fn player_stop(player: State<'_, Player>) -> Result<(), String> {
-    player.stop()
+pub fn player_stop(player: State<'_, Player>, discord: State<'_, DiscordPresence>) -> Result<(), String> {
+    player.stop()?;
+    sync_discord(&player, &discord);
+    Ok(())
 }
 
 /// Seek to a position in seconds.
 #[tauri::command]
-pub fn player_seek(player: State<'_, Player>, position: f64) -> Result<(), String> {
-    player.seek(position)
+pub fn player_seek(
+    player: State<'_, Player>,
+    discord: State<'_, DiscordPresence>,
+    position: f64,
+) -> Result<(), String> {
+    player.seek(position)?;
+    sync_discord(&player, &discord);
+    Ok(())
 }
 
 /// Set playback volume (0.0 to 1.0).
@@ -152,7 +172,12 @@ pub fn settings_load(app: AppHandle) -> Result<AppSettings, String> {
 }
 
 #[tauri::command]
-pub fn settings_save(app: AppHandle, data: AppSettings) -> Result<(), String> {
+pub fn settings_save(
+    app: AppHandle,
+    discord: State<'_, DiscordPresence>,
+    data: AppSettings,
+) -> Result<(), String> {
+    discord.configure(data.discord_rpc_enabled);
     settings::save_settings(&app, &data)
 }
 

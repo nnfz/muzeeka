@@ -14,6 +14,7 @@ use tauri::{AppHandle, Emitter};
 
 use crate::bass::{self, BassLibrary};
 use crate::cue::{self, PlaybackTarget};
+use crate::discord_rpc::DiscordPresence;
 use crate::equalizer::{eq_dsp_callback, EqDspContext, EqualizerSettings};
 
 /// Next track queued for gapless transition.
@@ -154,6 +155,7 @@ pub struct Player {
     inner: Arc<Mutex<PlayerInner>>,
     app: Arc<RwLock<Option<AppHandle>>>,
     bass_thread: Arc<RwLock<Option<thread::ThreadId>>>,
+    discord: Arc<RwLock<Option<DiscordPresence>>>,
 }
 
 impl Player {
@@ -183,11 +185,22 @@ impl Player {
             })),
             app: Arc::new(RwLock::new(None)),
             bass_thread: Arc::new(RwLock::new(None)),
+            discord: Arc::new(RwLock::new(None)),
         }
     }
 
     pub fn set_app_handle(&self, app: AppHandle) {
         *self.app.write() = Some(app);
+    }
+
+    pub fn set_discord_presence(&self, discord: DiscordPresence) {
+        *self.discord.write() = Some(discord);
+    }
+
+    fn sync_discord_presence(&self) {
+        if let Some(discord) = self.discord.read().clone() {
+            discord.update_from_player(&self.get_state());
+        }
     }
 
     pub fn set_bass_dir(&self, bass_dir: PathBuf) {
@@ -1338,21 +1351,25 @@ impl Player {
     pub fn start_position_emitter(&self, app: AppHandle) {
         let player = self.clone();
         let was_playing = Arc::new(StdMutex::new(false));
-        Self::schedule_position_poll(app, player, was_playing, POLL_INTERVAL_MS);
+        let last_rpc_state = Arc::new(StdMutex::new(None::<PlaybackState>));
+        Self::schedule_position_poll(app, player, was_playing, last_rpc_state, POLL_INTERVAL_MS);
     }
 
     fn schedule_position_poll(
         app: AppHandle,
         player: Player,
         was_playing: Arc<StdMutex<bool>>,
+        last_rpc_state: Arc<StdMutex<Option<PlaybackState>>>,
         poll_ms: u64,
     ) {
         let app_for_sleep = app.clone();
         let player_for_main = player.clone();
         let was_for_main = was_playing.clone();
+        let rpc_for_main = last_rpc_state.clone();
         let app_for_next = app.clone();
-        let player_for_next = player;
+        let player_for_next = player.clone();
         let was_for_next = was_playing;
+        let rpc_for_next = last_rpc_state;
 
         thread::spawn(move || {
             thread::sleep(Duration::from_millis(poll_ms));
@@ -1431,10 +1448,15 @@ impl Player {
                             state: snapshot.state,
                         },
                     );
+                    player_for_main.sync_discord_presence();
+                    if let Ok(mut rpc_state) = rpc_for_main.lock() {
+                        *rpc_state = Some(snapshot.state);
+                    }
                     Self::schedule_position_poll(
                         app_for_next,
                         player_for_next,
                         was_for_next,
+                        rpc_for_next,
                         POLL_INTERVAL_MS,
                     );
                     return;
@@ -1490,10 +1512,15 @@ impl Player {
                                     state: snapshot.state,
                                 },
                             );
+                            player_for_main.sync_discord_presence();
+                            if let Ok(mut rpc_state) = rpc_for_main.lock() {
+                                *rpc_state = Some(snapshot.state);
+                            }
                             Self::schedule_position_poll(
                                 app_for_next,
                                 player_for_next,
                                 was_for_next,
+                                rpc_for_next,
                                 POLL_INTERVAL_MS,
                             );
                             return;
@@ -1502,6 +1529,10 @@ impl Player {
                         player_for_main.release_ended_stream();
                         *was = false;
                         let _ = app_emit.emit("player:track-ended", serde_json::json!({}));
+                        player_for_main.sync_discord_presence();
+                        if let Ok(mut rpc_state) = rpc_for_main.lock() {
+                            *rpc_state = Some(PlaybackState::Stopped);
+                        }
                     }
                     _ => {
                         if snapshot.state != PlaybackState::Paused {
@@ -1510,10 +1541,23 @@ impl Player {
                     }
                 }
 
+                if let Ok(mut rpc_state) = rpc_for_main.lock() {
+                    if *rpc_state != Some(snapshot.state) {
+                        if snapshot.state == PlaybackState::Paused
+                            || snapshot.state == PlaybackState::Stopped
+                            || *rpc_state == Some(PlaybackState::Paused)
+                        {
+                            player_for_main.sync_discord_presence();
+                        }
+                        *rpc_state = Some(snapshot.state);
+                    }
+                }
+
                 Self::schedule_position_poll(
                     app_for_next,
                     player_for_next,
                     was_for_next,
+                    rpc_for_next,
                     next_poll_ms,
                 );
             });

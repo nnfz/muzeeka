@@ -5,8 +5,10 @@
 mod bass;
 mod commands;
 mod cue;
+mod discord_rpc;
 mod drop_handler;
 mod file_drag;
+mod musicbrainz;
 
 mod equalizer;
 mod library;
@@ -16,6 +18,7 @@ mod playlists;
 mod settings;
 mod ytdlp;
 
+use discord_rpc::DiscordPresence;
 use drop_handler::{handle_window_event, DropState, ExportDragState};
 
 use player::Player;
@@ -61,6 +64,8 @@ fn resolve_bass_dir(app: Option<&tauri::AppHandle>) -> PathBuf {
 pub fn run() {
     let player = Player::new();
     let player_for_close = player.clone();
+    let discord_presence = DiscordPresence::new();
+    let discord_for_close = discord_presence.clone();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -68,6 +73,7 @@ pub fn run() {
         .manage(DropState::default())
         .manage(ExportDragState::default())
         .manage(player.clone())
+        .manage(discord_presence.clone())
         .on_window_event(move |window, event| {
             handle_window_event(window, event);
 
@@ -78,6 +84,7 @@ pub fn run() {
                 if window.label() == "main" {
                     // Ensure audio is stopped and BASS device is freed when the main player window closes.
                     // Without this, sound could continue after the app exits.
+                    discord_for_close.shutdown();
                     let _ = player_for_close.shutdown();
                 }
             }
@@ -95,6 +102,7 @@ pub fn run() {
 
             player.set_bass_dir(resolve_bass_dir(Some(app.handle())));
             player.set_app_handle(app.handle().clone());
+            player.set_discord_presence(discord_presence.clone());
             player.mark_bass_thread();
             player.init().map_err(|e| {
                 std::io::Error::new(std::io::ErrorKind::Other, e)
@@ -104,6 +112,7 @@ pub fn run() {
             // so the first seconds of audio are processed by DSP.
             if let Ok(app_settings) = settings::load_settings(&app.handle()) {
                 let _ = player.set_equalizer(app_settings.equalizer);
+                discord_presence.configure(app_settings.discord_rpc_enabled);
             }
 
             player.start_position_emitter(app.handle().clone());

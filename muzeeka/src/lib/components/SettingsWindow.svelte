@@ -131,6 +131,21 @@
               </div>
               <div class="card-badge">Auto-saved</div>
             </div>
+            <div class="card-row">
+              <div>
+                <div class="card-label">Discord Rich Presence</div>
+                <div class="card-value">Show the current track in Discord</div>
+              </div>
+              <label class="discord-toggle">
+                <input
+                  type="checkbox"
+                  checked={settings.discordRpcEnabled}
+                  onchange={(e) =>
+                    settings.setDiscordRpcEnabled((e.target as HTMLInputElement).checked)}
+                />
+                <span>Enabled</span>
+              </label>
+            </div>
           </div>
 
           <div class="settings-info">
@@ -198,7 +213,9 @@
       {:else if activeSection === 'about'}
         <div class="settings-section about-section">
           <div class="about-header">
-            <div class="about-logo">♪</div>
+            <div class="about-logo">
+              <img src="/app-logo.png" alt="" width="52" height="52" />
+            </div>
             <div>
               <div class="about-name">{appName}</div>
               <div class="about-version">Version {appVersion}</div>

@@ -29,6 +29,13 @@ pub struct AppSettings {
     /// Playlist ID to auto-add downloaded tracks. Falls back to "Downloads" playlist.
     #[serde(default)]
     pub download_playlist_id: Option<String>,
+    /// Show the current track in Discord Rich Presence.
+    #[serde(default = "default_discord_rpc_enabled")]
+    pub discord_rpc_enabled: bool,
+}
+
+fn default_discord_rpc_enabled() -> bool {
+    true
 }
 
 fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {

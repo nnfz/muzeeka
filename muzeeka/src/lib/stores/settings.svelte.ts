@@ -19,6 +19,7 @@ export interface AppSettings {
   custom_presets?: EQPreset[];
   download_folder?: string | null;
   download_playlist_id?: string | null;
+  discord_rpc_enabled?: boolean;
 }
 
 export interface EQPreset {
@@ -39,6 +40,7 @@ let customPresets = $state<EQPreset[]>([]);
 let playbackRate = $state(1.0);
 let downloadFolder = $state<string | null>(null);
 let downloadPlaylistId = $state<string | null>(null);
+let discordRpcEnabled = $state(true);
 let defaultDownloadFolder = $state<string | null>(null);
 let isReady = $state(false);
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -66,6 +68,7 @@ function scheduleSave() {
       })),
       download_folder: downloadFolder,
       download_playlist_id: downloadPlaylistId,
+      discord_rpc_enabled: discordRpcEnabled,
     };
     invoke('settings_save', { data: payload }).catch((e) => {
       console.error('Failed to save settings:', e);
@@ -137,6 +140,7 @@ export function createSettingsStore(ensurePlayerReady: () => Promise<void>) {
       } else {
         downloadPlaylistId = null;
       }
+      discordRpcEnabled = data.discord_rpc_enabled !== false;
       try {
         defaultDownloadFolder = await invoke<string>('ytdlp_default_download_dir');
       } catch {
@@ -172,6 +176,9 @@ export function createSettingsStore(ensurePlayerReady: () => Promise<void>) {
     get downloadPlaylistId() {
       return downloadPlaylistId;
     },
+    get discordRpcEnabled() {
+      return discordRpcEnabled;
+    },
     get effectiveDownloadFolder() {
       return downloadFolder ?? defaultDownloadFolder ?? '';
     },
@@ -181,6 +188,10 @@ export function createSettingsStore(ensurePlayerReady: () => Promise<void>) {
     },
     setDownloadPlaylistId(id: string | null) {
       downloadPlaylistId = id?.trim() || null;
+      scheduleSave();
+    },
+    setDiscordRpcEnabled(enabled: boolean) {
+      discordRpcEnabled = enabled;
       scheduleSave();
     },
     async setEqualizerEnabled(enabled: boolean) {
