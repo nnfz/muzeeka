@@ -1,117 +1,21 @@
 <script lang="ts">
-  import { invoke } from '@tauri-apps/api/core';
-
   import { getPlayerStore, trackDisplayArtist } from '$lib/stores/player.svelte';
-  import { exportAudioPathForTrack } from '$lib/trackPaths';
   import MediaSlider from './MediaSlider.svelte';
   import TrackCover from './TrackCover.svelte';
 
   const player = getPlayerStore();
-
-  const DRAG_THRESHOLD = 6;
-
-  let fileDragSession = $state<{
-    x: number;
-    y: number;
-    path: string;
-    iconPath: string | null;
-    started: boolean;
-  } | null>(null);
-  let fileDragCaptureEl = $state<HTMLElement | null>(null);
-
-  let dragError = $state<string | null>(null);
-  let dragErrorTimer: ReturnType<typeof setTimeout> | null = null;
-
-  function showDragError(message: string) {
-    dragError = message;
-    if (dragErrorTimer) clearTimeout(dragErrorTimer);
-    dragErrorTimer = setTimeout(() => {
-      dragError = null;
-      dragErrorTimer = null;
-    }, 3200);
-  }
-
-  async function startNativeFileDrag(path: string, iconPath: string | null) {
-    try {
-      await invoke('start_file_drag', {
-        paths: [path],
-        icon_path: iconPath,
-      });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      console.error('Failed to start file drag:', err);
-      showDragError(message || 'Could not drag file');
-    }
-  }
-
-  function clearFileDragSession(pointerId?: number) {
-    if (fileDragCaptureEl && pointerId != null && fileDragCaptureEl.hasPointerCapture(pointerId)) {
-      fileDragCaptureEl.releasePointerCapture(pointerId);
-    }
-    fileDragCaptureEl = null;
-    fileDragSession = null;
-    window.removeEventListener('pointermove', onPlayerPointerMove);
-    window.removeEventListener('pointerup', onPlayerPointerUp);
-    window.removeEventListener('pointercancel', onPlayerPointerUp);
-  }
-
-  function onPlayerPointerDown(e: PointerEvent) {
-    if (e.button !== 0) return;
-    if (!player.currentFile || !player.currentTrack) return;
-    if ((e.target as HTMLElement).closest('.like-btn-transport')) return;
-
-    const path = exportAudioPathForTrack(player.currentTrack, player.currentFile);
-    if (!path) return;
-
-    fileDragSession = {
-      x: e.clientX,
-      y: e.clientY,
-      path,
-      iconPath: player.currentTrack.cover_path ?? null,
-      started: false,
-    };
-
-    fileDragCaptureEl = e.currentTarget as HTMLElement;
-    fileDragCaptureEl.setPointerCapture(e.pointerId);
-    window.addEventListener('pointermove', onPlayerPointerMove);
-    window.addEventListener('pointerup', onPlayerPointerUp);
-    window.addEventListener('pointercancel', onPlayerPointerUp);
-  }
-
-  function onPlayerPointerMove(e: PointerEvent) {
-    const session = fileDragSession;
-    if (!session || session.started) return;
-
-    const dx = e.clientX - session.x;
-    const dy = e.clientY - session.y;
-    if (Math.hypot(dx, dy) < DRAG_THRESHOLD) return;
-
-    fileDragSession = { ...session, started: true };
-    void startNativeFileDrag(session.path, session.iconPath);
-  }
-
-  function onPlayerPointerUp(e: PointerEvent) {
-    clearFileDragSession(e.pointerId);
-  }
 </script>
 
 <div class="transport-bar glass">
   <div class="transport-content">
     <div class="transport-info">
       {#if player.hasTrack}
-        <!-- svelte-ignore a11y_no_static_element_interactions -->
-        <div
-          class="np-drag-handle"
-          onpointerdown={onPlayerPointerDown}
-          title="Drag file to share"
-        >
-          <TrackCover track={player.currentTrack} />
-          <div class="now-playing-text">
-            <span class="np-title">{player.currentFileName ?? ''}</span>
-            {#if player.currentTrack}
-              <span class="np-artist">{trackDisplayArtist(player.currentTrack)}</span>
-            {/if}
-          </div>
+        <TrackCover track={player.currentTrack} />
+        <div class="now-playing-text">
+          <span class="np-title">{player.currentFileName ?? ''}</span>
+          {#if player.currentTrack}
+            <span class="np-artist">{trackDisplayArtist(player.currentTrack)}</span>
+          {/if}
         </div>
 
         {#if player.hasTrack && player.currentFile}
@@ -224,9 +128,6 @@
     <MediaSlider variant="progress" />
   </div>
 
-  {#if dragError}
-    <div class="transport-drag-error" role="alert">{dragError}</div>
-  {/if}
 </div>
 
 <style>

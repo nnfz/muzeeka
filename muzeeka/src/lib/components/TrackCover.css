@@ -4,6 +4,8 @@
   flex-shrink: 0;
   overflow: hidden;
   background: rgba(255, 255, 255, 0.06);
+  -webkit-user-drag: none;
+  user-select: none;
 }
 
 .track-cover img {
@@ -11,6 +13,8 @@
   height: 100%;
   object-fit: cover;
   display: block;
+  -webkit-user-drag: none;
+  pointer-events: none;
 }
 
 .cover-placeholder {

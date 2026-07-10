@@ -14,7 +14,7 @@
 
 <div class="track-cover">
   {#if src}
-    <img {src} alt="" loading="lazy" decoding="async" />
+    <img {src} alt="" loading="lazy" decoding="async" draggable="false" ondragstart={(e) => e.preventDefault()} />
   {:else}
     <div class="cover-placeholder" aria-hidden="true">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
