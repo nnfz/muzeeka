@@ -46,6 +46,7 @@ interface PlaylistsData {
   current_file: string | null;
   volume: number | null;
   liked_paths?: string[];
+  all_paths?: string[];
   shuffle_enabled?: boolean;
   repeat_mode?: RepeatMode;
 }
@@ -74,6 +75,7 @@ let shufflePosition = $state(0);
 let repeatMode = $state<RepeatMode>('off');
 let playbackRate = $state(1.0);
 let likedPaths = $state<string[]>([]);
+let allPaths = $state<string[]>([]);
 let isInitialized = $state(false);
 let initPromise: Promise<void> | null = null;
 let persistReady = $state(false);
@@ -84,21 +86,7 @@ let lastPlayedFile = '';
 
 // --- Derived ---
 
-let allTracks = $derived.by(() => {
-  const seen = new Set<string>();
-  const result: MusicFile[] = [];
-  for (const playlist of playlists) {
-    for (const track of playlist.tracks) {
-      if (!seen.has(track.path)) {
-        seen.add(track.path);
-        result.push(track);
-      }
-    }
-  }
-  return result;
-});
-
-let likedTracks = $derived.by(() => {
+function buildTrackByPathMap(): Map<string, MusicFile> {
   const trackByPath = new Map<string, MusicFile>();
   for (const playlist of playlists) {
     for (const track of playlist.tracks) {
@@ -107,6 +95,66 @@ let likedTracks = $derived.by(() => {
       }
     }
   }
+  return trackByPath;
+}
+
+function defaultAllPaths(): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const playlist of playlists) {
+    for (const track of playlist.tracks) {
+      if (!seen.has(track.path)) {
+        seen.add(track.path);
+        result.push(track.path);
+      }
+    }
+  }
+  return result;
+}
+
+function reorderPathList(list: string[], paths: string[], insertIndex: number): string[] {
+  const movingSet = new Set(paths);
+  const moving = list.filter((path) => movingSet.has(path));
+  if (moving.length === 0) return list;
+
+  const remaining = list.filter((path) => !movingSet.has(path));
+  const insertAt = Math.max(0, Math.min(insertIndex, remaining.length));
+  return [...remaining.slice(0, insertAt), ...moving, ...remaining.slice(insertAt)];
+}
+
+let allTracks = $derived.by(() => {
+  const trackByPath = buildTrackByPathMap();
+  const defaultOrder = defaultAllPaths();
+
+  if (allPaths.length === 0) {
+    return defaultOrder
+      .map((path) => trackByPath.get(path))
+      .filter((track): track is MusicFile => !!track);
+  }
+
+  const result: MusicFile[] = [];
+  const seen = new Set<string>();
+
+  for (const path of allPaths) {
+    const track = trackByPath.get(path);
+    if (track) {
+      result.push(track);
+      seen.add(path);
+    }
+  }
+
+  for (const path of defaultOrder) {
+    if (!seen.has(path)) {
+      const track = trackByPath.get(path);
+      if (track) result.push(track);
+    }
+  }
+
+  return result;
+});
+
+let likedTracks = $derived.by(() => {
+  const trackByPath = buildTrackByPathMap();
   const result: MusicFile[] = [];
   for (const path of likedPaths) {
     const track = trackByPath.get(path);
@@ -377,6 +425,7 @@ function buildSaveData(): PlaylistsData {
     current_file: currentFile,
     volume,
     liked_paths: likedPaths,
+    all_paths: allPaths,
     shuffle_enabled: shuffleEnabled,
     repeat_mode: repeatMode,
   };
@@ -403,6 +452,9 @@ async function loadPlaylists() {
     }
     if (Array.isArray(data.liked_paths)) {
       likedPaths = data.liked_paths.filter((p: any) => typeof p === 'string' && p);
+    }
+    if (Array.isArray(data.all_paths)) {
+      allPaths = data.all_paths.filter((p: any) => typeof p === 'string' && p);
     }
     if (typeof data.shuffle_enabled === 'boolean') {
       shuffleEnabled = data.shuffle_enabled;
@@ -540,6 +592,143 @@ function renamePlaylist(id: string, name: string) {
     p.id === id ? { ...p, name: trimmed } : p
   );
   scheduleSave();
+}
+
+export function isEditablePlaylist(id: string | null | undefined): boolean {
+  return !!id && id !== VIRTUAL_ALL_ID && id !== VIRTUAL_LIKED_ID;
+}
+
+export function supportsPlaylistReorder(id: string | null | undefined): boolean {
+  return !!id;
+}
+
+function setPlaylistTrackOrder(playlistId: string, tracks: MusicFile[]) {
+  if (!isEditablePlaylist(playlistId)) return;
+
+  playlists = playlists.map((p) =>
+    p.id === playlistId ? { ...p, tracks: [...tracks] } : p
+  );
+
+  if (playlistId === playingPlaylistId) {
+    syncTrackIndex();
+    if (shuffleEnabled) {
+      rebuildShuffleOrder(currentTrackIndex >= 0);
+      syncShufflePosition();
+    }
+  }
+
+  scheduleSave();
+}
+
+function reorderLikedPaths(paths: string[], insertIndex: number) {
+  likedPaths = reorderPathList(likedPaths, paths, insertIndex);
+  scheduleSave();
+}
+
+function reorderAllPaths(paths: string[], insertIndex: number) {
+  const base = allPaths.length > 0 ? allPaths : defaultAllPaths();
+  allPaths = reorderPathList(base, paths, insertIndex);
+  scheduleSave();
+}
+
+function reorderTracksInView(playlistId: string, paths: string[], insertIndex: number) {
+  if (playlistId === VIRTUAL_LIKED_ID) {
+    reorderLikedPaths(paths, insertIndex);
+    return;
+  }
+  if (playlistId === VIRTUAL_ALL_ID) {
+    reorderAllPaths(paths, insertIndex);
+    return;
+  }
+}
+
+function copyTracksToPlaylist(
+  paths: string[],
+  targetPlaylistId: string,
+  sourcePlaylistId: string,
+): number {
+  if (!isEditablePlaylist(targetPlaylistId)) return 0;
+  if (targetPlaylistId === sourcePlaylistId) return 0;
+
+  const trackByPath = buildTrackByPathMap();
+  const tracks = paths
+    .map((path) => trackByPath.get(path))
+    .filter((track): track is MusicFile => !!track);
+  if (tracks.length === 0) return 0;
+
+  return mergeTracksIntoPlaylist(targetPlaylistId, tracks);
+}
+
+function removeTracksFromPlaylist(paths: string[], playlistId: string) {
+  if (!isEditablePlaylist(playlistId)) return;
+
+  const pathSet = new Set(paths);
+  const playlist = playlists.find((p) => p.id === playlistId);
+  if (!playlist?.tracks.some((track) => pathSet.has(track.path))) return;
+
+  playlists = playlists.map((p) =>
+    p.id === playlistId
+      ? { ...p, tracks: p.tracks.filter((track) => !pathSet.has(track.path)) }
+      : p
+  );
+
+  if (currentFile && pathSet.has(currentFile)) {
+    void stop();
+    currentFile = null;
+    currentFileName = null;
+    currentTrackIndex = -1;
+    if (playlistId === playingPlaylistId) {
+      playingPlaylistId = null;
+    }
+    shuffleOrder = [];
+    shufflePosition = 0;
+  } else if (playlistId === playingPlaylistId) {
+    syncTrackIndex();
+    if (shuffleEnabled) {
+      rebuildShuffleOrder(currentTrackIndex >= 0);
+      syncShufflePosition();
+    }
+  }
+
+  scheduleSave();
+}
+
+function moveTracksToPlaylist(
+  paths: string[],
+  targetPlaylistId: string,
+  sourcePlaylistId: string,
+): number {
+  if (!isEditablePlaylist(targetPlaylistId)) return 0;
+  if (targetPlaylistId === sourcePlaylistId) return 0;
+
+  const trackByPath = buildTrackByPathMap();
+  const tracks = paths
+    .map((path) => trackByPath.get(path))
+    .filter((track): track is MusicFile => !!track);
+  if (tracks.length === 0) return 0;
+
+  mergeTracksIntoPlaylist(targetPlaylistId, tracks);
+
+  const pathSet = new Set(paths);
+
+  if (sourcePlaylistId === VIRTUAL_LIKED_ID) {
+    likedPaths = likedPaths.filter((path) => !pathSet.has(path));
+    scheduleSave();
+  } else if (sourcePlaylistId === VIRTUAL_ALL_ID) {
+    playlists = playlists.map((p) =>
+      p.id === targetPlaylistId
+        ? p
+        : { ...p, tracks: p.tracks.filter((track) => !pathSet.has(track.path)) }
+    );
+    if (allPaths.length > 0) {
+      allPaths = allPaths.filter((path) => !pathSet.has(path));
+    }
+    scheduleSave();
+  } else if (isEditablePlaylist(sourcePlaylistId)) {
+    removeTracksFromPlaylist(paths, sourcePlaylistId);
+  }
+
+  return tracks.length;
 }
 
 function mergeTracksIntoPlaylist(playlistId: string, files: MusicFile[]): number {
@@ -1165,6 +1354,10 @@ export function createPlayerStore() {
     deletePlaylist,
     renamePlaylist,
     removeTrack,
+    setPlaylistTrackOrder,
+    reorderTracksInView,
+    copyTracksToPlaylist,
+    moveTracksToPlaylist,
     addFolderToActivePlaylist,
     addDroppedPaths,
     addScannedTracks,

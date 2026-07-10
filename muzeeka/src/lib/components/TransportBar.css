@@ -35,6 +35,40 @@
   max-width: 310px;
 }
 
+.np-drag-handle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+  cursor: grab;
+  border-radius: var(--radius-sm);
+  transition: background var(--transition-fast);
+}
+
+.np-drag-handle:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.np-drag-handle:active {
+  cursor: grabbing;
+}
+
+.transport-drag-error {
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  bottom: calc(100% + 8px);
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  background: rgba(30, 20, 20, 0.95);
+  border: 1px solid rgba(248, 113, 113, 0.35);
+  color: #fca5a5;
+  font-size: 11px;
+  pointer-events: none;
+  z-index: 5;
+}
+
 .transport-info :global(.track-cover) {
   width: 45px;
   height: 45px;

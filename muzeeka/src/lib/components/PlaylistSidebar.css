@@ -154,6 +154,12 @@
   color: var(--text-muted);
 }
 
+.playlist-row.drop-target {
+  background: rgba(124, 92, 255, 0.14);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent);
+  border-radius: var(--radius-sm);
+}
+
 .rename-input {
   width: 100%;
   height: 22px;

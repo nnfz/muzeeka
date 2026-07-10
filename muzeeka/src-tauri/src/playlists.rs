@@ -42,6 +42,8 @@ pub struct PlaylistsData {
     #[serde(default)]
     pub liked_paths: Vec<String>,
     #[serde(default)]
+    pub all_paths: Vec<String>,
+    #[serde(default)]
     pub shuffle_enabled: bool,
     /// `off`, `all`, or `one`
     #[serde(default)]

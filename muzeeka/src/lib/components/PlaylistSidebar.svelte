@@ -3,6 +3,7 @@
   import TrackCover from './TrackCover.svelte';
   import { openContextMenuFromEvent, type ContextMenuItem } from '$lib/contextMenu';
   import { getPlayerStore, type Playlist, VIRTUAL_ALL_ID, VIRTUAL_LIKED_ID } from '$lib/stores/player.svelte';
+  import { trackDrag } from '$lib/stores/trackDrag.svelte';
 
   const player = getPlayerStore();
 
@@ -268,6 +269,7 @@
           class:active={isActive}
           class:playing={isPlayingFrom}
           class:has-current={hasCurrentStopped}
+          class:drop-target={trackDrag.isDraggingTracks && trackDrag.copyTargetPlaylistId === playlist.id}
           data-playlist-id={playlist.id}
           data-playlist-name={playlist.name}
           onmouseenter={() => (hoveredPlaylistId = playlist.id)}

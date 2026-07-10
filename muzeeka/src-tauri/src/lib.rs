@@ -6,6 +6,7 @@ mod bass;
 mod commands;
 mod cue;
 mod drop_handler;
+mod file_drag;
 mod equalizer;
 mod library;
 mod metadata;
@@ -135,6 +136,7 @@ pub fn run() {
             commands::ytdlp_download,
             commands::ytdlp_cancel,
             commands::ytdlp_default_download_dir,
+            file_drag::start_file_drag,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

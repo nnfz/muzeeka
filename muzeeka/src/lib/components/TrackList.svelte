@@ -2,12 +2,19 @@
   import ContextMenu from './ContextMenu.svelte';
   import {
     getPlayerStore,
+    isEditablePlaylist,
+    supportsPlaylistReorder,
     trackDisplayArtist,
     trackDisplayTitle,
     VIRTUAL_ALL_ID,
     VIRTUAL_LIKED_ID,
     type MusicFile,
   } from '$lib/stores/player.svelte';
+  import {
+    resetTrackDrag,
+    setTrackDragActive,
+    setTrackDragCopyTarget,
+  } from '$lib/stores/trackDrag.svelte';
   import { openContextMenuFromEvent, type ContextMenuItem } from '$lib/contextMenu';
   import { open } from '@tauri-apps/plugin-dialog';
   import TrackCover from './TrackCover.svelte';
@@ -45,6 +52,8 @@
   const STORAGE_SORT_KEY = 'muzeeka:track-table:sort';
 
   const player = getPlayerStore();
+
+  const DRAG_THRESHOLD = 4;
 
   let gridEl = $state<HTMLDivElement | null>(null);
   let gridWidth = $state(0);
@@ -134,6 +143,25 @@
   let selectionAnchor = $state<number | null>(null);
 
   let contextMenu = $state<{ item: ListedTrack; x: number; y: number } | null>(null);
+  let dragToast = $state<string | null>(null);
+  let dragToastTimer: ReturnType<typeof setTimeout> | null = null;
+
+  interface TrackDragState {
+    paths: string[];
+    sourcePlaylistId: string;
+    isCopy: boolean;
+    startX: number;
+    startY: number;
+    active: boolean;
+    dropIndex: number | null;
+    dropPlaylistId: string | null;
+  }
+
+  let trackDrag = $state<TrackDragState | null>(null);
+  let dragCaptureEl = $state<HTMLElement | null>(null);
+  let suppressTrackClick = false;
+
+  let canReorder = $derived(supportsPlaylistReorder(player.activePlaylistId));
 
   let trackMenuItems = $derived.by((): ContextMenuItem[] => {
     const target = contextMenu?.item;
@@ -386,7 +414,174 @@
     contextMenu = { item, ...position };
   }
 
+  function showDragToast(message: string) {
+    dragToast = message;
+    if (dragToastTimer) clearTimeout(dragToastTimer);
+    dragToastTimer = setTimeout(() => {
+      dragToast = null;
+      dragToastTimer = null;
+    }, 2400);
+  }
+
+  function pathsForDrag(item: ListedTrack): string[] {
+    if (selectedPaths.size > 0 && selectedPaths.has(item.track.path)) {
+      return [...selectedPaths];
+    }
+    return [item.track.path];
+  }
+
+  function onTrackPointerDown(e: PointerEvent, item: ListedTrack) {
+    if (!supportsPlaylistReorder(player.activePlaylistId)) return;
+    if (e.button !== 0) return;
+
+    const target = e.target as HTMLElement;
+    if (target.closest('.like-btn') || target.closest('.sort-btn') || target.closest('.col-resizer')) {
+      return;
+    }
+
+    trackDrag = {
+      paths: pathsForDrag(item),
+      sourcePlaylistId: player.activePlaylistId!,
+      isCopy: e.ctrlKey || e.metaKey,
+      startX: e.clientX,
+      startY: e.clientY,
+      active: false,
+      dropIndex: null,
+      dropPlaylistId: null,
+    };
+
+    dragCaptureEl = e.currentTarget as HTMLElement;
+    dragCaptureEl.setPointerCapture(e.pointerId);
+    window.addEventListener('pointermove', onTrackPointerMove);
+    window.addEventListener('pointerup', onTrackPointerUp);
+    window.addEventListener('pointercancel', onTrackPointerUp);
+  }
+
+  function onTrackPointerMove(e: PointerEvent) {
+    if (!trackDrag) return;
+
+    const dx = e.clientX - trackDrag.startX;
+    const dy = e.clientY - trackDrag.startY;
+    if (!trackDrag.active && Math.hypot(dx, dy) < DRAG_THRESHOLD) return;
+
+    if (!trackDrag.active) {
+      setTrackDragActive(true, e.ctrlKey || e.metaKey);
+    }
+
+    trackDrag.active = true;
+    trackDrag.isCopy = e.ctrlKey || e.metaKey;
+    setTrackDragActive(true, trackDrag.isCopy);
+
+    const el = document.elementFromPoint(e.clientX, e.clientY);
+    const playlistId = el?.closest('[data-playlist-id]')?.getAttribute('data-playlist-id') ?? null;
+    const validPlaylistTarget =
+      playlistId &&
+      playlistId !== trackDrag.sourcePlaylistId &&
+      isEditablePlaylist(playlistId);
+
+    if (validPlaylistTarget) {
+      trackDrag.dropPlaylistId = playlistId;
+      trackDrag.dropIndex = null;
+      setTrackDragCopyTarget(playlistId);
+    } else if (canReorder) {
+      const row = el?.closest('[data-track-index]');
+      if (row) {
+        const idx = Number(row.getAttribute('data-track-index'));
+        const rect = row.getBoundingClientRect();
+        const before = e.clientY < rect.top + rect.height / 2;
+        trackDrag.dropIndex = before ? idx : idx + 1;
+      } else {
+        trackDrag.dropIndex = displayedTracks.length;
+      }
+      trackDrag.dropPlaylistId = null;
+      setTrackDragCopyTarget(null);
+    } else {
+      trackDrag.dropPlaylistId = null;
+      trackDrag.dropIndex = null;
+      setTrackDragCopyTarget(null);
+    }
+
+    trackDrag = { ...trackDrag };
+  }
+
+  function applyDisplayedReorder(paths: string[], insertIndex: number, playlistId: string) {
+    const items = [...displayedTracks];
+    const movingSet = new Set(paths);
+    const moving = items.filter((item) => movingSet.has(item.track.path));
+    if (moving.length === 0) return;
+
+    const remaining = items.filter((item) => !movingSet.has(item.track.path));
+    const insertAt = Math.max(0, Math.min(insertIndex, remaining.length));
+    const newOrder = [
+      ...remaining.slice(0, insertAt),
+      ...moving,
+      ...remaining.slice(insertAt),
+    ];
+
+    if (playlistId === VIRTUAL_LIKED_ID || playlistId === VIRTUAL_ALL_ID) {
+      player.reorderTracksInView(playlistId, paths, insertAt);
+    } else {
+      player.setPlaylistTrackOrder(playlistId, newOrder.map((item) => item.track));
+    }
+
+    if (sortColumn !== null) {
+      sortColumn = null;
+      sortDirection = 'asc';
+      persistSort();
+    }
+  }
+
+  function onTrackPointerUp(e: PointerEvent) {
+    window.removeEventListener('pointermove', onTrackPointerMove);
+    window.removeEventListener('pointerup', onTrackPointerUp);
+    window.removeEventListener('pointercancel', onTrackPointerUp);
+    resetTrackDrag();
+
+    if (dragCaptureEl?.hasPointerCapture(e.pointerId)) {
+      dragCaptureEl.releasePointerCapture(e.pointerId);
+    }
+    dragCaptureEl = null;
+
+    const wasActive = trackDrag?.active ?? false;
+
+    if (!wasActive) {
+      trackDrag = null;
+      return;
+    }
+
+    suppressTrackClick = true;
+    const { paths, sourcePlaylistId, isCopy, dropIndex, dropPlaylistId } = trackDrag!;
+
+    if (
+      dropPlaylistId &&
+      isEditablePlaylist(dropPlaylistId) &&
+      dropPlaylistId !== sourcePlaylistId
+    ) {
+      const target = player.playlists.find((p) => p.id === dropPlaylistId)?.name ?? 'playlist';
+      if (isCopy) {
+        const added = player.copyTracksToPlaylist(paths, dropPlaylistId, sourcePlaylistId);
+        if (added > 0) {
+          showDragToast(`Copied ${added} track${added !== 1 ? 's' : ''} to ${target}`);
+        }
+      } else {
+        const moved = player.moveTracksToPlaylist(paths, dropPlaylistId, sourcePlaylistId);
+        if (moved > 0) {
+          showDragToast(`Moved ${moved} track${moved !== 1 ? 's' : ''} to ${target}`);
+        }
+      }
+    } else if (!isCopy && canReorder && dropIndex !== null) {
+      applyDisplayedReorder(paths, dropIndex, sourcePlaylistId);
+    }
+
+    trackDrag = null;
+  }
+
   function handleTrackClick(item: ListedTrack, index: number, e: MouseEvent) {
+    if (suppressTrackClick) {
+      suppressTrackClick = false;
+      return;
+    }
+
     closeContextMenu();
 
     const ctrl = e.ctrlKey || e.metaKey;
@@ -520,19 +715,25 @@
           {/each}
         </div>
 
-        <div class="track-rows">
+        <div class="track-rows" class:track-drag-active={trackDrag?.active}>
         {#each displayedTracks as item, i (item.track.path)}
           {@const track = item.track}
           {@const isActive = track.path === player.currentFile}
           {@const isSelected = selectedPaths.has(track.path)}
+          {@const isDraggingRow = trackDrag?.active && trackDrag.paths.includes(track.path)}
           <button
             class="track-row"
             class:active={isActive}
             class:playing={isActive && player.isPlaying}
             class:paused={isActive && player.isPaused && !player.isPlaying}
             class:selected={isSelected}
+            class:dragging={isDraggingRow}
+            class:drop-before={trackDrag?.active && !trackDrag.isCopy && trackDrag.dropIndex === i}
+            class:drop-after={trackDrag?.active && !trackDrag.isCopy && trackDrag.dropIndex === i + 1}
+            data-track-index={i}
             style="grid-template-columns: {gridTemplate}"
             onclick={(e) => handleTrackClick(item, i, e)}
+            onpointerdown={(e) => onTrackPointerDown(e, item)}
             oncontextmenu={(e) => openTrackContextMenu(e, item, i)}
             title={`${trackDisplayTitle(track)} — ${trackDisplayArtist(track)}`}
           >
@@ -604,6 +805,10 @@
   items={trackMenuItems}
   onclose={closeContextMenu}
 />
+
+{#if dragToast}
+  <div class="track-drag-toast" role="status">{dragToast}</div>
+{/if}
 
 <style>
   @import './TrackList.css';
