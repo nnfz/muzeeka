@@ -35,6 +35,25 @@
   max-width: 310px;
 }
 
+.np-drag-handle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+  cursor: grab;
+  border-radius: var(--radius-sm);
+  transition: background var(--transition-fast);
+}
+
+.np-drag-handle:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.np-drag-handle:active {
+  cursor: grabbing;
+}
+
 .transport-info :global(.track-cover) {
   width: 45px;
   height: 45px;

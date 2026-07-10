@@ -1,21 +1,90 @@
 <script lang="ts">
   import { getPlayerStore, trackDisplayArtist } from '$lib/stores/player.svelte';
+  import { exportAudioPathForTrack } from '$lib/trackPaths';
+  import { startFileDrag } from '$lib/fileDrag';
   import MediaSlider from './MediaSlider.svelte';
   import TrackCover from './TrackCover.svelte';
 
   const player = getPlayerStore();
+
+  const DRAG_THRESHOLD = 6;
+
+  let fileDragSession = $state<{
+    x: number;
+    y: number;
+    path: string;
+    iconPath: string | null;
+    started: boolean;
+  } | null>(null);
+
+  function clearFileDragSession() {
+    fileDragSession = null;
+    window.removeEventListener('pointermove', onPlayerPointerMove);
+    window.removeEventListener('pointerup', onPlayerPointerUp);
+    window.removeEventListener('pointercancel', onPlayerPointerUp);
+  }
+
+  function onPlayerPointerDown(e: PointerEvent) {
+    if (e.button !== 0) return;
+    if (!player.currentFile || !player.currentTrack) return;
+    if ((e.target as HTMLElement).closest('.like-btn-transport')) return;
+
+    const path = exportAudioPathForTrack(player.currentTrack, player.currentFile);
+    if (!path) return;
+
+    fileDragSession = {
+      x: e.clientX,
+      y: e.clientY,
+      path,
+      iconPath: player.currentTrack.cover_path ?? null,
+      started: false,
+    };
+
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    window.addEventListener('pointermove', onPlayerPointerMove);
+    window.addEventListener('pointerup', onPlayerPointerUp);
+    window.addEventListener('pointercancel', onPlayerPointerUp);
+  }
+
+  function onPlayerPointerMove(e: PointerEvent) {
+    const session = fileDragSession;
+    if (!session || session.started) return;
+
+    const dx = e.clientX - session.x;
+    const dy = e.clientY - session.y;
+    if (Math.hypot(dx, dy) < DRAG_THRESHOLD) return;
+
+    fileDragSession = { ...session, started: true };
+    void startFileDrag([session.path], session.iconPath).catch((err) => {
+      console.error('Failed to start file drag:', err);
+    });
+  }
+
+  function onPlayerPointerUp(e: PointerEvent) {
+    if (e.currentTarget instanceof HTMLElement && e.currentTarget.hasPointerCapture(e.pointerId)) {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    }
+    clearFileDragSession();
+  }
 </script>
 
 <div class="transport-bar glass">
   <div class="transport-content">
     <div class="transport-info">
       {#if player.hasTrack}
-        <TrackCover track={player.currentTrack} />
-        <div class="now-playing-text">
-          <span class="np-title">{player.currentFileName ?? ''}</span>
-          {#if player.currentTrack}
-            <span class="np-artist">{trackDisplayArtist(player.currentTrack)}</span>
-          {/if}
+        <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <div
+          class="np-drag-handle"
+          onpointerdown={onPlayerPointerDown}
+          title="Drag file to share"
+        >
+          <TrackCover track={player.currentTrack} />
+          <div class="now-playing-text">
+            <span class="np-title">{player.currentFileName ?? ''}</span>
+            {#if player.currentTrack}
+              <span class="np-artist">{trackDisplayArtist(player.currentTrack)}</span>
+            {/if}
+          </div>
         </div>
 
         {#if player.hasTrack && player.currentFile}
