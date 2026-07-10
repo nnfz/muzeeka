@@ -429,6 +429,7 @@ fn metadata_for_path(track_path: &str) -> TrackMetadata {
         track_number: None,
         genre: None,
         cover_path: None,
+        cover_path_full: None,
         audio_path: None,
         cue_start_secs: None,
         cue_end_secs: None,
@@ -449,6 +450,7 @@ fn metadata_for_path(track_path: &str) -> TrackMetadata {
             track_number: track.track_number,
             genre: track.genre,
             cover_path,
+            cover_path_full: track.cover_path_full.clone(),
         };
     }
 

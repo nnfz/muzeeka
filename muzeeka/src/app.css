@@ -112,6 +112,39 @@ body.track-table-resizing {
   background: rgba(139, 92, 246, 0.45);
 }
 
+/* Fullscreen: layer header + transport controls above overlay without moving layout */
+html.fullscreen-active .app-header {
+  position: relative;
+  z-index: 310;
+  pointer-events: none;
+}
+
+html.fullscreen-active .app-header .header-btn,
+html.fullscreen-active .app-header .window-controls,
+html.fullscreen-active .app-header .app-header-spacer,
+html.fullscreen-active .app-header .search-area {
+  pointer-events: auto;
+}
+
+html.fullscreen-active .transport-bar {
+  z-index: 310;
+  background: transparent !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  pointer-events: none;
+}
+
+html.fullscreen-active .transport-bar .transport-info,
+html.fullscreen-active .transport-bar .transport-progress,
+html.fullscreen-active .transport-bar .transport-right {
+  visibility: hidden;
+  pointer-events: none;
+}
+
+html.fullscreen-active .transport-bar .transport-controls {
+  pointer-events: auto;
+}
+
 /* --- Glassmorphism utility --- */
 .glass {
   background: var(--bg-glass);

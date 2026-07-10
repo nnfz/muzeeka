@@ -2,6 +2,7 @@
   import { getPlayerStore, trackDisplayArtist } from '$lib/stores/player.svelte';
   import { exportAudioPathForTrack } from '$lib/trackPaths';
   import { startFileDrag } from '$lib/fileDrag';
+  import FullscreenPlayer from './FullscreenPlayer.svelte';
   import MediaSlider from './MediaSlider.svelte';
   import TrackCover from './TrackCover.svelte';
 
@@ -9,12 +10,15 @@
 
   const DRAG_THRESHOLD = 6;
 
+  let fullscreenOpen = $state(false);
+
   let fileDragSession = $state<{
     x: number;
     y: number;
     path: string;
     iconPath: string | null;
     started: boolean;
+    openFullscreenOnClick?: boolean;
   } | null>(null);
   let fileDragCaptureEl = $state<HTMLElement | null>(null);
   let fileDragPointerId = $state<number | null>(null);
@@ -51,7 +55,10 @@
     }
   }
 
-  function onPlayerPointerDown(e: PointerEvent) {
+  function beginFileDragSession(
+    e: PointerEvent,
+    options?: { openFullscreenOnClick?: boolean }
+  ) {
     if (e.button !== 0) return;
     if (!player.currentFile || !player.currentTrack) return;
     if ((e.target as HTMLElement).closest('.like-btn-transport')) return;
@@ -67,6 +74,7 @@
       path,
       iconPath: player.currentTrack.cover_path ?? null,
       started: false,
+      openFullscreenOnClick: options?.openFullscreenOnClick,
     };
     fileDragCaptureEl = e.currentTarget as HTMLElement;
     fileDragPointerId = e.pointerId;
@@ -77,6 +85,14 @@
     window.addEventListener('pointercancel', onPlayerPointerUp);
     window.addEventListener('blur', onPlayerPointerCancel);
     document.addEventListener('visibilitychange', onPlayerFileDragVisibility);
+  }
+
+  function onCoverPointerDown(e: PointerEvent) {
+    beginFileDragSession(e, { openFullscreenOnClick: true });
+  }
+
+  function onTextPointerDown(e: PointerEvent) {
+    beginFileDragSession(e);
   }
 
   function onPlayerPointerMove(e: PointerEvent) {
@@ -95,22 +111,41 @@
   }
 
   function onPlayerPointerUp() {
+    const session = fileDragSession;
+    const shouldOpenFullscreen = !!session?.openFullscreenOnClick && !session.started;
     cleanupFileDragSession();
+    if (shouldOpenFullscreen) {
+      fullscreenOpen = true;
+    }
   }
+
+  $effect(() => {
+    document.documentElement.classList.toggle('fullscreen-active', fullscreenOpen);
+    return () => {
+      document.documentElement.classList.remove('fullscreen-active');
+    };
+  });
 </script>
 
 <div class="transport-bar glass">
   <div class="transport-content">
     <div class="transport-info">
       {#if player.hasTrack}
-        <!-- svelte-ignore a11y_no_static_element_interactions -->
-        <div
-          class="np-drag-handle"
-          onpointerdown={onPlayerPointerDown}
-          title="Drag file to share"
-        >
-          <TrackCover track={player.currentTrack} />
-          <div class="now-playing-text">
+        <div class="np-drag-handle">
+          <!-- svelte-ignore a11y_no_static_element_interactions -->
+          <div
+            class="np-cover-hit"
+            onpointerdown={onCoverPointerDown}
+            title="Open fullscreen · drag to share"
+          >
+            <TrackCover track={player.currentTrack} />
+          </div>
+          <!-- svelte-ignore a11y_no_static_element_interactions -->
+          <div
+            class="now-playing-text"
+            onpointerdown={onTextPointerDown}
+            title="Drag file to share"
+          >
             <span class="np-title">{player.currentFileName ?? ''}</span>
             {#if player.currentTrack}
               <span class="np-artist">{trackDisplayArtist(player.currentTrack)}</span>
@@ -229,6 +264,8 @@
   </div>
 
 </div>
+
+<FullscreenPlayer bind:open={fullscreenOpen} />
 
 <style>
   @import './TransportBar.css';

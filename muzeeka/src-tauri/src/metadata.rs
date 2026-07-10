@@ -31,6 +31,13 @@ pub struct TrackMetadata {
     pub track_number: Option<u32>,
     pub genre: Option<String>,
     pub cover_path: Option<String>,
+    pub cover_path_full: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CoverPaths {
+    thumb: Option<String>,
+    full: Option<String>,
 }
 
 /// Initialize the on-disk cover art cache under the app data directory.
@@ -160,6 +167,35 @@ fn thumb_cache_path(audio_path: &Path, suffix: &str) -> Option<PathBuf> {
     )
 }
 
+fn full_cache_path(audio_path: &Path, suffix: &str, ext: &str) -> Option<PathBuf> {
+    let cache_dir = COVER_CACHE_DIR.get()?;
+    Some(
+        cache_dir.join(format!(
+            "{}-{}-full.{}",
+            cache_key(audio_path),
+            suffix,
+            ext
+        )),
+    )
+}
+
+fn cache_full_cover_bytes(
+    audio_path: &Path,
+    data: &[u8],
+    mime: &str,
+    suffix: &str,
+) -> Option<String> {
+    let ext = mime_to_ext(mime);
+    let cache_path = full_cache_path(audio_path, suffix, ext)?;
+
+    if cache_path.exists() {
+        return Some(cache_path.to_string_lossy().to_string());
+    }
+
+    fs::write(&cache_path, data).ok()?;
+    Some(cache_path.to_string_lossy().to_string())
+}
+
 fn write_thumbnail_from_bytes(data: &[u8], dest: &Path) -> bool {
     let image = match image::load_from_memory(data) {
         Ok(image) => image,
@@ -187,70 +223,107 @@ fn write_thumbnail_from_image(image: &image::DynamicImage, dest: &Path) -> bool 
     thumb.save_with_format(dest, ImageFormat::Jpeg).is_ok()
 }
 
-fn cache_cover_bytes(audio_path: &Path, data: &[u8], mime: &str, suffix: &str) -> Option<String> {
-    let cache_path = thumb_cache_path(audio_path, suffix)?;
+fn cache_cover_bytes(audio_path: &Path, data: &[u8], mime: &str, suffix: &str) -> CoverPaths {
+    let mut paths = CoverPaths::default();
+    let cache_path = thumb_cache_path(audio_path, suffix);
 
-    if !cache_path.exists() {
-        if !write_thumbnail_from_bytes(data, &cache_path) {
-            let fallback = COVER_CACHE_DIR.get()?.join(format!(
-                "{}-{}.{}",
-                cache_key(audio_path),
-                suffix,
-                mime_to_ext(mime)
-            ));
-            fs::write(&fallback, data).ok()?;
-            return Some(fallback.to_string_lossy().to_string());
+    if let Some(cache_path) = cache_path {
+        if !cache_path.exists() {
+            if !write_thumbnail_from_bytes(data, &cache_path) {
+                let fallback = COVER_CACHE_DIR.get().map(|dir| {
+                    dir.join(format!(
+                        "{}-{}.{}",
+                        cache_key(audio_path),
+                        suffix,
+                        mime_to_ext(mime)
+                    ))
+                });
+                if let Some(fallback) = fallback {
+                    if fs::write(&fallback, data).is_ok() {
+                        paths.thumb = Some(fallback.to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+
+        if paths.thumb.is_none() && cache_path.exists() {
+            paths.thumb = Some(cache_path.to_string_lossy().to_string());
         }
     }
 
-    Some(cache_path.to_string_lossy().to_string())
+    paths.full = cache_full_cover_bytes(audio_path, data, mime, suffix);
+    paths
 }
 
-fn cache_cover_file(audio_path: &Path, source: &Path) -> Option<String> {
-    let cache_path = thumb_cache_path(audio_path, "nearby")?;
+fn cache_cover_file(audio_path: &Path, source: &Path) -> CoverPaths {
+    let mut paths = CoverPaths::default();
+    let cache_path = thumb_cache_path(audio_path, "nearby");
 
-    let source_modified = fs::metadata(source).and_then(|m| m.modified()).ok();
-    let cache_modified = fs::metadata(&cache_path).and_then(|m| m.modified()).ok();
-    let needs_refresh = !cache_path.exists()
-        || match (source_modified, cache_modified) {
-            (Some(src), Some(cache)) => src > cache,
-            _ => true,
-        };
+    if let Some(cache_path) = cache_path {
+        let source_modified = fs::metadata(source).and_then(|m| m.modified()).ok();
+        let cache_modified = fs::metadata(&cache_path).and_then(|m| m.modified()).ok();
+        let needs_refresh = !cache_path.exists()
+            || match (source_modified, cache_modified) {
+                (Some(src), Some(cache)) => src > cache,
+                _ => true,
+            };
 
-    if needs_refresh {
-        if !write_thumbnail_from_file(source, &cache_path) {
-            fs::copy(source, &cache_path).ok()?;
+        if needs_refresh {
+            if !write_thumbnail_from_file(source, &cache_path) {
+                fs::copy(source, &cache_path).ok();
+            }
+        }
+
+        if cache_path.exists() {
+            paths.thumb = Some(cache_path.to_string_lossy().to_string());
         }
     }
 
-    Some(cache_path.to_string_lossy().to_string())
+    paths.full = Some(source.to_string_lossy().to_string());
+    paths
 }
 
-fn extract_embedded_cover(tagged_file: &TaggedFile, path: &Path) -> Option<String> {
+fn extract_embedded_cover(tagged_file: &TaggedFile, path: &Path) -> CoverPaths {
     for tag in tagged_file.tags() {
         if let Some((data, mime)) = pick_cover_picture(tag) {
-            if let Some(cover_path) = cache_cover_bytes(path, data, &mime, "embedded") {
-                return Some(cover_path);
+            let paths = cache_cover_bytes(path, data, &mime, "embedded");
+            if paths.thumb.is_some() || paths.full.is_some() {
+                return paths;
             }
         }
     }
 
-    None
+    CoverPaths::default()
 }
 
-fn extract_nearby_cover(path: &Path) -> Option<String> {
-    let source = find_nearby_cover(path)?;
+fn extract_nearby_cover(path: &Path) -> CoverPaths {
+    let source = match find_nearby_cover(path) {
+        Some(source) => source,
+        None => return CoverPaths::default(),
+    };
     cache_cover_file(path, &source)
 }
 
-fn resolve_cover(path: &Path, tagged_file: Option<&TaggedFile>) -> Option<String> {
+fn resolve_cover_paths(path: &Path, tagged_file: Option<&TaggedFile>) -> CoverPaths {
     if let Some(tagged_file) = tagged_file {
-        if let Some(cover_path) = extract_embedded_cover(tagged_file, path) {
-            return Some(cover_path);
+        let embedded = extract_embedded_cover(tagged_file, path);
+        if embedded.thumb.is_some() || embedded.full.is_some() {
+            return embedded;
         }
     }
 
     extract_nearby_cover(path)
+}
+
+/// Resolve a full-resolution cover path for an audio file (creates cache if needed).
+pub fn resolve_full_cover(path: &Path) -> Option<String> {
+    let tagged_file = read_from_path(path).ok();
+    let paths = match tagged_file.as_ref() {
+        Some(tagged_file) => resolve_cover_paths(path, Some(tagged_file)),
+        None => resolve_cover_paths(path, None),
+    };
+
+    paths.full.or(paths.thumb)
 }
 
 /// Read tags and audio properties from a file. Falls back to the filename when tags are missing.
@@ -282,11 +355,15 @@ pub fn read_metadata(path: &Path, file_name: &str) -> TrackMetadata {
                 meta.track_number = tag.track();
             }
 
-            meta.cover_path = resolve_cover(path, Some(tagged_file));
+            let covers = resolve_cover_paths(path, Some(tagged_file));
+            meta.cover_path = covers.thumb;
+            meta.cover_path_full = covers.full;
         }
         Err(_) => {
             meta.title = Some(strip_ytdlp_id_suffix(&filename_stem(path, file_name)));
-            meta.cover_path = resolve_cover(path, None);
+            let covers = resolve_cover_paths(path, None);
+            meta.cover_path = covers.thumb;
+            meta.cover_path_full = covers.full;
         }
     }
 

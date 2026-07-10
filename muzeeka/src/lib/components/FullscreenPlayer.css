@@ -1,0 +1,220 @@
+.fullscreen-player {
+  position: fixed;
+  inset: 0;
+  z-index: 300;
+  display: flex;
+  flex-direction: column;
+  pointer-events: none;
+}
+
+.fullscreen-player > :not(.fullscreen-bottom-chrome) {
+  pointer-events: auto;
+}
+
+@keyframes fullscreen-backdrop-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes fullscreen-center-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, calc(-50% + 32px));
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, calc(-50% + 24px));
+  }
+}
+
+.fullscreen-backdrop {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  background: var(--bg-deep);
+  animation: fullscreen-backdrop-in 160ms ease;
+}
+
+.fullscreen-backdrop-img {
+  position: absolute;
+  inset: -20%;
+  width: 140%;
+  height: 140%;
+  object-fit: cover;
+  filter: blur(48px) saturate(1.35);
+  transform: scale(1.1);
+  opacity: 0.55;
+}
+
+.fullscreen-backdrop-shade {
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(ellipse at center, rgba(10, 10, 15, 0.2) 0%, rgba(10, 10, 15, 0.88) 70%),
+    linear-gradient(180deg, rgba(10, 10, 15, 0.35) 0%, rgba(10, 10, 15, 0.92) 100%);
+}
+
+.fullscreen-close-overlay {
+  position: fixed;
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 312;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 28px;
+  border-radius: var(--radius-full);
+  color: var(--text-secondary);
+  background: rgba(255, 255, 255, 0.06);
+  transition: color var(--transition-fast), background var(--transition-fast);
+}
+
+.fullscreen-close-overlay:hover {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.fullscreen-center {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 24px;
+  width: min(360px, calc(100vw - 48px));
+  padding: 0 24px;
+  transform: translate(-50%, calc(-50% + 24px));
+  pointer-events: none;
+  animation: fullscreen-center-in 180ms ease;
+}
+
+.fullscreen-art-wrap {
+  width: min(300px, 36vh, calc(100vw - 96px));
+  aspect-ratio: 1;
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  box-shadow: var(--shadow-lg), 0 24px 80px rgba(0, 0, 0, 0.55);
+}
+
+.fullscreen-art,
+.fullscreen-art-placeholder {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.fullscreen-art {
+  object-fit: cover;
+  image-rendering: auto;
+}
+
+.fullscreen-art-placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+  background: linear-gradient(135deg, rgba(255, 255, 255, 0.08), rgba(255, 255, 255, 0.03));
+}
+
+.fullscreen-meta {
+  width: 100%;
+  text-align: center;
+}
+
+.fullscreen-title {
+  font-size: 24px;
+  font-weight: 700;
+  line-height: 1.25;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fullscreen-artist {
+  margin-top: 8px;
+  font-size: 16px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fullscreen-album {
+  margin-top: 4px;
+  font-size: 13px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fullscreen-bottom-chrome {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 305;
+  width: 100%;
+  height: 52px;
+  padding-top: 32px;
+  box-sizing: content-box;
+  pointer-events: auto;
+}
+
+.fullscreen-bottom-chrome-inner {
+  transition:
+    opacity 280ms ease,
+    transform 280ms ease,
+    filter 280ms ease;
+  will-change: opacity, transform, filter;
+}
+
+.fullscreen-bottom-chrome-inner.chrome-hidden {
+  opacity: 0;
+  transform: translateY(14px);
+  filter: blur(8px);
+  pointer-events: none;
+}
+
+.fullscreen-progress {
+  width: 100%;
+  padding: 10px 0 12px;
+  box-sizing: border-box;
+}
+
+.fullscreen-progress :global(.media-slider.progress) {
+  width: 100%;
+  gap: 8px;
+}
+
+.fullscreen-progress :global(.slider-time) {
+  font-size: 11px;
+  min-width: 36px;
+  flex-shrink: 0;
+}
+
+.fullscreen-progress :global(.slider-time.current) {
+  padding-left: 12px;
+}
+
+.fullscreen-progress :global(.slider-time.duration) {
+  padding-right: 12px;
+}
+
+.fullscreen-progress :global(.slider-track) {
+  border-radius: 0;
+}
+
+.fullscreen-progress :global(.slider-fill) {
+  border-radius: 0;
+}

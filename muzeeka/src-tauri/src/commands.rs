@@ -201,6 +201,21 @@ pub fn library_fetch_metadata(paths: Vec<String>) -> Result<Vec<library::MusicFi
     library::fetch_metadata(&paths)
 }
 
+/// Resolve a full-resolution cover path for a track (creates cache if needed).
+#[tauri::command]
+pub fn library_resolve_full_cover(path: String) -> Result<Option<String>, String> {
+    use std::path::Path;
+
+    if crate::cue::is_cue_track_path(&path) {
+        if let Some((audio, _)) = crate::cue::parse_virtual_cue_path(&path) {
+            return Ok(crate::metadata::resolve_full_cover(Path::new(&audio)));
+        }
+        return Ok(None);
+    }
+
+    Ok(crate::metadata::resolve_full_cover(Path::new(&path)))
+}
+
 // ── Playlist persistence ──────────────────────────────────────────────────────
 
 /// Load saved playlists from disk.

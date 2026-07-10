@@ -40,8 +40,22 @@
   align-items: center;
   gap: 8px;
   min-width: 0;
-  flex: 1;
   border-radius: var(--radius-sm);
+}
+
+.np-cover-hit {
+  flex-shrink: 0;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: transform var(--transition-fast), opacity var(--transition-fast);
+}
+
+.np-cover-hit:hover {
+  opacity: 0.9;
+}
+
+.np-cover-hit:active {
+  transform: scale(0.96);
 }
 
 .transport-info :global(.track-cover) {
@@ -51,6 +65,8 @@
 
 .now-playing-text {
   min-width: 0;
+  border-radius: var(--radius-sm);
+  cursor: grab;
 }
 
 .np-title {

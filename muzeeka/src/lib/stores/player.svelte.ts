@@ -1,6 +1,7 @@
 import { prefetchCoverPaths } from '$lib/coverCache';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 
 // --- Types ---
 
@@ -27,6 +28,7 @@ export interface MusicFile {
   track_number?: number | null;
   genre?: string | null;
   cover_path?: string | null;
+  cover_path_full?: string | null;
   audio_path?: string | null;
   cue_start_secs?: number | null;
   cue_end_secs?: number | null;
@@ -245,6 +247,45 @@ export function trackDisplayArtist(track: MusicFile): string {
   return track.artist?.trim() || 'Unknown Artist';
 }
 
+export const APP_TITLE = 'Muzeeka';
+
+export function formatWindowTitle(
+  track: MusicFile | null,
+  fallbackFileName?: string | null
+): string {
+  if (!track && !fallbackFileName) return APP_TITLE;
+
+  const title = track ? trackDisplayTitle(track) : (fallbackFileName ?? APP_TITLE);
+  const artist = track ? trackDisplayArtist(track) : 'Unknown Artist';
+
+  return `${title} - ${artist} | ${APP_TITLE}`;
+}
+
+let lastWindowTitle = '';
+
+function syncWindowTitle() {
+  const title = currentFile
+    ? formatWindowTitle(currentTrack, currentFileName)
+    : APP_TITLE;
+
+  if (title === lastWindowTitle) return;
+  lastWindowTitle = title;
+
+  if (typeof document !== 'undefined') {
+    document.title = title;
+  }
+
+  try {
+    const win = getCurrentWindow();
+    if (win.label !== 'main') return;
+    void win.setTitle(title).catch((e) => {
+      console.error('Failed to set window title:', e);
+    });
+  } catch {
+    // not in a Tauri webview
+  }
+}
+
 export function trackSearchText(track: MusicFile): string {
   return [
     trackDisplayTitle(track),
@@ -270,6 +311,10 @@ function mergeMetadataIntoPlaylists(enriched: MusicFile[]) {
     ...playlist,
     tracks: playlist.tracks.map((track) => byPath.get(track.path) ?? track),
   }));
+
+  if (currentFile && byPath.has(currentFile)) {
+    syncWindowTitle();
+  }
 }
 
 async function enrichTrackMetadata() {
@@ -473,6 +518,7 @@ async function loadPlaylists() {
         currentFileName = track ? trackDisplayTitle(track) : data.current_file.split(/[\\/]/).pop()?.replace(/\.[^/.]+$/, '') ?? null;
         playingPlaylistId = findPlaylistForTrack(data.current_file);
         // Note: isPaused stays false — player is freshly started, track is just "remembered"
+        syncWindowTitle();
       }
     }
     syncTrackIndex();
@@ -544,6 +590,7 @@ function deletePlaylist(id: string) {
     playingPlaylistId = null;
     shuffleOrder = [];
     shufflePosition = 0;
+    syncWindowTitle();
   }
 
   if (activePlaylistId === id) {
@@ -574,6 +621,7 @@ function removeTrack(path: string, playlistId?: string | null) {
     }
     shuffleOrder = [];
     shufflePosition = 0;
+    syncWindowTitle();
   } else if (targetId === playingPlaylistId) {
     syncTrackIndex();
     if (shuffleEnabled) {
@@ -682,6 +730,7 @@ function removeTracksFromPlaylist(paths: string[], playlistId: string) {
     }
     shuffleOrder = [];
     shufflePosition = 0;
+    syncWindowTitle();
   } else if (playlistId === playingPlaylistId) {
     syncTrackIndex();
     if (shuffleEnabled) {
@@ -1014,6 +1063,7 @@ async function play(filePath: string) {
     isPaused = false;
     lastGaplessChangeAt = Date.now();
     scheduleSave(); // persist current_file so it survives restart
+    syncWindowTitle();
   } catch (e) {
     seekGuardUntil = 0;
     const message = typeof e === 'string' ? e : String(e);
@@ -1239,6 +1289,7 @@ function setupListeners() {
     scheduleSave();
     lastGaplessChangeAt = Date.now();
     void prepareGaplessNext(path);
+    syncWindowTitle();
   });
 
   listen<{ position: number; duration: number }>('player:position', (event) => {

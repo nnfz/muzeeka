@@ -57,6 +57,9 @@ pub struct MusicFile {
     /// Cached cover art path on disk.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cover_path: Option<String>,
+    /// Full-resolution cover art path (original file or uncropped cache).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cover_path_full: Option<String>,
     /// Underlying audio file for CUE sheet tracks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_path: Option<String>,
@@ -153,6 +156,7 @@ fn apply_metadata(file: &mut MusicFile, meta: metadata::TrackMetadata) {
     file.track_number = meta.track_number;
     file.genre = meta.genre;
     file.cover_path = meta.cover_path;
+    file.cover_path_full = meta.cover_path_full;
 }
 
 fn music_file_from_path(path: &Path, read_tags: bool) -> Option<MusicFile> {
@@ -190,6 +194,7 @@ fn music_file_from_path(path: &Path, read_tags: bool) -> Option<MusicFile> {
         track_number: None,
         genre: None,
         cover_path: None,
+        cover_path_full: None,
         audio_path: None,
         cue_start_secs: None,
         cue_end_secs: None,

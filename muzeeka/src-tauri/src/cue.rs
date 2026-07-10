@@ -74,6 +74,9 @@ fn apply_expanded_cue_track(track: &mut MusicFile, expanded: MusicFile) {
     if track.cover_path.is_none() {
         track.cover_path = expanded.cover_path;
     }
+    if track.cover_path_full.is_none() {
+        track.cover_path_full = expanded.cover_path_full;
+    }
 }
 
 /// Fill missing CUE metadata on a playlist track loaded from disk.
@@ -310,6 +313,7 @@ pub fn expand_cue_file(cue_path: &Path) -> Vec<MusicFile> {
             track_number: Some((index + 1) as u32),
             genre: None,
             cover_path: audio_meta.cover_path,
+            cover_path_full: audio_meta.cover_path_full,
             audio_path: Some(audio_path_str),
             cue_start_secs: Some(start),
             cue_end_secs: end_secs,

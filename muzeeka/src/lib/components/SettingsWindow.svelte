@@ -153,14 +153,6 @@
             Use Alt + scroll to adjust volume.
           </div>
 
-          <div class="quick-actions">
-            <button
-              class="action-btn"
-              onclick={() => settings.resetEqualizer()}
-            >
-              Reset Equalizer to flat
-            </button>
-          </div>
         </div>
       {:else if activeSection === 'audio'}
         <div class="settings-section">
