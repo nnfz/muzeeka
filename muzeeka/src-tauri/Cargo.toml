@@ -36,5 +36,6 @@ drag = "2"
 discord-rich-presence = "1.1"
 ureq = { version = "3", features = ["json"] }
 urlencoding = "2"
+base64 = "0.22"
 
 

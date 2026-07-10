@@ -15,6 +15,7 @@ use parking_lot::Mutex;
 use crate::cue;
 use crate::library::MusicFile;
 use crate::metadata::{self, TrackMetadata};
+use crate::imgbb;
 use crate::musicbrainz;
 use crate::player::{PlaybackState, PlayerStateSnapshot};
 
@@ -175,12 +176,10 @@ impl DiscordPresence {
         let generation = self.lookup_generation.fetch_add(1, Ordering::SeqCst) + 1;
         let inner = self.inner.clone();
         thread::spawn(move || {
-            let cover_url = musicbrainz::lookup_cover_url(&artist, &title, album.as_deref());
-            if cover_url.is_none() {
+            let cover_url = resolve_cover_url(&track_path, &artist, &title, album.as_deref());
+            let Some(cover_url) = cover_url else {
                 return;
-            }
-
-            let cover_url = cover_url.unwrap();
+            };
             let mut guard = inner.lock();
             if !guard.enabled {
                 return;
@@ -356,6 +355,45 @@ fn truncate(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars.saturating_sub(1)).collect::<String>() + "…"
 }
 
+fn resolve_cover_url(
+    track_path: &str,
+    artist: &str,
+    title: &str,
+    album: Option<&str>,
+) -> Option<String> {
+    if let Some(url) = musicbrainz::lookup_cover_url(artist, title, album) {
+        return Some(url);
+    }
+
+    local_cover_path(track_path).and_then(|path| imgbb::upload_image(&path))
+}
+
+fn local_cover_from_audio(track_path: &str, track: &MusicFile) -> Option<String> {
+    if let Some(audio_path) = track.audio_path.as_deref() {
+        let audio = Path::new(audio_path);
+        if audio.is_file() {
+            return metadata::read_metadata(audio, "").cover_path;
+        }
+    }
+
+    let path = Path::new(track_path);
+    if path.is_file() {
+        return metadata::read_metadata(path, &track.file_name).cover_path;
+    }
+
+    None
+}
+
+fn local_cover_path(track_path: &str) -> Option<std::path::PathBuf> {
+    let cover_path = metadata_for_path(track_path).cover_path?;
+    let path = std::path::PathBuf::from(cover_path);
+    if path.is_file() {
+        Some(path)
+    } else {
+        None
+    }
+}
+
 fn filename_title(path: &str) -> String {
     Path::new(path)
         .file_stem()
@@ -398,6 +436,10 @@ fn metadata_for_path(track_path: &str) -> TrackMetadata {
     cue::repair_track(&mut track);
 
     if track.title.is_some() || track.artist.is_some() || track.album.is_some() {
+        let mut cover_path = track.cover_path.clone();
+        if cover_path.is_none() {
+            cover_path = local_cover_from_audio(track_path, &track);
+        }
         return TrackMetadata {
             title: track.title,
             artist: track.artist,
@@ -406,7 +448,7 @@ fn metadata_for_path(track_path: &str) -> TrackMetadata {
             year: track.year,
             track_number: track.track_number,
             genre: track.genre,
-            cover_path: track.cover_path,
+            cover_path,
         };
     }
 

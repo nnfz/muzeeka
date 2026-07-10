@@ -8,6 +8,7 @@ mod cue;
 mod discord_rpc;
 mod drop_handler;
 mod file_drag;
+mod imgbb;
 mod musicbrainz;
 
 mod equalizer;

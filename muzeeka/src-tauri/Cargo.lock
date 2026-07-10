@@ -2238,6 +2238,7 @@ dependencies = [
 name = "muzeeka"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "cue-rw",
  "discord-rich-presence",
  "drag",
