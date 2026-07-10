@@ -216,6 +216,33 @@ pub fn library_resolve_full_cover(path: String) -> Result<Option<String>, String
     Ok(crate::metadata::resolve_full_cover(Path::new(&path)))
 }
 
+/// Return a data URL for a cover image file (works for library paths outside asset scope).
+#[tauri::command]
+pub fn library_cover_data_url(path: String) -> Result<Option<String>, String> {
+    use std::path::Path;
+    crate::metadata::cover_data_url(Path::new(&path))
+}
+
+/// Fetch synchronized lyrics TTML (network + disk cache) on a background thread.
+#[tauri::command]
+pub async fn lyrics_fetch(
+    title: String,
+    artist: String,
+    album: Option<String>,
+    duration_secs: Option<u32>,
+) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::lyrics::fetch_lyrics_ttml(
+            &title,
+            &artist,
+            album.as_deref(),
+            duration_secs,
+        )
+    })
+    .await
+    .map_err(|error| format!("Lyrics fetch task failed: {error}"))?
+}
+
 // ── Playlist persistence ──────────────────────────────────────────────────────
 
 /// Load saved playlists from disk.

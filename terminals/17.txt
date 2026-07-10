@@ -1,0 +1,16 @@
+---
+pid: 26428
+cwd: "Z:\code\muzeeka"
+command: "curl.exe -s -w \"\\nHTTP:%{http_code}\" \"https://lrclib.net/api/get?track_name=Hotline%20Bling&artist_name=Drake\" -H \"User-Agent: Muzeeka/0.1.0\""
+started_at: 2026-07-10T15:13:16.097Z
+running_for_ms: 8535006  
+---
+<html>
+<head><title>504 Gateway Time-out</title></head>
+<body>
+<center><h1>504 Gateway Time-out</h1></center>
+<hr><center>nginx/1.26.3</center>
+</body>
+</html>
+
+HTTP:504

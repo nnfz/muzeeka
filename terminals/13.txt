@@ -1,0 +1,22 @@
+---
+pid: 3452
+cwd: "Z:\code\muzeeka"
+command: "curl.exe -s \"https://raw.githubusercontent.com/better-lyrics/better-lyrics/master/src/modules/lyrics/injectLyrics.ts\" | more +818 | more /E +30"
+started_at: 2026-07-10T14:19:47.966Z
+running_for_ms: 30012    
+---
+Get-Content : Cannot find path 'Z:\code\muzeeka\+818' because it does not exist.
+
+At line:7 char:9
++         Get-Content $file | more.com
++         ~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Z:\code\muzeeka\+818:String) [Get-Content], ItemNotFoundException
+    + FullyQualifiedErrorId : PathNotFound,Microsoft.PowerShell.Commands.GetContentCommand
+ 
+Get-Content : Cannot find path 'Z:\E' because it does not exist.
+At line:7 char:9
++         Get-Content $file | more.com
++         ~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Z:\E:String) [Get-Content], ItemNotFoundException
+    + FullyQualifiedErrorId : PathNotFound,Microsoft.PowerShell.Commands.GetContentCommand
+ 

@@ -13,6 +13,9 @@ mod musicbrainz;
 
 mod equalizer;
 mod library;
+mod lrc;
+mod lrclib;
+mod lyrics;
 mod metadata;
 mod player;
 mod playlists;
@@ -92,7 +95,8 @@ pub fn run() {
         })
         .setup(move |app| {
             if let Ok(app_data) = app.path().app_data_dir() {
-                metadata::init_cover_cache(app_data);
+                metadata::init_cover_cache(app_data.clone());
+                lyrics::init_lyrics_cache(app_data);
             }
 
             if let Some(window) = app.get_webview_window("main") {
@@ -140,6 +144,8 @@ pub fn run() {
             commands::library_scan_paths,
             commands::library_fetch_metadata,
             commands::library_resolve_full_cover,
+            commands::library_cover_data_url,
+            commands::lyrics_fetch,
             commands::playlists_load,
             commands::playlists_save,
             commands::ytdlp_is_url,

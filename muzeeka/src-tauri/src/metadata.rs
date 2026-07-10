@@ -89,6 +89,28 @@ fn cache_key(path: &Path) -> String {
     format!("{:016x}", hasher.finish())
 }
 
+fn mime_from_path(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("webp") => "image/webp",
+        Some("gif") => "image/gif",
+        Some("bmp") => "image/bmp",
+        _ => "image/jpeg",
+    }
+}
+
+fn is_cover_cache_path(path: &str) -> bool {
+    let Some(cache_dir) = COVER_CACHE_DIR.get() else {
+        return false;
+    };
+    Path::new(path).starts_with(cache_dir)
+}
+
 fn mime_to_ext(mime: &str) -> &str {
     match mime {
         "image/png" => "png",
@@ -279,7 +301,15 @@ fn cache_cover_file(audio_path: &Path, source: &Path) -> CoverPaths {
         }
     }
 
-    paths.full = Some(source.to_string_lossy().to_string());
+    if let Ok(data) = fs::read(source) {
+        let mime = mime_from_path(source);
+        paths.full = cache_full_cover_bytes(audio_path, &data, mime, "nearby");
+    }
+
+    if paths.full.is_none() {
+        paths.full = paths.thumb.clone();
+    }
+
     paths
 }
 
@@ -323,7 +353,28 @@ pub fn resolve_full_cover(path: &Path) -> Option<String> {
         None => resolve_cover_paths(path, None),
     };
 
-    paths.full.or(paths.thumb)
+    if let Some(ref full) = paths.full {
+        if is_cover_cache_path(full) {
+            return paths.full;
+        }
+    }
+
+    paths.thumb.or(paths.full)
+}
+
+/// Read a cover image from disk and return a data URL (for paths outside the asset scope).
+pub fn cover_data_url(path: &Path) -> Result<Option<String>, String> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+
+    let data = fs::read(path).map_err(|e| format!("Failed to read cover: {e}"))?;
+    let mime = mime_from_path(path);
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    Ok(Some(format!(
+        "data:{mime};base64,{}",
+        STANDARD.encode(data)
+    )))
 }
 
 /// Read tags and audio properties from a file. Falls back to the filename when tags are missing.

@@ -41,6 +41,7 @@
   const settings = createSettingsStore(ensurePlayerReady);
   setSettingsStore(settings);
   let searchQuery = $state('');
+  let fullscreenOpen = $state(false);
 
   if (!isSecondaryWindow) {
     const precreateSettingsWindow = async () => {
@@ -201,6 +202,20 @@
     <header class="app-header glass">
       <SearchBar bind:searchQuery />
 
+      {#if fullscreenOpen}
+        <button
+          type="button"
+          class="header-btn"
+          onclick={() => { fullscreenOpen = false; }}
+          aria-label="Close fullscreen player"
+          title="Close fullscreen"
+        >
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <polyline points="6 9 12 15 18 9"/>
+          </svg>
+        </button>
+      {/if}
+
       <div class="app-header-spacer" data-tauri-drag-region></div>
 
       <button
@@ -224,7 +239,7 @@
       <TrackList />
     </div>
 
-    <TransportBar />
+    <TransportBar bind:fullscreenOpen />
     <DragDropHandler />
   </div>
 {/if}

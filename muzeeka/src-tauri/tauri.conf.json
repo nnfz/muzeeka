@@ -22,7 +22,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self' ipc: http://ipc.localhost; style-src 'self' 'unsafe-inline'; font-src 'self' asset: http://asset.localhost; img-src 'self' asset: http://asset.localhost data: blob:; media-src 'self' asset: http://asset.localhost data: blob:",
+      "csp": "default-src 'self' ipc: http://ipc.localhost; connect-src 'self' ipc: http://ipc.localhost asset: http://asset.localhost https://lyrics-api.boidu.dev; style-src 'self' 'unsafe-inline'; font-src 'self' asset: http://asset.localhost; img-src 'self' asset: http://asset.localhost data: blob:; media-src 'self' asset: http://asset.localhost data: blob:",
       "assetProtocol": {
         "enable": true,
         "scope": ["$APPDATA/**/*", "$APPLOCALDATA/**/*"]

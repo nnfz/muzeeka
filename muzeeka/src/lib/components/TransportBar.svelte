@@ -6,11 +6,15 @@
   import MediaSlider from './MediaSlider.svelte';
   import TrackCover from './TrackCover.svelte';
 
+  interface Props {
+    fullscreenOpen?: boolean;
+  }
+
+  let { fullscreenOpen = $bindable(false) }: Props = $props();
+
   const player = getPlayerStore();
 
   const DRAG_THRESHOLD = 6;
-
-  let fullscreenOpen = $state(false);
 
   let fileDragSession = $state<{
     x: number;
@@ -265,7 +269,9 @@
 
 </div>
 
-<FullscreenPlayer bind:open={fullscreenOpen} />
+{#if fullscreenOpen}
+  <FullscreenPlayer bind:open={fullscreenOpen} />
+{/if}
 
 <style>
   @import './TransportBar.css';
