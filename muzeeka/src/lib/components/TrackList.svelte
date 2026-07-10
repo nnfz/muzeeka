@@ -4,7 +4,6 @@
     getPlayerStore,
     trackDisplayArtist,
     trackDisplayTitle,
-    trackSearchText,
     VIRTUAL_ALL_ID,
     VIRTUAL_LIKED_ID,
     type MusicFile,
@@ -12,11 +11,6 @@
   import { openContextMenuFromEvent, type ContextMenuItem } from '$lib/contextMenu';
   import { open } from '@tauri-apps/plugin-dialog';
   import TrackCover from './TrackCover.svelte';
-  import { looksLikeMediaUrl } from '$lib/urlUtils';
-
-  interface Props {
-    searchQuery?: string;
-  }
 
   type ColumnId = 'index' | 'title' | 'album' | 'duration';
   type SortDirection = 'asc' | 'desc';
@@ -26,8 +20,6 @@
     playlistId: string;
     playlistName: string;
   }
-
-  let { searchQuery = $bindable('') }: Props = $props();
 
   interface ColumnLayout {
     index: number;
@@ -187,24 +179,7 @@
     return items;
   });
 
-  let isGlobalSearch = $derived(
-    searchQuery.trim().length > 0 && !looksLikeMediaUrl(searchQuery)
-  );
-
   let listedTracks = $derived.by((): ListedTrack[] => {
-    if (isGlobalSearch) {
-      const query = searchQuery.toLowerCase();
-      return player.playlists.flatMap((playlist) =>
-        playlist.tracks
-          .filter((track) => trackSearchText(track).includes(query))
-          .map((track) => ({
-            track,
-            playlistId: playlist.id,
-            playlistName: playlist.name,
-          }))
-      );
-    }
-
     if (!player.activePlaylistId) return [];
 
     return player.tracks.map((track) => ({
@@ -474,18 +449,13 @@
         <p class="empty-title">Select a playlist</p>
         <p class="empty-hint">Choose a playlist or drop music files here</p>
       </div>
-    {:else if !isGlobalSearch && !player.hasTracks}
+    {:else if !player.hasTracks}
       <div class="empty-state" data-tauri-drag-region>
         <p class="empty-title">Playlist is empty</p>
         <p class="empty-hint">Drop files or folders here</p>
         <button class="empty-btn" onclick={addTracksFromFolder}>
           Add Tracks
         </button>
-      </div>
-    {:else if listedTracks.length === 0}
-      <div class="empty-state" data-tauri-drag-region>
-        <p class="empty-title">No matches</p>
-        <p class="empty-hint">Try a different search term</p>
       </div>
     {:else}
       <div
@@ -564,7 +534,7 @@
             style="grid-template-columns: {gridTemplate}"
             onclick={(e) => handleTrackClick(item, i, e)}
             oncontextmenu={(e) => openTrackContextMenu(e, item, i)}
-            title={`${trackDisplayTitle(track)} — ${trackDisplayArtist(track)}${isGlobalSearch ? ` (${item.playlistName})` : ''}`}
+            title={`${trackDisplayTitle(track)} — ${trackDisplayArtist(track)}`}
           >
             {#each visibleColumns as column (column)}
               {#if column === 'index'}
@@ -594,12 +564,7 @@
                   <TrackCover track={track} />
                   <span class="title-group">
                     <span class="track-name">{trackDisplayTitle(track)}</span>
-                    <span class="track-artist">
-                      {trackDisplayArtist(track)}
-                      {#if isGlobalSearch}
-                        <span class="track-playlist"> · {item.playlistName}</span>
-                      {/if}
-                    </span>
+                    <span class="track-artist">{trackDisplayArtist(track)}</span>
                   </span>
                 </span>
               {:else if column === 'album'}

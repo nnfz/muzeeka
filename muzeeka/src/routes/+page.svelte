@@ -221,7 +221,7 @@
 
     <div class="app-body">
       <PlaylistSidebar />
-      <TrackList bind:searchQuery />
+      <TrackList />
     </div>
 
     <TransportBar />

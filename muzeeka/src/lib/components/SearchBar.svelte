@@ -1,6 +1,14 @@
 <script lang="ts">
   import { getDownloadStore } from '$lib/stores/download.svelte';
+  import { getPlayerStore } from '$lib/stores/player.svelte';
   import { looksLikeMediaUrl } from '$lib/urlUtils';
+  import {
+    applySuggestion,
+    getSearchSuggestions,
+    isTrackSearch,
+    type SearchSuggestion,
+  } from '$lib/searchUtils';
+  import SearchResults from './SearchResults.svelte';
 
   interface Props {
     searchQuery?: string;
@@ -9,12 +17,32 @@
   let { searchQuery = $bindable('') }: Props = $props();
 
   const download = getDownloadStore();
+  const player = getPlayerStore();
 
   let successMsg = $state<string | null>(null);
   let probeTimer: ReturnType<typeof setTimeout> | null = null;
   let successTimer: ReturnType<typeof setTimeout> | null = null;
+  let inputEl = $state<HTMLInputElement | null>(null);
+  let isFocused = $state(false);
+  let cursorPos = $state(0);
+  let selectedSuggestion = $state(0);
 
   let isUrlSearch = $derived(looksLikeMediaUrl(searchQuery));
+  let isTextSearch = $derived(isTrackSearch(searchQuery));
+
+  let suggestions = $derived.by(() => {
+    if (!isFocused || isUrlSearch) return [];
+    return getSearchSuggestions(searchQuery, cursorPos, player.playlists);
+  });
+
+  let showSuggestions = $derived(isFocused && !isUrlSearch && suggestions.length > 0);
+
+  let suggestionHeader = $derived.by(() => {
+    if (suggestions.some((s) => s.kind === 'playlist')) {
+      return { title: 'Playlists', meta: 'Partial name match' };
+    }
+    return { title: 'Filters', meta: 'Search modifiers' };
+  });
 
   let downloadLabel = $derived.by(() => {
     if (successMsg) return successMsg;
@@ -43,10 +71,27 @@
     searchQuery = '';
     successMsg = null;
     download.clearProbeState();
+    selectedSuggestion = 0;
     if (successTimer) {
       clearTimeout(successTimer);
       successTimer = null;
     }
+  }
+
+  function updateCursor() {
+    cursorPos = inputEl?.selectionStart ?? searchQuery.length;
+  }
+
+  function acceptSuggestion(suggestion: SearchSuggestion) {
+    searchQuery = applySuggestion(searchQuery, suggestion);
+    selectedSuggestion = 0;
+    queueMicrotask(() => {
+      if (!inputEl) return;
+      const pos = suggestion.replaceFrom + suggestion.insert.length;
+      inputEl.focus();
+      inputEl.setSelectionRange(pos, pos);
+      cursorPos = pos;
+    });
   }
 
   async function handleDownload() {
@@ -62,6 +107,40 @@
       }, 1800);
     }
   }
+
+  function handleInputKeydown(e: KeyboardEvent) {
+    if (!showSuggestions) return;
+
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      selectedSuggestion = (selectedSuggestion + 1) % suggestions.length;
+      return;
+    }
+
+    if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      selectedSuggestion = (selectedSuggestion - 1 + suggestions.length) % suggestions.length;
+      return;
+    }
+
+    if (e.key === 'Enter' || e.key === 'Tab') {
+      const suggestion = suggestions[selectedSuggestion];
+      if (suggestion) {
+        e.preventDefault();
+        acceptSuggestion(suggestion);
+      }
+      return;
+    }
+
+    if (e.key === 'Escape') {
+      selectedSuggestion = 0;
+    }
+  }
+
+  $effect(() => {
+    searchQuery;
+    selectedSuggestion = 0;
+  });
 
   $effect(() => {
     if (!isUrlSearch) {
@@ -85,7 +164,11 @@
   });
 </script>
 
-<div class="search-area" class:url-active={isUrlSearch}>
+<div
+  class="search-area"
+  class:url-active={isUrlSearch}
+  class:search-active={isTextSearch}
+>
   <div class="search-row">
     <svg class="search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
       <circle cx="11" cy="11" r="8"/>
@@ -94,9 +177,16 @@
     <input
       type="text"
       class="search-input"
-      placeholder="Search tracks or paste URL…"
+      placeholder="Search or paste URL"
+      bind:this={inputEl}
       bind:value={searchQuery}
       disabled={download.isDownloading}
+      onfocus={() => { isFocused = true; updateCursor(); }}
+      onblur={() => { isFocused = false; }}
+      onclick={updateCursor}
+      onkeyup={updateCursor}
+      onkeydown={handleInputKeydown}
+      onselect={updateCursor}
     />
     {#if searchQuery}
       <button class="search-clear" onclick={clearSearch} aria-label="Clear search">
@@ -107,6 +197,40 @@
       </button>
     {/if}
   </div>
+
+  {#if showSuggestions}
+    <div class="search-dropdown-panel search-suggestions-panel" role="listbox" aria-label="Search suggestions">
+      <div class="search-dropdown-header">
+        <span class="search-dropdown-title">{suggestionHeader.title}</span>
+        <span class="search-dropdown-meta">{suggestionHeader.meta}</span>
+        <span class="search-dropdown-hint">@artist · @title · @p=playlist</span>
+      </div>
+      <div class="search-dropdown-list">
+        {#each suggestions as suggestion, i (suggestion.label + suggestion.kind + i)}
+          <button
+            type="button"
+            class="search-dropdown-row"
+            class:selected={i === selectedSuggestion}
+            role="option"
+            aria-selected={i === selectedSuggestion}
+            onmousedown={(e) => e.preventDefault()}
+            onclick={() => acceptSuggestion(suggestion)}
+          >
+            <span class="search-dropdown-info">
+              <span class="search-dropdown-primary">{suggestion.label}</span>
+              {#if suggestion.detail}
+                <span class="search-dropdown-secondary">{suggestion.detail}</span>
+              {/if}
+            </span>
+          </button>
+        {/each}
+      </div>
+    </div>
+  {/if}
+
+  {#if isTextSearch}
+    <SearchResults query={searchQuery} />
+  {/if}
 
   {#if isUrlSearch}
     <div class="search-url-panel">
@@ -194,5 +318,6 @@
 </div>
 
 <style>
+  @import './searchDropdown.css';
   @import './SearchBar.css';
 </style>

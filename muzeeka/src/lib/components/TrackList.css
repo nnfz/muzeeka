@@ -315,10 +315,6 @@
   line-height: 1.3;
 }
 
-.track-playlist {
-  color: var(--text-secondary);
-}
-
 /* Album column */
 
 .col-album {

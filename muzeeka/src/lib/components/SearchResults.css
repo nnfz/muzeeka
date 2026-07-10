@@ -1,0 +1,14 @@
+.search-results-dropdown {
+  z-index: 20;
+}
+
+.search-dropdown-row.active {
+  background: rgba(124, 92, 255, 0.12);
+}
+
+.search-dropdown-aside {
+  font-size: 10px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}

@@ -7,7 +7,8 @@
 }
 
 .search-area:focus-within,
-.search-area.url-active {
+.search-area.url-active,
+.search-area.search-active {
   width: 520px;
 }
 
@@ -258,4 +259,8 @@
   cursor: not-allowed;
   transform: none;
   box-shadow: none;
+}
+
+.search-suggestions-panel {
+  z-index: 25;
 }
