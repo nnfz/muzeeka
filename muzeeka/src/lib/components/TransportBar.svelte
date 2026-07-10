@@ -89,7 +89,7 @@
 
     const { path, iconPath } = session;
     cleanupFileDragSession();
-    void startFileDrag([path], iconPath).catch((err) => {
+    void startFileDrag([path], { iconPath }).catch((err) => {
       console.error('Failed to start file drag:', err);
     });
   }

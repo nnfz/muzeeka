@@ -3,7 +3,19 @@
   import { isTauri } from '@tauri-apps/api/core';
   import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
   import { getCurrentWindow } from '@tauri-apps/api/window';
-  import { getPlayerStore, type MusicFile } from '$lib/stores/player.svelte';
+  import {
+    filterIncomingDropPaths,
+    getExportTrackSession,
+    isExportDragActive,
+    shouldSuppressDropOverlay,
+  } from '$lib/fileDrag';
+  import { getPlayerStore, supportsPlaylistReorder, type MusicFile } from '$lib/stores/player.svelte';
+  import {
+    endExportTrackDragUi,
+    setTrackDragCopyTarget,
+    setTrackDragTargets,
+  } from '$lib/stores/trackDrag.svelte';
+  import { applyTrackDrop, hitTestTrackDrop } from '$lib/trackDrop';
 
 
   const player = getPlayerStore();
@@ -48,6 +60,34 @@
     return el?.closest('[data-playlist-name]')?.getAttribute('data-playlist-name') ?? null;
   }
 
+  function updateDropOverlay(active: boolean, paths: string[] = pendingPaths) {
+    if (getExportTrackSession()) {
+      isDragging = false;
+      return;
+    }
+    isDragging = active && !isExportDragActive() && !shouldSuppressDropOverlay(paths);
+  }
+
+  function updateExportTrackDropTarget(x: number, y: number) {
+    const session = getExportTrackSession();
+    if (!session) return;
+
+    const canReorder = supportsPlaylistReorder(session.sourcePlaylistId);
+    const target = hitTestTrackDrop(x, y, session.sourcePlaylistId, canReorder);
+    setTrackDragCopyTarget(target.dropPlaylistId);
+    setTrackDragTargets(target.dropPlaylistId, target.dropIndex);
+  }
+
+  function handleExportTrackDrop(x: number, y: number) {
+    const session = getExportTrackSession();
+    if (!session || !shouldHandleDrop()) return;
+
+    const canReorder = supportsPlaylistReorder(session.sourcePlaylistId);
+    const target = hitTestTrackDrop(x, y, session.sourcePlaylistId, canReorder);
+    applyTrackDrop(player, session, target, showToast);
+    endExportTrackDragUi();
+  }
+
   function shouldHandleDrop(): boolean {
     const now = Date.now();
     if (now - lastHandledDropAt < 400) return false;
@@ -58,9 +98,20 @@
   function finishDrop(
     files: MusicFile[],
     position: [number, number],
-    message?: string | null
+    message?: string | null,
+    sourcePaths?: string[],
   ) {
     if (!shouldHandleDrop()) return;
+
+    if (sourcePaths) {
+      const importPaths = filterIncomingDropPaths(sourcePaths);
+      if (!importPaths) return;
+      if (importPaths.length < sourcePaths.length) {
+        const allowed = new Set(importPaths.map((path) => path.toLowerCase()));
+        files = files.filter((file) => allowed.has(file.path.toLowerCase()));
+        if (files.length === 0) return;
+      }
+    }
 
     if (message && files.length === 0) {
       showToast(message);
@@ -88,15 +139,18 @@
   async function handleNativeDrop(paths: string[], x: number, y: number) {
     if (!shouldHandleDrop()) return;
 
+    const importPaths = filterIncomingDropPaths(paths);
+    if (!importPaths) return;
+
     const playlistId = playlistIdAt(x / scaleFactor, y / scaleFactor);
-    const added = await player.addDroppedPaths(paths, playlistId);
+    const added = await player.addDroppedPaths(importPaths, playlistId);
 
     if (added > 0) {
       const target = playlistNameAt(x / scaleFactor, y / scaleFactor)
         ?? player.activePlaylist?.name
         ?? 'playlist';
       showToast(`Added ${added} track${added !== 1 ? 's' : ''} to ${target}`);
-    } else if (paths.length > 0) {
+    } else if (importPaths.length > 0) {
       showToast('No supported audio files found');
     }
   }
@@ -117,12 +171,13 @@
       });
 
     void webviewWindow.listen<boolean>('muzeeka:drag-active', (event) => {
-      isDragging = event.payload;
+      updateDropOverlay(event.payload);
     }).then((unlisten) => unlisteners.push(unlisten));
 
     void webviewWindow.listen<DroppedTracksPayload>('muzeeka:dropped-tracks', (event) => {
       const { files, position, message } = event.payload;
-      finishDrop(files, position, message);
+      const sourcePaths = files.map((file) => file.path);
+      finishDrop(files, position, message, sourcePaths);
     }).then((unlisten) => unlisteners.push(unlisten));
 
     // Fallback: native Tauri drag-drop API (in case Rust emit path fails)
@@ -130,24 +185,44 @@
       const payload = event.payload;
 
       if (payload.type === 'enter') {
-        isDragging = true;
+        const x = payload.position.x / scaleFactor;
+        const y = payload.position.y / scaleFactor;
         pendingPaths = normalizePaths(payload.paths);
+        if (getExportTrackSession()) {
+          updateExportTrackDropTarget(x, y);
+          updateDropOverlay(false);
+          return;
+        }
+        updateDropOverlay(true, pendingPaths);
         return;
       }
 
       if (payload.type === 'over') {
-        isDragging = true;
+        const x = payload.position.x / scaleFactor;
+        const y = payload.position.y / scaleFactor;
+        if (getExportTrackSession()) {
+          updateExportTrackDropTarget(x, y);
+          updateDropOverlay(false);
+          return;
+        }
+        updateDropOverlay(true, pendingPaths);
         return;
       }
 
       if (payload.type === 'leave') {
-        isDragging = false;
+        if (getExportTrackSession()) {
+          setTrackDragCopyTarget(null);
+          setTrackDragTargets(null, null);
+        }
+        updateDropOverlay(false);
         pendingPaths = [];
         return;
       }
 
       if (payload.type === 'drop') {
-        isDragging = false;
+        updateDropOverlay(false);
+        const x = payload.position.x / scaleFactor;
+        const y = payload.position.y / scaleFactor;
         const dropped = normalizePaths(payload.paths);
         const paths = dropped.length > 0 ? dropped : pendingPaths;
         pendingPaths = [];
@@ -157,7 +232,15 @@
           return;
         }
 
-        void handleNativeDrop(paths, payload.position.x, payload.position.y);
+        if (getExportTrackSession() && !filterIncomingDropPaths(paths)) {
+          handleExportTrackDrop(x, y);
+          return;
+        }
+
+        const importPaths = filterIncomingDropPaths(paths);
+        if (!importPaths) return;
+
+        void handleNativeDrop(importPaths, payload.position.x, payload.position.y);
       }
     }).then((unlisten) => unlisteners.push(unlisten));
 

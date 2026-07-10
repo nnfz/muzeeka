@@ -16,7 +16,7 @@ mod playlists;
 mod settings;
 mod ytdlp;
 
-use drop_handler::{handle_window_event, DropState};
+use drop_handler::{handle_window_event, DropState, ExportDragState};
 
 use player::Player;
 use std::path::{Path, PathBuf};
@@ -66,6 +66,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(DropState::default())
+        .manage(ExportDragState::default())
         .manage(player.clone())
         .on_window_event(move |window, event| {
             handle_window_event(window, event);

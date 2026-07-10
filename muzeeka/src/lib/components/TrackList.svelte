@@ -11,9 +11,11 @@
     type MusicFile,
   } from '$lib/stores/player.svelte';
   import {
+    beginExportTrackDragUi,
     resetTrackDrag,
     setTrackDragActive,
     setTrackDragCopyTarget,
+    trackDrag as trackDragUi,
   } from '$lib/stores/trackDrag.svelte';
   import { openContextMenuFromEvent, type ContextMenuItem } from '$lib/contextMenu';
   import { open } from '@tauri-apps/plugin-dialog';
@@ -465,7 +467,7 @@
     document.addEventListener('visibilitychange', onTrackDragVisibility);
   }
 
-  function cleanupTrackPointerDrag() {
+  function cleanupTrackPointerDrag(resetUi = true) {
     window.removeEventListener('pointermove', onTrackPointerMove);
     window.removeEventListener('pointerup', onTrackPointerUp);
     window.removeEventListener('pointercancel', onTrackPointerUp);
@@ -485,7 +487,7 @@
     dragCaptureEl = null;
     dragPointerId = null;
     trackDrag = null;
-    resetTrackDrag();
+    if (resetUi) resetTrackDrag();
   }
 
   function onTrackPointerCancel() {
@@ -511,22 +513,21 @@
     );
   }
 
-  function shouldStartFileExport(el: Element | null, clientX: number, clientY: number): boolean {
-    if (el?.closest('[data-playlist-id]')) return false;
-    if (el && !el.closest('.track-rows')) return true;
-    if (!el) return true;
-    return isNearViewportEdge(clientX, clientY);
+  function isOutsideViewport(clientX: number, clientY: number): boolean {
+    return (
+      clientX <= 0 ||
+      clientY <= 0 ||
+      clientX >= window.innerWidth ||
+      clientY >= window.innerHeight
+    );
   }
 
-  function beginExternalFileDrag(paths: string[]) {
-    const iconPath = trackByPath(paths[0])?.cover_path ?? null;
-    const audioPaths = audioPathsForDrag(paths, trackByPath);
-    cleanupTrackPointerDrag();
-    if (audioPaths.length > 0) {
-      void startFileDrag(audioPaths, iconPath).catch((err) => {
-        console.error('Failed to start file drag:', err);
-      });
-    }
+  /** Native file drag only when leaving the window (or its outer edge), not when moving inside. */
+  function shouldStartNativeFileDrag(el: Element | null, clientX: number, clientY: number): boolean {
+    if (el?.closest('[data-playlist-id]')) return false;
+    if (isOutsideViewport(clientX, clientY)) return true;
+    if (!isNearViewportEdge(clientX, clientY)) return false;
+    return !el?.closest('.track-row');
   }
 
   function onTrackPointerMove(e: PointerEvent) {
@@ -546,9 +547,23 @@
 
     const el = document.elementFromPoint(e.clientX, e.clientY);
 
-    if (!trackDrag.fileExportStarted && shouldStartFileExport(el, e.clientX, e.clientY)) {
+    if (!trackDrag.fileExportStarted && shouldStartNativeFileDrag(el, e.clientX, e.clientY)) {
       trackDrag.fileExportStarted = true;
-      beginExternalFileDrag(trackDrag.paths);
+      const { paths, sourcePlaylistId, isCopy } = trackDrag;
+      const audioPaths = audioPathsForDrag(paths, trackByPath);
+      if (audioPaths.length > 0) {
+        const iconPath = trackByPath(paths[0])?.cover_path ?? null;
+        beginExportTrackDragUi(paths, isCopy);
+        cleanupTrackPointerDrag(false);
+        void startFileDrag(audioPaths, {
+          iconPath,
+          trackSession: { paths, sourcePlaylistId, isCopy },
+        }).catch((err) => {
+          console.error('Failed to start file drag:', err);
+        });
+      } else {
+        cleanupTrackPointerDrag();
+      }
       return;
     }
     const playlistId = el?.closest('[data-playlist-id]')?.getAttribute('data-playlist-id') ?? null;
@@ -781,12 +796,14 @@
           {/each}
         </div>
 
-        <div class="track-rows" class:track-drag-active={trackDrag?.active}>
+        <div class="track-rows" class:track-drag-active={trackDrag?.active || trackDragUi.isExportSession}>
         {#each displayedTracks as item, i (item.track.path)}
           {@const track = item.track}
           {@const isActive = track.path === player.currentFile}
           {@const isSelected = selectedPaths.has(track.path)}
-          {@const isDraggingRow = trackDrag?.active && trackDrag.paths.includes(track.path)}
+          {@const isDraggingRow =
+            (trackDrag?.active && trackDrag.paths.includes(track.path)) ||
+            (trackDragUi.isExportSession && trackDragUi.draggingPaths.includes(track.path))}
           <button
             class="track-row"
             class:active={isActive}
@@ -794,8 +811,14 @@
             class:paused={isActive && player.isPaused && !player.isPlaying}
             class:selected={isSelected}
             class:dragging={isDraggingRow}
-            class:drop-before={trackDrag?.active && !trackDrag.isCopy && trackDrag.dropIndex === i}
-            class:drop-after={trackDrag?.active && !trackDrag.isCopy && trackDrag.dropIndex === i + 1}
+            class:drop-before={
+              (trackDrag?.active && !trackDrag.isCopy && trackDrag.dropIndex === i) ||
+              (trackDragUi.isExportSession && !trackDragUi.isCopyDrag && trackDragUi.dropIndex === i)
+            }
+            class:drop-after={
+              (trackDrag?.active && !trackDrag.isCopy && trackDrag.dropIndex === i + 1) ||
+              (trackDragUi.isExportSession && !trackDragUi.isCopyDrag && trackDragUi.dropIndex === i + 1)
+            }
             data-track-index={i}
             style="grid-template-columns: {gridTemplate}"
             onclick={(e) => handleTrackClick(item, i, e)}
