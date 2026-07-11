@@ -1,7 +1,0 @@
----
-pid: 36216
-cwd: "Z:\code\muzeeka"
-command: "curl.exe -s \"https://lyrics-api.boidu.dev/getLyrics?s=Hotline%20Bling&a=Drake&d=267\" -o Z:\\code\\muzeeka\\muzeeka\\scripts\\api-response.json"
-started_at: 2026-07-10T14:52:50.452Z
-running_for_ms: 11765012 
----
