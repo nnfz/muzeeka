@@ -1,0 +1,12 @@
+Z:\code\muzeeka\muzeeka\src-tauri\target-check-temp\debug\deps\gif-ceeeabc823fbe4a7.d: C:\Users\botni\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\gif-0.14.2\src\lib.rs C:\Users\botni\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\gif-0.14.2\src\common.rs C:\Users\botni\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\gif-0.14.2\src\encoder.rs C:\Users\botni\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\gif-0.14.2\src\reader\mod.rs C:\Users\botni\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\gif-0.14.2\src\reader\converter.rs C:\Users\botni\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\gif-0.14.2\src\reader\decoder.rs C:\Users\botni\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\gif-0.14.2\src\traits.rs C:\Users\botni\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\gif-0.14.2\src\../README.md
+
+Z:\code\muzeeka\muzeeka\src-tauri\target-check-temp\debug\deps\libgif-ceeeabc823fbe4a7.rmeta: C:\Users\botni\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\gif-0.14.2\src\lib.rs C:\Users\botni\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\gif-0.14.2\src\common.rs C:\Users\botni\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\gif-0.14.2\src\encoder.rs C:\Users\botni\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\gif-0.14.2\src\reader\mod.rs C:\Users\botni\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\gif-0.14.2\src\reader\converter.rs C:\Users\botni\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\gif-0.14.2\src\reader\decoder.rs C:\Users\botni\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\gif-0.14.2\src\traits.rs C:\Users\botni\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\gif-0.14.2\src\../README.md
+
+C:\Users\botni\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\gif-0.14.2\src\lib.rs:
+C:\Users\botni\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\gif-0.14.2\src\common.rs:
+C:\Users\botni\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\gif-0.14.2\src\encoder.rs:
+C:\Users\botni\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\gif-0.14.2\src\reader\mod.rs:
+C:\Users\botni\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\gif-0.14.2\src\reader\converter.rs:
+C:\Users\botni\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\gif-0.14.2\src\reader\decoder.rs:
+C:\Users\botni\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\gif-0.14.2\src\traits.rs:
+C:\Users\botni\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\gif-0.14.2\src\../README.md:
