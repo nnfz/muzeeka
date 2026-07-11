@@ -435,12 +435,14 @@
 
   <!-- Silent loop — required by mobile browsers to show OS media controls. -->
   <audio id="silentKeeper" loop playsinline webkit-playsinline preload="auto" style="display:none"
-    src="/api/silent.wav"></audio>
+    src="/api/silent.wav?secs=60"></audio>
 
   <script>
     const $ = (id) => document.getElementById(id);
 
     const LS_PLAYLIST_KEY = 'muzeeka-remote-active-playlist';
+    const IS_IOS = /iPhone|iPad|iPod/i.test(navigator.userAgent)
+      || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 
     let state = null;
     let playlists = [];
@@ -452,6 +454,7 @@
     let mediaSessionReady = false;
     let mediaSessionEnabled = false;
     let wakeLock = null;
+    let lastMediaPositionSync = 0;
 
     function fmt(sec) {
       if (!sec || sec < 0) return '0:00';
@@ -517,20 +520,34 @@
       bind('stop', () => { void mediaAction('/api/pause'); });
       bind('previoustrack', () => { void mediaAction('/api/prev'); });
       bind('nexttrack', () => { void mediaAction('/api/next'); });
-      bind('seekbackward', () => {
-        const pos = Math.max(0, (state?.position ?? 0) - 10);
-        void mediaAction('/api/seek', { position: pos });
-      });
-      bind('seekforward', () => {
-        const dur = state?.duration ?? 0;
-        const pos = dur > 0 ? Math.min(dur, (state?.position ?? 0) + 10) : (state?.position ?? 0) + 10;
-        void mediaAction('/api/seek', { position: pos });
-      });
-      bind('seekto', (details) => {
-        if (details.seekTime != null) {
-          void mediaAction('/api/seek', { position: details.seekTime });
-        }
-      });
+
+      const unbind = (actionName) => {
+        try {
+          navigator.mediaSession.setActionHandler(actionName, null);
+        } catch (_) {}
+      };
+
+      if (IS_IOS) {
+        // iOS shows ±10s skip buttons when these handlers are set — hide them to get prev/next.
+        unbind('seekbackward');
+        unbind('seekforward');
+        unbind('seekto');
+      } else {
+        bind('seekbackward', () => {
+          const pos = Math.max(0, (state?.position ?? 0) - 10);
+          void mediaAction('/api/seek', { position: pos });
+        });
+        bind('seekforward', () => {
+          const dur = state?.duration ?? 0;
+          const pos = dur > 0 ? Math.min(dur, (state?.position ?? 0) + 10) : (state?.position ?? 0) + 10;
+          void mediaAction('/api/seek', { position: pos });
+        });
+        bind('seekto', (details) => {
+          if (details.seekTime != null) {
+            void mediaAction('/api/seek', { position: details.seekTime });
+          }
+        });
+      }
 
       mediaSessionReady = true;
     }
@@ -542,19 +559,46 @@
       } catch (_) {}
     }
 
+    function syncKeeperClock(force = false) {
+      if (!IS_IOS) return;
+      const keeper = $('silentKeeper');
+      const pos = state?.position ?? 0;
+      if (!keeper || !Number.isFinite(pos) || !keeper.duration || keeper.duration <= 0) return;
+
+      const now = Date.now();
+      if (!force && now - lastMediaPositionSync < 1500) return;
+      lastMediaPositionSync = now;
+
+      const target = pos % keeper.duration;
+      if (Math.abs(keeper.currentTime - target) > 0.25) {
+        try {
+          keeper.currentTime = target;
+        } catch (_) {}
+      }
+    }
+
     async function syncSilentKeeper() {
       const keeper = $('silentKeeper');
       if (!keeper || !mediaSessionEnabled) return;
 
       keeper.volume = 0.02;
       const hasTrack = !!state?.track;
-      const shouldPlay = hasTrack && (state.isPlaying || state.isPaused);
+      const playing = !!state?.isPlaying;
+      const paused = !!state?.isPaused;
 
-      if (shouldPlay && keeper.paused) {
-        try {
-          await keeper.play();
-        } catch (_) {}
-      } else if (!shouldPlay && !keeper.paused) {
+      if (hasTrack && playing) {
+        syncKeeperClock(true);
+        if (keeper.paused) {
+          try {
+            await keeper.play();
+          } catch (_) {}
+        }
+      } else if (hasTrack && paused) {
+        syncKeeperClock(true);
+        if (!keeper.paused) {
+          keeper.pause();
+        }
+      } else if (!keeper.paused) {
         keeper.pause();
       }
     }
@@ -610,7 +654,8 @@
           ? 'paused'
           : 'none';
 
-      if ('setPositionState' in navigator.mediaSession) {
+      // iOS reads time from the <audio> element — setPositionState fights it and causes flicker.
+      if (!IS_IOS && 'setPositionState' in navigator.mediaSession) {
         const dur = state?.duration ?? 0;
         const pos = state?.position ?? 0;
         if (dur > 0 && Number.isFinite(pos)) {
@@ -622,9 +667,47 @@
             });
           } catch (_) {}
         }
+      } else {
+        syncKeeperClock();
       }
 
       void syncSilentKeeper();
+    }
+
+    function silentKeeperUrl(secs) {
+      return `/api/silent.wav?secs=${secs}`;
+    }
+
+    function waitForKeeperReady(keeper, timeoutMs = 20000) {
+      if (keeper.readyState >= HTMLMediaElement.HAVE_ENOUGH_DATA) {
+        return Promise.resolve();
+      }
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('timeout')), timeoutMs);
+        const finish = (err) => {
+          clearTimeout(timer);
+          if (err) reject(err);
+          else resolve();
+        };
+        keeper.addEventListener('canplaythrough', () => finish(), { once: true });
+        keeper.addEventListener('error', () => finish(keeper.error || new Error('load')), { once: true });
+      });
+    }
+
+    async function loadAndPlayKeeper(keeper, secs) {
+      keeper.src = silentKeeperUrl(secs);
+      keeper.load();
+      await waitForKeeperReady(keeper);
+      await keeper.play();
+    }
+
+    function preloadSilentKeeper() {
+      const keeper = $('silentKeeper');
+      if (!keeper) return;
+      const secs = IS_IOS ? 90 : 60;
+      keeper.src = silentKeeperUrl(secs);
+      keeper.preload = 'auto';
+      keeper.load();
     }
 
     async function enableSystemMedia() {
@@ -633,16 +716,28 @@
       setupMediaSession();
       if (!mediaSessionReady) return;
 
+      const btn = $('btnEnableMedia');
+      const prevText = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = 'Загрузка…';
+
       const keeper = $('silentKeeper');
       if (keeper) {
-        keeper.src = '/api/silent.wav';
-        keeper.load();
         keeper.volume = 0.02;
         keeper.muted = false;
-        try {
-          await keeper.play();
-        } catch (e) {
-          showError('Не удалось активировать медиа-сессию. Попробуй Chrome на Android.');
+        const attempts = IS_IOS ? [90, 45, 30] : [60, 30];
+        let activated = false;
+        for (const secs of attempts) {
+          try {
+            await loadAndPlayKeeper(keeper, secs);
+            activated = true;
+            break;
+          } catch (_) {}
+        }
+        if (!activated) {
+          btn.disabled = false;
+          btn.textContent = prevText;
+          showError('Не удалось активировать медиа-сессию. Проверь Wi‑Fi и нажми снова.');
           return;
         }
       }
@@ -651,8 +746,9 @@
       $('mediaBar').classList.add('enabled');
       $('btnEnableMedia').textContent = '✓ Плеер в шторке включён';
       $('btnEnableMedia').disabled = true;
-      $('mediaBarText').textContent =
-        'Готово. Не закрывай вкладку — шторка работает, пока страница открыта. Звук с компьютера.';
+      $('mediaBarText').textContent = IS_IOS
+        ? 'Готово. На iPhone: кнопки «назад/вперёд» переключают треки. Не закрывай вкладку Safari.'
+        : 'Готово. Не закрывай вкладку — шторка работает, пока страница открыта. Звук с компьютера.';
 
       await requestWakeLock();
       updateMediaSession();
@@ -795,6 +891,7 @@
 
     async function init() {
       setupMediaSession();
+      preloadSilentKeeper();
       $('btnEnableMedia').addEventListener('click', () => { void enableSystemMedia(); });
       document.addEventListener('visibilitychange', () => {
         if (document.visibilityState === 'visible' && mediaSessionEnabled) {

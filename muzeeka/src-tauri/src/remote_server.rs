@@ -259,11 +259,22 @@ async fn api_cover(
     }
 }
 
-fn silent_wav_one_second() -> Vec<u8> {
+#[derive(Debug, Deserialize)]
+struct SilentQuery {
+    #[serde(default = "default_silent_secs")]
+    secs: u32,
+}
+
+fn default_silent_secs() -> u32 {
+    120
+}
+
+fn silent_wav_seconds(secs: u32) -> Vec<u8> {
+    let secs = secs.clamp(10, 600);
     let sample_rate: u32 = 22_050;
     let num_channels: u16 = 1;
     let bits_per_sample: u16 = 16;
-    let data_size = sample_rate * num_channels as u32 * bits_per_sample as u32 / 8;
+    let data_size = sample_rate * secs * num_channels as u32 * bits_per_sample as u32 / 8;
     let riff_size = 36 + data_size;
 
     let mut wav = Vec::with_capacity(44 + data_size as usize);
@@ -286,9 +297,20 @@ fn silent_wav_one_second() -> Vec<u8> {
     wav
 }
 
-async fn api_silent_wav() -> Response {
-    static SILENT: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
-    let bytes = SILENT.get_or_init(silent_wav_one_second);
+async fn api_silent_wav(Query(query): Query<SilentQuery>) -> Response {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    static CACHE: Mutex<Option<HashMap<u32, Vec<u8>>>> = Mutex::new(None);
+
+    let secs = query.secs.clamp(30, 600);
+    let bytes = {
+        let mut cache = CACHE.lock().unwrap();
+        let map = cache.get_or_insert_with(HashMap::new);
+        map.entry(secs)
+            .or_insert_with(|| silent_wav_seconds(secs))
+            .clone()
+    };
 
     let mut headers = HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("audio/wav"));
@@ -296,7 +318,7 @@ async fn api_silent_wav() -> Response {
         header::CACHE_CONTROL,
         HeaderValue::from_static("public, max-age=86400"),
     );
-    (StatusCode::OK, headers, bytes.clone()).into_response()
+    (StatusCode::OK, headers, bytes).into_response()
 }
 
 fn local_urls(port: u16) -> Vec<String> {

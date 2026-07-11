@@ -123,6 +123,9 @@ struct PlayerInner {
     /// Timestamp (millis since UNIX epoch) when current track play started (for manual plays).
     /// Prevents spurious early gapless advance right after clicking a track in the current que.
     current_track_start_time: u64,
+    /// Logical pause state. Set immediately on pause() so that get_state() and emitted
+    /// events report paused even while the volume fade is still playing out.
+    user_paused: bool,
 }
 
 /// Official BASS format plugins that are known to work reliably.
@@ -182,6 +185,7 @@ impl Player {
                 preloaded_audio_path: None,
                 pause_generation: 0,
                 current_track_start_time: 0,
+                user_paused: false,
             })),
             app: Arc::new(RwLock::new(None)),
             bass_thread: Arc::new(RwLock::new(None)),
@@ -529,6 +533,7 @@ impl Player {
             Self::set_gapless_queue(inner, queue);
             Self::sync_gapless_index(inner, &track_path);
             Self::play_inner(inner, &track_path, audio_path.as_deref(), cue_start, cue_end)?;
+            inner.user_paused = false;
             // Record start time for this track (used to guard against early advance after manual que click)
             inner.current_track_start_time = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -900,6 +905,7 @@ impl Player {
         }
 
         inner.gapless_queue_index = next_index;
+        inner.user_paused = false;
         Self::refresh_pending_next(inner);
         Ok(next.track_path)
     }
@@ -938,6 +944,7 @@ impl Player {
         // Invalidate any pending scheduled pauses from previous pause() calls.
         inner.pause_generation = inner.pause_generation.wrapping_add(1);
 
+        inner.user_paused = false;
         Self::refresh_pending_next(inner);
         Ok(())
     }
@@ -1019,6 +1026,7 @@ impl Player {
         // Start the fade-out immediately (Spotify-style smooth tail)
         let (fade_started, gen) = self.run_on_bass_thread(|inner| {
             if inner.mixer_handle != 0 {
+                inner.user_paused = true;
                 inner.pause_generation = inner.pause_generation.wrapping_add(1);
                 let gen = inner.pause_generation;
                 if let Some(bass) = inner.bass.as_ref() {
@@ -1048,6 +1056,7 @@ impl Player {
                         if let Some(bass) = inner.bass.as_ref() {
                             let _ = bass.channel_pause(inner.mixer_handle);
                         }
+                        inner.user_paused = true;
                     }
                     Ok(())
                 });
@@ -1061,6 +1070,7 @@ impl Player {
         self.run_on_bass_thread(|inner| {
             let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
             if inner.mixer_handle != 0 {
+                inner.user_paused = false;
                 let target = inner.volume;
                 // Force start from silence, play, then musical fade-in (Spotify style)
                 let _ = bass.channel_set_attribute(
@@ -1094,6 +1104,7 @@ impl Player {
             inner.gapless_queue.clear();
             inner.gapless_queue_index = 0;
             inner.pending_next = None;
+            inner.user_paused = false;
             Ok(())
         })
     }
@@ -1215,6 +1226,7 @@ impl Player {
 
     fn release_ended_stream_inner(inner: &mut PlayerInner) {
         Self::teardown_current(inner);
+        inner.user_paused = false;
         // Do not stop the mixer here — it allows smoother resume / next play.
         // Full stop() command will handle explicit stop.
     }
@@ -1311,10 +1323,22 @@ impl Player {
                 .to_string()
         });
 
+        // Respect logical user_paused so that pause() reports paused state immediately
+        // (for UI) even while the musical fade-out is still in progress on the mixer.
+        let (report_playing, report_paused, report_state) = if inner.user_paused {
+            (false, true, PlaybackState::Paused)
+        } else {
+            (
+                active == PlaybackState::Playing,
+                active == PlaybackState::Paused,
+                active,
+            )
+        };
+
         PlayerStateSnapshot {
-            state: active,
-            is_playing: active == PlaybackState::Playing,
-            is_paused: active == PlaybackState::Paused,
+            state: report_state,
+            is_playing: report_playing,
+            is_paused: report_paused,
             volume: inner.volume,
             position,
             duration,
@@ -1468,6 +1492,19 @@ impl Player {
                 match snapshot.state {
                     PlaybackState::Playing => {
                         *was = true;
+                        let payload = PositionPayload {
+                            position: snapshot.position,
+                            duration: snapshot.duration,
+                            state: snapshot.state,
+                        };
+                        let _ = app_emit.emit("player:position", &payload);
+                        // Note: do not emit player:state on every poll tick.
+                        // The position event already carries the state, and the
+                        // frontend position listener applies it (with pause guard).
+                        // Frequent player:state was causing extra clobbering of isPlaying.
+                    }
+                    PlaybackState::Paused => {
+                        *was = false;
                         let payload = PositionPayload {
                             position: snapshot.position,
                             duration: snapshot.duration,

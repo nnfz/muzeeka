@@ -99,6 +99,7 @@ let saveTimer: ReturnType<typeof setTimeout> | null = null;
 let lastGaplessChangeAt = 0;
 let lastManualPlayAt = 0;
 let lastPlayedFile = '';
+let lastPauseRequestAt = 0;
 let applyingExternalSync = false;
 
 // --- Derived ---
@@ -1082,6 +1083,7 @@ async function play(filePath: string) {
     syncTrackIndex();
     isPlaying = true;
     isPaused = false;
+    lastPauseRequestAt = 0;
     lastGaplessChangeAt = Date.now();
     scheduleSave(); // persist current_file so it survives restart
     syncWindowTitle();
@@ -1095,6 +1097,7 @@ async function play(filePath: string) {
 }
 
 async function pause() {
+  lastPauseRequestAt = Date.now();
   try {
     await invoke('player_pause');
     isPaused = true;
@@ -1105,6 +1108,7 @@ async function pause() {
 }
 
 async function resume() {
+  lastPauseRequestAt = 0;
   try {
     await invoke('player_resume');
     isPaused = false;
@@ -1125,6 +1129,7 @@ async function stop() {
     await invoke('player_stop');
     isPlaying = false;
     isPaused = false;
+    lastPauseRequestAt = 0;
     position = 0;
   } catch (e) {
     console.error('Failed to stop:', e);
@@ -1316,10 +1321,18 @@ function applyStoreSync(payload: StoreSyncPayload) {
       syncWindowTitle();
     }
     if (typeof payload.isPlaying === 'boolean') {
-      isPlaying = payload.isPlaying;
+      const inPauseWindow = (Date.now() - lastPauseRequestAt) < 800;
+      if (payload.isPlaying && !inPauseWindow && !isPaused) {
+        isPlaying = true;
+        isPaused = false;
+        lastPauseRequestAt = 0;
+      } else if (!payload.isPlaying) {
+        isPlaying = false;
+      }
     }
     if (typeof payload.isPaused === 'boolean') {
       isPaused = payload.isPaused;
+      if (payload.isPaused) lastPauseRequestAt = 0;
     }
     if (typeof payload.position === 'number') {
       position = payload.position;
@@ -1372,6 +1385,7 @@ function setupListeners() {
     syncTrackIndex();
     isPlaying = true;
     isPaused = false;
+    lastPauseRequestAt = 0;
     scheduleSave();
     lastGaplessChangeAt = Date.now();
     void prepareGaplessNext(path);
@@ -1383,14 +1397,24 @@ function setupListeners() {
     duration = event.payload.duration;
 
     if (event.payload.state === 'playing') {
-      isPlaying = true;
-      isPaused = false;
+      // Ignore 'playing' reports while we have a pending pause request (fade in progress)
+      // or while the local state believes we are paused. This prevents the BASS
+      // "still playing during volume fade" reports + any stale immediate notifies
+      // (e.g. from remote controller) from flipping the button back to play icon.
+      const inPauseWindow = (Date.now() - lastPauseRequestAt) < 800;
+      if (!inPauseWindow && !isPaused) {
+        isPlaying = true;
+        isPaused = false;
+        lastPauseRequestAt = 0;
+      }
     } else if (event.payload.state === 'paused') {
       isPlaying = false;
       isPaused = true;
+      lastPauseRequestAt = 0;
     } else if (event.payload.state === 'stopped') {
       isPlaying = false;
       isPaused = false;
+      lastPauseRequestAt = 0;
     }
 
     if (
@@ -1408,8 +1432,18 @@ function setupListeners() {
   });
 
   listen<{ is_playing: boolean; is_paused: boolean }>('player:state', (event) => {
-    isPlaying = event.payload.is_playing;
-    isPaused = event.payload.is_paused;
+    if (event.payload.is_playing) {
+      const inPauseWindow = (Date.now() - lastPauseRequestAt) < 800;
+      if (!inPauseWindow && !isPaused) {
+        isPlaying = true;
+        isPaused = false;
+        lastPauseRequestAt = 0;
+      }
+    } else if (event.payload.is_paused) {
+      isPlaying = false;
+      isPaused = true;
+      lastPauseRequestAt = 0;
+    }
   });
 
   listen<{ files: MusicFile[]; playlistId: string | null }>('ytdlp:downloaded', (event) => {
@@ -1425,6 +1459,7 @@ function setupListeners() {
 
     isPlaying = false;
     isPaused = false;
+    lastPauseRequestAt = 0;
     position = 0;
 
     if (repeatMode === 'one' && currentFile) {

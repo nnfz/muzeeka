@@ -1,9 +1,9 @@
 ---
-pid: 17108
+pid: 15024
 cwd: "Z:\code\muzeeka"
 command: "cd Z:/code/muzeeka/muzeeka/src-tauri; cargo build 2>&1"
-started_at: 2026-07-10T17:42:17.767Z
-running_for_ms: 4715013  
+started_at: 2026-07-10T18:10:39.677Z
+running_for_ms: 3015004  
 ---
 cargo :     Blocking waiting for file lock on build directory
 At line:1 char:39
@@ -14,6 +14,7 @@ At line:1 char:39
  
 warning: muzeeka@0.1.0: Copied 14 BASS DLL(s) to \\?\Z:\code\muzeeka\muzeeka\src-tauri\target\debug\bass
 warning: muzeeka@0.1.0: Copied 149 file(s) from bin/ to \\?\Z:\code\muzeeka\muzeeka\src-tauri\target\debug\bin
+   Compiling muzeeka v0.1.0 (Z:\code\muzeeka\muzeeka\src-tauri)
 warning: fields `track_paths`, `source_playlist_id`, and `is_copy` are never read
   --> src\drop_handler.rs:25:9
    |
@@ -38,4 +39,4 @@ warning: method `has_track_context` is never used
 84 |     pub fn has_track_context(&self) -> bool {
    |            ^^^^^^^^^^^^^^^^^
 warning: `muzeeka` (lib) generated 2 warnings
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 25.77s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 18.19s
