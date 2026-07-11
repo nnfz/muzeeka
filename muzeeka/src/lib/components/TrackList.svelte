@@ -19,7 +19,9 @@
   } from '$lib/stores/trackDrag.svelte';
   import { openContextMenuFromEvent, type ContextMenuItem } from '$lib/contextMenu';
   import { open } from '@tauri-apps/plugin-dialog';
+  import { revealItemInDir } from '@tauri-apps/plugin-opener';
   import { audioPathsForDrag, startFileDrag } from '$lib/fileDrag';
+  import { exportAudioPathForTrack } from '$lib/trackPaths';
   import TrackCover from './TrackCover.svelte';
 
   type ColumnId = 'index' | 'title' | 'album' | 'duration';
@@ -147,7 +149,19 @@
   let selectionAnchor = $state<number | null>(null);
 
   let contextMenu = $state<{ item: ListedTrack; x: number; y: number } | null>(null);
+  let playlistSubmenu = $state<{
+    x: number;
+    y: number;
+    paths: string[];
+    sourcePlaylistId: string;
+    targetPlaylists: { id: string; name: string }[];
+  } | null>(null);
   let dragToast = $state<string | null>(null);
+  const MENU_WIDTH = 176;
+  const SUBMENU_WIDTH = 176;
+  const MENU_GAP = 6;
+  const MENU_ITEM_HEIGHT = 34;
+  const MENU_PADDING = 4;
   let dragToastTimer: ReturnType<typeof setTimeout> | null = null;
 
   interface TrackDragState {
@@ -179,7 +193,28 @@
     const affectedPaths = selectedPaths.size > 0 && selectedPaths.has(target.track.path)
       ? [...selectedPaths]
       : [target.track.path];
+    const affectedTracks = affectedPaths
+      .map((path) => displayedTracks.find((item) => item.track.path === path)?.track)
+      .filter((track): track is MusicFile => !!track);
     const multi = affectedPaths.length > 1;
+
+    items.push({
+      id: 'find-on-disk',
+      label: multi ? `Найти ${affectedTracks.length} на диске` : 'Найти на диске',
+      icon: 'folder',
+      disabled: affectedTracks.length === 0,
+      onSelect: () => revealTracksOnDisk(affectedTracks),
+    });
+
+    const availableTargetPlaylists = player.playlists.filter((playlist) => playlist.id !== target.playlistId);
+    items.push({
+      id: 'add-to-playlist',
+      label: multi ? `Добавить ${affectedPaths.length} в плейлист ›` : 'Добавить в плейлист ›',
+      icon: 'playlist',
+      disabled: availableTargetPlaylists.length === 0,
+      closeOnSelect: false,
+      onSelect: () => addTracksToPlaylist(affectedPaths, target.playlistId),
+    });
 
     // Like / Unlike
     const allLiked = affectedPaths.every((p) => player.isLiked(p));
@@ -407,6 +442,120 @@
 
   function closeContextMenu() {
     contextMenu = null;
+    playlistSubmenu = null;
+  }
+
+  function closePlaylistSubmenu() {
+    playlistSubmenu = null;
+  }
+
+  function getPlaylistSubmenuPosition(targetPlaylistsCount: number) {
+    if (!contextMenu) return { x: 8, y: 8 };
+
+    const estimatedHeight = Math.min(
+      window.innerHeight - 16,
+      MENU_PADDING * 2 + targetPlaylistsCount * MENU_ITEM_HEIGHT
+    );
+    const preferredX = contextMenu.x + MENU_WIDTH + MENU_GAP;
+    const x = preferredX + SUBMENU_WIDTH <= window.innerWidth - 8
+      ? preferredX
+      : Math.max(8, contextMenu.x - SUBMENU_WIDTH - MENU_GAP);
+    const y = Math.min(
+      Math.max(8, contextMenu.y + MENU_PADDING + MENU_ITEM_HEIGHT),
+      window.innerHeight - estimatedHeight - 8
+    );
+
+    return { x, y };
+  }
+
+  function openPlaylistSubmenuForAdd(paths: string[], sourcePlaylistId: string) {
+    const targetPlaylists = player.playlists.filter((playlist) => playlist.id !== sourcePlaylistId);
+    if (targetPlaylists.length === 0) {
+      closePlaylistSubmenu();
+      return;
+    }
+
+    if (targetPlaylists.length === 1) {
+      confirmAddTracksToPlaylist(targetPlaylists[0].id, paths, sourcePlaylistId);
+      return;
+    }
+
+    playlistSubmenu = {
+      ...getPlaylistSubmenuPosition(targetPlaylists.length),
+      paths,
+      sourcePlaylistId,
+      targetPlaylists: targetPlaylists.map(({ id, name }) => ({ id, name })),
+    };
+  }
+
+  function submenuItems(targetPlaylists: { id: string; name: string }[], paths: string[], sourcePlaylistId: string): ContextMenuItem[] {
+    return targetPlaylists.map((playlist) => ({
+      id: `playlist-${playlist.id}`,
+      label: playlist.name,
+      icon: 'playlist' as const,
+      onSelect: () => confirmAddTracksToPlaylist(playlist.id, paths, sourcePlaylistId),
+    }));
+  }
+
+  function stopWindowClickForTrackMenus(e: MouseEvent) {
+    const target = e.target;
+    if (target instanceof HTMLElement && target.closest('.context-menu')) return;
+    closeContextMenu();
+  }
+
+  function stopWindowContextMenuForTrackMenus(e: MouseEvent) {
+    const target = e.target;
+    if (target instanceof HTMLElement && target.closest('.context-menu')) return;
+    closeContextMenu();
+  }
+
+  function handleTrackMenuWindowKeydown(e: KeyboardEvent) {
+    if (e.key !== 'Escape') return;
+    if (!contextMenu && !playlistSubmenu) return;
+    e.preventDefault();
+    if (playlistSubmenu) {
+      closePlaylistSubmenu();
+      return;
+    }
+    closeContextMenu();
+  }
+
+  function handleTrackMenuWindowKeydownProxy(e: KeyboardEvent) {
+    handleTrackMenuWindowKeydown(e);
+  }
+
+  function playlistSubmenuItems(): ContextMenuItem[] {
+    if (!playlistSubmenu) return [];
+    return submenuItems(
+      playlistSubmenu.targetPlaylists,
+      playlistSubmenu.paths,
+      playlistSubmenu.sourcePlaylistId
+    );
+  }
+
+  function onPlaylistSubmenuClose() {
+    closePlaylistSubmenu();
+  }
+
+  function onContextMenuClose() {
+    closeContextMenu();
+  }
+
+  function stopMenuEventPropagation(e: Event) {
+    e.stopPropagation();
+  }
+
+  function onTrackMenuPointerEnter() {
+    playlistSubmenu = null;
+  }
+
+  function onTrackMenuPointerLeave() {
+  }
+
+  function onSubmenuPointerEnter() {
+  }
+
+  function onSubmenuPointerLeave() {
   }
 
   function openTrackContextMenu(e: MouseEvent, item: ListedTrack, index: number) {
@@ -416,8 +565,41 @@
       selectedPaths = new Set();
       selectionAnchor = index;
     }
-    const position = openContextMenuFromEvent(e);
+    const position = openContextMenuFromEvent(e, { width: 220, height: 160 });
     contextMenu = { item, ...position };
+  }
+
+  function revealTracksOnDisk(tracks: MusicFile[]) {
+    const paths = [
+      ...new Set(
+        tracks
+          .map((track) => exportAudioPathForTrack(track, track.path))
+          .filter((path): path is string => !!path)
+      ),
+    ];
+    if (paths.length === 0) return;
+
+    void revealItemInDir(paths.length === 1 ? paths[0] : paths).catch((err) => {
+      console.error('Failed to reveal track on disk:', err);
+      showDragToast('Could not find track on disk');
+    });
+  }
+
+  function addTracksToPlaylist(paths: string[], sourcePlaylistId: string) {
+    openPlaylistSubmenuForAdd(paths, sourcePlaylistId);
+  }
+
+  function confirmAddTracksToPlaylist(targetId: string, paths: string[], sourcePlaylistId: string) {
+    const added = player.copyTracksToPlaylist(paths, targetId, sourcePlaylistId);
+    if (added > 0) {
+      const targetName = player.playlists.find((playlist) => playlist.id === targetId)?.name ?? 'playlist';
+      showDragToast(`Added ${added} track${added !== 1 ? 's' : ''} to ${targetName}`);
+    }
+    closeContextMenu();
+  }
+
+  function handleAddToPlaylistDialogKeydown(e: KeyboardEvent) {
+    handleTrackMenuWindowKeydown(e);
   }
 
   function showDragToast(message: string) {
@@ -887,13 +1069,33 @@
   </div>
 </section>
 
-<ContextMenu
-  open={contextMenu !== null}
-  x={contextMenu?.x ?? 0}
-  y={contextMenu?.y ?? 0}
-  items={trackMenuItems}
-  onclose={closeContextMenu}
+<svelte:window
+  onclick={stopWindowClickForTrackMenus}
+  oncontextmenu={stopWindowContextMenuForTrackMenus}
+  onkeydown={handleTrackMenuWindowKeydownProxy}
 />
+
+<div class="track-menu-layer">
+  <div role="presentation" onmouseenter={onTrackMenuPointerEnter} onmouseleave={onTrackMenuPointerLeave} onclick={stopMenuEventPropagation} onkeydown={handleAddToPlaylistDialogKeydown} oncontextmenu={stopMenuEventPropagation}>
+    <ContextMenu
+      open={contextMenu !== null}
+      x={contextMenu?.x ?? 0}
+      y={contextMenu?.y ?? 0}
+      items={trackMenuItems}
+      onclose={onContextMenuClose}
+    />
+  </div>
+
+  <div role="presentation" onmouseenter={onSubmenuPointerEnter} onmouseleave={onSubmenuPointerLeave} onclick={stopMenuEventPropagation} onkeydown={handleAddToPlaylistDialogKeydown} oncontextmenu={stopMenuEventPropagation}>
+    <ContextMenu
+      open={playlistSubmenu !== null}
+      x={playlistSubmenu?.x ?? 0}
+      y={playlistSubmenu?.y ?? 0}
+      items={playlistSubmenuItems()}
+      onclose={onPlaylistSubmenuClose}
+    />
+  </div>
+</div>
 
 {#if dragToast}
   <div class="track-drag-toast" role="status">{dragToast}</div>

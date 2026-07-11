@@ -97,6 +97,25 @@
     contextMenu = { playlist, ...position };
   }
 
+  function playPlaylist(playlistId: string, firstTrackPath?: string | null) {
+    player.selectPlaylist(playlistId);
+    const path = firstTrackPath ?? player.tracks[0]?.path;
+    if (path) void player.play(path);
+  }
+
+  function playPlaylistFromButton(e: MouseEvent, playlistId: string, firstTrackPath?: string | null) {
+    e.stopPropagation();
+    playPlaylist(playlistId, firstTrackPath);
+  }
+
+  function handlePlaylistItemKeydown(e: KeyboardEvent, playlistId: string) {
+    if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+
+    e.preventDefault();
+    player.selectPlaylist(playlistId);
+  }
+
   /**
    * Focus the rename input and place the caret at the END of the text.
    * Uses multiple passes (immediate + rAF + setTimeout) to ensure the caret
@@ -277,14 +296,30 @@
             if (hoveredPlaylistId === playlist.id) hoveredPlaylistId = null;
           }}
         >
-          <button
+          <div
             class="playlist-item"
+            role="button"
+            tabindex="0"
             onclick={() => player.selectPlaylist(playlist.id)}
+            onkeydown={(e) => handlePlaylistItemKeydown(e, playlist.id)}
             oncontextmenu={(e) => openPlaylistContextMenu(e, playlist)}
             title={playlist.name}
           >
             <div class="playlist-icon">
               <TrackCover track={firstTrack} />
+              {#if firstTrack}
+                <button
+                  type="button"
+                  class="playlist-play-btn"
+                  onclick={(e) => playPlaylistFromButton(e, playlist.id, firstTrack.path)}
+                  aria-label={`Play ${playlist.name}`}
+                  title={`Play ${playlist.name}`}
+                >
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                    <path d="M8 5v14l11-7z" />
+                  </svg>
+                </button>
+              {/if}
             </div>
 
             <div class="playlist-details">
@@ -311,7 +346,7 @@
                 {playlist.tracks.length} track{playlist.tracks.length !== 1 ? 's' : ''}
               </span>
             </div>
-          </button>
+          </div>
         </div>
       {/each}
     {/if}

@@ -452,6 +452,17 @@
   box-shadow: inset 0 -2px 0 var(--accent);
 }
 
+.track-menu-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 299;
+  pointer-events: none;
+}
+
+.track-menu-layer :global(.context-menu) {
+  pointer-events: auto;
+}
+
 .track-drag-toast {
   position: fixed;
   left: 50%;
