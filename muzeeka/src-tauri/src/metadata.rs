@@ -307,14 +307,21 @@ fn cache_cover_file(audio_path: &Path, source: &Path) -> CoverPaths {
     paths
 }
 
+
 fn extract_embedded_cover(tagged_file: &TaggedFile, path: &Path) -> CoverPaths {
+    // For MP3/AIFF files, lofty mis-applies unsynchronisation decoding on the
+    // picture data — it inserts extra 0x00 bytes after every 0xFF, producing a
+    // corrupt JPEG (no EOI marker, broken scan data). The `id3` crate decodes
+    // unsync correctly, so try it first for ID3-bearing formats.
+    if let Some(paths) = extract_embedded_cover_id3(path) {
+        return paths;
+    }
+
+    // For all other formats (FLAC, OGG, MP4, …) fall back to lofty.
     for tag in tagged_file.tags() {
         if let Some((data, mime)) = pick_cover_picture(tag) {
-            // Validate that we have a plausible image (at least a few KB).
-            // A suspiciously small payload indicates lofty mis-parsed the frame
-            // size (e.g. syncsafe vs. non-syncsafe mix-up in ID3v2.4 unsync tags).
             if data.len() < 256 {
-                break; // fall through to the id3-crate fallback below
+                continue;
             }
             let paths = cache_cover_bytes(path, data, &mime, "embedded");
             if paths.thumb.is_some() || paths.full.is_some() {
@@ -323,16 +330,11 @@ fn extract_embedded_cover(tagged_file: &TaggedFile, path: &Path) -> CoverPaths {
         }
     }
 
-    // Fallback: try the `id3` crate which handles ID3v2.3/v2.4 unsynchronisation
-    // correctly even when lofty mis-reads the frame size.
-    if let Some(paths) = extract_embedded_cover_id3(path) {
-        return paths;
-    }
-
     CoverPaths::default()
 }
 
 /// Extract cover art from an MP3/ID3 file using the `id3` crate as a fallback.
+
 fn extract_embedded_cover_id3(path: &Path) -> Option<CoverPaths> {
     // Only attempt for files that could carry ID3 tags.
     let ext = path
