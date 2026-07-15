@@ -33,6 +33,9 @@
   let canvasEl = $state<HTMLCanvasElement | undefined>();
   let webglFailed = $state(false);
   let imageReady = $state(false);
+  let windowActive = $state(
+    typeof document === 'undefined' ? true : document.visibilityState === 'visible' && document.hasFocus()
+  );
 
   let kawarp: import('@kawarp/core').Kawarp | null = null;
   let currentSrc: string | null = null;
@@ -97,6 +100,19 @@
     resizeTimeout = setTimeout(updateSize, 100);
   }
 
+  function shouldAnimate(): boolean {
+    return active && windowActive;
+  }
+
+  function syncAnimationState() {
+    if (!kawarp || webglFailed) return;
+    if (shouldAnimate()) {
+      kawarp.start();
+    } else {
+      kawarp.stop();
+    }
+  }
+
   function disposeKawarp() {
     resizeObserver?.disconnect();
     resizeObserver = null;
@@ -157,7 +173,7 @@
 
     if (generation !== initGeneration) return;
 
-    if (untrack(() => active)) {
+    if (untrack(() => shouldAnimate())) {
       instance.start();
     }
   }
@@ -179,6 +195,26 @@
     return () => {
       initGeneration += 1;
       disposeKawarp();
+    };
+  });
+
+  $effect(() => {
+    syncAnimationState();
+  });
+
+  $effect(() => {
+    const updateActive = () => {
+      windowActive = document.visibilityState === 'visible' && document.hasFocus();
+    };
+
+    updateActive();
+    window.addEventListener('focus', updateActive);
+    window.addEventListener('blur', updateActive);
+    document.addEventListener('visibilitychange', updateActive);
+    return () => {
+      window.removeEventListener('focus', updateActive);
+      window.removeEventListener('blur', updateActive);
+      document.removeEventListener('visibilitychange', updateActive);
     };
   });
 

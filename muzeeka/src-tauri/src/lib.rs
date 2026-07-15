@@ -29,11 +29,53 @@ use drop_handler::{handle_window_event, DropState, ExportDragState};
 
 use player::Player;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tauri::path::BaseDirectory;
-use tauri::{Manager, WindowEvent};
+use tauri::{LogicalPosition, LogicalSize, Manager, WindowEvent};
 
 fn bass_dir_is_valid(dir: &Path) -> bool {
     dir.join("bass.dll").is_file()
+}
+
+fn apply_window_state(window: &tauri::WebviewWindow, state: &settings::WindowState) {
+    let width = state.width.clamp(800, 3840);
+    let height = state.height.clamp(600, 2160);
+    let _ = window.set_size(LogicalSize::new(width as f64, height as f64));
+    let _ = window.set_position(LogicalPosition::new(state.x as f64, state.y as f64));
+    if state.maximized {
+        let _ = window.maximize();
+    }
+}
+
+fn capture_window_state(window: &tauri::WebviewWindow) -> Option<settings::WindowState> {
+    let maximized = window.is_maximized().unwrap_or(false);
+    let position = window.outer_position().ok()?;
+    let size = window.outer_size().ok()?;
+
+    Some(settings::WindowState {
+        x: position.x,
+        y: position.y,
+        width: size.width.max(800),
+        height: size.height.max(600),
+        maximized,
+    })
+}
+
+fn save_window_state(app: &tauri::AppHandle, window: &tauri::WebviewWindow) {
+    let Some(window_state) = capture_window_state(window) else {
+        return;
+    };
+
+    match settings::load_settings(app) {
+        Ok(mut app_settings) => {
+            app_settings.window_state = Some(window_state);
+            if let Err(error) = settings::save_settings(app, &app_settings) {
+                eprintln!("Failed to save window state: {error}");
+            }
+        }
+        Err(error) => eprintln!("Failed to load settings for window state: {error}"),
+    }
 }
 
 /// Resolve the directory where bass.dll and format plugins live.
@@ -72,6 +114,8 @@ pub fn run() {
     let player_for_close = player.clone();
     let discord_presence = DiscordPresence::new();
     let discord_for_close = discord_presence.clone();
+    let last_window_state_save = Arc::new(Mutex::new(Instant::now() - Duration::from_secs(10)));
+    let last_window_state_save_for_event = Arc::clone(&last_window_state_save);
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -83,11 +127,32 @@ pub fn run() {
         .on_window_event(move |window, event| {
             handle_window_event(window, event);
 
+            if window.label() == "main" {
+                match event {
+                    WindowEvent::Resized(_) | WindowEvent::Moved(_) => {
+                        if let Ok(mut last_save) = last_window_state_save_for_event.lock() {
+                            if last_save.elapsed() >= Duration::from_millis(700) {
+                                let app = window.app_handle();
+                                if let Some(webview_window) = app.get_webview_window(window.label()) {
+                                    save_window_state(&app, &webview_window);
+                                }
+                                *last_save = Instant::now();
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
             if let WindowEvent::CloseRequested { .. } = event {
                 // Only shut down BASS when the *main* window is closed.
                 // The settings window (label "settings") and other secondary windows
                 // must not stop playback or free the audio device.
                 if window.label() == "main" {
+                    let app = window.app_handle();
+                    if let Some(webview_window) = app.get_webview_window(window.label()) {
+                        save_window_state(&app, &webview_window);
+                    }
                     // Ensure audio is stopped and BASS device is freed when the main player window closes.
                     // Without this, sound could continue after the app exits.
                     discord_for_close.shutdown();
@@ -102,6 +167,11 @@ pub fn run() {
             }
 
             if let Some(window) = app.get_webview_window("main") {
+                if let Ok(app_settings) = settings::load_settings(&app.handle()) {
+                    if let Some(window_state) = app_settings.window_state.as_ref() {
+                        apply_window_state(&window, window_state);
+                    }
+                }
                 let _ = window.eval(
                     "document.addEventListener('contextmenu',e=>e.preventDefault(),{capture:true});",
                 );

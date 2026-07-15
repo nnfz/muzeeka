@@ -20,6 +20,7 @@ pub struct DropState {
     pub last_paths: Mutex<Vec<PathBuf>>,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Default)]
 pub struct ExportDragContext {
     pub track_paths: Vec<String>,
@@ -81,6 +82,7 @@ impl ExportDragState {
         *self.suppress_until.lock() = Some(Instant::now() + EXPORT_DROP_SUPPRESS_FOR);
     }
 
+    #[allow(dead_code)]
     pub fn has_track_context(&self) -> bool {
         self.context.lock().is_some()
     }

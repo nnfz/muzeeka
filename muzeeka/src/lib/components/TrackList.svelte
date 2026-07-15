@@ -62,9 +62,15 @@
   const FILE_EXPORT_EDGE_MARGIN = 14;
 
   let gridEl = $state<HTMLDivElement | null>(null);
+  let rowsEl = $state<HTMLDivElement | null>(null);
   let gridWidth = $state(0);
+  let rowsViewportHeight = $state(0);
+  let rowsScrollTop = $state(0);
   let isNarrow = $state(false);
   let resizingPair = $state<{ left: ColumnId; right: ColumnId } | null>(null);
+
+  const ROW_HEIGHT = 52;
+  const VIRTUAL_OVERSCAN = 10;
 
   function isColumnId(value: unknown): value is ColumnId {
     return value === 'index' || value === 'title' || value === 'album' || value === 'duration';
@@ -311,6 +317,12 @@
     visibleColumns.map((id) => `${effectiveWidths[id]}px`).join(' ')
   );
 
+  let listedIndexByPath = $derived.by(() => {
+    const map = new Map<string, number>();
+    listedTracks.forEach((item, index) => map.set(item.track.path, index));
+    return map;
+  });
+
   let displayedTracks = $derived.by(() => {
     const items = [...listedTracks];
     if (!sortColumn) return items;
@@ -318,6 +330,26 @@
     const dir = sortDirection === 'asc' ? 1 : -1;
     return items.sort((a, b) => compareTracks(a, b, sortColumn!) * dir);
   });
+
+  let visibleRange = $derived.by(() => {
+    const total = displayedTracks.length;
+    if (total === 0) return { start: 0, end: 0, top: 0, bottom: 0 };
+
+    const start = Math.max(0, Math.floor(rowsScrollTop / ROW_HEIGHT) - VIRTUAL_OVERSCAN);
+    const visibleCount = Math.ceil(rowsViewportHeight / ROW_HEIGHT) + VIRTUAL_OVERSCAN * 2;
+    const end = Math.min(total, start + Math.max(visibleCount, VIRTUAL_OVERSCAN * 2));
+
+    return {
+      start,
+      end,
+      top: start * ROW_HEIGHT,
+      bottom: Math.max(0, (total - end) * ROW_HEIGHT),
+    };
+  });
+
+  let visibleTracks = $derived(
+    displayedTracks.slice(visibleRange.start, visibleRange.end)
+  );
 
   $effect(() => {
     const el = gridEl;
@@ -330,6 +362,25 @@
     observer.observe(el);
     return () => observer.disconnect();
   });
+
+  $effect(() => {
+    const el = rowsEl;
+    if (!el) return;
+
+    const updateViewport = () => {
+      rowsViewportHeight = el.clientHeight;
+      rowsScrollTop = el.scrollTop;
+    };
+
+    updateViewport();
+    const observer = new ResizeObserver(updateViewport);
+    observer.observe(el);
+    return () => observer.disconnect();
+  });
+
+  function handleRowsScroll(e: Event) {
+    rowsScrollTop = (e.currentTarget as HTMLDivElement).scrollTop;
+  }
 
   function persistColumnLayout() {
     localStorage.setItem(STORAGE_COLUMN_LAYOUT_KEY, JSON.stringify(columnLayout));
@@ -345,8 +396,8 @@
   function compareTracks(a: ListedTrack, b: ListedTrack, column: ColumnId): number {
     switch (column) {
       case 'index': {
-        const ai = listedTracks.findIndex((item) => item.track.path === a.track.path);
-        const bi = listedTracks.findIndex((item) => item.track.path === b.track.path);
+        const ai = listedIndexByPath.get(a.track.path) ?? -1;
+        const bi = listedIndexByPath.get(b.track.path) ?? -1;
         return ai - bi;
       }
       case 'title':
@@ -978,8 +1029,15 @@
           {/each}
         </div>
 
-        <div class="track-rows" class:track-drag-active={trackDrag?.active || trackDragUi.isExportSession}>
-        {#each displayedTracks as item, i (item.track.path)}
+        <div
+          class="track-rows"
+          class:track-drag-active={trackDrag?.active || trackDragUi.isExportSession}
+          bind:this={rowsEl}
+          onscroll={handleRowsScroll}
+        >
+        <div style="height: {visibleRange.top}px" aria-hidden="true"></div>
+        {#each visibleTracks as item, localIndex (item.track.path)}
+          {@const i = visibleRange.start + localIndex}
           {@const track = item.track}
           {@const isActive = track.path === player.currentFile}
           {@const isSelected = selectedPaths.has(track.path)}
@@ -1063,6 +1121,7 @@
             {/each}
           </button>
         {/each}
+        <div style="height: {visibleRange.bottom}px" aria-hidden="true"></div>
         </div>
       </div>
     {/if}

@@ -85,9 +85,9 @@ fn cache_key(
         .unwrap_or_default();
     let normalized = format!(
         "{}\0{}\0{}\0{}",
-        title.to_lowercase(),
-        artist.to_lowercase(),
-        album.to_lowercase(),
+        title.trim().to_lowercase(),
+        artist.trim().to_lowercase(),
+        album.trim().to_lowercase(),
         duration
     );
 

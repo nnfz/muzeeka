@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::{
+    body::Bytes,
     extract::{Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{Html, IntoResponse, Response},
@@ -12,7 +13,6 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
-use tower_http::cors::CorsLayer;
 
 use crate::discord_rpc::DiscordPresence;
 use crate::player::Player;
@@ -116,7 +116,6 @@ async fn run_server(controller: Arc<RemoteController>) -> Result<(), String> {
         .route("/api/repeat/toggle", post(api_toggle_repeat))
         .route("/api/cover", get(api_cover))
         .route("/api/silent.wav", get(api_silent_wav))
-        .layer(CorsLayer::permissive())
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], REMOTE_PORT));
@@ -144,16 +143,20 @@ async fn api_info() -> Json<InfoResponse> {
     })
 }
 
+fn json_value<T: Serialize>(value: T) -> Result<Json<serde_json::Value>, AppError> {
+    serde_json::to_value(value)
+        .map(Json)
+        .map_err(|error| AppError(format!("Failed to serialize response: {error}")))
+}
+
 async fn api_state(State(state): State<AppState>) -> Result<Json<serde_json::Value>, AppError> {
-    let remote_state = state.controller.get_state()?;
-    Ok(Json(serde_json::to_value(remote_state).unwrap()))
+    json_value(state.controller.get_state()?)
 }
 
 async fn api_playlists(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let playlists = state.controller.get_playlists()?;
-    Ok(Json(serde_json::to_value(playlists).unwrap()))
+    json_value(state.controller.get_playlists()?)
 }
 
 #[derive(Debug, Deserialize)]
@@ -165,8 +168,7 @@ async fn api_playlist(
     State(state): State<AppState>,
     Query(query): Query<PlaylistQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let view = state.controller.get_playlist_view(&query.id)?;
-    Ok(Json(serde_json::to_value(view).unwrap()))
+    json_value(state.controller.get_playlist_view(&query.id)?)
 }
 
 async fn api_play(State(state): State<AppState>, Json(body): Json<PlayBody>) -> Result<Json<OkResponse>, AppError> {
@@ -301,14 +303,14 @@ async fn api_silent_wav(Query(query): Query<SilentQuery>) -> Response {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
-    static CACHE: Mutex<Option<HashMap<u32, Vec<u8>>>> = Mutex::new(None);
+    static CACHE: Mutex<Option<HashMap<u32, Bytes>>> = Mutex::new(None);
 
     let secs = query.secs.clamp(30, 600);
     let bytes = {
-        let mut cache = CACHE.lock().unwrap();
+        let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
         let map = cache.get_or_insert_with(HashMap::new);
         map.entry(secs)
-            .or_insert_with(|| silent_wav_seconds(secs))
+            .or_insert_with(|| Bytes::from(silent_wav_seconds(secs)))
             .clone()
     };
 

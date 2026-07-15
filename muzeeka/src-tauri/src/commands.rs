@@ -185,35 +185,43 @@ pub fn settings_save(
 
 /// Scan a directory recursively for music files.
 #[tauri::command]
-pub fn library_scan(directory: String) -> Result<Vec<library::MusicFile>, String> {
-    library::scan_directory(&directory)
+pub async fn library_scan(directory: String) -> Result<Vec<library::MusicFile>, String> {
+    tauri::async_runtime::spawn_blocking(move || library::scan_directory(&directory))
+        .await
+        .map_err(|e| format!("Scan task failed: {e}"))?
 }
 
 /// Scan dropped file and folder paths for music files.
 #[tauri::command]
-pub fn library_scan_paths(paths: Vec<String>) -> Result<Vec<library::MusicFile>, String> {
-    library::scan_paths(&paths)
+pub async fn library_scan_paths(paths: Vec<String>) -> Result<Vec<library::MusicFile>, String> {
+    tauri::async_runtime::spawn_blocking(move || library::scan_paths(&paths))
+        .await
+        .map_err(|e| format!("Scan task failed: {e}"))?
 }
 
 /// Read or refresh metadata for known file paths.
 #[tauri::command]
-pub fn library_fetch_metadata(paths: Vec<String>) -> Result<Vec<library::MusicFile>, String> {
-    library::fetch_metadata(&paths)
+pub async fn library_fetch_metadata(paths: Vec<String>) -> Result<Vec<library::MusicFile>, String> {
+    tauri::async_runtime::spawn_blocking(move || library::fetch_metadata(&paths))
+        .await
+        .map_err(|e| format!("Metadata task failed: {e}"))?
 }
 
 /// Resolve a full-resolution cover path for a track (creates cache if needed).
 #[tauri::command]
-pub fn library_resolve_full_cover(path: String) -> Result<Option<String>, String> {
-    use std::path::Path;
-
-    if crate::cue::is_cue_track_path(&path) {
-        if let Some((audio, _)) = crate::cue::parse_virtual_cue_path(&path) {
-            return Ok(crate::metadata::resolve_full_cover(Path::new(&audio)));
+pub async fn library_resolve_full_cover(path: String) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        use std::path::Path;
+        if crate::cue::is_cue_track_path(&path) {
+            if let Some((audio, _)) = crate::cue::parse_virtual_cue_path(&path) {
+                return crate::metadata::resolve_full_cover(Path::new(&audio));
+            }
+            return None;
         }
-        return Ok(None);
-    }
-
-    Ok(crate::metadata::resolve_full_cover(Path::new(&path)))
+        crate::metadata::resolve_full_cover(Path::new(&path))
+    })
+    .await
+    .map_err(|e| format!("Cover resolve task failed: {e}"))
 }
 
 /// Return a data URL for a cover image file (works for library paths outside asset scope).

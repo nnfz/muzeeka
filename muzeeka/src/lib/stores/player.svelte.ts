@@ -101,6 +101,7 @@ let lastManualPlayAt = 0;
 let lastPlayedFile = '';
 let lastPauseRequestAt = 0;
 let applyingExternalSync = false;
+let listenersSetup = false;
 
 // --- Derived ---
 
@@ -140,8 +141,21 @@ function reorderPathList(list: string[], paths: string[], insertIndex: number): 
   return [...remaining.slice(0, insertAt), ...moving, ...remaining.slice(insertAt)];
 }
 
+let trackByPath = $derived(buildTrackByPathMap());
+let playlistById = $derived(new Map(playlists.map((playlist) => [playlist.id, playlist])));
+let playlistIdByTrackPath = $derived.by(() => {
+  const result = new Map<string, string>();
+  for (const playlist of playlists) {
+    for (const track of playlist.tracks) {
+      if (!result.has(track.path)) {
+        result.set(track.path, playlist.id);
+      }
+    }
+  }
+  return result;
+});
+
 let allTracks = $derived.by(() => {
-  const trackByPath = buildTrackByPathMap();
   const defaultOrder = defaultAllPaths();
 
   if (allPaths.length === 0) {
@@ -172,7 +186,6 @@ let allTracks = $derived.by(() => {
 });
 
 let likedTracks = $derived.by(() => {
-  const trackByPath = buildTrackByPathMap();
   const result: MusicFile[] = [];
   for (const path of likedPaths) {
     const track = trackByPath.get(path);
@@ -185,40 +198,34 @@ let tracks = $derived.by(() => {
   if (activePlaylistId === VIRTUAL_ALL_ID) return allTracks;
   if (activePlaylistId === VIRTUAL_LIKED_ID) return likedTracks;
   if (!activePlaylistId) return [];
-  return playlists.find((p) => p.id === activePlaylistId)?.tracks ?? [];
+  return playlistById.get(activePlaylistId)?.tracks ?? [];
 });
 
 let activePlaylist = $derived(
-  playlists.find((p) => p.id === activePlaylistId) ?? null
+  activePlaylistId ? (playlistById.get(activePlaylistId) ?? null) : null
 );
 
 let activePlaylistName = $derived.by(() => {
   if (activePlaylistId === VIRTUAL_ALL_ID) return 'All tracks';
   if (activePlaylistId === VIRTUAL_LIKED_ID) return 'Liked';
-  return playlists.find((p) => p.id === activePlaylistId)?.name ?? null;
+  return activePlaylist?.name ?? null;
 });
 
 let playingPlaylist = $derived(
-  playingPlaylistId
-    ? (playlists.find((p) => p.id === playingPlaylistId) ?? null)
-    : null
+  playingPlaylistId ? (playlistById.get(playingPlaylistId) ?? null) : null
 );
 
 let playingTracks = $derived.by(() => {
   if (!playingPlaylistId) return [];
   if (playingPlaylistId === VIRTUAL_ALL_ID) return allTracks;
   if (playingPlaylistId === VIRTUAL_LIKED_ID) return likedTracks;
-  return playlists.find((p) => p.id === playingPlaylistId)?.tracks ?? [];
+  return playlistById.get(playingPlaylistId)?.tracks ?? [];
 });
 
 // Search across ALL playlists so metadata survives playlist switches
 let currentTrack = $derived.by(() => {
   if (!currentFile) return null;
-  for (const playlist of playlists) {
-    const found = playlist.tracks.find((t) => t.path === currentFile);
-    if (found) return found;
-  }
-  return null;
+  return trackByPath.get(currentFile) ?? null;
 });
 
 let progress = $derived(duration > 0 ? position / duration : 0);
@@ -315,9 +322,16 @@ export function trackSearchText(track: MusicFile): string {
     .toLowerCase();
 }
 
-function needsMetadata(track: MusicFile): boolean {
-  return track.duration_secs == null || !track.cover_path;
+function isStaleCoverPath(path: string | null | undefined): boolean {
+  // A cover stored inside the app covers cache may disappear if the cache
+  // was wiped. Mark it as stale so enrichment fetches a fresh one.
+  return typeof path === 'string' && /[\\/]covers[\\/]/i.test(path);
 }
+
+function needsMetadata(track: MusicFile): boolean {
+  return track.duration_secs == null || !track.cover_path || isStaleCoverPath(track.cover_path);
+}
+
 
 function mergeMetadataIntoPlaylists(enriched: MusicFile[]) {
   if (enriched.length === 0) return;
@@ -359,12 +373,7 @@ function findPlaylistForTrack(path: string): string | null {
   if (playingPlaylistId && playingTracks.some((t) => t.path === path)) {
     return playingPlaylistId;
   }
-  for (const playlist of playlists) {
-    if (playlist.tracks.some((track) => track.path === path)) {
-      return playlist.id;
-    }
-  }
-  return null;
+  return playlistIdByTrackPath.get(path) ?? null;
 }
 
 function syncTrackIndex() {
@@ -440,7 +449,7 @@ async function syncDownloadPlaylistFromLibrary() {
       'settings_load'
     );
     const configured = current.download_playlist_id;
-    if (configured && playlists.some((p) => p.id === configured)) return;
+    if (configured && playlistById.has(configured)) return;
 
     const existing = playlists.find(
       (p) => p.name.toLowerCase() === DOWNLOADS_PLAYLIST_NAME.toLowerCase()
@@ -456,7 +465,7 @@ async function syncDownloadPlaylistFromLibrary() {
 }
 
 function resolveDownloadPlaylistId(configuredId: string | null | undefined): string {
-  if (configuredId && playlists.some((p) => p.id === configuredId)) {
+  if (configuredId && playlistById.has(configuredId)) {
     return configuredId;
   }
 
@@ -529,12 +538,9 @@ async function loadPlaylists() {
     }
     // Restore last playing track so metadata/status survive Ctrl+R
     if (data.current_file) {
-      const exists = playlists.some((p) => p.tracks.some((t) => t.path === data.current_file));
-      if (exists) {
+      const track = trackByPath.get(data.current_file);
+      if (track) {
         currentFile = data.current_file;
-        const track = playlists
-          .flatMap((p) => p.tracks)
-          .find((t) => t.path === data.current_file);
         currentFileName = track ? trackDisplayTitle(track) : data.current_file.split(/[\\/]/).pop()?.replace(/\.[^/.]+$/, '') ?? null;
         if (!data.playing_playlist_id) {
           playingPlaylistId = findPlaylistForTrack(data.current_file);
@@ -592,11 +598,10 @@ function selectPlaylist(id: string) {
     scheduleSave();
     return;
   }
-  if (!playlists.some((p) => p.id === id)) return;
+  const playlist = playlistById.get(id);
+  if (!playlist) return;
   activePlaylistId = id;
-  prefetchCoverPaths(
-    playlists.find((p) => p.id === id)?.tracks.map((track) => track.cover_path) ?? []
-  );
+  prefetchCoverPaths(playlist.tracks.map((track) => track.cover_path));
   scheduleSave();
 }
 
@@ -626,7 +631,7 @@ function removeTrack(path: string, playlistId?: string | null) {
   const targetId = playlistId ?? activePlaylistId;
   if (!targetId) return;
 
-  const playlist = playlists.find((p) => p.id === targetId);
+  const playlist = playlistById.get(targetId);
   if (!playlist?.tracks.some((track) => track.path === path)) return;
 
   playlists = playlists.map((p) =>
@@ -720,7 +725,6 @@ function copyTracksToPlaylist(
   if (!isEditablePlaylist(targetPlaylistId)) return 0;
   if (targetPlaylistId === sourcePlaylistId) return 0;
 
-  const trackByPath = buildTrackByPathMap();
   const tracks = paths
     .map((path) => trackByPath.get(path))
     .filter((track): track is MusicFile => !!track);
@@ -733,7 +737,7 @@ function removeTracksFromPlaylist(paths: string[], playlistId: string) {
   if (!isEditablePlaylist(playlistId)) return;
 
   const pathSet = new Set(paths);
-  const playlist = playlists.find((p) => p.id === playlistId);
+  const playlist = playlistById.get(playlistId);
   if (!playlist?.tracks.some((track) => pathSet.has(track.path))) return;
 
   playlists = playlists.map((p) =>
@@ -772,7 +776,6 @@ function moveTracksToPlaylist(
   if (!isEditablePlaylist(targetPlaylistId)) return 0;
   if (targetPlaylistId === sourcePlaylistId) return 0;
 
-  const trackByPath = buildTrackByPathMap();
   const tracks = paths
     .map((path) => trackByPath.get(path))
     .filter((track): track is MusicFile => !!track);
@@ -804,7 +807,7 @@ function moveTracksToPlaylist(
 
 function mergeTracksIntoPlaylist(playlistId: string, files: MusicFile[]): number {
   const existing = new Set(
-    playlists.find((p) => p.id === playlistId)?.tracks.map((t) => t.path) ?? []
+    playlistById.get(playlistId)?.tracks.map((t) => t.path) ?? []
   );
   const newTracks = files.filter((f) => !existing.has(f.path));
   if (newTracks.length === 0) return 0;
@@ -826,7 +829,7 @@ function addScannedTracks(files: MusicFile[], playlistId?: string | null): numbe
   let targetId = playlistId ?? activePlaylistId;
   if (!targetId) {
     targetId = createPlaylist();
-  } else if (!playlists.some((p) => p.id === targetId)) {
+  } else if (!playlistById.has(targetId)) {
     return 0;
   }
 
@@ -990,8 +993,7 @@ function orderedTracksFrom(filePath: string): MusicFile[] {
 
 function buildGaplessQueue(filePath: string) {
   if (repeatMode === 'one') {
-    const track = playingTracks.find((t) => t.path === filePath) ??
-      playlists.flatMap((p) => p.tracks).find((t) => t.path === filePath);
+    const track = playingTracks.find((t) => t.path === filePath) ?? trackByPath.get(filePath);
     if (track) {
       return [gaplessArgsForTrack(track, filePath)];
     }
@@ -1045,7 +1047,7 @@ async function play(filePath: string) {
     if (repeatMode === 'one') {
       queueToSend = [gaplessArgsForTrack(track || ({ path: filePath } as any), filePath)];
     } else if (playlistId) {
-      const pl = playlists.find((p) => p.id === playlistId);
+      const pl = playlistById.get(playlistId);
       if (pl) {
         const idx = pl.tracks.findIndex((t) => t.path === filePath);
         const slice = (idx >= 0) ? pl.tracks.slice(idx, idx + MAX_GAPLESS_FOLLOWING) : [track || {path: filePath} as any];
@@ -1076,7 +1078,7 @@ async function play(filePath: string) {
       ? trackDisplayTitle(file)
       : filePath.split(/[\\/]/).pop()?.replace(/\.[^/.]+$/, '') ?? null;
     position = 0;
-    const meta = track || playlists.flatMap((p) => p.tracks).find((t) => t.path === filePath);
+    const meta = track || trackByPath.get(filePath);
     if (meta?.duration_secs != null) {
       duration = meta.duration_secs;
     }
@@ -1166,13 +1168,8 @@ function setPlaybackRate(rate: number) {
   void invoke('player_set_playback_rate', { rate: playbackRate }).catch((e) => {
     console.error('Failed to set playback rate:', e);
   });
-  // Persist to settings (without clobbering EQ etc)
-  void (async () => {
-    try {
-      const current = await invoke<any>('settings_load');
-      await invoke('settings_save', { data: { ...current, playback_rate: playbackRate } });
-    } catch {}
-  })();
+  // Persistence is handled by the settings store. Avoid loading and rewriting the
+  // whole settings file here, which can race with equalizer/download settings saves.
 }
 
 function toggleLike(path: string) {
@@ -1307,7 +1304,7 @@ function applyStoreSync(payload: StoreSyncPayload) {
     if (payload.currentFile !== undefined) {
       currentFile = payload.currentFile;
       if (currentFile) {
-        const track = playlists.flatMap((p) => p.tracks).find((t) => t.path === currentFile);
+        const track = trackByPath.get(currentFile);
         currentFileName = track
           ? trackDisplayTitle(track)
           : currentFile.split(/[\\/]/).pop()?.replace(/\.[^/.]+$/, '') ?? null;
@@ -1348,6 +1345,9 @@ function applyStoreSync(payload: StoreSyncPayload) {
 // --- Event Listeners ---
 
 function setupListeners() {
+  if (listenersSetup) return;
+  listenersSetup = true;
+
   listen<StoreSyncPayload>('player:store-sync', (event) => {
     applyStoreSync(event.payload);
     if (currentFile && (isPlaying || isPaused)) {
@@ -1366,7 +1366,7 @@ function setupListeners() {
     }
 
     currentFile = path;
-    const track = playlists.flatMap((p) => p.tracks).find((t) => t.path === path);
+    const track = trackByPath.get(path);
     currentFileName = track
       ? trackDisplayTitle(track)
       : path.split(/[\\/]/).pop()?.replace(/\.[^/.]+$/, '') ?? null;

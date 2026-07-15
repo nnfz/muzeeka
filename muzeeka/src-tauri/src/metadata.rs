@@ -1,4 +1,5 @@
 // Audio metadata reader — ID3, Vorbis, FLAC, MP4, etc. via lofty.
+// Falls back to the `id3` crate for MP3 files with tricky unsynchronisation tags.
 
 use image::imageops::FilterType;
 use image::{GenericImageView, ImageFormat};
@@ -218,10 +219,14 @@ fn cache_full_cover_bytes(
     Some(cache_path.to_string_lossy().to_string())
 }
 
+fn decode_image_bytes(data: &[u8]) -> Option<image::DynamicImage> {
+    image::load_from_memory(data).ok()
+}
+
+#[allow(dead_code)]
 fn write_thumbnail_from_bytes(data: &[u8], dest: &Path) -> bool {
-    let image = match image::load_from_memory(data) {
-        Ok(image) => image,
-        Err(_) => return false,
+    let Some(image) = decode_image_bytes(data) else {
+        return false;
     };
     write_thumbnail_from_image(&image, dest)
 }
@@ -247,28 +252,17 @@ fn write_thumbnail_from_image(image: &image::DynamicImage, dest: &Path) -> bool 
 
 fn cache_cover_bytes(audio_path: &Path, data: &[u8], mime: &str, suffix: &str) -> CoverPaths {
     let mut paths = CoverPaths::default();
+    let Some(image) = decode_image_bytes(data) else {
+        return paths;
+    };
     let cache_path = thumb_cache_path(audio_path, suffix);
 
     if let Some(cache_path) = cache_path {
         if !cache_path.exists() {
-            if !write_thumbnail_from_bytes(data, &cache_path) {
-                let fallback = COVER_CACHE_DIR.get().map(|dir| {
-                    dir.join(format!(
-                        "{}-{}.{}",
-                        cache_key(audio_path),
-                        suffix,
-                        mime_to_ext(mime)
-                    ))
-                });
-                if let Some(fallback) = fallback {
-                    if fs::write(&fallback, data).is_ok() {
-                        paths.thumb = Some(fallback.to_string_lossy().to_string());
-                    }
-                }
-            }
+            let _ = write_thumbnail_from_image(&image, &cache_path);
         }
 
-        if paths.thumb.is_none() && cache_path.exists() {
+        if cache_path.exists() {
             paths.thumb = Some(cache_path.to_string_lossy().to_string());
         }
     }
@@ -316,6 +310,12 @@ fn cache_cover_file(audio_path: &Path, source: &Path) -> CoverPaths {
 fn extract_embedded_cover(tagged_file: &TaggedFile, path: &Path) -> CoverPaths {
     for tag in tagged_file.tags() {
         if let Some((data, mime)) = pick_cover_picture(tag) {
+            // Validate that we have a plausible image (at least a few KB).
+            // A suspiciously small payload indicates lofty mis-parsed the frame
+            // size (e.g. syncsafe vs. non-syncsafe mix-up in ID3v2.4 unsync tags).
+            if data.len() < 256 {
+                break; // fall through to the id3-crate fallback below
+            }
             let paths = cache_cover_bytes(path, data, &mime, "embedded");
             if paths.thumb.is_some() || paths.full.is_some() {
                 return paths;
@@ -323,7 +323,49 @@ fn extract_embedded_cover(tagged_file: &TaggedFile, path: &Path) -> CoverPaths {
         }
     }
 
+    // Fallback: try the `id3` crate which handles ID3v2.3/v2.4 unsynchronisation
+    // correctly even when lofty mis-reads the frame size.
+    if let Some(paths) = extract_embedded_cover_id3(path) {
+        return paths;
+    }
+
     CoverPaths::default()
+}
+
+/// Extract cover art from an MP3/ID3 file using the `id3` crate as a fallback.
+fn extract_embedded_cover_id3(path: &Path) -> Option<CoverPaths> {
+    // Only attempt for files that could carry ID3 tags.
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("mp3") | Some("aiff") | Some("aif") => {}
+        _ => return None,
+    }
+
+    let tag = id3::Tag::read_from_path(path).ok()?;
+    let pic = tag
+        .pictures()
+        .find(|p| p.picture_type == id3::frame::PictureType::CoverFront)
+        .or_else(|| tag.pictures().next())?;
+
+    if pic.data.is_empty() {
+        return None;
+    }
+
+    let mime = if pic.mime_type.is_empty() {
+        guess_mime(&pic.data)
+    } else {
+        pic.mime_type.clone()
+    };
+
+    let paths = cache_cover_bytes(path, &pic.data, &mime, "embedded");
+    if paths.thumb.is_some() || paths.full.is_some() {
+        Some(paths)
+    } else {
+        None
+    }
 }
 
 fn extract_nearby_cover(path: &Path) -> CoverPaths {
@@ -339,6 +381,13 @@ fn resolve_cover_paths(path: &Path, tagged_file: Option<&TaggedFile>) -> CoverPa
         let embedded = extract_embedded_cover(tagged_file, path);
         if embedded.thumb.is_some() || embedded.full.is_some() {
             return embedded;
+        }
+    } else {
+        // No lofty tag at all — still try id3 fallback for MP3.
+        if let Some(paths) = extract_embedded_cover_id3(path) {
+            if paths.thumb.is_some() || paths.full.is_some() {
+                return paths;
+            }
         }
     }
 

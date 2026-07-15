@@ -95,10 +95,56 @@ pub fn load_playlists(app: &AppHandle) -> Result<PlaylistsData, String> {
     Ok(data)
 }
 
+fn write_file_atomic(path: &PathBuf, contents: &[u8]) -> Result<(), String> {
+    let tmp_path = path.with_extension("json.tmp");
+    let bak_path = path.with_extension("json.bak");
+
+    let write_result = (|| {
+        let mut file = fs::File::create(&tmp_path)
+            .map_err(|e| format!("Failed to create temporary playlists file: {}", e))?;
+        use std::io::Write as _;
+        file.write_all(contents)
+            .map_err(|e| format!("Failed to write temporary playlists file: {}", e))?;
+        file.sync_all()
+            .map_err(|e| format!("Failed to flush temporary playlists file: {}", e))?;
+        drop(file);
+
+        match fs::rename(&tmp_path, path) {
+            Ok(()) => Ok(()),
+            Err(first_error) if path.exists() => {
+                let _ = fs::remove_file(&bak_path);
+                fs::rename(path, &bak_path)
+                    .map_err(|e| format!("Failed to back up playlists file before replace: {}", e))?;
+
+                match fs::rename(&tmp_path, path) {
+                    Ok(()) => {
+                        let _ = fs::remove_file(&bak_path);
+                        Ok(())
+                    }
+                    Err(second_error) => {
+                        let _ = fs::rename(&bak_path, path);
+                        Err(format!(
+                            "Failed to replace playlists file: {}; original rename error: {}",
+                            second_error, first_error
+                        ))
+                    }
+                }
+            }
+            Err(error) => Err(format!("Failed to replace playlists file: {}", error)),
+        }
+    })();
+
+    if write_result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+
+    write_result
+}
+
 pub fn save_playlists(app: &AppHandle, data: &PlaylistsData) -> Result<(), String> {
     let path = playlists_path(app)?;
-    let json = serde_json::to_string_pretty(data)
+    let json = serde_json::to_vec_pretty(data)
         .map_err(|e| format!("Failed to serialize playlists: {}", e))?;
 
-    fs::write(&path, json).map_err(|e| format!("Failed to write playlists file: {}", e))
+    write_file_atomic(&path, &json)
 }

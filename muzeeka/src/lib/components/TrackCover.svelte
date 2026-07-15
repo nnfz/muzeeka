@@ -9,12 +9,20 @@
 
   let { track }: Props = $props();
 
-  let src = $derived(getCoverSrc(track?.cover_path));
+  let failedSrc = $state<string | null>(null);
+  let src = $derived.by(() => {
+    const next = getCoverSrc(track?.cover_path);
+    return next && next !== failedSrc ? next : null;
+  });
+
+  function handleImageError() {
+    if (src) failedSrc = src;
+  }
 </script>
 
 <div class="track-cover">
   {#if src}
-    <img {src} alt="" loading="lazy" decoding="async" draggable="false" ondragstart={(e) => e.preventDefault()} />
+    <img {src} alt="" loading="lazy" decoding="async" draggable="false" onerror={handleImageError} ondragstart={(e) => e.preventDefault()} />
   {:else}
     <div class="cover-placeholder" aria-hidden="true">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
