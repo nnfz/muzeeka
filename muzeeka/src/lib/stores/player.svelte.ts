@@ -322,15 +322,22 @@ export function trackSearchText(track: MusicFile): string {
     .toLowerCase();
 }
 
+// Set to true after the first enrichment pass so we stop treating all cached
+// cover paths as potentially stale on subsequent calls.
+let coverCacheValidated = false;
+
 function isStaleCoverPath(path: string | null | undefined): boolean {
   // A cover stored inside the app covers cache may disappear if the cache
   // was wiped. Mark it as stale so enrichment fetches a fresh one.
+  // Only do this check on the very first pass — after that we trust the cache.
+  if (coverCacheValidated) return false;
   return typeof path === 'string' && /[\\/]covers[\\/]/i.test(path);
 }
 
 function needsMetadata(track: MusicFile): boolean {
   return track.duration_secs == null || !track.cover_path || isStaleCoverPath(track.cover_path);
 }
+
 
 
 function mergeMetadataIntoPlaylists(enriched: MusicFile[]) {
@@ -356,6 +363,10 @@ async function enrichTrackMetadata() {
     ),
   ];
 
+  // After collecting which paths need work, mark cache as validated so
+  // subsequent calls (e.g. after adding new tracks) don't re-scan everything.
+  coverCacheValidated = true;
+
   if (paths.length === 0) return;
 
   try {
@@ -366,6 +377,7 @@ async function enrichTrackMetadata() {
   } catch (e) {
     console.error('Failed to fetch track metadata:', e);
   }
+
 }
 
 function findPlaylistForTrack(path: string): string | null {
