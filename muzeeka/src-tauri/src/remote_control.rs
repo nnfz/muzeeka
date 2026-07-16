@@ -1,6 +1,8 @@
 // Remote playback controller — mirrors frontend queue logic for the HTTP API.
 
+use std::fs;
 use std::path::Path;
+use std::time::SystemTime;
 
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -99,6 +101,7 @@ struct PlayerStateEvent {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct StoreSyncPayload {
+    #[serde(skip_serializing_if = "Option::is_none")]
     active_playlist_id: Option<String>,
     playing_playlist_id: Option<String>,
     shuffle_enabled: bool,
@@ -111,12 +114,18 @@ struct StoreSyncPayload {
     duration: f64,
 }
 
+struct PlaylistsCache {
+    data: PlaylistsData,
+    modified: Option<SystemTime>,
+}
+
 pub struct RemoteController {
     player: Player,
     discord: DiscordPresence,
     app: AppHandle,
     shuffle_order: Mutex<Vec<usize>>,
     shuffle_position: Mutex<usize>,
+    playlists_cache: Mutex<Option<PlaylistsCache>>,
 }
 
 impl RemoteController {
@@ -127,6 +136,7 @@ impl RemoteController {
             app,
             shuffle_order: Mutex::new(Vec::new()),
             shuffle_position: Mutex::new(0),
+            playlists_cache: Mutex::new(None),
         }
     }
 
@@ -136,9 +146,8 @@ impl RemoteController {
             .or_else(|| data.active_playlist_id.clone())
     }
 
-    fn notify_ui(&self, data: &PlaylistsData) {
+    fn notify_playback(&self) {
         let snapshot = self.player.get_state();
-
         let _ = self.app.emit(
             "player:state",
             PlayerStateEvent {
@@ -146,14 +155,6 @@ impl RemoteController {
                 is_paused: snapshot.is_paused,
             },
         );
-
-        if let Some(path) = snapshot.current_file.clone() {
-            let _ = self.app.emit(
-                "player:track-changed",
-                TrackChangedPayload { path },
-            );
-        }
-
         let _ = self.app.emit(
             "player:position",
             PositionPayload {
@@ -162,11 +163,14 @@ impl RemoteController {
                 state: snapshot.state,
             },
         );
+    }
 
+    fn notify_store_sync(&self, data: &PlaylistsData) {
+        let snapshot = self.player.get_state();
         let _ = self.app.emit(
             "player:store-sync",
             StoreSyncPayload {
-                active_playlist_id: data.active_playlist_id.clone(),
+                active_playlist_id: None,
                 playing_playlist_id: data.playing_playlist_id.clone(),
                 shuffle_enabled: data.shuffle_enabled,
                 repeat_mode: data.repeat_mode.clone(),
@@ -180,16 +184,51 @@ impl RemoteController {
         );
     }
 
+    fn notify_track_changed(&self, path: &str) {
+        let _ = self.app.emit(
+            "player:track-changed",
+            TrackChangedPayload {
+                path: path.to_string(),
+            },
+        );
+    }
+
     fn load_data(&self) -> Result<PlaylistsData, String> {
-        playlists::load_playlists(&self.app)
+        let path = playlists::playlists_path(&self.app)?;
+        let modified = fs::metadata(&path).ok().and_then(|meta| meta.modified().ok());
+
+        if let Some(cached) = self.playlists_cache.lock().as_ref() {
+            if cached.modified == modified {
+                return Ok(cached.data.clone());
+            }
+        }
+
+        let data = playlists::load_playlists_fast(&self.app)?;
+        *self.playlists_cache.lock() = Some(PlaylistsCache {
+            data: data.clone(),
+            modified,
+        });
+        Ok(data)
     }
 
     fn save_data(&self, data: &PlaylistsData) -> Result<(), String> {
-        playlists::save_playlists(&self.app, data)
+        playlists::save_playlists(&self.app, data)?;
+        let modified = playlists::playlists_path(&self.app)
+            .ok()
+            .and_then(|path| fs::metadata(&path).ok().and_then(|meta| meta.modified().ok()));
+        *self.playlists_cache.lock() = Some(PlaylistsCache {
+            data: data.clone(),
+            modified,
+        });
+        Ok(())
     }
 
     fn sync_discord(&self) {
-        self.discord.update_from_player(&self.player.get_state());
+        let player = self.player.clone();
+        let discord = self.discord.clone();
+        std::thread::spawn(move || {
+            discord.update_from_player(&player.get_state());
+        });
     }
 
     fn track_map(data: &PlaylistsData) -> std::collections::HashMap<String, MusicFile> {
@@ -490,6 +529,7 @@ impl RemoteController {
 
         let mut playing_id = playlist_id
             .map(|id| id.to_string())
+            .or_else(|| data.playing_playlist_id.clone())
             .or_else(|| data.active_playlist_id.clone());
 
         if let Some(ref id) = playing_id {
@@ -502,9 +542,6 @@ impl RemoteController {
 
         if let Some(id) = playing_id.clone() {
             data.playing_playlist_id = Some(id);
-            if let Some(req_id) = playlist_id {
-                data.active_playlist_id = Some(req_id.to_string());
-            }
         }
 
         let repeat = Self::repeat_mode(&data);
@@ -588,18 +625,17 @@ impl RemoteController {
         data.current_file = Some(file_path.to_string());
         self.save_data(&data)?;
         self.sync_discord();
-        self.notify_ui(&data);
+        self.notify_track_changed(file_path);
+        self.notify_store_sync(&data);
         Ok(())
     }
 
     pub fn get_state(&self) -> Result<RemoteState, String> {
         let data = self.load_data()?;
         let snapshot = self.player.get_state();
-        let active_id = data.active_playlist_id.clone().or_else(|| {
-            Self::playing_id_from_data(&data).or_else(|| {
-                snapshot.current_file.as_ref().and_then(|path| {
-                    Self::find_playlist_for_track(&data, path, data.playing_playlist_id.as_deref())
-                })
+        let active_id = Self::playing_id_from_data(&data).or_else(|| {
+            snapshot.current_file.as_ref().and_then(|path| {
+                Self::find_playlist_for_track(&data, path, data.playing_playlist_id.as_deref())
             })
         });
 
@@ -669,16 +705,14 @@ impl RemoteController {
     pub fn pause(&self) -> Result<(), String> {
         self.player.pause()?;
         self.sync_discord();
-        let data = self.load_data()?;
-        self.notify_ui(&data);
+        self.notify_playback();
         Ok(())
     }
 
     pub fn resume(&self) -> Result<(), String> {
         self.player.resume()?;
         self.sync_discord();
-        let data = self.load_data()?;
-        self.notify_ui(&data);
+        self.notify_playback();
         Ok(())
     }
 
@@ -692,10 +726,10 @@ impl RemoteController {
             self.play_track(&path, None)
         } else {
             let data = self.load_data()?;
-            let playing_id = data.active_playlist_id.as_deref();
-            let tracks = Self::playing_tracks(&data, playing_id);
+            let playing_id = Self::playing_id_from_data(&data);
+            let tracks = Self::playing_tracks(&data, playing_id.as_deref());
             if let Some(track) = tracks.first() {
-                self.play_track(&track.path, playing_id)
+                self.play_track(&track.path, playing_id.as_deref())
             } else {
                 Ok(())
             }
@@ -750,8 +784,7 @@ impl RemoteController {
             if state.current_file.is_some() {
                 self.player.seek(0.0)?;
                 self.sync_discord();
-                let data = self.load_data()?;
-                self.notify_ui(&data);
+                self.notify_playback();
                 return Ok(());
             }
         }
@@ -789,8 +822,7 @@ impl RemoteController {
     pub fn seek(&self, position: f64) -> Result<(), String> {
         self.player.seek(position)?;
         self.sync_discord();
-        let data = self.load_data()?;
-        self.notify_ui(&data);
+        self.notify_playback();
         Ok(())
     }
 
@@ -800,7 +832,7 @@ impl RemoteController {
         let mut data = self.load_data()?;
         data.volume = Some(volume);
         self.save_data(&data)?;
-        self.notify_ui(&data);
+        self.notify_store_sync(&data);
         Ok(())
     }
 
@@ -812,9 +844,10 @@ impl RemoteController {
         {
             return Err("Playlist not found".to_string());
         }
-        data.active_playlist_id = Some(playlist_id.to_string());
+        // Remote queue only — do not change the desktop app's viewed playlist.
+        data.playing_playlist_id = Some(playlist_id.to_string());
         self.save_data(&data)?;
-        self.notify_ui(&data);
+        self.notify_store_sync(&data);
         Ok(())
     }
 
@@ -830,7 +863,7 @@ impl RemoteController {
         }
         let enabled = data.shuffle_enabled;
         self.save_data(&data)?;
-        self.notify_ui(&data);
+        self.notify_store_sync(&data);
         Ok(enabled)
     }
 
@@ -846,7 +879,7 @@ impl RemoteController {
 
         let mode = next.as_str().to_string();
         self.save_data(&data)?;
-        self.notify_ui(&data);
+        self.notify_store_sync(&data);
         Ok(mode)
     }
 

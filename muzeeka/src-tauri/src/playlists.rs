@@ -52,7 +52,7 @@ pub struct PlaylistsData {
     pub repeat_mode: Option<String>,
 }
 
-fn playlists_path(app: &AppHandle) -> Result<PathBuf, String> {
+pub fn playlists_path(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app
         .path()
         .app_data_dir()
@@ -71,28 +71,40 @@ fn prune_missing_tracks(data: &mut PlaylistsData) {
     }
 }
 
-pub fn load_playlists(app: &AppHandle) -> Result<PlaylistsData, String> {
-    let path = playlists_path(app)?;
-
+fn parse_playlists_file(path: &PathBuf, prune: bool) -> Result<PlaylistsData, String> {
     if !path.exists() {
         return Ok(PlaylistsData::default());
     }
 
-    let raw = fs::read_to_string(&path)
+    let raw = fs::read_to_string(path)
         .map_err(|e| format!("Failed to read playlists file: {}", e))?;
 
     let mut data: PlaylistsData = serde_json::from_str(&raw)
         .map_err(|e| format!("Failed to parse playlists file: {}", e))?;
 
-    prune_missing_tracks(&mut data);
+    if prune {
+        prune_missing_tracks(&mut data);
+    }
 
     if let Some(active_id) = &data.active_playlist_id {
-        if !data.playlists.iter().any(|p| p.id == *active_id) {
+        if active_id != "__all__"
+            && active_id != "__liked__"
+            && !data.playlists.iter().any(|p| p.id == *active_id)
+        {
             data.active_playlist_id = data.playlists.first().map(|p| p.id.clone());
         }
     }
 
     Ok(data)
+}
+
+pub fn load_playlists(app: &AppHandle) -> Result<PlaylistsData, String> {
+    parse_playlists_file(&playlists_path(app)?, true)
+}
+
+/// Hot-path load for remote/polling — skips per-track filesystem checks.
+pub fn load_playlists_fast(app: &AppHandle) -> Result<PlaylistsData, String> {
+    parse_playlists_file(&playlists_path(app)?, false)
 }
 
 fn write_file_atomic(path: &PathBuf, contents: &[u8]) -> Result<(), String> {

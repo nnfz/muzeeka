@@ -451,6 +451,8 @@
     let volumeDragging = false;
     let seekDragging = false;
     let userPickedPlaylist = false;
+    let volumeSendTimer = null;
+    let lastTrackListPath = null;
     let mediaSessionReady = false;
     let mediaSessionEnabled = false;
     let wakeLock = null;
@@ -484,11 +486,33 @@
       setTimeout(() => el.classList.remove('show'), 4000);
     }
 
-    async function action(path, body) {
+    function applyTransportOptimistic(path) {
+      if (!state) return;
+      if (path === '/api/toggle') {
+        if (state.isPlaying) {
+          state.isPlaying = false;
+          state.isPaused = true;
+        } else {
+          state.isPlaying = true;
+          state.isPaused = false;
+        }
+      } else if (path === '/api/pause') {
+        state.isPlaying = false;
+        state.isPaused = true;
+      } else if (path === '/api/resume') {
+        state.isPlaying = true;
+        state.isPaused = false;
+      }
+      renderNowPlaying();
+    }
+
+    async function action(path, body, opts = {}) {
+      if (opts.optimistic) applyTransportOptimistic(path);
       try {
         await api(path, { method: 'POST', body: body ? JSON.stringify(body) : undefined });
-        await refreshState();
+        if (!opts.skipRefresh) await refreshState();
       } catch (e) {
+        await refreshState();
         showError(e.message);
       }
     }
@@ -789,8 +813,18 @@
         $('volumeSlider').value = Math.round(state.volume * 100);
       }
 
-      renderTrackList();
+      highlightPlayingTrack();
       updateMediaSession();
+    }
+
+    function highlightPlayingTrack() {
+      const currentPath = state?.track?.path ?? null;
+      if (currentPath === lastTrackListPath) return;
+      lastTrackListPath = currentPath;
+      const list = $('trackList');
+      list.querySelectorAll('.track-item').forEach((el) => {
+        el.classList.toggle('playing', !!currentPath && el.dataset.path === currentPath);
+      });
     }
 
     function renderTabs() {
@@ -804,9 +838,16 @@
           activePlaylistId = btn.dataset.id;
           userPickedPlaylist = true;
           localStorage.setItem(LS_PLAYLIST_KEY, activePlaylistId);
-          await action('/api/playlist/select', { id: activePlaylistId });
-          await loadPlaylist(activePlaylistId);
           renderTabs();
+          try {
+            await api('/api/playlist/select', {
+              method: 'POST',
+              body: JSON.stringify({ id: activePlaylistId }),
+            });
+            await loadPlaylist(activePlaylistId);
+          } catch (e) {
+            showError(e.message);
+          }
         });
       });
     }
@@ -814,6 +855,7 @@
     function renderTrackList() {
       const list = $('trackList');
       const currentPath = state?.track?.path;
+      lastTrackListPath = null;
       list.innerHTML = playlistTracks.map((t) => {
         const playing = t.path === currentPath;
         const thumb = t.coverUrl
@@ -914,8 +956,8 @@
       }
     }
 
-    $('btnPlay').addEventListener('click', () => action('/api/toggle'));
-    $('btnPause')?.addEventListener('click', () => action('/api/pause'));
+    $('btnPlay').addEventListener('click', () => action('/api/toggle', null, { optimistic: true }));
+    $('btnPause')?.addEventListener('click', () => action('/api/pause', null, { optimistic: true }));
     $('btnPrev').addEventListener('click', () => action('/api/prev'));
     $('btnNext').addEventListener('click', () => action('/api/next'));
     $('btnShuffle').addEventListener('click', () => action('/api/shuffle/toggle'));
@@ -924,9 +966,15 @@
     $('volumeSlider').addEventListener('input', (e) => {
       volumeDragging = true;
       const vol = e.target.value / 100;
-      action('/api/volume', { volume: vol }).finally(() => {
-        setTimeout(() => { volumeDragging = false; }, 300);
-      });
+      if (state) state.volume = vol;
+      if (volumeSendTimer) clearTimeout(volumeSendTimer);
+      volumeSendTimer = setTimeout(() => {
+        api('/api/volume', { method: 'POST', body: JSON.stringify({ volume: vol }) })
+          .catch((err) => showError(err.message))
+          .finally(() => {
+            setTimeout(() => { volumeDragging = false; }, 120);
+          });
+      }, 120);
     });
 
     function seekFromEvent(e) {

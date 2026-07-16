@@ -1291,9 +1291,7 @@ function toggleRepeat() {
 function applyStoreSync(payload: StoreSyncPayload) {
   applyingExternalSync = true;
   try {
-    if (payload.activePlaylistId !== undefined) {
-      activePlaylistId = payload.activePlaylistId;
-    }
+    // Remote sync updates the playback queue only — not the playlist shown in the UI.
     if (payload.playingPlaylistId !== undefined) {
       playingPlaylistId = payload.playingPlaylistId;
     }
@@ -1361,8 +1359,14 @@ function setupListeners() {
   listenersSetup = true;
 
   listen<StoreSyncPayload>('player:store-sync', (event) => {
+    const prevPlayingId = playingPlaylistId;
+    const prevFile = currentFile;
     applyStoreSync(event.payload);
-    if (currentFile && (isPlaying || isPaused)) {
+    if (
+      currentFile &&
+      (isPlaying || isPaused) &&
+      (currentFile !== prevFile || playingPlaylistId !== prevPlayingId)
+    ) {
       void prepareGaplessNext(currentFile);
     }
   });
