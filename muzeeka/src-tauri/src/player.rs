@@ -34,6 +34,8 @@ pub struct TrackChangedPayload {
 // Spotify-like short musical fades (not on track changes)
 const PAUSE_FADE_MS: u32 = 220;
 const RESUME_FADE_MS: u32 = 180;
+const PLAYBACK_RATE_RAMP_MS: u32 = 600;
+const RATE_RAMP_STEPS: u32 = 30;
 
 // For seek: we want it instant.
 // Very short hard mute only during the flush to hide any restart artifact.
@@ -107,10 +109,15 @@ struct PlayerInner {
     current_audio_path: Option<String>,
     volume: f32,
     playback_rate: f32,
+    /// Rate currently applied to the active decode/tempo channel (may lag during ramps).
+    applied_playback_rate: f32,
+    /// Bumped to cancel an in-flight playback-rate ramp.
+    rate_ramp_generation: u64,
     /// When true, speed changes also shift pitch (BASS_ATTRIB_FREQ). When false, tempo FX preserves pitch.
     pitch_enabled: bool,
-    current_tempo_fx: u32,
-    preloaded_tempo_fx: u32,
+    /// Raw decode handle when `current_source` is a tempo wrapper (otherwise 0).
+    current_decode: u32,
+    preloaded_decode: u32,
     cue_start: Option<f64>,
     cue_end: Option<f64>,
     eq_context: &'static EqDspContext,
@@ -130,6 +137,8 @@ struct PlayerInner {
     /// Logical pause state. Set immediately on pause() so that get_state() and emitted
     /// events report paused even while the volume fade is still playing out.
     user_paused: bool,
+    /// Ignore spurious track-end detections while rebuilding playback channels.
+    suppress_gapless_until: u64,
 }
 
 /// Official BASS format plugins that are known to work reliably.
@@ -178,9 +187,11 @@ impl Player {
                 current_audio_path: None,
                 volume: 1.0,
                 playback_rate: 1.0,
+                applied_playback_rate: 1.0,
+                rate_ramp_generation: 0,
                 pitch_enabled: true,
-                current_tempo_fx: 0,
-                preloaded_tempo_fx: 0,
+                current_decode: 0,
+                preloaded_decode: 0,
                 cue_start: None,
                 cue_end: None,
                 eq_context: Box::leak(Box::new(EqDspContext::new())),
@@ -193,6 +204,7 @@ impl Player {
                 pause_generation: 0,
                 current_track_start_time: 0,
                 user_paused: false,
+                suppress_gapless_until: 0,
             })),
             app: Arc::new(RwLock::new(None)),
             bass_thread: Arc::new(RwLock::new(None)),
@@ -631,21 +643,25 @@ impl Player {
     fn clear_preload(inner: &mut PlayerInner) {
         if inner.preloaded_source != 0 {
             if let Some(bass) = inner.bass.as_ref() {
-                // Remove from mixer if present; free will happen via AUTOFREE or explicit.
                 let _ = bass.mixer_channel_remove(inner.preloaded_source);
-                let _ = bass.channel_stop(inner.preloaded_source);
+                Self::free_playback_channel(
+                    bass,
+                    inner.preloaded_source,
+                    inner.preloaded_decode,
+                );
             }
             inner.preloaded_source = 0;
         }
         inner.preloaded_audio_path = None;
-        inner.preloaded_tempo_fx = 0;
+        inner.preloaded_decode = 0;
     }
 
     fn teardown_current(inner: &mut PlayerInner) {
+        Self::cancel_rate_ramp(inner);
         if inner.current_source != 0 {
             if let Some(bass) = inner.bass.as_ref() {
                 let _ = bass.mixer_channel_remove(inner.current_source);
-                // We don't stop the mixer itself.
+                Self::free_playback_channel(bass, inner.current_source, inner.current_decode);
             }
             inner.current_source = 0;
         }
@@ -653,7 +669,7 @@ impl Player {
         inner.current_audio_path = None;
         inner.cue_start = None;
         inner.cue_end = None;
-        inner.current_tempo_fx = 0;
+        inner.current_decode = 0;
     }
 
     fn apply_segment_metadata(
@@ -764,7 +780,9 @@ impl Player {
             return Err("Mixer not created".to_string());
         }
         // NORAMPIN is key for gapless: no volume ramp on start of this source.
-        let add_flags = bass::BASS_MIXER_CHAN_NORAMPIN | bass::BASS_STREAM_AUTOFREE;
+        // No AUTOFREE: rate/pitch changes remove and re-add the channel; AUTOFREE would
+        // destroy the decode handle and trigger false gapless track advances.
+        let add_flags = bass::BASS_MIXER_CHAN_NORAMPIN;
         bass.mixer_stream_add_channel(inner.mixer_handle, source, add_flags)?;
         Ok(())
     }
@@ -785,36 +803,33 @@ impl Player {
             false
         };
 
-        let source = Self::create_decode_source(inner, &playback.audio_path, playback.cue_start)?;
+        let decode = Self::create_decode_source(inner, &playback.audio_path, playback.cue_start)?;
+        let rate = inner.playback_rate;
+        let pitch_enabled = inner.pitch_enabled;
+        let volume = inner.volume;
+        let (mixer_channel, tracked_decode) = {
+            let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
+            Self::wrap_decode_for_rate(bass, decode, rate, pitch_enabled)?
+        };
 
-        Self::add_source_to_mixer(inner, source)?;
+        Self::add_source_to_mixer(inner, mixer_channel)?;
 
         if let Some(bass) = inner.bass.as_ref() {
-            let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_VOL, inner.volume);
+            let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_VOL, volume);
             if was_paused_or_stopped {
                 // Hard restart to flush any old buffer from previous track/fade.
                 let _ = bass.channel_play(inner.mixer_handle, true);
             } else {
                 // Mixer is already playing — just ensure it keeps going.
-                // No hard restart needed; the old source was already removed
-                // and the new source is now the only one feeding the mixer.
                 let _ = bass.channel_play(inner.mixer_handle, false);
             }
             let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_BUFFER, 0.2);
         }
 
-        inner.current_source = source;
-        let rate = inner.playback_rate;
-        let pitch_enabled = inner.pitch_enabled;
-        if let Some(bass) = inner.bass.as_ref() {
-            Self::apply_playback_rate_to_source(
-                bass,
-                source,
-                rate,
-                pitch_enabled,
-                &mut inner.current_tempo_fx,
-            );
-        }
+        inner.current_source = mixer_channel;
+        inner.current_decode = tracked_decode;
+        inner.applied_playback_rate = rate;
+        Self::cancel_rate_ramp(inner);
         Self::apply_segment_metadata(inner, track_path, playback);
 
         // Ensure EQ on mixer
@@ -860,19 +875,15 @@ impl Player {
         // We add it to mixer only near the end of current track (in activate or advance).
         // This keeps only 1 source active in mixer during long playback → more stable, less crackling.
 
-        inner.preloaded_source = source;
-        inner.preloaded_audio_path = Some(playback.audio_path);
         let rate = inner.playback_rate;
         let pitch_enabled = inner.pitch_enabled;
-        if let Some(bass) = inner.bass.as_ref() {
-            Self::apply_playback_rate_to_source(
-                bass,
-                source,
-                rate,
-                pitch_enabled,
-                &mut inner.preloaded_tempo_fx,
-            );
-        }
+        let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
+        let (mixer_channel, tracked_decode) =
+            Self::wrap_decode_for_rate(bass, source, rate, pitch_enabled)?;
+
+        inner.preloaded_source = mixer_channel;
+        inner.preloaded_decode = tracked_decode;
+        inner.preloaded_audio_path = Some(playback.audio_path);
         Ok(())
     }
 
@@ -898,6 +909,11 @@ impl Player {
         if let Some(bass) = inner.bass.as_ref() {
             if inner.current_source != 0 && inner.current_source != preloaded {
                 let _ = bass.mixer_channel_remove(inner.current_source);
+                Self::free_playback_channel(
+                    bass,
+                    inner.current_source,
+                    inner.current_decode,
+                );
             }
         }
 
@@ -918,8 +934,8 @@ impl Player {
         inner.preloaded_source = 0;
         inner.preloaded_audio_path = None;
         inner.current_source = preloaded;
-        inner.current_tempo_fx = inner.preloaded_tempo_fx;
-        inner.preloaded_tempo_fx = 0;
+        inner.current_decode = inner.preloaded_decode;
+        inner.preloaded_decode = 0;
 
         Self::apply_segment_metadata(inner, track_path, playback);
         Ok(())
@@ -1030,104 +1046,285 @@ impl Player {
         bass.channel_set_position(handle, byte_pos, bass::BASS_POS_BYTE)
     }
 
-    fn clear_tempo_fx(bass: &BassLibrary, handle: u32, tempo_fx: &mut u32) {
-        if *tempo_fx != 0 {
-            let _ = bass.channel_remove_fx(handle, *tempo_fx);
-            *tempo_fx = 0;
+    fn free_playback_channel(bass: &BassLibrary, mixer_channel: u32, tracked_decode: u32) {
+        if mixer_channel == 0 {
+            return;
         }
+        if tracked_decode != 0 && tracked_decode != mixer_channel {
+            let _ = bass.channel_stop(mixer_channel);
+            let _ = bass.channel_stop(tracked_decode);
+            return;
+        }
+        let _ = bass.channel_stop(mixer_channel);
     }
 
-    fn apply_freq_rate(bass: &BassLibrary, handle: u32, rate: f32) {
+    fn decode_handle_for_channel(
+        bass: &BassLibrary,
+        mixer_channel: u32,
+        tracked_decode: u32,
+    ) -> u32 {
+        if tracked_decode != 0 {
+            return tracked_decode;
+        }
+        let source = bass.fx_tempo_get_source(mixer_channel);
+        if source != 0 {
+            return source;
+        }
+        mixer_channel
+    }
+
+    fn is_tempo_wrapped(bass: &BassLibrary, mixer_channel: u32, tracked_decode: u32) -> bool {
+        tracked_decode != 0 && tracked_decode != mixer_channel
+            || bass.fx_tempo_get_source(mixer_channel) != 0
+    }
+
+    fn freq_rate_target(bass: &BassLibrary, handle: u32, rate: f32) -> f32 {
         if (rate - 1.0).abs() < 0.001 {
-            let _ = bass.channel_set_attribute(handle, bass::BASS_ATTRIB_FREQ, 0.0);
-            return;
+            return 0.0;
         }
         if let Ok(info) = bass.channel_get_info(handle) {
             if info.freq > 0 {
-                let target = (info.freq as f64) * (rate as f64);
-                let _ = bass.channel_set_attribute(handle, bass::BASS_ATTRIB_FREQ, target as f32);
-            } else {
-                let _ = bass.channel_set_attribute(
-                    handle,
-                    bass::BASS_ATTRIB_FREQ,
-                    (44100.0 * rate as f64) as f32,
-                );
+                return ((info.freq as f64) * (rate as f64)) as f32;
             }
-        } else {
-            let _ = bass.channel_set_attribute(handle, bass::BASS_ATTRIB_FREQ, 0.0);
         }
+        (44100.0 * rate as f64) as f32
     }
 
-    /// Apply playback rate to a decode source.
-    fn apply_playback_rate_to_source(
+    fn apply_freq_rate(bass: &BassLibrary, handle: u32, rate: f32) {
+        let target = Self::freq_rate_target(bass, handle, rate);
+        let _ = bass.channel_set_attribute(handle, bass::BASS_ATTRIB_FREQ, target);
+    }
+
+    fn smoothstep(t: f32) -> f32 {
+        let t = t.clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    }
+
+    fn cancel_rate_ramp(inner: &mut PlayerInner) {
+        inner.rate_ramp_generation = inner.rate_ramp_generation.wrapping_add(1);
+    }
+
+    /// Build the channel that should be fed into the mixer for the given decode source.
+    /// Returns `(mixer_channel, tracked_decode)` where `tracked_decode` is non-zero only
+    /// when a tempo wrapper owns the underlying decode stream.
+    fn wrap_decode_for_rate(
         bass: &BassLibrary,
-        handle: u32,
+        decode: u32,
         rate: f32,
         pitch_enabled: bool,
-        tempo_fx: &mut u32,
-    ) {
-        let _ = bass.channel_set_attribute(handle, bass::BASS_ATTRIB_FREQ, 0.0);
+    ) -> Result<(u32, u32), String> {
+        let _ = bass.channel_set_attribute(decode, bass::BASS_ATTRIB_FREQ, 0.0);
+        let _ = bass.channel_set_attribute(decode, bass::BASS_ATTRIB_TEMPO, 0.0);
 
         if (rate - 1.0).abs() < 0.001 {
-            Self::clear_tempo_fx(bass, handle, tempo_fx);
-            return;
+            return Ok((decode, 0));
         }
 
         if pitch_enabled || !bass.has_fx() {
-            Self::clear_tempo_fx(bass, handle, tempo_fx);
-            Self::apply_freq_rate(bass, handle, rate);
-            return;
+            Self::apply_freq_rate(bass, decode, rate);
+            return Ok((decode, 0));
         }
 
-        Self::clear_tempo_fx(bass, handle, tempo_fx);
-        match bass.channel_set_fx(handle, bass::BASS_FX_BFX_TEMPO, 0) {
-            Ok(fx) => {
-                let params = bass::BassBfxTempo {
-                    f_target: 0.0,
-                    f_quiet: 0.0,
-                    f_rate: 1.0,
-                    f_tempo: rate * 100.0,
-                    f_pitch: 0.0,
-                };
-                if bass.fx_set_tempo_parameters(fx, &params).is_ok() {
-                    *tempo_fx = fx;
-                } else {
-                    let _ = bass.channel_remove_fx(handle, fx);
-                    Self::apply_freq_rate(bass, handle, rate);
-                }
+        let tempo = bass.fx_tempo_create(decode, bass::BASS_STREAM_DECODE)?;
+        let tempo_pct = (rate - 1.0) * 100.0;
+        bass.channel_set_attribute(tempo, bass::BASS_ATTRIB_TEMPO, tempo_pct)?;
+        Ok((tempo, decode))
+    }
+
+    fn wants_tempo_wrap(bass: &BassLibrary, rate: f32, pitch_enabled: bool) -> bool {
+        !pitch_enabled && bass.has_fx() && (rate - 1.0).abs() >= 0.001
+    }
+
+    fn now_millis() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    fn apply_rate_in_place(
+        bass: &BassLibrary,
+        channel: u32,
+        tracked_decode: u32,
+        rate: f32,
+        pitch_enabled: bool,
+    ) -> Result<(u32, u32), String> {
+        if channel == 0 {
+            return Ok((0, 0));
+        }
+
+        let wrapped = Self::is_tempo_wrapped(bass, channel, tracked_decode);
+
+        // Neutral speed on an existing tempo wrapper — avoid tearing down mid-ramp.
+        if wrapped && (rate - 1.0).abs() < 0.001 {
+            bass.channel_set_attribute(channel, bass::BASS_ATTRIB_TEMPO, 0.0)?;
+            return Ok((channel, tracked_decode));
+        }
+
+        let wants_wrap = Self::wants_tempo_wrap(bass, rate, pitch_enabled);
+
+        if wants_wrap == wrapped {
+            if wants_wrap {
+                let tempo_pct = (rate - 1.0) * 100.0;
+                bass.channel_set_attribute(channel, bass::BASS_ATTRIB_TEMPO, tempo_pct)?;
+                Ok((channel, tracked_decode))
+            } else {
+                let decode = Self::decode_handle_for_channel(bass, channel, tracked_decode);
+                Self::apply_freq_rate(bass, decode, rate);
+                Ok((channel, 0))
             }
-            Err(_) => Self::apply_freq_rate(bass, handle, rate),
+        } else {
+            Err("playback mode switch requires channel rebuild".to_string())
         }
     }
 
-    fn reapply_playback_rates(inner: &mut PlayerInner) {
-        let rate = inner.playback_rate;
-        let pitch_enabled = inner.pitch_enabled;
-        let current = inner.current_source;
-        let preloaded = inner.preloaded_source;
+    fn refresh_playback_channel(
+        bass: &BassLibrary,
+        mixer_handle: u32,
+        mixer_channel: u32,
+        tracked_decode: u32,
+        in_mixer: bool,
+        rate: f32,
+        pitch_enabled: bool,
+    ) -> Result<(u32, u32), String> {
+        if mixer_channel == 0 {
+            return Ok((0, 0));
+        }
 
-        if current != 0 {
-            if let Some(bass) = inner.bass.as_ref() {
-                Self::apply_playback_rate_to_source(
-                    bass,
-                    current,
-                    rate,
-                    pitch_enabled,
-                    &mut inner.current_tempo_fx,
-                );
+        let decode = Self::decode_handle_for_channel(bass, mixer_channel, tracked_decode);
+        let pos_bytes = if in_mixer {
+            bass.mixer_channel_get_position(mixer_channel, bass::BASS_POS_BYTE)
+        } else {
+            bass.channel_get_position(mixer_channel, bass::BASS_POS_BYTE)
+        };
+
+        if in_mixer {
+            let _ = bass.mixer_channel_remove(mixer_channel);
+        }
+
+        if Self::is_tempo_wrapped(bass, mixer_channel, tracked_decode) {
+            let _ = bass.channel_stop(mixer_channel);
+        } else {
+            let _ = bass.channel_set_attribute(decode, bass::BASS_ATTRIB_FREQ, 0.0);
+        }
+
+        let (new_channel, new_decode) =
+            Self::wrap_decode_for_rate(bass, decode, rate, pitch_enabled)?;
+
+        if in_mixer {
+            if mixer_handle == 0 {
+                return Err("Mixer not created".to_string());
+            }
+            let add_flags = bass::BASS_MIXER_CHAN_NORAMPIN;
+            bass.mixer_stream_add_channel(mixer_handle, new_channel, add_flags)?;
+            if pos_bytes > 0 {
+                let _ = bass.mixer_channel_set_position(new_channel, pos_bytes, bass::BASS_POS_BYTE);
             }
         }
-        if preloaded != 0 {
-            if let Some(bass) = inner.bass.as_ref() {
-                Self::apply_playback_rate_to_source(
-                    bass,
-                    preloaded,
-                    rate,
-                    pitch_enabled,
-                    &mut inner.preloaded_tempo_fx,
-                );
+
+        Ok((new_channel, new_decode))
+    }
+
+    fn reapply_at_rate(inner: &mut PlayerInner, rate: f32) {
+        let pitch_enabled = inner.pitch_enabled;
+        let mixer_handle = inner.mixer_handle;
+        let current_source = inner.current_source;
+        let current_decode = inner.current_decode;
+        let preloaded_source = inner.preloaded_source;
+        let preloaded_decode = inner.preloaded_decode;
+        let Some(bass) = inner.bass.as_ref() else {
+            return;
+        };
+
+        if current_source != 0 {
+            match Self::apply_rate_in_place(
+                bass,
+                current_source,
+                current_decode,
+                rate,
+                pitch_enabled,
+            ) {
+                Ok((channel, decode)) => {
+                    inner.current_source = channel;
+                    inner.current_decode = decode;
+                }
+                Err(_) => {
+                    inner.suppress_gapless_until = Self::now_millis().saturating_add(800);
+                    if let Ok((channel, decode)) = Self::refresh_playback_channel(
+                        bass,
+                        mixer_handle,
+                        current_source,
+                        current_decode,
+                        true,
+                        rate,
+                        pitch_enabled,
+                    ) {
+                        inner.current_source = channel;
+                        inner.current_decode = decode;
+                    }
+                }
             }
         }
+
+        if preloaded_source != 0 {
+            match Self::apply_rate_in_place(
+                bass,
+                preloaded_source,
+                preloaded_decode,
+                rate,
+                pitch_enabled,
+            ) {
+                Ok((channel, decode)) => {
+                    inner.preloaded_source = channel;
+                    inner.preloaded_decode = decode;
+                }
+                Err(_) => {
+                    if let Ok((channel, decode)) = Self::refresh_playback_channel(
+                        bass,
+                        mixer_handle,
+                        preloaded_source,
+                        preloaded_decode,
+                        false,
+                        rate,
+                        pitch_enabled,
+                    ) {
+                        inner.preloaded_source = channel;
+                        inner.preloaded_decode = decode;
+                    }
+                }
+            }
+        }
+    }
+
+    fn run_rate_ramp(player: Player, from: f32, to: f32, generation: u64) {
+        let step_ms = (PLAYBACK_RATE_RAMP_MS / RATE_RAMP_STEPS).max(1);
+        for step in 1..=RATE_RAMP_STEPS {
+            thread::sleep(Duration::from_millis(step_ms as u64));
+            let t = Self::smoothstep(step as f32 / RATE_RAMP_STEPS as f32);
+            let current = from + (to - from) * t;
+            let still_active = player
+                .run_on_bass_thread(move |inner| {
+                    if inner.rate_ramp_generation != generation {
+                        return Ok(false);
+                    }
+                    Self::reapply_at_rate(inner, current);
+                    inner.applied_playback_rate = current;
+                    Ok(true)
+                })
+                .unwrap_or(false);
+            if !still_active {
+                return;
+            }
+        }
+
+        let _ = player.run_on_bass_thread(move |inner| {
+            if inner.rate_ramp_generation != generation {
+                return Ok(());
+            }
+            Self::reapply_at_rate(inner, to);
+            inner.applied_playback_rate = to;
+            Ok(())
+        });
     }
 
     fn stream_duration_secs(bass: &BassLibrary, handle: u32) -> f64 {
@@ -1316,18 +1513,30 @@ impl Player {
     /// Set playback rate (0.25 — 2.0).
     pub fn set_playback_rate(&self, rate: f32) -> Result<(), String> {
         let rate = rate.clamp(0.25, 2.0);
-        self.run_on_bass_thread(move |inner| {
+        let (from, generation) = self.run_on_bass_thread(move |inner| {
             inner.playback_rate = rate;
-            Self::reapply_playback_rates(inner);
-            Ok(())
-        })
+            Self::cancel_rate_ramp(inner);
+            let generation = inner.rate_ramp_generation;
+            Ok((inner.applied_playback_rate, generation))
+        })?;
+
+        if (from - rate).abs() < 0.001 {
+            return Ok(());
+        }
+
+        let player = self.clone();
+        thread::spawn(move || Self::run_rate_ramp(player, from, rate, generation));
+        Ok(())
     }
 
     /// When enabled, playback speed also shifts pitch. When disabled, tempo FX preserves pitch.
     pub fn set_pitch_enabled(&self, enabled: bool) -> Result<(), String> {
         self.run_on_bass_thread(move |inner| {
             inner.pitch_enabled = enabled;
-            Self::reapply_playback_rates(inner);
+            Self::cancel_rate_ramp(inner);
+            let rate = inner.playback_rate;
+            Self::reapply_at_rate(inner, rate);
+            inner.applied_playback_rate = rate;
             Ok(())
         })
     }
@@ -1548,13 +1757,13 @@ impl Player {
                     // Source ended (or no source) means the track is done, even if mixer is still "playing" silence (NONSTOP)
                     let stream_done = src_active == bass::BASS_ACTIVE_STOPPED || mixer_active == bass::BASS_ACTIVE_STOPPED;
 
-                    if Self::has_next_in_gapless_queue(inner) && (ending || stream_done) {
+                    let now = Self::now_millis();
+                    if Self::has_next_in_gapless_queue(inner)
+                        && (ending || stream_done)
+                        && now >= inner.suppress_gapless_until
+                    {
                         // Guard against spurious early advance after manual click in que (new track can briefly appear done).
                         // Use time since this track started (set in play()), not just pos (which can be small at legit end in recovery).
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_millis() as u64)
-                            .unwrap_or(0);
                         if now.saturating_sub(inner.current_track_start_time) > 1500 {
                             return Self::try_advance_gapless(inner)
                                 .map(|path| (Some(path), POLL_INTERVAL_MS))
@@ -1570,6 +1779,13 @@ impl Player {
                         // Do not stop the mixer — keep it running (silent) so next playback starts without device hiccup.
                         if inner.current_source != 0 {
                             let _ = bass.mixer_channel_remove(inner.current_source);
+                            Self::free_playback_channel(
+                                bass,
+                                inner.current_source,
+                                inner.current_decode,
+                            );
+                            inner.current_source = 0;
+                            inner.current_decode = 0;
                         }
                     }
 

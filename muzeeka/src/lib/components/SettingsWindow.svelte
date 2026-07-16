@@ -198,17 +198,19 @@
             <div class="rate-presets">
               {#each [0.75, 0.85, 1.0, 1.25, 1.5] as r}
                 <button
+                  type="button"
                   class="preset-btn"
                   class:active={Math.abs(settings.playbackRate - r) < 0.01}
-                  onclick={() => settings.setPlaybackRate(r)}
+                  onclick={() => void settings.setPlaybackRate(r)}
                 >
                   {r.toFixed(r === 1 ? 1 : 2)}×
                 </button>
               {/each}
               <button
+                type="button"
                 class="preset-btn pitch-btn"
                 class:active={settings.pitchEnabled}
-                onclick={() => settings.setPitchEnabled(!settings.pitchEnabled)}
+                onclick={() => void settings.setPitchEnabled(!settings.pitchEnabled)}
                 title={settings.pitchEnabled
                   ? 'Pitch shifts with speed — click to preserve pitch'
                   : 'Pitch preserved — click to couple pitch with speed'}

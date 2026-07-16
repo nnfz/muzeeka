@@ -90,11 +90,9 @@ pub struct BassLibrary {
 
     // ── FX (bass_fx via BASS_PluginLoad — symbols live in bass.dll) ─────────
     fx_ready: bool,
-    bass_channel_set_fx:
-        unsafe extern "system" fn(handle: DWORD, fx_type: DWORD, priority: i32) -> HFX,
-    bass_channel_remove_fx: unsafe extern "system" fn(handle: DWORD, fx: HFX) -> BOOL,
-    bass_fx_set_parameters:
-        unsafe extern "system" fn(handle: HFX, params: *const std::ffi::c_void) -> BOOL,
+    bass_fx_tempo_create:
+        unsafe extern "system" fn(chan: DWORD, flags: DWORD) -> HSTREAM,
+    bass_fx_tempo_get_source: unsafe extern "system" fn(chan: HSTREAM) -> DWORD,
 }
 
 // Safety: BassLibrary is always used behind a parking_lot::Mutex.
@@ -208,28 +206,23 @@ impl BassLibrary {
                 bass_mixer_channel_get_position: mixer_get_pos,
                 bass_mixer_channel_flags: mixer_flags,
                 fx_ready: false,
-                bass_channel_set_fx: std::mem::transmute::<*const (), _>(ptr::null::<()>()),
-                bass_channel_remove_fx: std::mem::transmute::<*const (), _>(ptr::null::<()>()),
-                bass_fx_set_parameters: std::mem::transmute::<*const (), _>(ptr::null::<()>()),
+                bass_fx_tempo_create: std::mem::transmute::<*const (), _>(ptr::null::<()>()),
+                bass_fx_tempo_get_source: std::mem::transmute::<*const (), _>(ptr::null::<()>()),
             })
         }
     }
 
-    /// Resolve FX entry points from bass.dll after `BASS_PluginLoad("bass_fx.dll")`.
+    /// Resolve tempo FX entry points from bass.dll after `BASS_PluginLoad("bass_fx.dll")`.
     pub fn enable_fx_from_plugin(&mut self) -> bool {
         unsafe {
-            let Some(set) = try_load_fn!(self._lib, b"BASS_ChannelSetFX\0") else {
+            let Some(create) = try_load_fn!(self._lib, b"BASS_FX_TempoCreate\0") else {
                 return false;
             };
-            let Some(remove) = try_load_fn!(self._lib, b"BASS_ChannelRemoveFX\0") else {
+            let Some(get_source) = try_load_fn!(self._lib, b"BASS_FX_TempoGetSource\0") else {
                 return false;
             };
-            let Some(params) = try_load_fn!(self._lib, b"BASS_FXSetParameters\0") else {
-                return false;
-            };
-            self.bass_channel_set_fx = set;
-            self.bass_channel_remove_fx = remove;
-            self.bass_fx_set_parameters = params;
+            self.bass_fx_tempo_create = create;
+            self.bass_fx_tempo_get_source = get_source;
             self.fx_ready = true;
             true
         }
@@ -503,42 +496,23 @@ impl BassLibrary {
         unsafe { (self.bass_mixer_channel_flags)(channel, flags, mask) }
     }
 
-    pub fn channel_set_fx(&self, handle: DWORD, fx_type: DWORD, priority: i32) -> Result<HFX, String> {
+    pub fn fx_tempo_create(&self, chan: DWORD, flags: DWORD) -> Result<HSTREAM, String> {
         if !self.fx_ready {
             return Err("bass_fx is not loaded".to_string());
         }
-        let fx = unsafe { (self.bass_channel_set_fx)(handle, fx_type, priority) };
-        if fx == 0 {
+        let tempo = unsafe { (self.bass_fx_tempo_create)(chan, flags) };
+        if tempo == 0 {
             Err(self.last_error_string())
         } else {
-            Ok(fx)
+            Ok(tempo)
         }
     }
 
-    pub fn channel_remove_fx(&self, handle: DWORD, fx: HFX) -> Result<(), String> {
+    pub fn fx_tempo_get_source(&self, tempo: HSTREAM) -> DWORD {
         if !self.fx_ready {
-            return Err("bass_fx is not loaded".to_string());
+            return 0;
         }
-        let ok = unsafe { (self.bass_channel_remove_fx)(handle, fx) };
-        if ok == 0 {
-            Err(self.last_error_string())
-        } else {
-            Ok(())
-        }
-    }
-
-    pub fn fx_set_tempo_parameters(&self, fx: HFX, params: &BassBfxTempo) -> Result<(), String> {
-        if !self.fx_ready {
-            return Err("bass_fx is not loaded".to_string());
-        }
-        let ok = unsafe {
-            (self.bass_fx_set_parameters)(fx, params as *const BassBfxTempo as *const std::ffi::c_void)
-        };
-        if ok == 0 {
-            Err(self.last_error_string())
-        } else {
-            Ok(())
-        }
+        unsafe { (self.bass_fx_tempo_get_source)(tempo) }
     }
 
     // ── Error helpers ─────────────────────────────────────────────────────

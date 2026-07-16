@@ -95,19 +95,10 @@ pub const BASS_DSP_PRIORITY_FIRST: i32 = 2147483647;
 pub const BASS_DSP_FLOAT: DWORD = 0x400;
 
 // ── FX (bass_fx) ────────────────────────────────────────────────────────────
-pub type HFX = DWORD;
-
-pub const BASS_FX_BFX_TEMPO: DWORD = 0x10001;
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct BassBfxTempo {
-    pub f_target: f32,
-    pub f_quiet: f32,
-    pub f_rate: f32,
-    pub f_tempo: f32,
-    pub f_pitch: f32,
-}
+pub const BASS_FX_FREESOURCE: DWORD = 0x10000;
+pub const BASS_ATTRIB_TEMPO: DWORD = 0x10000;
+pub const BASS_ATTRIB_TEMPO_PITCH: DWORD = 0x10001;
+pub const BASS_ATTRIB_TEMPO_FREQ: DWORD = 0x10002;
 
 // ── Mixer (bassmix) ─────────────────────────────────────────────────────────
 pub const BASS_MIXER_END: DWORD = 0x10000;
