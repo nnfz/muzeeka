@@ -1039,9 +1039,7 @@ async function play(filePath: string) {
     // Calling stop() first destroys the current_source and current_audio_path,
     // which prevents the CUE reuse optimization and causes glitches/delays.
 
-    const track = playlists
-      .flatMap((p) => p.tracks)
-      .find((t) => t.path === filePath);
+    const track = trackByPath.get(filePath);
     // Prefer the currently viewed playlist (incl. virtual All/Liked) so that next/prev
     // operate over the collected list when playing from All or Liked views.
     let playlistId = activePlaylistId;
@@ -1080,17 +1078,12 @@ async function play(filePath: string) {
     seekGuardUntil = Date.now() + 600;
     position = 0;
 
-    await invoke('player_play', {
-      ...playOptionsForTrack(track, filePath),
-      queue: queueToSend,
-    });
+    // Update UI immediately — don't wait for IPC (file open + Discord sync can take 100ms+).
     currentFile = filePath;
-    const file = track;
-    currentFileName = file
-      ? trackDisplayTitle(file)
+    currentFileName = track
+      ? trackDisplayTitle(track)
       : filePath.split(/[\\/]/).pop()?.replace(/\.[^/.]+$/, '') ?? null;
-    position = 0;
-    const meta = track || trackByPath.get(filePath);
+    const meta = track ?? trackByPath.get(filePath);
     if (meta?.duration_secs != null) {
       duration = meta.duration_secs;
     }
@@ -1099,8 +1092,13 @@ async function play(filePath: string) {
     isPaused = false;
     lastPauseRequestAt = 0;
     lastGaplessChangeAt = Date.now();
-    scheduleSave(); // persist current_file so it survives restart
+    scheduleSave();
     syncWindowTitle();
+
+    await invoke('player_play', {
+      ...playOptionsForTrack(track, filePath),
+      queue: queueToSend,
+    });
   } catch (e) {
     seekGuardUntil = 0;
     const message = typeof e === 'string' ? e : String(e);
@@ -1112,27 +1110,29 @@ async function play(filePath: string) {
 
 async function pause() {
   lastPauseRequestAt = Date.now();
+  isPaused = true;
+  isPlaying = false;
   try {
     await invoke('player_pause');
-    isPaused = true;
-    isPlaying = false;
   } catch (e) {
     console.error('Failed to pause:', e);
+    isPaused = false;
+    isPlaying = true;
   }
 }
 
 async function resume() {
   lastPauseRequestAt = 0;
+  isPaused = false;
+  isPlaying = true;
   try {
     await invoke('player_resume');
-    isPaused = false;
-    isPlaying = true;
   } catch (e) {
     // Backend has no audio loaded (e.g. after app restart) — fall back to playing from start
     if (currentFile) {
-      isPaused = false;
       await play(currentFile);
     } else {
+      isPlaying = false;
       console.error('Failed to resume:', e);
     }
   }

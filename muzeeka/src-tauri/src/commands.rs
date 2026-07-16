@@ -11,7 +11,12 @@ use crate::library;
 use crate::player::{EqualizerStatus, GaplessTrack, Player, PlayerStateSnapshot};
 
 fn sync_discord(player: &Player, discord: &DiscordPresence) {
-    discord.update_from_player(&player.get_state());
+    // Don't block IPC on get_state + metadata reads + Discord network I/O.
+    let player = player.clone();
+    let discord = discord.clone();
+    std::thread::spawn(move || {
+        discord.update_from_player(&player.get_state());
+    });
 }
 
 #[derive(Debug, Deserialize, Default)]
