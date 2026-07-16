@@ -244,6 +244,7 @@ export function createDownloadStore() {
         const result = await invoke<{ files: MusicFile[] }>('ytdlp_download', {
           url: normalized,
           outputDir: downloadFolder ?? null,
+          allowPlaylist: probe?.is_playlist ?? false,
         });
 
         await emit('ytdlp:downloaded', {

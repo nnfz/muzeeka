@@ -304,9 +304,15 @@ pub async fn ytdlp_download(
     app: AppHandle,
     url: String,
     output_dir: Option<String>,
+    allow_playlist: Option<bool>,
 ) -> Result<YtdlpDownloadResult, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        ytdlp::download(&app, &url, output_dir.as_deref())
+        ytdlp::download(
+            &app,
+            &url,
+            output_dir.as_deref(),
+            allow_playlist.unwrap_or(false),
+        )
     })
     .await
     .map_err(|_| "Download task failed".to_string())?

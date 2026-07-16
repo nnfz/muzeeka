@@ -1,5 +1,6 @@
 // yt-dlp integration — download audio from supported URLs via external binary.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -289,6 +290,52 @@ fn emit_progress(app: &AppHandle, url: &str, status: &str, percent: Option<f32>)
     );
 }
 
+fn normalize_path_key(path: &Path) -> String {
+    path.canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .to_string()
+        .to_ascii_lowercase()
+}
+
+fn snapshot_mp3_dir(dir: &Path) -> HashSet<String> {
+    let mut set = HashSet::new();
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("mp3")) {
+                set.insert(normalize_path_key(&path));
+            }
+        }
+    }
+    set
+}
+
+fn collect_new_mp3_files(dir: &Path, before: &HashSet<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("mp3")) {
+                let key = normalize_path_key(&path);
+                if !before.contains(&key) {
+                    out.push(path.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+fn sanitize_printed_path(line: &str) -> String {
+    let trimmed = line.trim();
+    trimmed
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .unwrap_or(trimmed)
+        .to_string()
+}
+
 fn parse_progress_line(line: &str) -> Option<f32> {
     // [download]  45.3% of ...
     if !line.contains("[download]") {
@@ -307,6 +354,7 @@ pub fn download(
     app: &AppHandle,
     url: &str,
     output_dir: Option<&str>,
+    allow_playlist: bool,
 ) -> Result<YtdlpDownloadResult, String> {
     let trimmed = url.trim();
     if !is_supported_url(trimmed) {
@@ -317,6 +365,7 @@ pub fn download(
 
     let dir = resolve_download_dir(app, output_dir)?;
     let dir_str = dir.to_string_lossy().to_string();
+    let before_snapshot = snapshot_mp3_dir(&dir);
 
     let output_template = format!("{}/%(title)s.%(ext)s", dir_str);
 
@@ -349,8 +398,11 @@ pub fn download(
         output_template,
         "--print".to_string(),
         "after_move:filepath".to_string(),
-        trimmed.to_string(),
     ]);
+    if !allow_playlist {
+        cmd_args.push("--no-playlist".to_string());
+    }
+    cmd_args.push(trimmed.to_string());
 
     let mut child = Command::new(&binary)
         .args(&cmd_args)
@@ -389,7 +441,7 @@ pub fn download(
             let mut paths = Vec::new();
             let reader = BufReader::new(stdout);
             for line in reader.lines().map_while(Result::ok) {
-                let path = line.trim().to_string();
+                let path = sanitize_printed_path(&line);
                 if !path.is_empty() && Path::new(&path).is_file() {
                     paths.push(path);
                 }
@@ -428,16 +480,12 @@ pub fn download(
         .map_err(|_| "Failed to read yt-dlp output".to_string())?
         .unwrap_or_default();
 
-    // Fallback: scan output dir for new mp3 files if --print didn't yield paths
+    // Trust yt-dlp's printed paths when available (covers re-downloads/overwrites).
+    downloaded_paths.retain(|path| Path::new(path).is_file());
+
+    // Fallback: only files created during this download, never the whole folder.
     if downloaded_paths.is_empty() {
-        if let Ok(entries) = fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("mp3")) {
-                    downloaded_paths.push(path.to_string_lossy().to_string());
-                }
-            }
-        }
+        downloaded_paths = collect_new_mp3_files(&dir, &before_snapshot);
     }
 
     if downloaded_paths.is_empty() {
