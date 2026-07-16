@@ -4,7 +4,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::{
-    body::Bytes,
     extract::{Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{Html, IntoResponse, Response},
@@ -115,7 +114,6 @@ async fn run_server(controller: Arc<RemoteController>) -> Result<(), String> {
         .route("/api/shuffle/toggle", post(api_toggle_shuffle))
         .route("/api/repeat/toggle", post(api_toggle_repeat))
         .route("/api/cover", get(api_cover))
-        .route("/api/silent.wav", get(api_silent_wav))
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], REMOTE_PORT));
@@ -259,68 +257,6 @@ async fn api_cover(
         }
         None => Ok(StatusCode::NOT_FOUND.into_response()),
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct SilentQuery {
-    #[serde(default = "default_silent_secs")]
-    secs: u32,
-}
-
-fn default_silent_secs() -> u32 {
-    120
-}
-
-fn silent_wav_seconds(secs: u32) -> Vec<u8> {
-    let secs = secs.clamp(10, 600);
-    let sample_rate: u32 = 22_050;
-    let num_channels: u16 = 1;
-    let bits_per_sample: u16 = 16;
-    let data_size = sample_rate * secs * num_channels as u32 * bits_per_sample as u32 / 8;
-    let riff_size = 36 + data_size;
-
-    let mut wav = Vec::with_capacity(44 + data_size as usize);
-    wav.extend_from_slice(b"RIFF");
-    wav.extend_from_slice(&riff_size.to_le_bytes());
-    wav.extend_from_slice(b"WAVE");
-    wav.extend_from_slice(b"fmt ");
-    wav.extend_from_slice(&16u32.to_le_bytes());
-    wav.extend_from_slice(&1u16.to_le_bytes());
-    wav.extend_from_slice(&num_channels.to_le_bytes());
-    wav.extend_from_slice(&sample_rate.to_le_bytes());
-    let byte_rate = sample_rate * num_channels as u32 * bits_per_sample as u32 / 8;
-    wav.extend_from_slice(&byte_rate.to_le_bytes());
-    let block_align = num_channels * bits_per_sample / 8;
-    wav.extend_from_slice(&block_align.to_le_bytes());
-    wav.extend_from_slice(&bits_per_sample.to_le_bytes());
-    wav.extend_from_slice(b"data");
-    wav.extend_from_slice(&data_size.to_le_bytes());
-    wav.resize(wav.len() + data_size as usize, 0);
-    wav
-}
-
-async fn api_silent_wav(Query(query): Query<SilentQuery>) -> Response {
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-
-    static CACHE: Mutex<Option<HashMap<u32, Bytes>>> = Mutex::new(None);
-
-    let secs = query.secs.clamp(30, 600);
-    let bytes = {
-        let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-        let map = cache.get_or_insert_with(HashMap::new);
-        map.entry(secs)
-            .or_insert_with(|| Bytes::from(silent_wav_seconds(secs)))
-            .clone()
-    };
-
-    let mut headers = HeaderMap::new();
-    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("audio/wav"));
-    headers.insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("public, max-age=86400"),
-    );
-    (StatusCode::OK, headers, bytes).into_response()
 }
 
 fn local_urls(port: u16) -> Vec<String> {

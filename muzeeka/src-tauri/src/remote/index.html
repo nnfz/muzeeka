@@ -334,44 +334,6 @@
 
     .error-banner.show { display: block; }
 
-    .media-bar {
-      margin: 0 20px 12px;
-      padding: 12px 14px;
-      background: rgba(124,92,255,0.12);
-      border: 1px solid rgba(124,92,255,0.28);
-      border-radius: 12px;
-      display: flex;
-      flex-direction: column;
-      gap: 10px;
-    }
-
-    .media-bar.enabled {
-      background: rgba(61,214,140,0.1);
-      border-color: rgba(61,214,140,0.28);
-    }
-
-    .media-bar-text {
-      font-size: 12px;
-      color: var(--muted);
-      line-height: 1.4;
-    }
-
-    .media-enable-btn {
-      width: 100%;
-      padding: 12px 16px;
-      border: none;
-      border-radius: 12px;
-      background: var(--accent);
-      color: #fff;
-      font-size: 14px;
-      font-weight: 700;
-      cursor: pointer;
-    }
-
-    .media-enable-btn:disabled {
-      opacity: 0.55;
-      cursor: default;
-    }
   </style>
 </head>
 <body>
@@ -383,15 +345,6 @@
       </div>
 
       <div class="error-banner" id="errorBanner"></div>
-
-      <div class="media-bar" id="mediaBar">
-        <div class="media-bar-text" id="mediaBarText">
-          Нажми кнопку, чтобы плеер появился в шторке и на экране блокировки. Звук по-прежнему идёт с компьютера.
-        </div>
-        <button type="button" class="media-enable-btn" id="btnEnableMedia">
-          Включить плеер в шторке
-        </button>
-      </div>
 
       <div class="now-playing">
         <div class="cover-wrap" id="coverWrap">
@@ -433,9 +386,8 @@
     </div>
   </div>
 
-  <!-- Silent loop — required by mobile browsers to show OS media controls. -->
-  <audio id="silentKeeper" loop playsinline webkit-playsinline preload="auto" style="display:none"
-    src="/api/silent.wav?secs=60"></audio>
+  <!-- Near-silent micro-loop keeps lock-screen / shade controls alive (sound plays on PC). -->
+  <audio id="silentKeeper" loop playsinline webkit-playsinline preload="auto" style="display:none"></audio>
 
   <script>
     const $ = (id) => document.getElementById(id);
@@ -455,6 +407,7 @@
     let lastTrackListPath = null;
     let mediaSessionReady = false;
     let mediaSessionEnabled = false;
+    let silentBlobUrl = null;
     let wakeLock = null;
     let lastMediaPositionSync = 0;
 
@@ -507,6 +460,7 @@
     }
 
     async function action(path, body, opts = {}) {
+      if (!mediaSessionEnabled) void tryEnableSystemMedia();
       if (opts.optimistic) applyTransportOptimistic(path);
       try {
         await api(path, { method: 'POST', body: body ? JSON.stringify(body) : undefined });
@@ -525,11 +479,8 @@
     }
 
     function setupMediaSession() {
-      if (!('mediaSession' in navigator)) {
-        $('mediaBarText').textContent = 'Этот браузер не поддерживает Media Session API.';
-        $('btnEnableMedia').disabled = true;
-        return;
-      }
+      if (mediaSessionReady) return;
+      if (!('mediaSession' in navigator)) return;
 
       const bind = (actionName, handler) => {
         try {
@@ -664,7 +615,7 @@
     }
 
     function updateMediaSession() {
-      if (!mediaSessionReady || !mediaSessionEnabled) return;
+      if (!mediaSessionReady) return;
 
       const track = state?.track;
       const playing = !!state?.isPlaying;
@@ -672,11 +623,15 @@
 
       setMediaMetadata(track);
 
-      navigator.mediaSession.playbackState = playing
-        ? 'playing'
-        : paused
-          ? 'paused'
-          : 'none';
+      try {
+        navigator.mediaSession.playbackState = playing
+          ? 'playing'
+          : paused
+            ? 'paused'
+            : 'none';
+      } catch (_) {}
+
+      if (!mediaSessionEnabled) return;
 
       // iOS reads time from the <audio> element — setPositionState fights it and causes flicker.
       if (!IS_IOS && 'setPositionState' in navigator.mediaSession) {
@@ -698,84 +653,83 @@
       void syncSilentKeeper();
     }
 
-    function silentKeeperUrl(secs) {
-      return `/api/silent.wav?secs=${secs}`;
+    function createSilentBlobUrl(durationSec = 0.5) {
+      if (silentBlobUrl) return silentBlobUrl;
+
+      const sampleRate = 8000;
+      const channels = 1;
+      const bits = 16;
+      const samples = Math.max(1, Math.floor(sampleRate * durationSec));
+      const dataSize = samples * channels * (bits / 8);
+      const buffer = new ArrayBuffer(44 + dataSize);
+      const view = new DataView(buffer);
+
+      const writeStr = (offset, str) => {
+        for (let i = 0; i < str.length; i++) {
+          view.setUint8(offset + i, str.charCodeAt(i));
+        }
+      };
+
+      writeStr(0, 'RIFF');
+      view.setUint32(4, 36 + dataSize, true);
+      writeStr(8, 'WAVE');
+      writeStr(12, 'fmt ');
+      view.setUint32(16, 16, true);
+      view.setUint16(20, 1, true);
+      view.setUint16(22, channels, true);
+      view.setUint32(24, sampleRate, true);
+      view.setUint32(28, sampleRate * channels * bits / 8, true);
+      view.setUint16(32, channels * bits / 8, true);
+      view.setUint16(34, bits, true);
+      writeStr(36, 'data');
+      view.setUint32(40, dataSize, true);
+
+      silentBlobUrl = URL.createObjectURL(new Blob([buffer], { type: 'audio/wav' }));
+      return silentBlobUrl;
     }
 
-    function waitForKeeperReady(keeper, timeoutMs = 20000) {
-      if (keeper.readyState >= HTMLMediaElement.HAVE_ENOUGH_DATA) {
-        return Promise.resolve();
-      }
-      return new Promise((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error('timeout')), timeoutMs);
-        const finish = (err) => {
-          clearTimeout(timer);
-          if (err) reject(err);
-          else resolve();
-        };
-        keeper.addEventListener('canplaythrough', () => finish(), { once: true });
-        keeper.addEventListener('error', () => finish(keeper.error || new Error('load')), { once: true });
-      });
-    }
-
-    async function loadAndPlayKeeper(keeper, secs) {
-      keeper.src = silentKeeperUrl(secs);
-      keeper.load();
-      await waitForKeeperReady(keeper);
-      await keeper.play();
-    }
-
-    function preloadSilentKeeper() {
+    function prepareSilentKeeper() {
       const keeper = $('silentKeeper');
       if (!keeper) return;
-      const secs = IS_IOS ? 90 : 60;
-      keeper.src = silentKeeperUrl(secs);
+      keeper.src = createSilentBlobUrl(0.5);
+      keeper.loop = true;
+      keeper.volume = 0.001;
+      keeper.muted = false;
       keeper.preload = 'auto';
-      keeper.load();
     }
 
-    async function enableSystemMedia() {
-      if (mediaSessionEnabled) return;
+    async function tryEnableSystemMedia() {
+      if (mediaSessionEnabled) return true;
 
       setupMediaSession();
-      if (!mediaSessionReady) return;
-
-      const btn = $('btnEnableMedia');
-      const prevText = btn.textContent;
-      btn.disabled = true;
-      btn.textContent = 'Загрузка…';
+      if (!mediaSessionReady) return false;
 
       const keeper = $('silentKeeper');
-      if (keeper) {
-        keeper.volume = 0.02;
-        keeper.muted = false;
-        const attempts = IS_IOS ? [90, 45, 30] : [60, 30];
-        let activated = false;
-        for (const secs of attempts) {
-          try {
-            await loadAndPlayKeeper(keeper, secs);
-            activated = true;
-            break;
-          } catch (_) {}
+      if (!keeper) return false;
+
+      try {
+        prepareSilentKeeper();
+        if (keeper.paused) {
+          await keeper.play();
         }
-        if (!activated) {
-          btn.disabled = false;
-          btn.textContent = prevText;
-          showError('Не удалось активировать медиа-сессию. Проверь Wi‑Fi и нажми снова.');
-          return;
-        }
+        mediaSessionEnabled = true;
+        await requestWakeLock();
+        updateMediaSession();
+        return true;
+      } catch (_) {
+        return false;
       }
+    }
 
-      mediaSessionEnabled = true;
-      $('mediaBar').classList.add('enabled');
-      $('btnEnableMedia').textContent = '✓ Плеер в шторке включён';
-      $('btnEnableMedia').disabled = true;
-      $('mediaBarText').textContent = IS_IOS
-        ? 'Готово. На iPhone: кнопки «назад/вперёд» переключают треки. Не закрывай вкладку Safari.'
-        : 'Готово. Не закрывай вкладку — шторка работает, пока страница открыта. Звук с компьютера.';
+    function bindMediaUnlock() {
+      const unlock = () => {
+        if (mediaSessionEnabled) return;
+        void tryEnableSystemMedia();
+      };
 
-      await requestWakeLock();
-      updateMediaSession();
+      ['pointerdown', 'touchstart', 'keydown'].forEach((eventName) => {
+        document.addEventListener(eventName, unlock, { capture: true, passive: true });
+      });
     }
 
     function renderNowPlaying() {
@@ -933,13 +887,17 @@
 
     async function init() {
       setupMediaSession();
-      preloadSilentKeeper();
-      $('btnEnableMedia').addEventListener('click', () => { void enableSystemMedia(); });
+      prepareSilentKeeper();
+      bindMediaUnlock();
+      void tryEnableSystemMedia();
       document.addEventListener('visibilitychange', () => {
-        if (document.visibilityState === 'visible' && mediaSessionEnabled) {
-          void requestWakeLock();
-          void syncSilentKeeper();
-          updateMediaSession();
+        if (document.visibilityState === 'visible') {
+          if (!mediaSessionEnabled) void tryEnableSystemMedia();
+          if (mediaSessionEnabled) {
+            void requestWakeLock();
+            void syncSilentKeeper();
+            updateMediaSession();
+          }
         }
       });
       try {
@@ -951,6 +909,10 @@
           await loadPlaylist(activePlaylistId);
         }
         renderTabs();
+        updateMediaSession();
+        if (state?.track && (state.isPlaying || state.isPaused)) {
+          void tryEnableSystemMedia();
+        }
       } catch (e) {
         showError('Не удалось подключиться к Muzeeka');
       }
