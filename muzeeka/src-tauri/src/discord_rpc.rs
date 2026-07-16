@@ -326,13 +326,7 @@ impl DiscordPresence {
         }
 
         if let Some(cover_url) = payload.cover_url.as_deref() {
-            let mut assets = Assets::new().large_image(cover_url);
-            if let Some(album) = payload.album.as_deref() {
-                assets = assets.large_text(truncate(album, 128));
-            }
-            activity = activity.assets(assets);
-        } else if let Some(album) = payload.album.as_deref() {
-            activity = activity.assets(Assets::new().large_text(truncate(album, 128)));
+            activity = activity.assets(Assets::new().large_image(cover_url));
         }
 
         client

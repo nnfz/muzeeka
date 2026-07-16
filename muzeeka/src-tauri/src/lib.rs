@@ -38,11 +38,20 @@ fn bass_dir_is_valid(dir: &Path) -> bool {
     dir.join("bass.dll").is_file()
 }
 
+fn is_valid_window_position(x: i32, y: i32) -> bool {
+    // Windows uses -32000 when minimized; never restore or persist that.
+    x > -500 && y > -500 && x < 16000 && y < 16000
+}
+
 fn apply_window_state(window: &tauri::WebviewWindow, state: &settings::WindowState) {
     let width = state.width.clamp(800, 3840);
     let height = state.height.clamp(600, 2160);
     let _ = window.set_size(LogicalSize::new(width as f64, height as f64));
-    let _ = window.set_position(LogicalPosition::new(state.x as f64, state.y as f64));
+    if is_valid_window_position(state.x, state.y) {
+        let _ = window.set_position(LogicalPosition::new(state.x as f64, state.y as f64));
+    } else {
+        let _ = window.center();
+    }
     if state.maximized {
         let _ = window.maximize();
     }
@@ -53,9 +62,28 @@ fn capture_window_state(window: &tauri::WebviewWindow) -> Option<settings::Windo
     let position = window.outer_position().ok()?;
     let size = window.outer_size().ok()?;
 
+    let (x, y) = if is_valid_window_position(position.x, position.y) {
+        (position.x, position.y)
+    } else {
+        match settings::load_settings(window.app_handle()) {
+            Ok(app_settings) => {
+                if let Some(saved) = app_settings.window_state.as_ref() {
+                    if is_valid_window_position(saved.x, saved.y) {
+                        (saved.x, saved.y)
+                    } else {
+                        (100, 100)
+                    }
+                } else {
+                    (100, 100)
+                }
+            }
+            Err(_) => (100, 100),
+        }
+    };
+
     Some(settings::WindowState {
-        x: position.x,
-        y: position.y,
+        x,
+        y,
         width: size.width.max(800),
         height: size.height.max(600),
         maximized,

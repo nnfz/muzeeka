@@ -70,6 +70,10 @@
       text-align: center;
     }
 
+    .now-playing-meta {
+      min-width: 0;
+    }
+
     .player-section {
       flex-shrink: 0;
     }
@@ -334,6 +338,103 @@
 
     .error-banner.show { display: block; }
 
+    /* Mini overlay for OBS / narrow browser source (height < 200px) */
+    .mini-time {
+      display: none;
+      flex-shrink: 0;
+      align-items: center;
+      gap: 3px;
+      font-size: clamp(10px, 2.6vw, 12px);
+      font-variant-numeric: tabular-nums;
+      color: var(--muted);
+      white-space: nowrap;
+      text-shadow: 0 1px 3px rgba(0, 0, 0, 0.85);
+    }
+
+    .mini-time-sep { opacity: 0.55; }
+
+    @media (max-height: 199px) {
+      html, body {
+        overflow: hidden;
+        height: 100%;
+      }
+
+      body {
+        background: transparent;
+      }
+
+      .app {
+        min-height: 100vh;
+        height: 100vh;
+        max-width: none;
+        margin: 0;
+        padding: 0;
+        background:
+          linear-gradient(180deg, rgba(10, 10, 18, 0.88) 0%, rgba(6, 6, 12, 0.94) 100%),
+          var(--bg);
+      }
+
+      .header,
+      .progress,
+      .controls,
+      .volume-row,
+      .playlists-panel,
+      .error-banner {
+        display: none !important;
+      }
+
+      .player-section {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+      }
+
+      .now-playing {
+        flex: 1;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 6px 10px;
+        text-align: left;
+        min-height: 0;
+        cursor: pointer;
+      }
+
+      .cover-wrap {
+        width: auto;
+        height: min(72px, calc(100vh - 12px));
+        margin: 0;
+        flex-shrink: 0;
+        border-radius: 8px;
+        box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45);
+      }
+
+      .now-playing-meta {
+        flex: 1;
+        min-width: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+      }
+
+      .track-title {
+        font-size: clamp(11px, 3.2vw, 14px);
+        font-weight: 600;
+        margin-bottom: 0;
+        text-shadow: 0 1px 4px rgba(0, 0, 0, 0.85);
+      }
+
+      .track-artist {
+        font-size: clamp(10px, 2.8vw, 12px);
+        text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
+      }
+
+      .mini-time {
+        display: flex;
+      }
+    }
+
   </style>
 </head>
 <body>
@@ -351,8 +452,15 @@
           <div class="cover-placeholder" id="coverPlaceholder">♪</div>
           <img id="coverImg" alt="" style="display:none">
         </div>
-        <div class="track-title" id="trackTitle">Ничего не играет</div>
-        <div class="track-artist" id="trackArtist">Открой плейлист и выбери трек</div>
+        <div class="now-playing-meta">
+          <div class="track-title" id="trackTitle">Ничего не играет</div>
+          <div class="track-artist" id="trackArtist">Открой плейлист и выбери трек</div>
+        </div>
+        <div class="mini-time" id="miniTime" aria-label="Playback position">
+          <span id="miniTimeCurrent">0:00</span>
+          <span class="mini-time-sep">/</span>
+          <span id="miniTimeTotal">0:00</span>
+        </div>
       </div>
 
       <div class="progress">
@@ -754,6 +862,8 @@
       $('progressFill').style.width = `${pct}%`;
       $('timeCurrent').textContent = fmt(pos);
       $('timeTotal').textContent = fmt(dur);
+      $('miniTimeCurrent').textContent = fmt(pos);
+      $('miniTimeTotal').textContent = fmt(dur);
 
       const playing = state?.isPlaying;
       $('btnPlay').textContent = playing ? '⏸' : '▶';
@@ -917,6 +1027,11 @@
         showError('Не удалось подключиться к Muzeeka');
       }
     }
+
+    document.querySelector('.now-playing')?.addEventListener('click', () => {
+      if (window.innerHeight >= 200) return;
+      action('/api/toggle', null, { optimistic: true });
+    });
 
     $('btnPlay').addEventListener('click', () => action('/api/toggle', null, { optimistic: true }));
     $('btnPause')?.addEventListener('click', () => action('/api/pause', null, { optimistic: true }));
