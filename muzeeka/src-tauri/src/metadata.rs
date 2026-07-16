@@ -15,6 +15,10 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 static COVER_CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();
+static PLAYLIST_COVER_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+const PLAYLIST_COVER_SIZE: u32 = 256;
+const MAX_PLAYLIST_GIF_BYTES: u64 = 20 * 1024 * 1024;
 
 const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp", "gif"];
 const COVER_NAMES: &[&str] = &[
@@ -46,6 +50,10 @@ pub fn init_cover_cache(app_data_dir: PathBuf) {
     let covers = app_data_dir.join("covers");
     let _ = fs::create_dir_all(&covers);
     let _ = COVER_CACHE_DIR.set(covers);
+
+    let playlist_covers = app_data_dir.join("playlist_covers");
+    let _ = fs::create_dir_all(&playlist_covers);
+    let _ = PLAYLIST_COVER_DIR.set(playlist_covers);
 }
 
 fn clean_tag_value(value: &str) -> String {
@@ -240,14 +248,107 @@ fn write_thumbnail_from_file(source: &Path, dest: &Path) -> bool {
 }
 
 fn write_thumbnail_from_image(image: &image::DynamicImage, dest: &Path) -> bool {
+    write_resized_jpeg(image, dest, THUMB_SIZE)
+}
+
+fn write_resized_jpeg(image: &image::DynamicImage, dest: &Path, max_size: u32) -> bool {
     let (width, height) = image.dimensions();
-    let thumb = if width <= THUMB_SIZE && height <= THUMB_SIZE {
+    let thumb = if width <= max_size && height <= max_size {
         image.clone()
     } else {
-        image.resize(THUMB_SIZE, THUMB_SIZE, FilterType::Triangle)
+        image.resize(max_size, max_size, FilterType::Triangle)
     };
 
+    if let Some(parent) = dest.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
     thumb.save_with_format(dest, ImageFormat::Jpeg).is_ok()
+}
+
+fn sanitized_playlist_id(playlist_id: &str) -> Result<String, String> {
+    let safe: String = playlist_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    if safe.is_empty() {
+        Err("Invalid playlist id".to_string())
+    } else {
+        Ok(safe)
+    }
+}
+
+fn is_animated_gif(source: &Path) -> bool {
+    if source
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("gif"))
+    {
+        return true;
+    }
+
+    let Ok(data) = fs::read(source) else {
+        return false;
+    };
+    data.len() >= 6 && (&data[..6] == b"GIF87a" || &data[..6] == b"GIF89a")
+}
+
+fn clear_cached_playlist_covers(dir: &Path, safe_id: &str) {
+    for ext in ["jpg", "jpeg", "gif", "png", "webp", "bmp"] {
+        let path = dir.join(format!("{safe_id}.{ext}"));
+        if path.is_file() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+/// Copy and resize a user-picked image into the playlist cover cache.
+/// GIFs are copied as-is so animation is preserved.
+pub fn cache_playlist_cover(playlist_id: &str, source: &Path) -> Result<String, String> {
+    if !source.is_file() {
+        return Err("Cover image file not found".to_string());
+    }
+
+    let safe_id = sanitized_playlist_id(playlist_id)?;
+    let dir = PLAYLIST_COVER_DIR
+        .get()
+        .ok_or_else(|| "Playlist cover cache not initialized".to_string())?;
+
+    clear_cached_playlist_covers(dir, &safe_id);
+
+    if is_animated_gif(source) {
+        let size = fs::metadata(source)
+            .map_err(|e| format!("Failed to read cover file: {e}"))?
+            .len();
+        if size > MAX_PLAYLIST_GIF_BYTES {
+            return Err(format!(
+                "GIF is too large (max {} MB)",
+                MAX_PLAYLIST_GIF_BYTES / (1024 * 1024)
+            ));
+        }
+
+        let dest = dir.join(format!("{safe_id}.gif"));
+        fs::copy(source, &dest).map_err(|e| format!("Failed to copy GIF cover: {e}"))?;
+        return Ok(dest.to_string_lossy().to_string());
+    }
+
+    let dest = dir.join(format!("{safe_id}.jpg"));
+    let image = image::open(source).map_err(|e| format!("Failed to open image: {e}"))?;
+    if !write_resized_jpeg(&image, &dest, PLAYLIST_COVER_SIZE) {
+        return Err("Failed to write playlist cover".to_string());
+    }
+
+    Ok(dest.to_string_lossy().to_string())
+}
+
+/// Remove a cached custom playlist cover file.
+pub fn remove_playlist_cover_file(playlist_id: &str) -> Result<(), String> {
+    let safe_id = sanitized_playlist_id(playlist_id)?;
+    let Some(dir) = PLAYLIST_COVER_DIR.get() else {
+        return Ok(());
+    };
+    clear_cached_playlist_covers(dir, &safe_id);
+    Ok(())
 }
 
 fn cache_cover_bytes(audio_path: &Path, data: &[u8], mime: &str, suffix: &str) -> CoverPaths {

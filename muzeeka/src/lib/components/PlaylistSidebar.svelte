@@ -2,8 +2,10 @@
   import ContextMenu from './ContextMenu.svelte';
   import TrackCover from './TrackCover.svelte';
   import { openContextMenuFromEvent, type ContextMenuItem } from '$lib/contextMenu';
+  import { resolvePlaylistCoverTrack } from '$lib/playlistCover';
   import { getPlayerStore, type Playlist, VIRTUAL_ALL_ID, VIRTUAL_LIKED_ID } from '$lib/stores/player.svelte';
   import { trackDrag } from '$lib/stores/trackDrag.svelte';
+  import { open } from '@tauri-apps/plugin-dialog';
 
   const player = getPlayerStore();
 
@@ -38,7 +40,25 @@
     const target = contextMenu?.playlist;
     if (!target) return [];
 
-    return [
+    const items: ContextMenuItem[] = [
+      {
+        id: 'cover',
+        label: 'Set cover image',
+        icon: 'image',
+        onSelect: () => void pickPlaylistCover(target),
+      },
+    ];
+
+    if (target.cover_path) {
+      items.push({
+        id: 'clear-cover',
+        label: 'Remove cover image',
+        icon: 'delete',
+        onSelect: () => void player.clearPlaylistCover(target.id),
+      });
+    }
+
+    items.push(
       {
         id: 'rename',
         label: 'Rename',
@@ -52,7 +72,9 @@
         danger: true,
         onSelect: () => player.deletePlaylist(target.id),
       },
-    ];
+    );
+
+    return items;
   });
 
   function persist() {
@@ -95,6 +117,20 @@
   function openPlaylistContextMenu(e: MouseEvent, playlist: Playlist) {
     const position = openContextMenuFromEvent(e);
     contextMenu = { playlist, ...position };
+  }
+
+  async function pickPlaylistCover(playlist: Playlist) {
+    const selected = await open({
+      multiple: false,
+      filters: [
+        {
+          name: 'Images',
+          extensions: ['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp'],
+        },
+      ],
+    });
+    if (!selected || typeof selected !== 'string') return;
+    await player.setPlaylistCover(playlist.id, selected);
   }
 
   function playPlaylist(playlistId: string, firstTrackPath?: string | null) {
@@ -282,6 +318,7 @@
           player.hasCurrentTrack &&
           playlist.tracks.some((t) => t.path === player.currentFile)}
         {@const firstTrack = playlist.tracks[0] ?? null}
+        {@const coverTrack = resolvePlaylistCoverTrack(playlist)}
         <div
           class="playlist-row"
           role="listitem"
@@ -306,7 +343,7 @@
             title={playlist.name}
           >
             <div class="playlist-icon">
-              <TrackCover track={firstTrack} />
+              <TrackCover track={coverTrack} />
               {#if firstTrack}
                 <button
                   type="button"

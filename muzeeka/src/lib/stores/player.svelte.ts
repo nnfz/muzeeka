@@ -1,4 +1,5 @@
 import { prefetchCoverPaths } from '$lib/coverCache';
+import { collectPlaylistCoverPaths } from '$lib/playlistCover';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
@@ -38,6 +39,7 @@ export interface Playlist {
   id: string;
   name: string;
   tracks: MusicFile[];
+  cover_path?: string | null;
 }
 
 type RepeatMode = 'off' | 'all' | 'one';
@@ -331,7 +333,7 @@ function isStaleCoverPath(path: string | null | undefined): boolean {
   // was wiped. Mark it as stale so enrichment fetches a fresh one.
   // Only do this check on the very first pass — after that we trust the cache.
   if (coverCacheValidated) return false;
-  return typeof path === 'string' && /[\\/]covers[\\/]/i.test(path);
+  return typeof path === 'string' && /[\\/](?:covers|playlist_covers)[\\/]/i.test(path);
 }
 
 function needsMetadata(track: MusicFile): boolean {
@@ -566,9 +568,10 @@ async function loadPlaylists() {
       rebuildShuffleOrder(currentTrackIndex >= 0);
       syncShufflePosition();
     }
-    prefetchCoverPaths(
-      playlists.flatMap((playlist) => playlist.tracks.map((track) => track.cover_path))
-    );
+    prefetchCoverPaths([
+      ...playlists.flatMap((playlist) => playlist.tracks.map((track) => track.cover_path)),
+      ...collectPlaylistCoverPaths(playlists),
+    ]);
     void enrichTrackMetadata();
   } catch (e) {
     console.error('Failed to load playlists:', e);
@@ -669,6 +672,36 @@ function removeTrack(path: string, playlistId?: string | null) {
     }
   }
 
+  scheduleSave();
+}
+
+async function setPlaylistCover(id: string, sourcePath: string) {
+  const trimmed = sourcePath.trim();
+  if (!trimmed) return;
+  try {
+    const coverPath = await invoke<string>('playlist_cache_cover', {
+      playlistId: id,
+      sourcePath: trimmed,
+    });
+    playlists = playlists.map((p) =>
+      p.id === id ? { ...p, cover_path: coverPath } : p
+    );
+    prefetchCoverPaths([coverPath]);
+    scheduleSave();
+  } catch (e) {
+    console.error('Failed to set playlist cover:', e);
+  }
+}
+
+async function clearPlaylistCover(id: string) {
+  try {
+    await invoke('playlist_remove_cover', { playlistId: id });
+  } catch (e) {
+    console.error('Failed to remove playlist cover file:', e);
+  }
+  playlists = playlists.map((p) =>
+    p.id === id ? { ...p, cover_path: null } : p
+  );
   scheduleSave();
 }
 
@@ -1552,6 +1585,8 @@ export function createPlayerStore() {
     selectPlaylist,
     deletePlaylist,
     renamePlaylist,
+    setPlaylistCover,
+    clearPlaylistCover,
     removeTrack,
     setPlaylistTrackOrder,
     reorderTracksInView,

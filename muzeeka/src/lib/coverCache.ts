@@ -5,7 +5,7 @@ const warmed = new Set<string>();
 const inflight = new Map<string, Promise<string | null>>();
 
 function isCoverCachePath(path: string): boolean {
-  return /[\\/]covers[\\/]/i.test(path);
+  return /[\\/]covers[\\/]/i.test(path) || /[\\/]playlist_covers[\\/]/i.test(path);
 }
 
 export function getCoverSrc(coverPath: string | null | undefined): string | null {

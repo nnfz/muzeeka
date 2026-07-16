@@ -226,6 +226,8 @@ pub fn run() {
             commands::lyrics_fetch,
             commands::playlists_load,
             commands::playlists_save,
+            commands::playlist_cache_cover,
+            commands::playlist_remove_cover,
             commands::ytdlp_is_url,
             commands::ytdlp_available,
             commands::ytdlp_ffmpeg_available,

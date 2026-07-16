@@ -30,6 +30,9 @@ pub struct SavedPlaylist {
     pub id: String,
     pub name: String,
     pub tracks: Vec<MusicFile>,
+    /// User-assigned cover image (cached under app data). When absent, UI picks a track cover.
+    #[serde(default)]
+    pub cover_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

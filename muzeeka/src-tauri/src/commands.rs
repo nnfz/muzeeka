@@ -276,6 +276,18 @@ pub fn playlists_save(app: AppHandle, data: PlaylistsData) -> Result<(), String>
     playlists::save_playlists(&app, &data)
 }
 
+/// Cache a user-selected image as a playlist cover.
+#[tauri::command]
+pub fn playlist_cache_cover(playlist_id: String, source_path: String) -> Result<String, String> {
+    crate::metadata::cache_playlist_cover(&playlist_id, std::path::Path::new(&source_path))
+}
+
+/// Delete a cached custom playlist cover file.
+#[tauri::command]
+pub fn playlist_remove_cover(playlist_id: String) -> Result<(), String> {
+    crate::metadata::remove_playlist_cover_file(&playlist_id)
+}
+
 // ── yt-dlp ────────────────────────────────────────────────────────────────────
 
 /// Check whether a string looks like a supported media URL.
