@@ -286,3 +286,8 @@
   color: white;
   border-color: var(--accent);
 }
+
+.preset-btn.pitch-btn {
+  margin-left: auto;
+  font-weight: 600;
+}

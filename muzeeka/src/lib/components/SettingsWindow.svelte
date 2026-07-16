@@ -167,7 +167,13 @@
             <div class="card-header">
               <div>
                 <div class="card-label">Playback speed</div>
-                <div class="card-value">Adjusts playback rate (affects pitch with simple scaling)</div>
+                <div class="card-value">
+                  {#if settings.pitchEnabled}
+                    Speed changes shift pitch (vinyl-style)
+                  {:else}
+                    Original pitch preserved while changing speed
+                  {/if}
+                </div>
               </div>
               <div class="rate-display">
                 <span class="rate-value-big">{settings.playbackRate.toFixed(2)}×</span>
@@ -199,6 +205,16 @@
                   {r.toFixed(r === 1 ? 1 : 2)}×
                 </button>
               {/each}
+              <button
+                class="preset-btn pitch-btn"
+                class:active={settings.pitchEnabled}
+                onclick={() => settings.setPitchEnabled(!settings.pitchEnabled)}
+                title={settings.pitchEnabled
+                  ? 'Pitch shifts with speed — click to preserve pitch'
+                  : 'Pitch preserved — click to couple pitch with speed'}
+              >
+                Pitch
+              </button>
             </div>
           </div>
         </div>

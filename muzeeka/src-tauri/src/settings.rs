@@ -33,6 +33,9 @@ pub struct AppSettings {
     /// Playback rate multiplier. 1.0 = normal. Persisted so it survives restarts.
     #[serde(default = "default_playback_rate")]
     pub playback_rate: f32,
+    /// When true, speed changes also shift pitch. When false, pitch is preserved.
+    #[serde(default = "default_pitch_enabled")]
+    pub pitch_enabled: bool,
     /// Custom folder for yt-dlp downloads. Falls back to app_data/downloads.
     #[serde(default)]
     pub download_folder: Option<String>,
@@ -53,6 +56,7 @@ impl Default for AppSettings {
             equalizer: EqualizerSettings::default(),
             custom_presets: Vec::new(),
             playback_rate: default_playback_rate(),
+            pitch_enabled: default_pitch_enabled(),
             download_folder: None,
             download_playlist_id: None,
             discord_rpc_enabled: default_discord_rpc_enabled(),
@@ -63,6 +67,10 @@ impl Default for AppSettings {
 
 fn default_playback_rate() -> f32 {
     1.0
+}
+
+fn default_pitch_enabled() -> bool {
+    true
 }
 
 fn default_discord_rpc_enabled() -> bool {

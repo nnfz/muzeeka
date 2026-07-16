@@ -87,6 +87,14 @@ pub struct BassLibrary {
         unsafe extern "system" fn(channel: DWORD, mode: DWORD) -> QWORD,
     bass_mixer_channel_flags:
         unsafe extern "system" fn(channel: DWORD, flags: DWORD, mask: DWORD) -> DWORD,
+
+    // ── FX (bass_fx via BASS_PluginLoad — symbols live in bass.dll) ─────────
+    fx_ready: bool,
+    bass_channel_set_fx:
+        unsafe extern "system" fn(handle: DWORD, fx_type: DWORD, priority: i32) -> HFX,
+    bass_channel_remove_fx: unsafe extern "system" fn(handle: DWORD, fx: HFX) -> BOOL,
+    bass_fx_set_parameters:
+        unsafe extern "system" fn(handle: HFX, params: *const std::ffi::c_void) -> BOOL,
 }
 
 // Safety: BassLibrary is always used behind a parking_lot::Mutex.
@@ -105,6 +113,15 @@ macro_rules! load_fn {
             .get($name)
             .map_err(|e| format!("Failed to load {}: {}", String::from_utf8_lossy($name), e))?;
         std::mem::transmute(*sym)
+    }};
+}
+
+macro_rules! try_load_fn {
+    ($lib:expr, $name:expr) => {{
+        $lib
+            .get($name)
+            .ok()
+            .map(|sym: Symbol<*const ()>| std::mem::transmute(*sym))
     }};
 }
 
@@ -190,8 +207,36 @@ impl BassLibrary {
                 bass_mixer_channel_set_position: mixer_set_pos,
                 bass_mixer_channel_get_position: mixer_get_pos,
                 bass_mixer_channel_flags: mixer_flags,
+                fx_ready: false,
+                bass_channel_set_fx: std::mem::transmute::<*const (), _>(ptr::null::<()>()),
+                bass_channel_remove_fx: std::mem::transmute::<*const (), _>(ptr::null::<()>()),
+                bass_fx_set_parameters: std::mem::transmute::<*const (), _>(ptr::null::<()>()),
             })
         }
+    }
+
+    /// Resolve FX entry points from bass.dll after `BASS_PluginLoad("bass_fx.dll")`.
+    pub fn enable_fx_from_plugin(&mut self) -> bool {
+        unsafe {
+            let Some(set) = try_load_fn!(self._lib, b"BASS_ChannelSetFX\0") else {
+                return false;
+            };
+            let Some(remove) = try_load_fn!(self._lib, b"BASS_ChannelRemoveFX\0") else {
+                return false;
+            };
+            let Some(params) = try_load_fn!(self._lib, b"BASS_FXSetParameters\0") else {
+                return false;
+            };
+            self.bass_channel_set_fx = set;
+            self.bass_channel_remove_fx = remove;
+            self.bass_fx_set_parameters = params;
+            self.fx_ready = true;
+            true
+        }
+    }
+
+    pub fn has_fx(&self) -> bool {
+        self.fx_ready
     }
 
     /// Load a BASS format plugin (bassflac.dll, bassape.dll, etc.).
@@ -456,6 +501,44 @@ impl BassLibrary {
 
     pub fn mixer_channel_flags(&self, channel: DWORD, flags: DWORD, mask: DWORD) -> DWORD {
         unsafe { (self.bass_mixer_channel_flags)(channel, flags, mask) }
+    }
+
+    pub fn channel_set_fx(&self, handle: DWORD, fx_type: DWORD, priority: i32) -> Result<HFX, String> {
+        if !self.fx_ready {
+            return Err("bass_fx is not loaded".to_string());
+        }
+        let fx = unsafe { (self.bass_channel_set_fx)(handle, fx_type, priority) };
+        if fx == 0 {
+            Err(self.last_error_string())
+        } else {
+            Ok(fx)
+        }
+    }
+
+    pub fn channel_remove_fx(&self, handle: DWORD, fx: HFX) -> Result<(), String> {
+        if !self.fx_ready {
+            return Err("bass_fx is not loaded".to_string());
+        }
+        let ok = unsafe { (self.bass_channel_remove_fx)(handle, fx) };
+        if ok == 0 {
+            Err(self.last_error_string())
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn fx_set_tempo_parameters(&self, fx: HFX, params: &BassBfxTempo) -> Result<(), String> {
+        if !self.fx_ready {
+            return Err("bass_fx is not loaded".to_string());
+        }
+        let ok = unsafe {
+            (self.bass_fx_set_parameters)(fx, params as *const BassBfxTempo as *const std::ffi::c_void)
+        };
+        if ok == 0 {
+            Err(self.last_error_string())
+        } else {
+            Ok(())
+        }
     }
 
     // ── Error helpers ─────────────────────────────────────────────────────

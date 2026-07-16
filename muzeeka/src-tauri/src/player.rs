@@ -107,6 +107,10 @@ struct PlayerInner {
     current_audio_path: Option<String>,
     volume: f32,
     playback_rate: f32,
+    /// When true, speed changes also shift pitch (BASS_ATTRIB_FREQ). When false, tempo FX preserves pitch.
+    pitch_enabled: bool,
+    current_tempo_fx: u32,
+    preloaded_tempo_fx: u32,
     cue_start: Option<f64>,
     cue_end: Option<f64>,
     eq_context: &'static EqDspContext,
@@ -174,6 +178,9 @@ impl Player {
                 current_audio_path: None,
                 volume: 1.0,
                 playback_rate: 1.0,
+                pitch_enabled: true,
+                current_tempo_fx: 0,
+                preloaded_tempo_fx: 0,
                 cue_start: None,
                 cue_end: None,
                 eq_context: Box::leak(Box::new(EqDspContext::new())),
@@ -264,7 +271,7 @@ impl Player {
             ));
         }
 
-        let bass = BassLibrary::load(&inner.bass_dir)?;
+        let mut bass = BassLibrary::load(&inner.bass_dir)?;
 
         // FLOATDSP must be configured before BASS_Init.
         let float_dsp_ok = bass.set_config(bass::BASS_CONFIG_FLOATDSP, 1.0).is_ok();
@@ -282,6 +289,22 @@ impl Player {
         // while leaving 150ms margin over the 50ms gapless poll interval.
         let _ = bass.set_config(bass::BASS_CONFIG_BUFFER, 200.0);
         let _ = bass.set_config(bass::BASS_CONFIG_UPDATEPERIOD, 20.0);
+
+        let fx_dll = inner.bass_dir.join("bass_fx.dll");
+        if fx_dll.is_file() {
+            let path_str = fx_dll.to_string_lossy().to_string();
+            match bass.plugin_load(&path_str) {
+                Ok(handle) => {
+                    inner._plugin_handles.push(handle);
+                    if bass.enable_fx_from_plugin() {
+                        eprintln!("BASS FX loaded (pitch-preserving tempo available)");
+                    } else {
+                        eprintln!("bass_fx.dll loaded but FX entry points were not found");
+                    }
+                }
+                Err(error) => eprintln!("BASS FX plugin not loaded: {error}"),
+            }
+        }
 
         inner.eq_context.set_float_dsp_enabled(float_dsp_ok);
         inner.bass = Some(bass);
@@ -615,6 +638,7 @@ impl Player {
             inner.preloaded_source = 0;
         }
         inner.preloaded_audio_path = None;
+        inner.preloaded_tempo_fx = 0;
     }
 
     fn teardown_current(inner: &mut PlayerInner) {
@@ -629,6 +653,7 @@ impl Player {
         inner.current_audio_path = None;
         inner.cue_start = None;
         inner.cue_end = None;
+        inner.current_tempo_fx = 0;
     }
 
     fn apply_segment_metadata(
@@ -718,8 +743,6 @@ impl Player {
         }
         .map_err(|error| format!("{error} — file: {}", audio_path))?;
 
-        Self::apply_playback_rate(inner, bass, source);
-
         // Very short wait so length becomes available quickly, but we don't block long.
         // This is critical for fast manual play.
         for _ in 0..8 {
@@ -781,6 +804,17 @@ impl Player {
         }
 
         inner.current_source = source;
+        let rate = inner.playback_rate;
+        let pitch_enabled = inner.pitch_enabled;
+        if let Some(bass) = inner.bass.as_ref() {
+            Self::apply_playback_rate_to_source(
+                bass,
+                source,
+                rate,
+                pitch_enabled,
+                &mut inner.current_tempo_fx,
+            );
+        }
         Self::apply_segment_metadata(inner, track_path, playback);
 
         // Ensure EQ on mixer
@@ -828,6 +862,17 @@ impl Player {
 
         inner.preloaded_source = source;
         inner.preloaded_audio_path = Some(playback.audio_path);
+        let rate = inner.playback_rate;
+        let pitch_enabled = inner.pitch_enabled;
+        if let Some(bass) = inner.bass.as_ref() {
+            Self::apply_playback_rate_to_source(
+                bass,
+                source,
+                rate,
+                pitch_enabled,
+                &mut inner.preloaded_tempo_fx,
+            );
+        }
         Ok(())
     }
 
@@ -873,6 +918,8 @@ impl Player {
         inner.preloaded_source = 0;
         inner.preloaded_audio_path = None;
         inner.current_source = preloaded;
+        inner.current_tempo_fx = inner.preloaded_tempo_fx;
+        inner.preloaded_tempo_fx = 0;
 
         Self::apply_segment_metadata(inner, track_path, playback);
         Ok(())
@@ -983,9 +1030,14 @@ impl Player {
         bass.channel_set_position(handle, byte_pos, bass::BASS_POS_BYTE)
     }
 
-    /// Apply playback rate (or native when 1.0).
-    fn apply_playback_rate(inner: &PlayerInner, bass: &BassLibrary, handle: u32) {
-        let rate = inner.playback_rate;
+    fn clear_tempo_fx(bass: &BassLibrary, handle: u32, tempo_fx: &mut u32) {
+        if *tempo_fx != 0 {
+            let _ = bass.channel_remove_fx(handle, *tempo_fx);
+            *tempo_fx = 0;
+        }
+    }
+
+    fn apply_freq_rate(bass: &BassLibrary, handle: u32, rate: f32) {
         if (rate - 1.0).abs() < 0.001 {
             let _ = bass.channel_set_attribute(handle, bass::BASS_ATTRIB_FREQ, 0.0);
             return;
@@ -995,10 +1047,86 @@ impl Player {
                 let target = (info.freq as f64) * (rate as f64);
                 let _ = bass.channel_set_attribute(handle, bass::BASS_ATTRIB_FREQ, target as f32);
             } else {
-                let _ = bass.channel_set_attribute(handle, bass::BASS_ATTRIB_FREQ, (44100.0 * rate as f64) as f32);
+                let _ = bass.channel_set_attribute(
+                    handle,
+                    bass::BASS_ATTRIB_FREQ,
+                    (44100.0 * rate as f64) as f32,
+                );
             }
         } else {
             let _ = bass.channel_set_attribute(handle, bass::BASS_ATTRIB_FREQ, 0.0);
+        }
+    }
+
+    /// Apply playback rate to a decode source.
+    fn apply_playback_rate_to_source(
+        bass: &BassLibrary,
+        handle: u32,
+        rate: f32,
+        pitch_enabled: bool,
+        tempo_fx: &mut u32,
+    ) {
+        let _ = bass.channel_set_attribute(handle, bass::BASS_ATTRIB_FREQ, 0.0);
+
+        if (rate - 1.0).abs() < 0.001 {
+            Self::clear_tempo_fx(bass, handle, tempo_fx);
+            return;
+        }
+
+        if pitch_enabled || !bass.has_fx() {
+            Self::clear_tempo_fx(bass, handle, tempo_fx);
+            Self::apply_freq_rate(bass, handle, rate);
+            return;
+        }
+
+        Self::clear_tempo_fx(bass, handle, tempo_fx);
+        match bass.channel_set_fx(handle, bass::BASS_FX_BFX_TEMPO, 0) {
+            Ok(fx) => {
+                let params = bass::BassBfxTempo {
+                    f_target: 0.0,
+                    f_quiet: 0.0,
+                    f_rate: 1.0,
+                    f_tempo: rate * 100.0,
+                    f_pitch: 0.0,
+                };
+                if bass.fx_set_tempo_parameters(fx, &params).is_ok() {
+                    *tempo_fx = fx;
+                } else {
+                    let _ = bass.channel_remove_fx(handle, fx);
+                    Self::apply_freq_rate(bass, handle, rate);
+                }
+            }
+            Err(_) => Self::apply_freq_rate(bass, handle, rate),
+        }
+    }
+
+    fn reapply_playback_rates(inner: &mut PlayerInner) {
+        let rate = inner.playback_rate;
+        let pitch_enabled = inner.pitch_enabled;
+        let current = inner.current_source;
+        let preloaded = inner.preloaded_source;
+
+        if current != 0 {
+            if let Some(bass) = inner.bass.as_ref() {
+                Self::apply_playback_rate_to_source(
+                    bass,
+                    current,
+                    rate,
+                    pitch_enabled,
+                    &mut inner.current_tempo_fx,
+                );
+            }
+        }
+        if preloaded != 0 {
+            if let Some(bass) = inner.bass.as_ref() {
+                Self::apply_playback_rate_to_source(
+                    bass,
+                    preloaded,
+                    rate,
+                    pitch_enabled,
+                    &mut inner.preloaded_tempo_fx,
+                );
+            }
         }
     }
 
@@ -1185,21 +1313,21 @@ impl Player {
         })
     }
 
-    /// Set playback rate (0.25 — 2.0). Affects speed (+ pitch for simple scaling).
+    /// Set playback rate (0.25 — 2.0).
     pub fn set_playback_rate(&self, rate: f32) -> Result<(), String> {
         let rate = rate.clamp(0.25, 2.0);
         self.run_on_bass_thread(move |inner| {
             inner.playback_rate = rate;
-            if let Some(bass) = inner.bass.as_ref() {
-                // Apply to current source if active
-                if inner.current_source != 0 {
-                    Self::apply_playback_rate(inner, bass, inner.current_source);
-                }
-                // Apply to preloaded for upcoming gapless
-                if inner.preloaded_source != 0 {
-                    Self::apply_playback_rate(inner, bass, inner.preloaded_source);
-                }
-            }
+            Self::reapply_playback_rates(inner);
+            Ok(())
+        })
+    }
+
+    /// When enabled, playback speed also shifts pitch. When disabled, tempo FX preserves pitch.
+    pub fn set_pitch_enabled(&self, enabled: bool) -> Result<(), String> {
+        self.run_on_bass_thread(move |inner| {
+            inner.pitch_enabled = enabled;
+            Self::reapply_playback_rates(inner);
             Ok(())
         })
     }

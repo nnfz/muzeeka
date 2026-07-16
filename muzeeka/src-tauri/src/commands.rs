@@ -131,10 +131,16 @@ pub fn player_set_volume(player: State<'_, Player>, volume: f32) -> Result<(), S
     player.set_volume(volume)
 }
 
-/// Set playback rate multiplier (0.25 to 2.0). Changes speed (and pitch).
+/// Set playback rate multiplier (0.25 to 2.0).
 #[tauri::command]
 pub fn player_set_playback_rate(player: State<'_, Player>, rate: f32) -> Result<(), String> {
     player.set_playback_rate(rate)
+}
+
+/// Toggle pitch coupling with playback speed (off = preserve pitch via tempo FX).
+#[tauri::command]
+pub fn player_set_pitch_enabled(player: State<'_, Player>, enabled: bool) -> Result<(), String> {
+    player.set_pitch_enabled(enabled)
 }
 
 /// Get a snapshot of the current player state.

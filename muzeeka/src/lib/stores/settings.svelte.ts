@@ -16,6 +16,7 @@ export interface EqualizerSettings {
 export interface AppSettings {
   equalizer: EqualizerSettings;
   playback_rate?: number;
+  pitch_enabled?: boolean;
   custom_presets?: EQPreset[];
   download_folder?: string | null;
   download_playlist_id?: string | null;
@@ -38,6 +39,7 @@ const DEFAULT_EQUALIZER: EqualizerSettings = {
 let equalizer = $state<EqualizerSettings>({ ...DEFAULT_EQUALIZER, bands_db: [...DEFAULT_EQUALIZER.bands_db] });
 let customPresets = $state<EQPreset[]>([]);
 let playbackRate = $state(1.0);
+let pitchEnabled = $state(true);
 let downloadFolder = $state<string | null>(null);
 let downloadPlaylistId = $state<string | null>(null);
 let discordRpcEnabled = $state(true);
@@ -61,6 +63,7 @@ function scheduleSave() {
     const payload: AppSettings = {
       equalizer: clampEqualizer(equalizer),
       playback_rate: playbackRate,
+      pitch_enabled: pitchEnabled,
       custom_presets: customPresets.map((p) => ({
         name: p.name,
         preamp_db: p.preamp_db,
@@ -103,6 +106,16 @@ async function applyPlaybackRate(rate: number) {
   scheduleSave();
 }
 
+async function applyPitchEnabled(enabled: boolean) {
+  pitchEnabled = enabled;
+  try {
+    await invoke('player_set_pitch_enabled', { enabled });
+  } catch (e) {
+    console.error('Failed to set pitch mode:', e);
+  }
+  scheduleSave();
+}
+
 export function createSettingsStore(ensurePlayerReady: () => Promise<void>) {
   async function bootstrap() {
     try {
@@ -130,6 +143,7 @@ export function createSettingsStore(ensurePlayerReady: () => Promise<void>) {
       } else {
         playbackRate = 1.0;
       }
+      pitchEnabled = data.pitch_enabled !== false;
       if (typeof data.download_folder === 'string' && data.download_folder.trim()) {
         downloadFolder = data.download_folder.trim();
       } else {
@@ -151,6 +165,7 @@ export function createSettingsStore(ensurePlayerReady: () => Promise<void>) {
       if (playbackRate !== 1.0) {
         await invoke('player_set_playback_rate', { rate: playbackRate }).catch(() => {});
       }
+      await invoke('player_set_pitch_enabled', { enabled: pitchEnabled }).catch(() => {});
     } catch (e) {
       console.error('Failed to load settings:', e);
     } finally {
@@ -166,6 +181,9 @@ export function createSettingsStore(ensurePlayerReady: () => Promise<void>) {
     },
     get playbackRate() {
       return playbackRate;
+    },
+    get pitchEnabled() {
+      return pitchEnabled;
     },
     get customPresets() {
       return [...customPresets];
@@ -239,6 +257,9 @@ export function createSettingsStore(ensurePlayerReady: () => Promise<void>) {
 
     async setPlaybackRate(rate: number) {
       await applyPlaybackRate(rate);
+    },
+    async setPitchEnabled(enabled: boolean) {
+      await applyPitchEnabled(enabled);
     },
   };
 }
