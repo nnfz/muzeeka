@@ -169,6 +169,8 @@ const NON_FORMAT_BASS_DLLS: &[&str] = &[
 #[derive(Clone)]
 pub struct Player {
     inner: Arc<Mutex<PlayerInner>>,
+    /// Serializes play/pause/resume/seek so concurrent IPC calls cannot deadlock the main thread.
+    ops: Arc<Mutex<()>>,
     app: Arc<RwLock<Option<AppHandle>>>,
     bass_thread: Arc<RwLock<Option<thread::ThreadId>>>,
     discord: Arc<RwLock<Option<DiscordPresence>>>,
@@ -206,10 +208,63 @@ impl Player {
                 user_paused: false,
                 suppress_gapless_until: 0,
             })),
+            ops: Arc::new(Mutex::new(())),
             app: Arc::new(RwLock::new(None)),
             bass_thread: Arc::new(RwLock::new(None)),
             discord: Arc::new(RwLock::new(None)),
         }
+    }
+
+    fn cancel_pending_pause(inner: &mut PlayerInner) {
+        inner.pause_generation = inner.pause_generation.wrapping_add(1);
+        inner.user_paused = false;
+        if let Some(bass) = inner.bass.as_ref() {
+            if inner.mixer_handle != 0 {
+                // Cancel the pause fade and stay silent until the new stream is ready.
+                // Restoring volume here leaked ~0.5s of the previous track from the mixer buffer.
+                let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_VOL, 0.0);
+            }
+        }
+    }
+
+    /// Drop buffered audio from the mixer output after removing sources.
+    fn flush_mixer_hard(inner: &PlayerInner) {
+        if let Some(bass) = inner.bass.as_ref() {
+            if inner.mixer_handle != 0 {
+                let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_VOL, 0.0);
+                let _ = bass.channel_play(inner.mixer_handle, true);
+                let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_BUFFER, 0.0);
+            }
+        }
+    }
+
+    fn begin_manual_track_switch(inner: &mut PlayerInner, playback: &PlaybackTarget) {
+        if Self::can_gapless_reuse(inner, &playback.audio_path) {
+            return;
+        }
+
+        if Self::can_use_preloaded(inner, &playback.audio_path) {
+            if inner.current_source != 0 && inner.current_source != inner.preloaded_source {
+                if let Some(bass) = inner.bass.as_ref() {
+                    let _ = bass.mixer_channel_remove(inner.current_source);
+                    Self::free_playback_channel(
+                        bass,
+                        inner.current_source,
+                        inner.current_decode,
+                    );
+                }
+                inner.current_source = 0;
+                inner.current_decode = 0;
+                inner.current_audio_path = None;
+                inner.cue_start = None;
+                inner.cue_end = None;
+            }
+        } else {
+            Self::teardown_current(inner);
+            Self::clear_preload(inner);
+        }
+
+        Self::flush_mixer_hard(inner);
     }
 
     pub fn set_app_handle(&self, app: AppHandle) {
@@ -562,6 +617,7 @@ impl Player {
         cue_end: Option<f64>,
         queue: Vec<GaplessTrack>,
     ) -> Result<(), String> {
+        let _ops = self.ops.lock();
         let track_path = track_path.to_string();
         let audio_path = audio_path.map(str::to_string);
         self.run_on_bass_thread(move |inner| {
@@ -796,13 +852,6 @@ impl Player {
         Self::teardown_current(inner);
         Self::clear_preload(inner);
 
-        let was_paused_or_stopped = if let Some(bass) = inner.bass.as_ref() {
-            let active = bass.channel_is_active(inner.mixer_handle);
-            active != bass::BASS_ACTIVE_PLAYING
-        } else {
-            false
-        };
-
         let decode = Self::create_decode_source(inner, &playback.audio_path, playback.cue_start)?;
         let rate = inner.playback_rate;
         let pitch_enabled = inner.pitch_enabled;
@@ -816,14 +865,9 @@ impl Player {
 
         if let Some(bass) = inner.bass.as_ref() {
             let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_VOL, volume);
-            if was_paused_or_stopped {
-                // Hard restart to flush any old buffer from previous track/fade.
-                let _ = bass.channel_play(inner.mixer_handle, true);
-            } else {
-                // Mixer is already playing — just ensure it keeps going.
-                let _ = bass.channel_play(inner.mixer_handle, false);
-            }
-            let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_BUFFER, 0.2);
+            // Manual track switch: always hard-restart to flush stale audio from pause/buffer.
+            let _ = bass.channel_play(inner.mixer_handle, true);
+            let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_BUFFER, 0.0);
         }
 
         inner.current_source = mixer_channel;
@@ -925,10 +969,9 @@ impl Player {
                 let byte = bass.channel_seconds2bytes(preloaded, start);
                 let _ = bass.mixer_channel_set_position(preloaded, byte, bass::BASS_POS_BYTE);
             }
-            if bass.channel_is_active(inner.mixer_handle) != bass::BASS_ACTIVE_PLAYING {
-                let _ = bass.channel_play(inner.mixer_handle, false);
-            }
-            let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_BUFFER, 0.2);
+            let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_VOL, inner.volume);
+            let _ = bass.channel_play(inner.mixer_handle, true);
+            let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_BUFFER, 0.0);
         }
 
         inner.preloaded_source = 0;
@@ -980,8 +1023,12 @@ impl Player {
         cue_start: Option<f64>,
         cue_end: Option<f64>,
     ) -> Result<(), String> {
+        Self::cancel_pending_pause(inner);
+
         let playback = cue::resolve_playback(track_path, audio_path, cue_start, cue_end)
             .map_err(|error| format!("{error} (track: {track_path})"))?;
+
+        Self::begin_manual_track_switch(inner, &playback);
 
         if Self::can_gapless_reuse(inner, &playback.audio_path) {
             // CUE same-file: seek within the already-open stream (instant, no reopening).
@@ -993,21 +1040,16 @@ impl Player {
             if let Some(bass) = inner.bass.as_ref() {
                 let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_VOL, inner.volume);
                 let _ = bass.channel_play(inner.mixer_handle, true);
-                let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_BUFFER, 0.2);
+                let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_BUFFER, 0.0);
             }
         } else if Self::can_use_preloaded(inner, &playback.audio_path) {
             // Fast path for manual next/prev when the track was preloaded for gapless.
             // This makes "hand switching" to the next track nearly instant.
             Self::activate_preloaded(inner, track_path, &playback)?;
         } else {
-            Self::teardown_current(inner);
             Self::open_stream(inner, track_path, &playback)?;
         }
 
-        // Invalidate any pending scheduled pauses from previous pause() calls.
-        inner.pause_generation = inner.pause_generation.wrapping_add(1);
-
-        inner.user_paused = false;
         Self::refresh_pending_next(inner);
         Ok(())
     }
@@ -1348,6 +1390,7 @@ impl Player {
     }
 
     pub fn pause(&self) -> Result<(), String> {
+        let _ops = self.ops.lock();
         // Start the fade-out immediately (Spotify-style smooth tail)
         let (fade_started, gen) = self.run_on_bass_thread(|inner| {
             if inner.mixer_handle != 0 {
@@ -1392,10 +1435,11 @@ impl Player {
     }
 
     pub fn resume(&self) -> Result<(), String> {
+        let _ops = self.ops.lock();
         self.run_on_bass_thread(|inner| {
+            Self::cancel_pending_pause(inner);
             let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
             if inner.mixer_handle != 0 {
-                inner.user_paused = false;
                 let target = inner.volume;
                 // Force start from silence, play, then musical fade-in (Spotify style)
                 let _ = bass.channel_set_attribute(
@@ -1417,6 +1461,7 @@ impl Player {
     }
 
     pub fn stop(&self) -> Result<(), String> {
+        let _ops = self.ops.lock();
         self.run_on_bass_thread(|inner| {
             Self::teardown_current(inner);
             Self::clear_preload(inner);
@@ -1467,6 +1512,7 @@ impl Player {
     /// Feels like a smooth blend/transition during scrub, similar to Spotify.
     /// No full silence, short times. Not used on track changes.
     pub fn seek(&self, position_secs: f64) -> Result<(), String> {
+        let _ops = self.ops.lock();
         self.run_on_bass_thread(move |inner| {
             if inner.current_source == 0 || inner.mixer_handle == 0 {
                 return Err("Nothing is playing".into());

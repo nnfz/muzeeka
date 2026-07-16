@@ -12,7 +12,7 @@ use tauri_plugin_taskbar::TaskbarExt;
 
 use crate::remote_control::RemoteController;
 
-const TOGGLE_DEBOUNCE_MS: u64 = 280;
+const TOGGLE_DEBOUNCE_MS: u64 = 120;
 
 static LAST_TOGGLE_MS: AtomicU64 = AtomicU64::new(0);
 

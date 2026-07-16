@@ -91,13 +91,24 @@ struct BiquadState {
     z2: f64,
 }
 
+/// Flush subnormals to zero. Tiny IIR residues from quiet passages otherwise
+/// become denormal floats and can burn a full CPU core (track-dependent lag).
+#[inline(always)]
+fn undenormal(x: f64) -> f64 {
+    if x.abs() < 1.0e-15 {
+        0.0
+    } else {
+        x
+    }
+}
+
 impl BiquadState {
     #[inline(always)]
     fn process(&mut self, input: f64, c: &BiquadCoeffs) -> f64 {
         let output = c.b0 * input + self.z1;
-        self.z1 = c.b1 * input - c.a1 * output + self.z2;
-        self.z2 = c.b2 * input - c.a2 * output;
-        output
+        self.z1 = undenormal(c.b1 * input - c.a1 * output + self.z2);
+        self.z2 = undenormal(c.b2 * input - c.a2 * output);
+        undenormal(output)
     }
 }
 

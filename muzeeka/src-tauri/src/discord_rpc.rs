@@ -22,6 +22,9 @@ use crate::player::{PlaybackState, PlayerStateSnapshot};
 /// Discord Application ID — https://discord.com/developers/applications
 pub const DISCORD_CLIENT_ID: &str = "1525094033666473995";
 
+/// Last resolved tags for the active track — avoids re-parsing ID3 on every RPC sync.
+static META_CACHE: Mutex<Option<(String, TrackMetadata)>> = Mutex::new(None);
+
 #[derive(Clone)]
 pub struct DiscordPresence {
     inner: Arc<Mutex<PresenceInner>>,
@@ -394,6 +397,23 @@ fn filename_title(path: &str) -> String {
 }
 
 fn metadata_for_path(track_path: &str) -> TrackMetadata {
+    // Discord updates can fire on play/pause/seek/gapless; re-reading ID3 + decoding
+    // embedded art each time made some tracks (large APIC) stutter for free.
+    {
+        let cache = META_CACHE.lock();
+        if let Some((cached_path, meta)) = cache.as_ref() {
+            if cached_path == track_path {
+                return meta.clone();
+            }
+        }
+    }
+
+    let meta = metadata_for_path_uncached(track_path);
+    *META_CACHE.lock() = Some((track_path.to_string(), meta.clone()));
+    meta
+}
+
+fn metadata_for_path_uncached(track_path: &str) -> TrackMetadata {
     let path = Path::new(track_path);
     let file_name = path
         .file_name()

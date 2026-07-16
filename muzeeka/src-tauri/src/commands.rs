@@ -9,6 +9,7 @@ use tauri::{AppHandle, State};
 
 use crate::discord_rpc::DiscordPresence;
 use crate::remote_control::RemoteController;
+
 use crate::equalizer::EqualizerSettings;
 use crate::library;
 use crate::player::{EqualizerStatus, GaplessTrack, Player, PlayerStateSnapshot};
@@ -22,8 +23,10 @@ fn sync_discord(player: &Player, discord: &DiscordPresence) {
     });
 }
 
-fn sync_playback_ui(controller: &RemoteController) {
-    controller.notify_playback();
+fn sync_playback_ui_async(controller: Arc<RemoteController>) {
+    std::thread::spawn(move || {
+        controller.notify_playback();
+    });
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -85,7 +88,7 @@ pub fn player_play(
         parse_gapless_queue(queue),
     )?;
     sync_discord(&player, &discord);
-    sync_playback_ui(&controller);
+    sync_playback_ui_async(Arc::clone(controller.inner()));
     Ok(())
 }
 
@@ -107,7 +110,7 @@ pub fn player_pause(
 ) -> Result<(), String> {
     player.pause()?;
     sync_discord(&player, &discord);
-    sync_playback_ui(&controller);
+    sync_playback_ui_async(Arc::clone(controller.inner()));
     Ok(())
 }
 
@@ -120,7 +123,7 @@ pub fn player_resume(
 ) -> Result<(), String> {
     player.resume()?;
     sync_discord(&player, &discord);
-    sync_playback_ui(&controller);
+    sync_playback_ui_async(Arc::clone(controller.inner()));
     Ok(())
 }
 
@@ -133,7 +136,7 @@ pub fn player_stop(
 ) -> Result<(), String> {
     player.stop()?;
     sync_discord(&player, &discord);
-    sync_playback_ui(&controller);
+    sync_playback_ui_async(Arc::clone(controller.inner()));
     Ok(())
 }
 
@@ -147,7 +150,7 @@ pub fn player_seek(
 ) -> Result<(), String> {
     player.seek(position)?;
     sync_discord(&player, &discord);
-    sync_playback_ui(&controller);
+    sync_playback_ui_async(Arc::clone(controller.inner()));
     Ok(())
 }
 

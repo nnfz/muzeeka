@@ -353,16 +353,28 @@ pub fn remove_playlist_cover_file(playlist_id: &str) -> Result<(), String> {
 
 fn cache_cover_bytes(audio_path: &Path, data: &[u8], mime: &str, suffix: &str) -> CoverPaths {
     let mut paths = CoverPaths::default();
+    let cache_path = thumb_cache_path(audio_path, suffix);
+
+    // Fast path: thumb + full already on disk — never re-decode the embedded JPEG.
+    // read_metadata is called often (Discord RPC, enrichment); decoding 1200² covers
+    // every time was a free main-thread stall for tracks with large APIC frames.
+    if let Some(ref thumb_path) = cache_path {
+        if thumb_path.exists() {
+            paths.thumb = Some(thumb_path.to_string_lossy().to_string());
+            paths.full = cache_full_cover_bytes(audio_path, data, mime, suffix)
+                .or_else(|| paths.thumb.clone());
+            return paths;
+        }
+    }
+
     let Some(image) = decode_image_bytes(data) else {
         return paths;
     };
-    let cache_path = thumb_cache_path(audio_path, suffix);
 
     if let Some(cache_path) = cache_path {
-        if !cache_path.exists() {
-            let _ = write_thumbnail_from_image(&image, &cache_path);
+        if !write_thumbnail_from_image(&image, &cache_path) {
+            return paths;
         }
-
         if cache_path.exists() {
             paths.thumb = Some(cache_path.to_string_lossy().to_string());
         }
@@ -447,6 +459,11 @@ fn extract_embedded_cover_id3(path: &Path) -> Option<CoverPaths> {
         _ => return None,
     }
 
+    // Cached cover from a previous read — skip re-parsing ID3 + re-decoding JPEG.
+    if let Some(paths) = existing_embedded_cover_cache(path) {
+        return Some(paths);
+    }
+
     let tag = id3::Tag::read_from_path(path).ok()?;
     let pic = tag
         .pictures()
@@ -469,6 +486,20 @@ fn extract_embedded_cover_id3(path: &Path) -> Option<CoverPaths> {
     } else {
         None
     }
+}
+
+fn existing_embedded_cover_cache(path: &Path) -> Option<CoverPaths> {
+    let thumb = thumb_cache_path(path, "embedded").filter(|p| p.is_file())?;
+    let full = ["jpg", "jpeg", "png", "webp", "bmp", "gif"]
+        .into_iter()
+        .find_map(|ext| full_cache_path(path, "embedded", ext).filter(|p| p.is_file()));
+
+    Some(CoverPaths {
+        thumb: Some(thumb.to_string_lossy().to_string()),
+        full: full
+            .map(|p| p.to_string_lossy().to_string())
+            .or_else(|| Some(thumb.to_string_lossy().to_string())),
+    })
 }
 
 fn extract_nearby_cover(path: &Path) -> CoverPaths {

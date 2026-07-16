@@ -106,6 +106,49 @@ let lastPauseRequestAt = 0;
 let applyingExternalSync = false;
 let listenersSetup = false;
 
+const PAUSE_FADE_GUARD_MS = 350;
+
+function recentPlayRequested(): boolean {
+  return Date.now() - lastManualPlayAt < PAUSE_FADE_GUARD_MS;
+}
+
+function inPauseFadeWindow(): boolean {
+  return Date.now() - lastPauseRequestAt < PAUSE_FADE_GUARD_MS;
+}
+
+/** Apply backend playback flags without stale pause events clobbering a new play. */
+function applyBackendPlaybackState(payload: {
+  is_playing?: boolean;
+  is_paused?: boolean;
+  state?: string;
+}) {
+  const playing = payload.is_playing === true || payload.state === 'playing';
+  const paused = payload.is_paused === true || payload.state === 'paused';
+
+  if (playing) {
+    // Ignore stale "playing" only while UI is still paused during the fade-out tail.
+    if (isPaused && inPauseFadeWindow() && !recentPlayRequested()) return;
+    isPlaying = true;
+    isPaused = false;
+    lastPauseRequestAt = 0;
+    return;
+  }
+
+  if (paused) {
+    if (recentPlayRequested()) return;
+    if (inPauseFadeWindow() && isPlaying) return;
+    isPlaying = false;
+    isPaused = true;
+    return;
+  }
+
+  if (payload.state === 'stopped') {
+    if (recentPlayRequested()) return;
+    isPlaying = false;
+    isPaused = false;
+  }
+}
+
 // --- Derived ---
 
 function buildTrackByPathMap(): Map<string, MusicFile> {
@@ -1059,11 +1102,19 @@ async function prepareGaplessNext(filePath: string) {
   }
 }
 
+let playRequestId = 0;
+
 async function play(filePath: string) {
+  const requestId = ++playRequestId;
   try {
     await ensureInit();
+    if (requestId !== playRequestId) return;
+
     lastManualPlayAt = Date.now();
     lastPlayedFile = filePath;
+    lastPauseRequestAt = 0;
+    isPlaying = true;
+    isPaused = false;
 
     // DON'T call player_stop before player_play!
     // The backend's play_inner handles transitions properly:
@@ -1122,18 +1173,25 @@ async function play(filePath: string) {
       duration = meta.duration_secs;
     }
     syncTrackIndex();
-    isPlaying = true;
-    isPaused = false;
-    lastPauseRequestAt = 0;
     lastGaplessChangeAt = Date.now();
     scheduleSave();
     syncWindowTitle();
 
-    await invoke('player_play', {
+    if (requestId !== playRequestId) return;
+
+    void invoke('player_play', {
       ...playOptionsForTrack(track, filePath),
       queue: queueToSend,
+    }).catch((e) => {
+      if (requestId !== playRequestId) return;
+      seekGuardUntil = 0;
+      const message = typeof e === 'string' ? e : String(e);
+      console.error('Failed to play:', message);
+      isPlaying = false;
+      isPaused = false;
     });
   } catch (e) {
+    if (requestId !== playRequestId) return;
     seekGuardUntil = 0;
     const message = typeof e === 'string' ? e : String(e);
     console.error('Failed to play:', message);
@@ -1142,34 +1200,29 @@ async function play(filePath: string) {
   }
 }
 
-async function pause() {
+function pause() {
   lastPauseRequestAt = Date.now();
   isPaused = true;
   isPlaying = false;
-  try {
-    await invoke('player_pause');
-  } catch (e) {
+  void invoke('player_pause').catch((e) => {
     console.error('Failed to pause:', e);
     isPaused = false;
     isPlaying = true;
-  }
+  });
 }
 
-async function resume() {
+function resume() {
   lastPauseRequestAt = 0;
   isPaused = false;
   isPlaying = true;
-  try {
-    await invoke('player_resume');
-  } catch (e) {
-    // Backend has no audio loaded (e.g. after app restart) — fall back to playing from start
+  void invoke('player_resume').catch((e) => {
     if (currentFile) {
-      await play(currentFile);
-    } else {
-      isPlaying = false;
-      console.error('Failed to resume:', e);
+      void play(currentFile);
+      return;
     }
-  }
+    isPlaying = false;
+    console.error('Failed to resume:', e);
+  });
 }
 
 async function stop() {
@@ -1232,25 +1285,17 @@ function isLiked(path: string): boolean {
   return likedPaths.includes(path);
 }
 
-let toggleInFlight = false;
-
-async function togglePlayPause() {
-  if (toggleInFlight) return;
-  toggleInFlight = true;
-  try {
-    if (isPlaying) {
-      await pause();
-    } else if (isPaused) {
-      await resume();
-    } else if (currentFile) {
-      await play(currentFile);
-    } else if (hasPlayingTracks && currentTrackIndex >= 0) {
-      await play(playingTracks[currentTrackIndex].path);
-    } else if (hasPlayingTracks) {
-      await play(playingTracks[0].path);
-    }
-  } finally {
-    toggleInFlight = false;
+function togglePlayPause() {
+  if (isPlaying) {
+    pause();
+  } else if (isPaused) {
+    resume();
+  } else if (currentFile) {
+    void play(currentFile);
+  } else if (hasPlayingTracks && currentTrackIndex >= 0) {
+    void play(playingTracks[currentTrackIndex].path);
+  } else if (hasPlayingTracks) {
+    void play(playingTracks[0].path);
   }
 }
 
@@ -1369,19 +1414,11 @@ function applyStoreSync(payload: StoreSyncPayload) {
       syncTrackIndex();
       syncWindowTitle();
     }
-    if (typeof payload.isPlaying === 'boolean') {
-      const inPauseWindow = (Date.now() - lastPauseRequestAt) < 800;
-      if (payload.isPlaying && !inPauseWindow && !isPaused) {
-        isPlaying = true;
-        isPaused = false;
-        lastPauseRequestAt = 0;
-      } else if (!payload.isPlaying) {
-        isPlaying = false;
-      }
-    }
-    if (typeof payload.isPaused === 'boolean') {
-      isPaused = payload.isPaused;
-      if (payload.isPaused) lastPauseRequestAt = 0;
+    if (typeof payload.isPlaying === 'boolean' || typeof payload.isPaused === 'boolean') {
+      applyBackendPlaybackState({
+        is_playing: payload.isPlaying,
+        is_paused: payload.isPaused,
+      });
     }
     if (typeof payload.position === 'number') {
       position = payload.position;
@@ -1453,25 +1490,8 @@ function setupListeners() {
   listen<{ position: number; duration: number; state?: string }>('player:position', (event) => {
     const newPos = event.payload.position;
     duration = event.payload.duration;
-    if (event.payload.state === 'playing') {
-      // Ignore 'playing' reports while we have a pending pause request (fade in progress)
-      // or while the local state believes we are paused. This prevents the BASS
-      // "still playing during volume fade" reports + any stale immediate notifies
-      // (e.g. from remote controller) from flipping the button back to play icon.
-      const inPauseWindow = (Date.now() - lastPauseRequestAt) < 800;
-      if (!inPauseWindow && !isPaused) {
-        isPlaying = true;
-        isPaused = false;
-        lastPauseRequestAt = 0;
-      }
-    } else if (event.payload.state === 'paused') {
-      isPlaying = false;
-      isPaused = true;
-      lastPauseRequestAt = 0;
-    } else if (event.payload.state === 'stopped') {
-      isPlaying = false;
-      isPaused = false;
-      lastPauseRequestAt = 0;
+    if (event.payload.state) {
+      applyBackendPlaybackState({ state: event.payload.state });
     }
 
     if (
@@ -1489,18 +1509,7 @@ function setupListeners() {
   });
 
   listen<{ is_playing: boolean; is_paused: boolean }>('player:state', (event) => {
-    if (event.payload.is_playing) {
-      const inPauseWindow = (Date.now() - lastPauseRequestAt) < 800;
-      if (!inPauseWindow && !isPaused) {
-        isPlaying = true;
-        isPaused = false;
-        lastPauseRequestAt = 0;
-      }
-    } else if (event.payload.is_paused) {
-      isPlaying = false;
-      isPaused = true;
-      lastPauseRequestAt = 0;
-    }
+    applyBackendPlaybackState(event.payload);
   });
 
   listen<{ files: MusicFile[]; playlistId: string | null }>('ytdlp:downloaded', (event) => {

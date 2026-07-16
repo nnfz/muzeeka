@@ -193,7 +193,7 @@ impl RemoteController {
         (has_prev, has_next)
     }
 
-    pub fn notify_playback(&self) {
+    pub fn emit_playback_state(&self) {
         let snapshot = self.player.get_state();
         let _ = self.app.emit(
             "player:state",
@@ -210,6 +210,10 @@ impl RemoteController {
                 state: snapshot.state,
             },
         );
+    }
+
+    pub fn notify_playback(&self) {
+        self.emit_playback_state();
         taskbar_handler::sync_taskbar(self);
     }
 
