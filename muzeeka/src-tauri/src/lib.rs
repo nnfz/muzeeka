@@ -22,12 +22,14 @@ mod playlists;
 mod remote_control;
 mod remote_server;
 mod settings;
+mod taskbar_handler;
 mod ytdlp;
 
 use discord_rpc::DiscordPresence;
 use drop_handler::{handle_window_event, DropState, ExportDragState};
 
 use player::Player;
+use remote_control::RemoteController;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -148,6 +150,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_taskbar::init())
         .manage(DropState::default())
         .manage(ExportDragState::default())
         .manage(player.clone())
@@ -221,11 +224,16 @@ pub fn run() {
             }
 
             player.start_position_emitter(app.handle().clone());
-            remote_server::start(
+
+            let remote_controller = Arc::new(RemoteController::new(
                 player.clone(),
                 discord_presence.clone(),
                 app.handle().clone(),
-            );
+            ));
+            app.manage(remote_controller.clone());
+            taskbar_handler::setup(app.handle(), remote_controller.clone());
+            remote_server::start(remote_controller);
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

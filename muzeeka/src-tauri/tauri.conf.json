@@ -29,12 +29,33 @@
       }
     }
   },
+  "plugins": {
+    "taskbar": {
+      "autoAttach": false,
+      "windowLabel": "main",
+      "tooltips": {
+        "previous": "Предыдущий",
+        "play": "Воспроизвести",
+        "pause": "Пауза",
+        "next": "Следующий"
+      },
+      "icons": {
+        "previous": "icons/taskbar/PREV_THUMB.ico",
+        "previousDisabled": "icons/taskbar/PREV_THUMB_DISABLED.ico",
+        "play": "icons/taskbar/PLAY_THUMB.ico",
+        "pause": "icons/taskbar/PAUSE_THUMB.ico",
+        "next": "icons/taskbar/NEXT_THUMB.ico",
+        "nextDisabled": "icons/taskbar/NEXT_THUMB_DISABLED.ico"
+      }
+    }
+  },
   "bundle": {
     "active": true,
     "targets": ["nsis"],
     "resources": {
       "bass/": "bass",
-      "bin/": "bin"
+      "bin/": "bin",
+      "icons/taskbar/": "icons/taskbar"
     },
     "icon": [
       "icons/32x32.png",

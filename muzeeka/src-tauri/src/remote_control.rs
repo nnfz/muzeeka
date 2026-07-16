@@ -11,7 +11,8 @@ use tauri::{AppHandle, Emitter};
 use crate::discord_rpc::DiscordPresence;
 use crate::library::MusicFile;
 use crate::metadata;
-use crate::player::{GaplessTrack, Player, PositionPayload, TrackChangedPayload};
+use crate::player::{GaplessTrack, Player, PlayerStateSnapshot, PositionPayload, TrackChangedPayload};
+use crate::taskbar_handler;
 use crate::playlists::{self, PlaylistsData};
 
 pub const VIRTUAL_ALL_ID: &str = "__all__";
@@ -146,7 +147,53 @@ impl RemoteController {
             .or_else(|| data.active_playlist_id.clone())
     }
 
-    fn notify_playback(&self) {
+    pub fn app_handle(&self) -> AppHandle {
+        self.app.clone()
+    }
+
+    pub fn player_snapshot(&self) -> PlayerStateSnapshot {
+        self.player.get_state()
+    }
+
+    /// Whether prev/next taskbar buttons should be enabled.
+    pub fn navigation_enabled(&self) -> (bool, bool) {
+        let Ok(data) = self.load_data() else {
+            return (false, false);
+        };
+        let snapshot = self.player.get_state();
+        let playing_id = Self::playing_id_from_data(&data);
+        let tracks = Self::playing_tracks(&data, playing_id.as_deref());
+        if tracks.is_empty() {
+            return (false, false);
+        }
+
+        let repeat = Self::repeat_mode(&data);
+        let current_path = snapshot.current_file.as_deref().unwrap_or("");
+        let current_idx = tracks.iter().position(|t| t.path == current_path);
+
+        let has_next = if repeat == RepeatMode::All {
+            true
+        } else if data.shuffle_enabled {
+            self.ensure_shuffle_order(&data);
+            let pos = *self.shuffle_position.lock();
+            let order = self.shuffle_order.lock();
+            pos < order.len().saturating_sub(1)
+        } else {
+            current_idx.is_some_and(|idx| idx + 1 < tracks.len())
+        };
+
+        let has_prev = if data.shuffle_enabled {
+            self.ensure_shuffle_order(&data);
+            let pos = *self.shuffle_position.lock();
+            pos > 0 || snapshot.position > 3.0
+        } else {
+            current_idx.is_some_and(|idx| idx > 0) || snapshot.position > 3.0
+        };
+
+        (has_prev, has_next)
+    }
+
+    pub fn notify_playback(&self) {
         let snapshot = self.player.get_state();
         let _ = self.app.emit(
             "player:state",
@@ -163,6 +210,7 @@ impl RemoteController {
                 state: snapshot.state,
             },
         );
+        taskbar_handler::sync_taskbar(self);
     }
 
     fn notify_store_sync(&self, data: &PlaylistsData) {

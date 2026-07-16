@@ -2,10 +2,13 @@
 //
 // Each `#[tauri::command]` becomes callable from JS via `invoke("command_name", { args })`.
 
+use std::sync::Arc;
+
 use serde::Deserialize;
 use tauri::{AppHandle, State};
 
 use crate::discord_rpc::DiscordPresence;
+use crate::remote_control::RemoteController;
 use crate::equalizer::EqualizerSettings;
 use crate::library;
 use crate::player::{EqualizerStatus, GaplessTrack, Player, PlayerStateSnapshot};
@@ -17,6 +20,10 @@ fn sync_discord(player: &Player, discord: &DiscordPresence) {
     std::thread::spawn(move || {
         discord.update_from_player(&player.get_state());
     });
+}
+
+fn sync_playback_ui(controller: &RemoteController) {
+    controller.notify_playback();
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -63,6 +70,7 @@ pub fn player_init(player: State<'_, Player>) -> Result<(), String> {
 pub fn player_play(
     player: State<'_, Player>,
     discord: State<'_, DiscordPresence>,
+    controller: State<'_, Arc<RemoteController>>,
     file_path: String,
     audio_path: Option<String>,
     cue_start: Option<f64>,
@@ -77,6 +85,7 @@ pub fn player_play(
         parse_gapless_queue(queue),
     )?;
     sync_discord(&player, &discord);
+    sync_playback_ui(&controller);
     Ok(())
 }
 
@@ -91,25 +100,40 @@ pub fn player_prepare_next(
 
 /// Pause the current playback.
 #[tauri::command]
-pub fn player_pause(player: State<'_, Player>, discord: State<'_, DiscordPresence>) -> Result<(), String> {
+pub fn player_pause(
+    player: State<'_, Player>,
+    discord: State<'_, DiscordPresence>,
+    controller: State<'_, Arc<RemoteController>>,
+) -> Result<(), String> {
     player.pause()?;
     sync_discord(&player, &discord);
+    sync_playback_ui(&controller);
     Ok(())
 }
 
 /// Resume the current playback.
 #[tauri::command]
-pub fn player_resume(player: State<'_, Player>, discord: State<'_, DiscordPresence>) -> Result<(), String> {
+pub fn player_resume(
+    player: State<'_, Player>,
+    discord: State<'_, DiscordPresence>,
+    controller: State<'_, Arc<RemoteController>>,
+) -> Result<(), String> {
     player.resume()?;
     sync_discord(&player, &discord);
+    sync_playback_ui(&controller);
     Ok(())
 }
 
 /// Stop the current playback and discard the stream.
 #[tauri::command]
-pub fn player_stop(player: State<'_, Player>, discord: State<'_, DiscordPresence>) -> Result<(), String> {
+pub fn player_stop(
+    player: State<'_, Player>,
+    discord: State<'_, DiscordPresence>,
+    controller: State<'_, Arc<RemoteController>>,
+) -> Result<(), String> {
     player.stop()?;
     sync_discord(&player, &discord);
+    sync_playback_ui(&controller);
     Ok(())
 }
 
@@ -118,10 +142,12 @@ pub fn player_stop(player: State<'_, Player>, discord: State<'_, DiscordPresence
 pub fn player_seek(
     player: State<'_, Player>,
     discord: State<'_, DiscordPresence>,
+    controller: State<'_, Arc<RemoteController>>,
     position: f64,
 ) -> Result<(), String> {
     player.seek(position)?;
     sync_discord(&player, &discord);
+    sync_playback_ui(&controller);
     Ok(())
 }
 

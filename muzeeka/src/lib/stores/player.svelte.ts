@@ -1,5 +1,6 @@
 import { prefetchCoverPaths } from '$lib/coverCache';
 import { collectPlaylistCoverPaths } from '$lib/playlistCover';
+import { setupTaskbar } from '$lib/taskbar';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
@@ -1231,17 +1232,25 @@ function isLiked(path: string): boolean {
   return likedPaths.includes(path);
 }
 
+let toggleInFlight = false;
+
 async function togglePlayPause() {
-  if (isPlaying) {
-    await pause();
-  } else if (isPaused) {
-    await resume();
-  } else if (currentFile) {
-    await play(currentFile);
-  } else if (hasPlayingTracks && currentTrackIndex >= 0) {
-    await play(playingTracks[currentTrackIndex].path);
-  } else if (hasPlayingTracks) {
-    await play(playingTracks[0].path);
+  if (toggleInFlight) return;
+  toggleInFlight = true;
+  try {
+    if (isPlaying) {
+      await pause();
+    } else if (isPaused) {
+      await resume();
+    } else if (currentFile) {
+      await play(currentFile);
+    } else if (hasPlayingTracks && currentTrackIndex >= 0) {
+      await play(playingTracks[currentTrackIndex].path);
+    } else if (hasPlayingTracks) {
+      await play(playingTracks[0].path);
+    }
+  } finally {
+    toggleInFlight = false;
   }
 }
 
@@ -1444,7 +1453,6 @@ function setupListeners() {
   listen<{ position: number; duration: number; state?: string }>('player:position', (event) => {
     const newPos = event.payload.position;
     duration = event.payload.duration;
-
     if (event.payload.state === 'playing') {
       // Ignore 'playing' reports while we have a pending pause request (fade in progress)
       // or while the local state believes we are paused. This prevents the BASS
@@ -1540,6 +1548,7 @@ function setupListeners() {
 
 export function createPlayerStore() {
   setupListeners();
+  void setupTaskbar();
   void bootstrap();
 
   return {

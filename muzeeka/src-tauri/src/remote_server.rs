@@ -11,10 +11,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use tauri::AppHandle;
 
-use crate::discord_rpc::DiscordPresence;
-use crate::player::Player;
 use crate::remote_control::RemoteController;
 
 const REMOTE_PORT: u16 = 8765;
@@ -73,9 +70,7 @@ struct ToggleRepeatResponse {
     repeat_mode: String,
 }
 
-pub fn start(player: Player, discord: DiscordPresence, app: AppHandle) {
-    let controller = Arc::new(RemoteController::new(player, discord, app));
-
+pub fn start(controller: Arc<RemoteController>) {
     std::thread::Builder::new()
         .name("muzeeka-remote".into())
         .spawn(move || {

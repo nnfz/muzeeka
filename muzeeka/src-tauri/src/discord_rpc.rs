@@ -312,11 +312,7 @@ impl DiscordPresence {
             .activity_type(ActivityType::Listening)
             .status_display_type(StatusDisplayType::Details)
             .details(truncate(&payload.title, 128))
-            .state(if payload.paused {
-                format!("⏸ {}", truncate(&payload.artist, 120))
-            } else {
-                truncate(&payload.artist, 128)
-            });
+            .state(truncate(&payload.artist, 128));
 
         if !payload.paused && payload.duration > 0.0 {
             let now = unix_now();
