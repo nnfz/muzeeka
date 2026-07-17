@@ -8,6 +8,7 @@ mod cue;
 mod discord_rpc;
 mod drop_handler;
 mod file_drag;
+mod cover_url_cache;
 mod imgbb;
 mod musicbrainz;
 
@@ -196,7 +197,8 @@ pub fn run() {
         .setup(move |app| {
             if let Ok(app_data) = app.path().app_data_dir() {
                 metadata::init_cover_cache(app_data.clone());
-                lyrics::init_lyrics_cache(app_data);
+                lyrics::init_lyrics_cache(app_data.clone());
+                cover_url_cache::init(app_data);
             }
 
             // ffmpeg for animated GIF → WebP cover conversion

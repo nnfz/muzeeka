@@ -12,10 +12,13 @@ use std::time::{Duration, Instant};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::Deserialize;
 
+use crate::cover_url_cache;
+
 /// imgBB API key — get one at https://api.imgbb.com/ (free, takes ~1 minute).
 pub const IMGBB_API_KEY: &str = "fc29c1706c2f35e26c49a805cb6effdd";
 
 const IMGBB_UPLOAD_URL: &str = "https://api.imgbb.com/1/upload";
+const DISK_KEY_PREFIX: &str = "imgbb:";
 
 static UPLOAD_CACHE: Mutex<Option<HashMap<String, Option<String>>>> = Mutex::new(None);
 static RATE_LIMIT: Mutex<Option<Instant>> = Mutex::new(None);
@@ -90,6 +93,15 @@ pub fn upload_image(path: &Path) -> Option<String> {
         }
     }
 
+    let disk_key = format!("{DISK_KEY_PREFIX}{key}");
+    if let Some(url) = cover_url_cache::get(&disk_key) {
+        let mut guard = cache();
+        if let Some(map) = guard.as_mut() {
+            map.insert(key, Some(url.clone()));
+        }
+        return Some(url);
+    }
+
     let bytes = fs::read(path).ok()?;
     if bytes.is_empty() {
         return None;
@@ -118,6 +130,10 @@ pub fn upload_image(path: &Path) -> Option<String> {
     } else {
         None
     };
+
+    if let Some(url) = result.as_deref() {
+        cover_url_cache::set(&disk_key, url);
+    }
 
     let mut guard = cache();
     if let Some(map) = guard.as_mut() {

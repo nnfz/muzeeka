@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex as StdMutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
@@ -44,6 +44,8 @@ const SEEK_DIP_LEVEL: f32 = 0.0;
 // Gapless: switch at the real segment boundary (tight tolerance avoids early cuts).
 const GAPLESS_END_EPSILON_SECS: f64 = 0.008;
 const POLL_INTERVAL_MS: u64 = 50;
+/// Re-push Discord RPC timestamps while playing so progress stays in sync.
+const RPC_POSITION_SYNC_MS: u64 = 5000;
 
 // ── Playback state enum ───────────────────────────────────────────────────────
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1759,7 +1761,20 @@ impl Player {
         let player = self.clone();
         let was_playing = Arc::new(StdMutex::new(false));
         let last_rpc_state = Arc::new(StdMutex::new(None::<PlaybackState>));
-        Self::schedule_position_poll(app, player, was_playing, last_rpc_state, POLL_INTERVAL_MS);
+        // Force an immediate position push on the first Playing tick.
+        let last_rpc_sync = Arc::new(StdMutex::new(
+            Instant::now()
+                .checked_sub(Duration::from_millis(RPC_POSITION_SYNC_MS))
+                .unwrap_or_else(Instant::now),
+        ));
+        Self::schedule_position_poll(
+            app,
+            player,
+            was_playing,
+            last_rpc_state,
+            last_rpc_sync,
+            POLL_INTERVAL_MS,
+        );
     }
 
     fn schedule_position_poll(
@@ -1767,16 +1782,19 @@ impl Player {
         player: Player,
         was_playing: Arc<StdMutex<bool>>,
         last_rpc_state: Arc<StdMutex<Option<PlaybackState>>>,
+        last_rpc_sync: Arc<StdMutex<Instant>>,
         poll_ms: u64,
     ) {
         let app_for_sleep = app.clone();
         let player_for_main = player.clone();
         let was_for_main = was_playing.clone();
         let rpc_for_main = last_rpc_state.clone();
+        let rpc_sync_for_main = last_rpc_sync.clone();
         let app_for_next = app.clone();
         let player_for_next = player.clone();
         let was_for_next = was_playing;
         let rpc_for_next = last_rpc_state;
+        let rpc_sync_for_next = last_rpc_sync;
 
         thread::spawn(move || {
             thread::sleep(Duration::from_millis(poll_ms));
@@ -1866,11 +1884,15 @@ impl Player {
                     if let Ok(mut rpc_state) = rpc_for_main.lock() {
                         *rpc_state = Some(snapshot.state);
                     }
+                    if let Ok(mut last_sync) = rpc_sync_for_main.lock() {
+                        *last_sync = Instant::now();
+                    }
                     Self::schedule_position_poll(
                         app_for_next,
                         player_for_next,
                         was_for_next,
                         rpc_for_next,
+                        rpc_sync_for_next,
                         POLL_INTERVAL_MS,
                     );
                     return;
@@ -1943,11 +1965,15 @@ impl Player {
                             if let Ok(mut rpc_state) = rpc_for_main.lock() {
                                 *rpc_state = Some(snapshot.state);
                             }
+                            if let Ok(mut last_sync) = rpc_sync_for_main.lock() {
+                                *last_sync = Instant::now();
+                            }
                             Self::schedule_position_poll(
                                 app_for_next,
                                 player_for_next,
                                 was_for_next,
                                 rpc_for_next,
+                                rpc_sync_for_next,
                                 POLL_INTERVAL_MS,
                             );
                             return;
@@ -1959,6 +1985,9 @@ impl Player {
                         player_for_main.sync_discord_presence();
                         if let Ok(mut rpc_state) = rpc_for_main.lock() {
                             *rpc_state = Some(PlaybackState::Stopped);
+                        }
+                        if let Ok(mut last_sync) = rpc_sync_for_main.lock() {
+                            *last_sync = Instant::now();
                         }
                     }
                     _ => {
@@ -1975,8 +2004,24 @@ impl Player {
                             || *rpc_state == Some(PlaybackState::Paused)
                         {
                             player_for_main.sync_discord_presence();
+                            if let Ok(mut last_sync) = rpc_sync_for_main.lock() {
+                                *last_sync = Instant::now();
+                            }
                         }
                         *rpc_state = Some(snapshot.state);
+                    } else if snapshot.state == PlaybackState::Playing {
+                        // While playing, re-push timestamps every few seconds so Discord
+                        // progress does not drift (rate changes, clock skew, long tracks).
+                        let due = rpc_sync_for_main
+                            .lock()
+                            .map(|last| last.elapsed() >= Duration::from_millis(RPC_POSITION_SYNC_MS))
+                            .unwrap_or(false);
+                        if due {
+                            player_for_main.sync_discord_presence();
+                            if let Ok(mut last_sync) = rpc_sync_for_main.lock() {
+                                *last_sync = Instant::now();
+                            }
+                        }
                     }
                 }
 
@@ -1985,6 +2030,7 @@ impl Player {
                     player_for_next,
                     was_for_next,
                     rpc_for_next,
+                    rpc_sync_for_next,
                     next_poll_ms,
                 );
             });

@@ -6,9 +6,12 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
+use crate::cover_url_cache;
+
 const USER_AGENT: &str = "Muzeeka/0.1.0 (https://github.com/muzeeka/muzeeka)";
 const MB_BASE: &str = "https://musicbrainz.org/ws/2";
 const CAA_BASE: &str = "https://coverartarchive.org";
+const DISK_KEY_PREFIX: &str = "mb:";
 
 static RATE_LIMIT: Mutex<Option<Instant>> = Mutex::new(None);
 static COVER_CACHE: Mutex<Option<HashMap<String, Option<String>>>> = Mutex::new(None);
@@ -148,7 +151,20 @@ pub fn lookup_cover_url(artist: &str, title: &str, album: Option<&str>) -> Optio
         }
     }
 
+    let disk_key = format!("{DISK_KEY_PREFIX}{key}");
+    if let Some(url) = cover_url_cache::get(&disk_key) {
+        let mut guard = cache();
+        if let Some(map) = guard.as_mut() {
+            map.insert(key, Some(url.clone()));
+        }
+        return Some(url);
+    }
+
     let result = release_mbid(artist, title, album).and_then(|mbid| cover_from_release(&mbid));
+
+    if let Some(url) = result.as_deref() {
+        cover_url_cache::set(&disk_key, url);
+    }
 
     let mut guard = cache();
     if let Some(map) = guard.as_mut() {
