@@ -311,6 +311,12 @@ pub fn playlist_cache_cover(playlist_id: String, source_path: String) -> Result<
     crate::metadata::cache_playlist_cover(&playlist_id, std::path::Path::new(&source_path))
 }
 
+/// Download a remote image and store it as the playlist cover.
+#[tauri::command]
+pub fn playlist_cache_cover_url(playlist_id: String, url: String) -> Result<String, String> {
+    crate::metadata::cache_playlist_cover_from_url(&playlist_id, &url)
+}
+
 /// Delete a cached custom playlist cover file.
 #[tauri::command]
 pub fn playlist_remove_cover(playlist_id: String) -> Result<(), String> {

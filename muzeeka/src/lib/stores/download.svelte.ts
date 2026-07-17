@@ -17,6 +17,88 @@ export interface YtdlpProbeResult {
   entry_count: number | null;
 }
 
+/** Heuristic: URL is a playlist/album/set (not a single track). */
+function looksLikePlaylistOrAlbumUrl(url: string): boolean {
+  const u = url.toLowerCase();
+  return (
+    u.includes('/playlist') ||
+    u.includes('/album') ||
+    u.includes('/sets/') ||
+    u.includes('/music/playlist') ||
+    u.includes('/music/album') ||
+    u.includes('list=') ||
+    u.includes('/artist/') ||
+    (u.includes('soundcloud.com') && u.includes('/sets/'))
+  );
+}
+
+/** Build a readable playlist name from a media URL path. */
+function playlistNameFromUrl(url: string): string {
+  try {
+    const parsed = new URL(url);
+    const parts = parsed.pathname.split('/').filter(Boolean);
+    // Prefer last meaningful segment (skip ids-only when possible)
+    for (let i = parts.length - 1; i >= 0; i--) {
+      const seg = decodeURIComponent(parts[i]).replace(/[-_]+/g, ' ').trim();
+      if (!seg || /^(track|tracks|playlist|playlists|album|albums|sets|artist)$/i.test(seg)) {
+        continue;
+      }
+      if (/^[a-zA-Z0-9]{10,}$/.test(seg) && !seg.includes(' ')) {
+        // opaque id — keep looking for a name segment
+        continue;
+      }
+      return seg.length > 80 ? seg.slice(0, 80) : seg;
+    }
+    return parts[parts.length - 1]
+      ? decodeURIComponent(parts[parts.length - 1]).slice(0, 80)
+      : 'Downloaded playlist';
+  } catch {
+    return 'Downloaded playlist';
+  }
+}
+
+/** Safe folder name for Windows/macOS/Linux. */
+function sanitizeFolderName(name: string): string {
+  let s = name
+    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_')
+    .replace(/\s+/g, ' ')
+    .replace(/[. ]+$/g, '')
+    .trim();
+  if (!s) s = 'Playlist';
+  if (s.length > 100) s = s.slice(0, 100).trim();
+  return s;
+}
+
+function joinPath(base: string, segment: string): string {
+  const sep = base.includes('\\') ? '\\' : '/';
+  return `${base.replace(/[\\/]+$/, '')}${sep}${segment}`;
+}
+
+/**
+ * Resolve where files should land:
+ * - single track → download folder root
+ * - playlist/album → download folder / <playlist name>/
+ */
+async function resolveDownloadOutputDir(namedFolder: string | null): Promise<string> {
+  const { downloadFolder } = readDownloadSettings();
+  let base = downloadFolder?.trim() || '';
+  if (!base) {
+    base = await invoke<string>('ytdlp_default_download_dir');
+  }
+  if (!namedFolder) return base;
+  return joinPath(base, sanitizeFolderName(namedFolder));
+}
+
+function resolveNamedDownload(normalizedUrl: string): string | null {
+  if (probe?.is_playlist && probe.title.trim()) {
+    return probe.title.trim();
+  }
+  if (looksLikePlaylistOrAlbumUrl(normalizedUrl)) {
+    return playlistNameFromUrl(normalizedUrl);
+  }
+  return null;
+}
+
 export interface YtdlpProgress {
   status: string;
   percent: number | null;
@@ -243,16 +325,36 @@ export function createDownloadStore() {
       progress = { status: 'Starting…', percent: 0, url: normalized };
 
       try {
-        const { downloadFolder, downloadPlaylistId } = readDownloadSettings();
+        const { downloadPlaylistId } = readDownloadSettings();
+        // Same name for disk folder + library playlist (albums/playlists/sets).
+        const named =
+          resolveNamedDownload(normalized) ??
+          null;
+
+        const outputDir = await resolveDownloadOutputDir(named);
+
         const result = await invoke<{ files: MusicFile[] }>('ytdlp_download', {
           url: normalized,
-          outputDir: downloadFolder ?? null,
-          allowPlaylist: probe?.is_playlist ?? false,
+          outputDir,
+          allowPlaylist: probe?.is_playlist ?? looksLikePlaylistOrAlbumUrl(normalized),
         });
+
+        // Multi-file fallback: if we didn't know the name before download, still
+        // create a library playlist when several tracks arrived from a set URL.
+        let namedPlaylist = named;
+        if (!namedPlaylist && result.files.length > 1 && looksLikePlaylistOrAlbumUrl(normalized)) {
+          namedPlaylist = playlistNameFromUrl(normalized);
+        }
 
         await emit('ytdlp:downloaded', {
           files: result.files,
           playlistId: downloadPlaylistId ?? null,
+          namedPlaylist,
+          // Probe thumbnail → playlist cover (VK / Spotify / SoundCloud / YouTube)
+          coverUrl:
+            namedPlaylist && probe?.thumbnail?.trim()
+              ? probe.thumbnail.trim()
+              : null,
         });
 
         downloadPercent = 100;

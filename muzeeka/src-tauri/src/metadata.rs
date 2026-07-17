@@ -11,6 +11,7 @@ use lofty::tag::{Accessor, Tag, TagType};
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -334,6 +335,71 @@ pub fn cache_playlist_cover(playlist_id: &str, source: &Path) -> Result<String, 
 
     let dest = dir.join(format!("{safe_id}.jpg"));
     let image = image::open(source).map_err(|e| format!("Failed to open image: {e}"))?;
+    if !write_resized_jpeg(&image, &dest, PLAYLIST_COVER_SIZE) {
+        return Err("Failed to write playlist cover".to_string());
+    }
+
+    Ok(dest.to_string_lossy().to_string())
+}
+
+/// Download a remote image and store it as the playlist cover.
+pub fn cache_playlist_cover_from_url(playlist_id: &str, url: &str) -> Result<String, String> {
+    let url = url.trim();
+    if url.is_empty() || !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err("Invalid cover URL".to_string());
+    }
+
+    let mut response = ureq::get(url)
+        .header(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        )
+        .header("Accept", "image/avif,image/webp,image/apng,image/*,*/*;q=0.8")
+        .header("Referer", "https://vk.com/")
+        .call()
+        .map_err(|e| format!("Failed to download playlist cover: {e}"))?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "Playlist cover HTTP {}",
+            response.status().as_u16()
+        ));
+    }
+
+    let mut bytes = Vec::new();
+    response
+        .body_mut()
+        .as_reader()
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("Failed to read playlist cover: {e}"))?;
+
+    if bytes.len() < 32 {
+        return Err("Playlist cover is empty".to_string());
+    }
+
+    let safe_id = sanitized_playlist_id(playlist_id)?;
+    let dir = PLAYLIST_COVER_DIR
+        .get()
+        .ok_or_else(|| "Playlist cover cache not initialized".to_string())?;
+
+    clear_cached_playlist_covers(dir, &safe_id);
+
+    // Animated GIF: keep as-is
+    if bytes.len() >= 6 && (&bytes[0..6] == b"GIF87a" || &bytes[0..6] == b"GIF89a") {
+        if bytes.len() as u64 > MAX_PLAYLIST_GIF_BYTES {
+            return Err(format!(
+                "GIF is too large (max {} MB)",
+                MAX_PLAYLIST_GIF_BYTES / (1024 * 1024)
+            ));
+        }
+        let dest = dir.join(format!("{safe_id}.gif"));
+        fs::write(&dest, &bytes).map_err(|e| format!("Failed to write GIF cover: {e}"))?;
+        return Ok(dest.to_string_lossy().to_string());
+    }
+
+    let dest = dir.join(format!("{safe_id}.jpg"));
+    let image =
+        image::load_from_memory(&bytes).map_err(|e| format!("Failed to decode cover: {e}"))?;
     if !write_resized_jpeg(&image, &dest, PLAYLIST_COVER_SIZE) {
         return Err("Failed to write playlist cover".to_string());
     }

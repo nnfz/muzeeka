@@ -737,6 +737,26 @@ async function setPlaylistCover(id: string, sourcePath: string) {
   }
 }
 
+async function setPlaylistCoverFromUrl(id: string, url: string) {
+  const trimmed = url.trim();
+  if (!trimmed || !(trimmed.startsWith('http://') || trimmed.startsWith('https://'))) {
+    return;
+  }
+  try {
+    const coverPath = await invoke<string>('playlist_cache_cover_url', {
+      playlistId: id,
+      url: trimmed,
+    });
+    playlists = playlists.map((p) =>
+      p.id === id ? { ...p, cover_path: coverPath } : p
+    );
+    prefetchCoverPaths([coverPath]);
+    scheduleSave();
+  } catch (e) {
+    console.error('Failed to set playlist cover from URL:', e);
+  }
+}
+
 async function clearPlaylistCover(id: string) {
   try {
     await invoke('playlist_remove_cover', { playlistId: id });
@@ -1512,11 +1532,33 @@ function setupListeners() {
     applyBackendPlaybackState(event.payload);
   });
 
-  listen<{ files: MusicFile[]; playlistId: string | null }>('ytdlp:downloaded', (event) => {
+  listen<{
+    files: MusicFile[];
+    playlistId: string | null;
+    namedPlaylist?: string | null;
+    coverUrl?: string | null;
+  }>('ytdlp:downloaded', (event) => {
     const files = event.payload.files ?? [];
     if (files.length === 0) return;
-    const targetId = resolveDownloadPlaylistId(event.payload.playlistId);
+
+    const named = event.payload.namedPlaylist?.trim();
+    const targetId = named
+      ? ensurePlaylist(named, { select: true })
+      : resolveDownloadPlaylistId(event.payload.playlistId);
+
     addScannedTracks(files, targetId);
+
+    // Apply source cover for imported playlists/albums (VK, Spotify, SoundCloud, …)
+    const coverUrl = event.payload.coverUrl?.trim();
+    if (named && coverUrl) {
+      void setPlaylistCoverFromUrl(targetId, coverUrl);
+    } else if (named) {
+      // Fallback: first track cover once tags are loaded
+      const firstCover = files.find((f) => f.cover_path?.trim())?.cover_path?.trim();
+      if (firstCover) {
+        void setPlaylistCover(targetId, firstCover);
+      }
+    }
   });
 
   listen('player:track-ended', () => {

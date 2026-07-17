@@ -76,10 +76,6 @@ pub fn cancel_download() {
     }
 }
 
-pub fn is_download_cancelled() -> bool {
-    DOWNLOAD_CANCELLED.load(Ordering::SeqCst)
-}
-
 fn ytdlp_binary_name() -> &'static str {
     if cfg!(windows) {
         "yt-dlp.exe"
@@ -241,13 +237,15 @@ fn parse_probe_json(raw: &str) -> Result<YtdlpProbeResult, String> {
 
     if let Some(entries) = entry.entries {
         let count = entries.len() as u32;
-        let first_title = entries
-            .first()
-            .and_then(|e| e.title.clone())
+        // Prefer the playlist/album title from the root entry, not the first track.
+        let title = entry
+            .title
+            .filter(|t| !t.trim().is_empty())
+            .or_else(|| entries.first().and_then(|e| e.title.clone()))
             .unwrap_or_else(|| "Playlist".to_string());
 
         return Ok(YtdlpProbeResult {
-            title: first_title,
+            title,
             uploader: entry.uploader,
             duration_secs: None,
             thumbnail: entry.thumbnail,

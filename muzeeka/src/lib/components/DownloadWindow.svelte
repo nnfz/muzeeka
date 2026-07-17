@@ -43,9 +43,15 @@
 
   async function handleDownload() {
     successMsg = null;
+    const wasPlaylist = download.probe?.is_playlist ?? false;
+    const playlistName = download.probe?.title?.trim() || null;
     const added = await download.download();
     if (added > 0) {
-      successMsg = `Added ${added} track${added === 1 ? '' : 's'} to library`;
+      if (wasPlaylist && playlistName) {
+        successMsg = `Added ${added} track${added === 1 ? '' : 's'} to “${playlistName}”`;
+      } else {
+        successMsg = `Added ${added} track${added === 1 ? '' : 's'} to library`;
+      }
     }
   }
 

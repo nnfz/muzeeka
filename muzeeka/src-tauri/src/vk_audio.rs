@@ -283,16 +283,6 @@ fn has_session_cookie_pairs(pairs: &[(String, String)]) -> bool {
     pairs.iter().any(|(k, v)| is_auth_cookie_name(k) && is_plausible_session_value(v))
 }
 
-fn session_cookie_value(pairs: &[(String, String)]) -> Option<String> {
-    pairs.iter().find_map(|(k, v)| {
-        if is_auth_cookie_name(k) && is_plausible_session_value(v) {
-            Some(v.clone())
-        } else {
-            None
-        }
-    })
-}
-
 fn pairs_to_header(pairs: &[(String, String)]) -> String {
     let mut map = std::collections::HashMap::<String, String>::new();
     for (k, v) in pairs {
@@ -326,53 +316,6 @@ fn write_netscape_cookies(path: &Path, pairs: &[(String, String)]) -> Result<(),
         ));
     }
     fs::write(path, out).map_err(|e| format!("Failed to write VK cookies: {e}"))
-}
-
-fn re_user_name() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r#"(?i)"(?:first_name|firstName)"\s*:\s*"([^"\\]{1,80})""#).expect("name re")
-    })
-}
-
-fn resolve_user_profile(cookie: &str) -> Result<(i64, Option<String>), String> {
-    let user_id = resolve_user_id(cookie)?;
-    let mut name: Option<String> = None;
-
-    // Try mobile profile/settings pages for display name
-    for url in [
-        "https://m.vk.ru/settings",
-        "https://m.vk.ru/audio",
-        "https://vk.ru/feed",
-    ] {
-        if let Ok(html) = http_get(url, cookie, url.contains("m.vk")) {
-            if let Some(caps) = re_user_name().captures(&html) {
-                let n = caps[1].trim();
-                if !n.is_empty() {
-                    // Optional last name
-                    let last_re = Regex::new(r#"(?i)"(?:last_name|lastName)"\s*:\s*"([^"\\]{0,80})""#)
-                        .ok();
-                    name = if let Some(re) = last_re {
-                        if let Some(lc) = re.captures(&html) {
-                            let last = lc[1].trim();
-                            if last.is_empty() {
-                                Some(n.to_string())
-                            } else {
-                                Some(format!("{n} {last}"))
-                            }
-                        } else {
-                            Some(n.to_string())
-                        }
-                    } else {
-                        Some(n.to_string())
-                    };
-                    break;
-                }
-            }
-        }
-    }
-
-    Ok((user_id, name))
 }
 
 fn logged_out_status() -> VkAuthStatus {
@@ -1866,14 +1809,7 @@ fn fetch_playlist_tracks(
             }
         }
         if thumb.is_none() {
-            for key in ["thumb", "coverUrl_p", "coverUrl_l", "photo"] {
-                if let Some(s) = section.get(key).and_then(|v| v.as_str()) {
-                    if s.starts_with("http") {
-                        thumb = Some(s.to_string());
-                        break;
-                    }
-                }
-            }
+            thumb = extract_playlist_thumb(&section);
         }
 
         let list = section
@@ -1923,7 +1859,78 @@ fn fetch_playlist_tracks(
     }
 
     let tracks = reload_audio(cookie, user_id, &all_ids)?;
+    // Fallback: first track cover if playlist has no own art
+    let thumb = thumb.or_else(|| tracks.first().and_then(|t| t.covers.first().cloned()));
     Ok((title, thumb, tracks))
+}
+
+/// Extract the best playlist/album cover URL from a VK load_section payload.
+fn extract_playlist_thumb(section: &Value) -> Option<String> {
+    let push_http = |s: &str| -> Option<String> {
+        let s = s.trim();
+        if s.starts_with("http") {
+            Some(s.to_string())
+        } else {
+            None
+        }
+    };
+
+    // Direct string fields
+    for key in [
+        "thumb",
+        "coverUrl_l",
+        "coverUrl_p",
+        "coverUrl_s",
+        "photo",
+        "cover",
+        "img",
+    ] {
+        if let Some(s) = section.get(key).and_then(|v| v.as_str()) {
+            if let Some(u) = push_http(s) {
+                return Some(u);
+            }
+        }
+    }
+
+    // Nested photo / thumb objects with size keys (photo_600, etc.)
+    for key in ["thumb", "photo", "cover", "image"] {
+        let Some(obj) = section.get(key).and_then(|v| v.as_object()) else {
+            continue;
+        };
+        // Prefer larger sizes
+        let mut sized: Vec<(u32, String)> = Vec::new();
+        for (k, v) in obj {
+            if let Some(s) = v.as_str() {
+                if !s.starts_with("http") {
+                    continue;
+                }
+                let size = k
+                    .rsplit('_')
+                    .next()
+                    .and_then(|p| p.parse::<u32>().ok())
+                    .unwrap_or(0);
+                sized.push((size, s.to_string()));
+            }
+        }
+        sized.sort_by(|a, b| b.0.cmp(&a.0));
+        if let Some((_, u)) = sized.first() {
+            return Some(u.clone());
+        }
+        for k in ["photo_1200", "photo_600", "photo_300", "src", "url"] {
+            if let Some(s) = obj.get(k).and_then(|v| v.as_str()).and_then(push_http) {
+                return Some(s);
+            }
+        }
+    }
+
+    // Sometimes covers live under album
+    if let Some(album) = section.get("album") {
+        if let Some(u) = extract_playlist_thumb(album) {
+            return Some(u);
+        }
+    }
+
+    None
 }
 
 // ── Download helpers ─────────────────────────────────────────────────────────
