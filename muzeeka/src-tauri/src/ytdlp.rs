@@ -68,6 +68,7 @@ static ACTIVE_CHILD: Mutex<Option<Child>> = Mutex::new(None);
 pub fn cancel_download() {
     DOWNLOAD_CANCELLED.store(true, Ordering::SeqCst);
     crate::vk_audio::cancel();
+    crate::spotdl::cancel();
     if let Ok(mut guard) = ACTIVE_CHILD.lock() {
         if let Some(mut child) = guard.take() {
             let _ = child.kill();
@@ -344,18 +345,61 @@ fn sanitize_printed_path(line: &str) -> String {
         .to_string()
 }
 
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // ESC[ ... letter
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                while let Some(n) = chars.next() {
+                    if n.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        // yt-dlp sometimes uses bare CR for progress redraws
+        if c == '\r' {
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
 fn parse_progress_line(line: &str) -> Option<f32> {
-    // [download]  45.3% of ...
-    if !line.contains("[download]") {
+    let line = strip_ansi(line);
+    let line = line.trim();
+    if line.is_empty() {
         return None;
     }
-    let pct_pos = line.find('%')?;
-    let before = &line[..pct_pos];
-    let num_start = before
-        .rfind(|c: char| !c.is_ascii_digit() && c != '.')
-        .map(|i| i + 1)
-        .unwrap_or(0);
-    before[num_start..].trim().parse().ok()
+
+    // Machine-readable: muzeeka-progress:45.3
+    if let Some(rest) = line.strip_prefix("muzeeka-progress:") {
+        let num = rest.trim().trim_end_matches('%').trim();
+        return num.parse().ok().filter(|p| *p >= 0.0 && *p <= 100.0);
+    }
+
+    // [download]  45.3% of  4.50MiB at ...
+    // [download] 100% of 1.23MiB in 00:01
+    if line.contains("[download]") && line.contains('%') {
+        let pct_pos = line.find('%')?;
+        let before = &line[..pct_pos];
+        let num_start = before
+            .rfind(|c: char| !c.is_ascii_digit() && c != '.')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        if let Ok(p) = before[num_start..].trim().parse::<f32>() {
+            if (0.0..=100.0).contains(&p) {
+                return Some(p);
+            }
+        }
+    }
+
+    None
 }
 
 pub fn download(
@@ -394,6 +438,13 @@ pub fn download(
     cmd_args.extend([
         "--newline".to_string(),
         "--no-warnings".to_string(),
+        // Force progress on stderr even when not a TTY (piped on Windows).
+        "--progress".to_string(),
+        "--console-title".to_string(),
+        // Machine-readable percent for reliable UI updates.
+        // `_percent_str` is widely available (e.g. " 45.3%"); we parse the number.
+        "--progress-template".to_string(),
+        "download:muzeeka-progress:%(progress._percent_str)s".to_string(),
         "-x".to_string(),
         "--audio-format".to_string(),
         "mp3".to_string(),
@@ -433,14 +484,49 @@ pub fn download(
     let stderr_handle = stderr.map(|stderr| {
         std::thread::spawn(move || {
             let reader = BufReader::new(stderr);
+            let mut last_emitted = -1.0f32;
+            let mut saw_download = false;
             for line in reader.lines().map_while(Result::ok) {
                 if DOWNLOAD_CANCELLED.load(Ordering::SeqCst) {
                     break;
                 }
-                if let Some(pct) = parse_progress_line(&line) {
-                    emit_progress(&app_stderr, &url_stderr, "Downloading…", Some(pct));
-                } else if line.contains("ExtractAudio") || line.contains("ffmpeg") {
-                    emit_progress(&app_stderr, &url_stderr, "Converting to MP3…", Some(99.0));
+                // yt-dlp may pack multiple CR-separated updates in one "line"
+                for part in line.split(['\r', '\n']) {
+                    let part = part.trim();
+                    if part.is_empty() {
+                        continue;
+                    }
+                    if let Some(pct) = parse_progress_line(part) {
+                        saw_download = true;
+                        // Throttle spam: emit on 0.5% steps (or first/last)
+                        if (pct - last_emitted).abs() >= 0.5 || pct >= 99.5 || last_emitted < 0.0 {
+                            last_emitted = pct;
+                            emit_progress(
+                                &app_stderr,
+                                &url_stderr,
+                                "Downloading…",
+                                Some(pct.clamp(0.0, 100.0)),
+                            );
+                        }
+                    } else if part.contains("[download] Destination")
+                        || part.contains("[download] Destination:")
+                    {
+                        emit_progress(&app_stderr, &url_stderr, "Downloading…", Some(0.0));
+                    } else if part.contains("ExtractAudio")
+                        || part.contains("[ExtractAudio]")
+                        || (part.to_ascii_lowercase().contains("ffmpeg")
+                            && (part.contains("Destination") || part.contains("Merging")
+                                || part.contains("Post-process")))
+                    {
+                        emit_progress(
+                            &app_stderr,
+                            &url_stderr,
+                            "Converting to MP3…",
+                            Some(if saw_download { 97.0 } else { 90.0 }),
+                        );
+                    } else if part.contains("[Metadata]") || part.contains("Embedding") {
+                        emit_progress(&app_stderr, &url_stderr, "Writing tags…", Some(99.0));
+                    }
                 }
             }
         })

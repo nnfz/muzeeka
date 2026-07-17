@@ -5,7 +5,7 @@ use image::imageops::FilterType;
 use image::{GenericImageView, ImageFormat};
 use lofty::config::WriteOptions;
 use lofty::file::{AudioFile, TaggedFile, TaggedFileExt};
-use lofty::picture::PictureType;
+use lofty::picture::{MimeType, Picture, PictureType};
 use lofty::read_from_path;
 use lofty::tag::{Accessor, Tag, TagType};
 use std::collections::hash_map::DefaultHasher;
@@ -651,6 +651,99 @@ pub fn write_track_tags(
     tagged_file
         .save_to_path(path, WriteOptions::default())
         .map_err(|e| format!("Failed to save tags: {}", e))?;
+
+    Ok(())
+}
+
+fn mime_from_image_bytes(data: &[u8], hint: Option<&str>) -> MimeType {
+    if let Some(h) = hint {
+        let h = h.to_ascii_lowercase();
+        if h.contains("png") {
+            return MimeType::Png;
+        }
+        if h.contains("gif") {
+            return MimeType::Gif;
+        }
+        if h.contains("jpeg") || h.contains("jpg") {
+            return MimeType::Jpeg;
+        }
+        if h.contains("webp") {
+            return MimeType::Unknown("image/webp".into());
+        }
+        if h.contains("image/") {
+            return MimeType::from_str(h.split(';').next().unwrap_or(h.as_str()).trim());
+        }
+    }
+    if data.len() >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF {
+        return MimeType::Jpeg;
+    }
+    if data.len() >= 8 && &data[0..8] == b"\x89PNG\r\n\x1a\n" {
+        return MimeType::Png;
+    }
+    if data.len() >= 6 && (&data[0..6] == b"GIF87a" || &data[0..6] == b"GIF89a") {
+        return MimeType::Gif;
+    }
+    if data.len() >= 12 && &data[0..4] == b"RIFF" && &data[8..12] == b"WEBP" {
+        return MimeType::Unknown("image/webp".into());
+    }
+    MimeType::Jpeg
+}
+
+/// Embed cover art into the file's primary tag (ID3 APIC / similar).
+pub fn write_track_cover(path: &Path, data: &[u8], mime_hint: Option<&str>) -> Result<(), String> {
+    if data.is_empty() {
+        return Err("Empty cover image".to_string());
+    }
+
+    // Re-encode exotic formats (webp) to JPEG so more players accept the tag.
+    let (bytes, mime) = match mime_from_image_bytes(data, mime_hint) {
+        MimeType::Jpeg | MimeType::Png | MimeType::Gif | MimeType::Bmp | MimeType::Tiff => {
+            (data.to_vec(), mime_from_image_bytes(data, mime_hint))
+        }
+        other => {
+            // Try decode → jpeg
+            match image::load_from_memory(data) {
+                Ok(img) => {
+                    let mut out = Vec::new();
+                    let rgb = img.to_rgb8();
+                    let mut cursor = std::io::Cursor::new(&mut out);
+                    image::DynamicImage::ImageRgb8(rgb)
+                        .write_to(&mut cursor, ImageFormat::Jpeg)
+                        .map_err(|e| format!("Failed to re-encode cover: {e}"))?;
+                    (out, MimeType::Jpeg)
+                }
+                Err(_) => (data.to_vec(), other),
+            }
+        }
+    };
+
+    let mut tagged_file = read_from_path(path)
+        .map_err(|e| format!("Failed to read audio file for cover: {}", e))?;
+
+    if tagged_file.primary_tag_mut().is_none() {
+        let tag_type = tagged_file
+            .primary_tag()
+            .or_else(|| tagged_file.first_tag())
+            .map(|tag| tag.tag_type())
+            .unwrap_or(TagType::Id3v2);
+        tagged_file.insert_tag(Tag::new(tag_type));
+    }
+
+    let tag = tagged_file
+        .primary_tag_mut()
+        .ok_or_else(|| "No writable tag slot".to_string())?;
+
+    tag.remove_picture_type(PictureType::CoverFront);
+
+    let picture = Picture::unchecked(bytes)
+        .pic_type(PictureType::CoverFront)
+        .mime_type(mime)
+        .build();
+    tag.push_picture(picture);
+
+    tagged_file
+        .save_to_path(path, WriteOptions::default())
+        .map_err(|e| format!("Failed to save cover tag: {}", e))?;
 
     Ok(())
 }

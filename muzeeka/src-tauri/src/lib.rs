@@ -23,6 +23,7 @@ mod remote_control;
 mod remote_server;
 mod settings;
 mod taskbar_handler;
+mod spotdl;
 mod vk_audio;
 mod ytdlp;
 

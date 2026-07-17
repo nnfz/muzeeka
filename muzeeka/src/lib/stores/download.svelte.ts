@@ -63,7 +63,10 @@ async function ensureProgressListener() {
   unlistenProgress = await listen<YtdlpProgress>('ytdlp:progress', (event) => {
     progress = event.payload;
     if (event.payload.percent != null) {
-      downloadPercent = Math.max(0, Math.min(100, Math.round(event.payload.percent)));
+      const next = Math.max(0, Math.min(100, Math.round(event.payload.percent)));
+      // Monotonic while downloading so the bar never jumps backwards.
+      downloadPercent =
+        downloadPercent == null ? next : Math.max(downloadPercent, next);
     }
   });
 }
@@ -252,11 +255,13 @@ export function createDownloadStore() {
           playlistId: downloadPlaylistId ?? null,
         });
 
-        progress = null;
-        downloadPercent = null;
+        downloadPercent = 100;
+        progress = { status: 'Done', percent: 100, url: normalized };
         return result.files.length;
       } catch (e) {
         error = typeof e === 'string' ? e : String(e);
+        progress = null;
+        downloadPercent = null;
         return 0;
       } finally {
         isDownloading = false;

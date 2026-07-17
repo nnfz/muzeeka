@@ -343,6 +343,11 @@ pub async fn ytdlp_probe(app: AppHandle, url: String) -> Result<YtdlpProbeResult
     if crate::vk_audio::is_vk_audio_url(&url) {
         return crate::vk_audio::probe_async(app, url).await;
     }
+    if crate::spotdl::is_spotify_url(&url) {
+        return tauri::async_runtime::spawn_blocking(move || crate::spotdl::probe(&app, &url))
+            .await
+            .map_err(|_| "Probe task failed".to_string())?;
+    }
     tauri::async_runtime::spawn_blocking(move || ytdlp::probe(&app, &url))
         .await
         .map_err(|_| "Probe task failed".to_string())?
@@ -364,6 +369,18 @@ pub async fn ytdlp_download(
             allow_playlist.unwrap_or(false),
         )
         .await;
+    }
+    if crate::spotdl::is_spotify_url(&url) {
+        return tauri::async_runtime::spawn_blocking(move || {
+            crate::spotdl::download(
+                &app,
+                &url,
+                output_dir.as_deref(),
+                allow_playlist.unwrap_or(false),
+            )
+        })
+        .await
+        .map_err(|_| "Download task failed".to_string())?;
     }
     tauri::async_runtime::spawn_blocking(move || {
         ytdlp::download(

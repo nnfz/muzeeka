@@ -20,9 +20,12 @@
     return null;
   });
 
-  let footerPercent = $derived(
-    download.progress?.percent != null ? Math.round(download.progress.percent) : null
-  );
+  let footerPercent = $derived.by(() => {
+    if (download.downloadPercent != null) return download.downloadPercent;
+    if (download.progress?.percent != null) return Math.round(download.progress.percent);
+    if (download.isDownloading) return 0;
+    return null;
+  });
 
   if (typeof document !== 'undefined') {
     document.documentElement.style.setProperty('background-color', '#0a0a0f', 'important');
@@ -182,11 +185,16 @@
         </span>
       {/if}
 
-      {#if footerPercent != null}
-        <div class="progress-bar">
-          <div class="progress-fill" style="width: {footerPercent}%"></div>
+      {#if download.isDownloading || footerPercent != null}
+        <div
+          class="progress-bar"
+          class:indeterminate={download.isDownloading && (footerPercent == null || footerPercent === 0)}
+        >
+          <div class="progress-fill" style="width: {footerPercent ?? 0}%"></div>
         </div>
-        <span class="progress-pct">{footerPercent}%</span>
+        {#if footerPercent != null}
+          <span class="progress-pct">{footerPercent}%</span>
+        {/if}
       {/if}
     </div>
 

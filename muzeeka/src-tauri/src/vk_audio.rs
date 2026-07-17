@@ -1260,6 +1260,39 @@ fn convert_m3u8_to_mp3(url: &str) -> String {
         .into_owned()
 }
 
+/// Prefer original-quality direct MP3 over HLS re-encode.
+/// VK often serves the full-bitrate file at a rewritten `.mp3` URL.
+fn stream_url_candidates(url: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let push = |list: &mut Vec<String>, u: String| {
+        if !u.is_empty() && !list.iter().any(|x| x == &u) {
+            list.push(u);
+        }
+    };
+
+    if url.contains("m3u8") {
+        // Classic vk_api rewrite: .../hex(/audios)?/hex/index.m3u8 → .../hex(/audios)?/hex.mp3
+        push(&mut out, convert_m3u8_to_mp3(url));
+        // Simpler rewrites some CDNs accept
+        push(&mut out, url.replace("/index.m3u8", ".mp3"));
+        push(&mut out, url.replace("index.m3u8", "index.mp3"));
+        // Strip query string then rewrite
+        if let Some((base, _)) = url.split_once('?') {
+            if base.contains("m3u8") {
+                push(&mut out, convert_m3u8_to_mp3(base));
+                push(&mut out, base.replace("/index.m3u8", ".mp3"));
+            }
+        }
+        // HLS last — only if direct mp3 fails (forces re-encode)
+        push(&mut out, url.to_string());
+    } else {
+        push(&mut out, url.to_string());
+        // If API already gave mp3, still nothing else to try
+    }
+
+    out
+}
+
 // ── Track parsing ────────────────────────────────────────────────────────────
 
 fn strip_html(input: &str) -> String {
@@ -1296,7 +1329,8 @@ fn parse_audio_array(arr: &[Value], user_id: i64) -> Option<VkTrack> {
     let artist = strip_html(arr[4].as_str().unwrap_or("Unknown"));
     let duration = arr[5].as_u64().unwrap_or(0) as u32;
 
-    let covers = arr
+    // Field 14 is often "small,large" — prefer larger first for embedding.
+    let mut covers = arr
         .get(14)
         .and_then(|v| v.as_str())
         .unwrap_or("")
@@ -1304,6 +1338,7 @@ fn parse_audio_array(arr: &[Value], user_id: i64) -> Option<VkTrack> {
         .map(|s| s.trim().to_string())
         .filter(|s| s.starts_with("http"))
         .collect::<Vec<_>>();
+    covers.reverse();
 
     if url.contains("audio_api_unavailable") {
         if let Ok(decoded) = decode_audio_url(&url, user_id) {
@@ -1350,24 +1385,7 @@ fn parse_audio_object(obj: &serde_json::Map<String, Value>, user_id: i64) -> Opt
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as u32;
 
-    let mut covers = Vec::new();
-    for key in ["coverUrl_p", "coverUrl_l", "coverUrl_s", "album"] {
-        if let Some(v) = obj.get(key) {
-            if let Some(s) = v.as_str() {
-                if s.starts_with("http") {
-                    covers.push(s.to_string());
-                }
-            } else if let Some(map) = v.as_object() {
-                for ck in ["thumb", "photo", "cover"] {
-                    if let Some(s) = map.get(ck).and_then(|x| x.as_str()) {
-                        if s.starts_with("http") {
-                            covers.push(s.to_string());
-                        }
-                    }
-                }
-            }
-        }
-    }
+    let covers = collect_cover_urls_from_object(obj);
 
     if url.contains("audio_api_unavailable") {
         if let Ok(decoded) = decode_audio_url(&url, user_id) {
@@ -1387,6 +1405,81 @@ fn parse_audio_object(obj: &serde_json::Map<String, Value>, user_id: i64) -> Opt
         url,
         covers,
     })
+}
+
+/// Collect cover URLs from VK audio object (API / al_audio).
+/// Prefers larger album.thumb photo_* sizes when present.
+fn collect_cover_urls_from_object(obj: &serde_json::Map<String, Value>) -> Vec<String> {
+    let mut covers = Vec::new();
+    let mut push = |s: &str| {
+        let s = s.trim();
+        if s.starts_with("http") && !covers.iter().any(|c| c == s) {
+            covers.push(s.to_string());
+        }
+    };
+
+    for key in [
+        "coverUrl_l",
+        "coverUrl_p",
+        "coverUrl_s",
+        "cover_url",
+        "thumb",
+        "photo",
+    ] {
+        if let Some(s) = obj.get(key).and_then(|v| v.as_str()) {
+            push(s);
+        }
+    }
+
+    // album may be object with thumb.photo_600 etc., or a nested structure
+    if let Some(album) = obj.get("album") {
+        if let Some(map) = album.as_object() {
+            if let Some(thumb) = map.get("thumb").or_else(|| map.get("photo")) {
+                if let Some(s) = thumb.as_str() {
+                    push(s);
+                } else if let Some(tm) = thumb.as_object() {
+                    // Prefer larger sizes first
+                    let mut sized: Vec<(u32, String)> = Vec::new();
+                    for (k, v) in tm {
+                        if let Some(s) = v.as_str() {
+                            if !s.starts_with("http") {
+                                continue;
+                            }
+                            let size = k
+                                .rsplit('_')
+                                .next()
+                                .and_then(|p| p.parse::<u32>().ok())
+                                .unwrap_or(0);
+                            sized.push((size, s.to_string()));
+                        }
+                    }
+                    sized.sort_by(|a, b| b.0.cmp(&a.0));
+                    for (_, s) in sized {
+                        push(&s);
+                    }
+                    for key in ["photo_1200", "photo_600", "photo_300", "photo_270", "src"] {
+                        if let Some(s) = tm.get(key).and_then(|v| v.as_str()) {
+                            push(s);
+                        }
+                    }
+                }
+            }
+            for key in ["cover", "thumb", "photo"] {
+                if let Some(s) = map.get(key).and_then(|v| v.as_str()) {
+                    push(s);
+                }
+            }
+        }
+    }
+
+    // Some payloads put covers as comma-separated string
+    if let Some(s) = obj.get("covers").and_then(|v| v.as_str()) {
+        for part in s.split(',') {
+            push(part);
+        }
+    }
+
+    covers
 }
 
 fn parse_track_value(value: &Value, user_id: i64) -> Option<VkTrack> {
@@ -1879,8 +1972,18 @@ fn emit_progress(app: &AppHandle, url: &str, status: &str, percent: Option<f32>)
     );
 }
 
-fn download_bytes(url: &str, cookie: &str, dest: &Path, app: &AppHandle, page_url: &str) -> Result<(), String> {
+fn download_bytes(
+    url: &str,
+    cookie: &str,
+    dest: &Path,
+    app: &AppHandle,
+    page_url: &str,
+    progress_lo: f32,
+    progress_hi: f32,
+) -> Result<(), String> {
     check_cancel()?;
+    emit_progress(app, page_url, "Downloading…", Some(progress_lo));
+
     let mut response = http()
         .get(url)
         .header("User-Agent", USER_AGENT)
@@ -1906,6 +2009,8 @@ fn download_bytes(url: &str, cookie: &str, dest: &Path, app: &AppHandle, page_ur
 
     let mut buf = [0u8; 64 * 1024];
     let mut written: u64 = 0;
+    let mut last_emit = progress_lo - 1.0;
+    let span = (progress_hi - progress_lo).max(1.0);
     loop {
         check_cancel()?;
         let n = reader
@@ -1917,14 +2022,20 @@ fn download_bytes(url: &str, cookie: &str, dest: &Path, app: &AppHandle, page_ur
         file.write_all(&buf[..n])
             .map_err(|e| format!("Download write error: {e}"))?;
         written += n as u64;
-        if let Some(total) = len {
-            if total > 0 {
-                let pct = (written as f32 / total as f32) * 100.0;
-                emit_progress(app, page_url, "Downloading…", Some(pct.min(99.0)));
-            }
+        let pct = if let Some(total) = len.filter(|t| *t > 0) {
+            progress_lo + (written as f32 / total as f32) * span
+        } else {
+            // Unknown size: ease toward hi without jumping to 100
+            let approx = progress_lo + span * (1.0 - (-(written as f32) / 2_000_000.0).exp());
+            approx.min(progress_hi - 0.5)
+        };
+        if (pct - last_emit).abs() >= 0.4 {
+            last_emit = pct;
+            emit_progress(app, page_url, "Downloading…", Some(pct.clamp(0.0, 99.0)));
         }
     }
 
+    emit_progress(app, page_url, "Downloading…", Some(progress_hi.min(99.0)));
     Ok(())
 }
 
@@ -1933,6 +2044,7 @@ fn download_with_ffmpeg(
     url: &str,
     dest: &Path,
     page_url: &str,
+    progress_lo: f32,
 ) -> Result<(), String> {
     let ffmpeg_dir = ytdlp::resolve_ffmpeg_location(app)
         .ok_or_else(|| "ffmpeg not found (required for HLS streams)".to_string())?;
@@ -1945,8 +2057,11 @@ fn download_with_ffmpeg(
         return Err(format!("ffmpeg not found at {}", ffmpeg.display()));
     }
 
-    emit_progress(app, page_url, "Converting HLS…", Some(50.0));
+    // Pulse a few intermediate ticks so UI doesn't sit frozen at one value.
+    let start = progress_lo.clamp(5.0, 70.0);
+    emit_progress(app, page_url, "Converting to 320 kbps MP3…", Some(start));
 
+    // CBR 320 — not VBR q=0 (which often lands ~220–260 kbps from AAC HLS).
     let status = std::process::Command::new(&ffmpeg)
         .args([
             "-y",
@@ -1958,8 +2073,12 @@ fn download_with_ffmpeg(
             "-vn",
             "-c:a",
             "libmp3lame",
-            "-q:a",
-            "0",
+            "-b:a",
+            "320k",
+            "-ar",
+            "44100",
+            "-ac",
+            "2",
             dest.to_string_lossy().as_ref(),
         ])
         .status()
@@ -1971,7 +2090,19 @@ fn download_with_ffmpeg(
     if !dest.is_file() {
         return Err("ffmpeg finished but output file is missing".to_string());
     }
+    emit_progress(app, page_url, "Converting to 320 kbps MP3…", Some(96.0));
     Ok(())
+}
+
+fn looks_like_m3u8_file(path: &Path) -> bool {
+    if let Ok(meta) = fs::metadata(path) {
+        if meta.len() < 8192 {
+            if let Ok(head) = fs::read_to_string(path) {
+                return head.contains("#EXTM3U") || head.contains("#EXTINF");
+            }
+        }
+    }
+    false
 }
 
 fn download_track_file(
@@ -1995,56 +2126,154 @@ fn download_track_file(
     let base = sanitize_filename(&format!("{} - {}", track.artist, track.title));
     let dest = unique_path(dir, &base, "mp3");
 
+    // Map multi-track downloads into a global 5%…95% window.
+    let track_lo = if total > 1 {
+        5.0 + (index as f32 / total as f32) * 90.0
+    } else {
+        5.0
+    };
+    let track_hi = if total > 1 {
+        5.0 + ((index as f32 + 1.0) / total as f32) * 90.0
+    } else {
+        92.0
+    };
     let label = if total > 1 {
         format!("Downloading {}/{}…", index + 1, total)
     } else {
         "Downloading…".to_string()
     };
-    let start_pct = if total > 1 {
-        Some((index as f32 / total as f32) * 100.0)
-    } else {
-        Some(0.0)
-    };
-    emit_progress(app, page_url, &label, start_pct);
+    emit_progress(app, page_url, &label, Some(track_lo));
 
-    let is_hls = track.url.contains(".m3u8");
-    if is_hls {
-        download_with_ffmpeg(app, &track.url, &dest, page_url)?;
-    } else {
-        // Try direct; if content is still m3u8-ish, fall back to ffmpeg
-        match download_bytes(&track.url, cookie, &dest, app, page_url) {
+    // Prefer direct MP3 (keeps original VK bitrate, often 320 CBR).
+    // Only fall back to ffmpeg re-encode for real HLS.
+    let candidates = stream_url_candidates(&track.url);
+    let mut last_err = String::from("no candidates");
+    let mut downloaded = false;
+
+    for cand in &candidates {
+        check_cancel()?;
+        if cand.contains(".m3u8") {
+            continue;
+        }
+        match download_bytes(cand, cookie, &dest, app, page_url, track_lo, track_hi) {
             Ok(()) => {
-                // Heuristic: tiny file that looks like playlist
+                if looks_like_m3u8_file(&dest) {
+                    let _ = fs::remove_file(&dest);
+                    last_err = format!("got m3u8 body from {cand}");
+                    continue;
+                }
+                // Reject tiny non-audio junk
                 if let Ok(meta) = fs::metadata(&dest) {
-                    if meta.len() < 4096 {
-                        if let Ok(head) = fs::read_to_string(&dest) {
-                            if head.contains("#EXTM3U") {
-                                let _ = fs::remove_file(&dest);
-                                download_with_ffmpeg(app, &track.url, &dest, page_url)?;
-                            }
-                        }
+                    if meta.len() < 16 * 1024 {
+                        let _ = fs::remove_file(&dest);
+                        last_err = format!("file too small from {cand}");
+                        continue;
                     }
                 }
+                downloaded = true;
+                break;
             }
             Err(err) => {
-                // Retry via ffmpeg for odd CDNs
-                if let Err(e2) = download_with_ffmpeg(app, &track.url, &dest, page_url) {
-                    return Err(format!("{err}; ffmpeg fallback: {e2}"));
-                }
+                let _ = fs::remove_file(&dest);
+                last_err = err;
             }
         }
     }
 
+    if !downloaded {
+        // HLS re-encode at max 320 kbps CBR
+        let hls = candidates
+            .iter()
+            .find(|u| u.contains(".m3u8"))
+            .map(|s| s.as_str())
+            .unwrap_or(track.url.as_str());
+        if let Err(e2) = download_with_ffmpeg(app, hls, &dest, page_url, track_lo + 10.0) {
+            return Err(format!(
+                "Direct MP3 failed ({last_err}); ffmpeg fallback: {e2}"
+            ));
+        }
+    }
+
+    emit_progress(app, page_url, "Writing tags…", Some(track_hi.min(97.0)));
     let _ = metadata::write_track_tags(
         &dest,
         Some(track.title.as_str()),
         Some(track.artist.as_str()),
     );
 
-    // Best-effort cover download into nearby folder is skipped; tags only for now.
-    // Cover URLs are used for probe thumbnails.
+    if let Err(err) = embed_track_cover(&dest, track, cookie) {
+        eprintln!(
+            "[vk_audio] cover not embedded for {} — {}: {err}",
+            track.artist, track.title
+        );
+    }
+    emit_progress(app, page_url, &label, Some(track_hi.min(99.0)));
 
     Ok(dest.to_string_lossy().to_string())
+}
+
+fn embed_track_cover(audio_path: &Path, track: &VkTrack, cookie: &str) -> Result<(), String> {
+    let urls: Vec<&str> = track
+        .covers
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|s| s.starts_with("http"))
+        .collect();
+
+    if urls.is_empty() {
+        return Err("no cover URLs on track".to_string());
+    }
+
+    // Prefer larger images first (coverUrl_l / photo_600 usually earlier after sort)
+    for url in urls {
+        match download_cover_bytes(url, cookie) {
+            Ok((bytes, mime)) if !bytes.is_empty() => {
+                metadata::write_track_cover(audio_path, &bytes, mime.as_deref())?;
+                return Ok(());
+            }
+            Ok(_) => continue,
+            Err(e) => {
+                eprintln!("[vk_audio] cover download failed ({url}): {e}");
+                continue;
+            }
+        }
+    }
+
+    Err("all cover URLs failed".to_string())
+}
+
+fn download_cover_bytes(url: &str, cookie: &str) -> Result<(Vec<u8>, Option<String>), String> {
+    let mut response = http()
+        .get(url)
+        .header("User-Agent", DESKTOP_UA)
+        .header("Cookie", cookie)
+        .header("Referer", "https://vk.com/")
+        .header("Accept", "image/avif,image/webp,image/apng,image/*,*/*;q=0.8")
+        .call()
+        .map_err(|e| format!("cover request failed: {e}"))?;
+
+    if !response.status().is_success() {
+        return Err(format!("cover HTTP {}", response.status().as_u16()));
+    }
+
+    let mime = response
+        .headers()
+        .get("Content-Type")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(';').next().unwrap_or(s).trim().to_string());
+
+    let mut bytes = Vec::new();
+    response
+        .body_mut()
+        .as_reader()
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("cover read failed: {e}"))?;
+
+    if bytes.len() < 32 {
+        return Err("cover too small".to_string());
+    }
+
+    Ok((bytes, mime))
 }
 
 // ── WebView session resolve (same context as VK Music Saver) ─────────────────
@@ -2347,7 +2576,7 @@ pub async fn probe_async(app: AppHandle, url: String) -> Result<YtdlpProbeResult
             )
             .await?;
             Ok(YtdlpProbeResult {
-                title: format!("{} - {}", track.artist, track.title),
+                title: track.title.clone(),
                 uploader: Some(track.artist),
                 duration_secs: if track.duration > 0 {
                     Some(track.duration as f64)
@@ -2404,7 +2633,7 @@ pub async fn download_async(
     let user_id = resolve_user_id_for_app(&app, &cookie).unwrap_or(0);
     let dir = ytdlp::resolve_download_dir(&app, output_dir.as_deref())?;
 
-    emit_progress(&app, &url, "Resolving VK track…", Some(0.0));
+    emit_progress(&app, &url, "Resolving VK track…", Some(2.0));
 
     let tracks = match target {
         VkTarget::Track {
@@ -2538,6 +2767,15 @@ mod tests {
         let url = "https://psv4.userapi.com/s/v1/ab12/audios/cd34/index.m3u8";
         let out = convert_m3u8_to_mp3(url);
         assert!(out.ends_with("/audios/cd34.mp3"), "{out}");
+    }
+
+    #[test]
+    fn prefers_direct_mp3_before_hls() {
+        let url = "https://psv4.userapi.com/s/v1/ab12/audios/cd34/index.m3u8";
+        let c = stream_url_candidates(url);
+        assert!(c.len() >= 2);
+        assert!(!c[0].contains("m3u8"), "first candidate should be mp3: {}", c[0]);
+        assert!(c.last().unwrap().contains("m3u8"));
     }
 
     #[test]
