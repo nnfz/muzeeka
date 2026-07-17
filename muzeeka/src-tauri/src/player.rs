@@ -1588,6 +1588,7 @@ impl Player {
     /// Quick shallow volume dip (not to zero), immediate seek, quick restore.
     /// Feels like a smooth blend/transition during scrub, similar to Spotify.
     /// No full silence, short times. Not used on track changes.
+    /// While paused, position updates but playback stays paused (arrow keys / scrub).
     pub fn seek(&self, position_secs: f64) -> Result<(), String> {
         let _ops = self.ops.lock();
         self.run_on_bass_thread(move |inner| {
@@ -1596,6 +1597,7 @@ impl Player {
             }
             let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
             let target = inner.volume;
+            let was_paused = inner.user_paused;
 
             // Instant seek: hard jump + flush. No long animation.
             // Dip only for the flush moment to avoid click, then immediate restore.
@@ -1605,12 +1607,19 @@ impl Player {
             let byte = bass.channel_seconds2bytes(inner.current_source, absolute_secs);
             let _ = bass.mixer_channel_set_position(inner.current_source, byte, bass::BASS_POS_BYTE);
 
-            // This flush makes the seek actually happen right now (discards stale buffer data).
+            // Flush mixer buffer so the new position is heard immediately.
+            // channel_play restarts the mixer — re-pause if we were paused.
             let _ = bass.channel_play(inner.mixer_handle, true);
             let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_BUFFER, 0.2);
 
-            // Restore volume hard for maximum speed.
-            let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_VOL, target);
+            if was_paused {
+                let _ = bass.channel_pause(inner.mixer_handle);
+                // Match post-pause-fade state: silent until resume.
+                let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_VOL, 0.0);
+                inner.user_paused = true;
+            } else {
+                let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_VOL, target);
+            }
 
             Ok(())
         })
