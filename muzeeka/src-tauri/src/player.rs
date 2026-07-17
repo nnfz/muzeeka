@@ -362,16 +362,18 @@ impl Player {
         let fx_dll = inner.bass_dir.join("bass_fx.dll");
         if fx_dll.is_file() {
             let path_str = fx_dll.to_string_lossy().to_string();
+            // Register bass_fx as a BASS plugin (for format support).
             match bass.plugin_load(&path_str) {
                 Ok(handle) => {
                     inner._plugin_handles.push(handle);
-                    if bass.enable_fx_from_plugin() {
-                        eprintln!("BASS FX loaded (pitch-preserving tempo available)");
-                    } else {
-                        eprintln!("bass_fx.dll loaded but FX entry points were not found");
-                    }
                 }
-                Err(error) => eprintln!("BASS FX plugin not loaded: {error}"),
+                Err(error) => eprintln!("BASS FX plugin_load: {error}"),
+            }
+            // Load bass_fx.dll directly to resolve tempo FX entry points.
+            if bass.enable_fx_from_plugin(&fx_dll) {
+                eprintln!("BASS FX loaded (pitch-preserving tempo available)");
+            } else {
+                eprintln!("bass_fx.dll loaded but FX entry points were not found");
             }
         }
 

@@ -88,7 +88,8 @@ pub struct BassLibrary {
     bass_mixer_channel_flags:
         unsafe extern "system" fn(channel: DWORD, flags: DWORD, mask: DWORD) -> DWORD,
 
-    // ── FX (bass_fx via BASS_PluginLoad — symbols live in bass.dll) ─────────
+    // ── FX (bass_fx.dll — loaded as a separate Library) ─────────────────────
+    _fx_lib: Option<Library>,
     fx_ready: bool,
     bass_fx_tempo_create:
         unsafe extern "system" fn(chan: DWORD, flags: DWORD) -> HSTREAM,
@@ -205,6 +206,7 @@ impl BassLibrary {
                 bass_mixer_channel_set_position: mixer_set_pos,
                 bass_mixer_channel_get_position: mixer_get_pos,
                 bass_mixer_channel_flags: mixer_flags,
+                _fx_lib: None,
                 fx_ready: false,
                 bass_fx_tempo_create: std::mem::transmute::<*const (), _>(ptr::null::<()>()),
                 bass_fx_tempo_get_source: std::mem::transmute::<*const (), _>(ptr::null::<()>()),
@@ -212,17 +214,25 @@ impl BassLibrary {
         }
     }
 
-    /// Resolve tempo FX entry points from bass.dll after `BASS_PluginLoad("bass_fx.dll")`.
-    pub fn enable_fx_from_plugin(&mut self) -> bool {
+    /// Load bass_fx.dll directly and resolve tempo FX entry points from it.
+    pub fn enable_fx_from_plugin(&mut self, fx_dll_path: &Path) -> bool {
+        let fx_lib = match unsafe { Library::new(fx_dll_path) } {
+            Ok(lib) => lib,
+            Err(e) => {
+                eprintln!("Failed to load bass_fx.dll as Library: {e}");
+                return false;
+            }
+        };
         unsafe {
-            let Some(create) = try_load_fn!(self._lib, b"BASS_FX_TempoCreate\0") else {
+            let Some(create) = try_load_fn!(fx_lib, b"BASS_FX_TempoCreate\0") else {
                 return false;
             };
-            let Some(get_source) = try_load_fn!(self._lib, b"BASS_FX_TempoGetSource\0") else {
+            let Some(get_source) = try_load_fn!(fx_lib, b"BASS_FX_TempoGetSource\0") else {
                 return false;
             };
             self.bass_fx_tempo_create = create;
             self.bass_fx_tempo_get_source = get_source;
+            self._fx_lib = Some(fx_lib);
             self.fx_ready = true;
             true
         }
