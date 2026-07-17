@@ -199,6 +199,17 @@ pub fn run() {
                 lyrics::init_lyrics_cache(app_data);
             }
 
+            // ffmpeg for animated GIF → WebP cover conversion
+            let ffmpeg = ytdlp::resolve_ffmpeg_location(app.handle()).and_then(|dir| {
+                let bin = dir.join(if cfg!(windows) {
+                    "ffmpeg.exe"
+                } else {
+                    "ffmpeg"
+                });
+                bin.is_file().then_some(bin)
+            });
+            metadata::set_ffmpeg_bin(ffmpeg);
+
             if let Some(window) = app.get_webview_window("main") {
                 if let Ok(app_settings) = settings::load_settings(&app.handle()) {
                     if let Some(window_state) = app_settings.window_state.as_ref() {
@@ -261,6 +272,7 @@ pub fn run() {
             commands::library_fetch_metadata,
             commands::library_resolve_full_cover,
             commands::library_cover_data_url,
+            commands::library_rebuild_covers,
             commands::lyrics_fetch,
             commands::playlists_load,
             commands::playlists_save,

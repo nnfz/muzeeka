@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use serde::Deserialize;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, State};
 
 use crate::discord_rpc::DiscordPresence;
 use crate::remote_control::RemoteController;
@@ -269,6 +269,55 @@ pub async fn library_resolve_full_cover(path: String) -> Result<Option<String>, 
 pub fn library_cover_data_url(path: String) -> Result<Option<String>, String> {
     use std::path::Path;
     crate::metadata::cover_data_url(Path::new(&path))
+}
+
+/// Wipe the track cover cache, re-extract covers as WebP, convert playlist GIF/JPG → WebP.
+#[tauri::command]
+pub async fn library_rebuild_covers(
+    app: AppHandle,
+) -> Result<crate::metadata::CoverRebuildStats, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut data = playlists::load_playlists(&app)?;
+
+        let mut track_paths: Vec<String> = Vec::new();
+        for pl in &data.playlists {
+            for t in &pl.tracks {
+                track_paths.push(t.path.clone());
+            }
+        }
+        track_paths.extend(data.all_paths.iter().cloned());
+        track_paths.extend(data.liked_paths.iter().cloned());
+
+        let playlist_covers: Vec<(String, Option<String>)> = data
+            .playlists
+            .iter()
+            .map(|p| (p.id.clone(), p.cover_path.clone()))
+            .collect();
+
+        let (stats, cover_updates) =
+            crate::metadata::rebuild_cover_cache(&track_paths, &playlist_covers)?;
+
+        // Refresh track cover paths from regenerated cache (clear stale paths too).
+        for pl in &mut data.playlists {
+            for track in &mut pl.tracks {
+                let (thumb, full) = crate::metadata::fresh_cover_paths_for_track(&track.path);
+                track.cover_path = thumb;
+                track.cover_path_full = full;
+            }
+        }
+
+        for (id, path) in cover_updates {
+            if let Some(pl) = data.playlists.iter_mut().find(|p| p.id == id) {
+                pl.cover_path = path;
+            }
+        }
+
+        playlists::save_playlists(&app, &data)?;
+        let _ = app.emit("covers:rebuilt", &stats);
+        Ok(stats)
+    })
+    .await
+    .map_err(|e| format!("Cover rebuild task failed: {e}"))?
 }
 
 /// Fetch synchronized lyrics TTML (network + disk cache) on a background thread.

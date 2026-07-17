@@ -83,3 +83,10 @@ export function prefetchCoverPaths(
     count += 1;
   }
 }
+
+/** Drop in-memory URL maps after the on-disk cover cache is rebuilt. */
+export function clearCoverSrcCache() {
+  srcCache.clear();
+  warmed.clear();
+  inflight.clear();
+}

@@ -3,7 +3,8 @@
 // Flow:
 // 1. Parse vk.com / vk.ru audio & playlist URLs
 // 2. Load session cookies from app login (Settings) / vk_cookies.txt / browser
-// 3. Resolve stream URLs via m.vk.ru reload_audio / load_section
+// 3. Playlist catalog via m.vk load_section; streams via session WebView
+//    audio.getById / al_audio (plain HTTP reload_audio returns antibot stubs)
 // 4. Decode audio_api_unavailable links, rewrite m3u8 → mp3 when possible
 // 5. Download (direct or ffmpeg HLS) into the same download folder as yt-dlp
 
@@ -1612,59 +1613,98 @@ fn reload_audio_ids(
     for chunk in id_tokens.chunks(10) {
         check_cancel()?;
         let joined = chunk.join(",");
+        let mut chunk_tracks = Vec::new();
 
         // 1) mobile
         let body = format!("act=reload_audio&ids={}", urlencoding::encode(&joined));
         if let Ok(raw) = http_post_form("https://m.vk.ru/audio", cookie, &body, true) {
-            tracks.extend(tracks_from_reload_json(&raw, user_id));
-        }
-        if !tracks.is_empty() {
-            break;
+            chunk_tracks.extend(tracks_from_reload_json(&raw, user_id));
         }
 
         // 2) desktop al_audio.php
-        let body = format!(
-            "act=reload_audio&al=1&ids={}",
-            urlencoding::encode(&joined)
-        );
-        if let Ok(raw) = http_post_form("https://vk.ru/al_audio.php", cookie, &body, false) {
-            tracks.extend(tracks_from_reload_json(&raw, user_id));
-        }
-        if !tracks.is_empty() {
-            break;
-        }
-        if let Ok(raw) = http_post_form("https://vk.com/al_audio.php", cookie, &body, false) {
-            tracks.extend(tracks_from_reload_json(&raw, user_id));
-        }
-        if !tracks.is_empty() {
-            break;
+        if chunk_tracks.is_empty() {
+            let body = format!(
+                "act=reload_audio&al=1&ids={}",
+                urlencoding::encode(&joined)
+            );
+            if let Ok(raw) = http_post_form("https://vk.ru/al_audio.php", cookie, &body, false) {
+                chunk_tracks.extend(tracks_from_reload_json(&raw, user_id));
+            }
+            if chunk_tracks.is_empty() {
+                if let Ok(raw) =
+                    http_post_form("https://vk.com/al_audio.php", cookie, &body, false)
+                {
+                    chunk_tracks.extend(tracks_from_reload_json(&raw, user_id));
+                }
+            }
         }
 
-        std::thread::sleep(Duration::from_millis(300));
+        tracks.extend(
+            chunk_tracks
+                .into_iter()
+                .filter(|t| has_playable_stream(t)),
+        );
+        std::thread::sleep(Duration::from_millis(250));
     }
 
     Ok(tracks)
 }
 
-fn reload_audio(
-    cookie: &str,
-    user_id: i64,
-    ids: &[(i64, u64, String, String)],
-) -> Result<Vec<VkTrack>, String> {
-    let tokens: Vec<String> = ids
-        .iter()
-        .map(|(owner, id, action, url_hash)| {
-            if !action.is_empty() && !url_hash.is_empty() {
-                format!("{owner}_{id}_{action}_{url_hash}")
-            } else if !action.is_empty() {
-                // access_key-only form used by audio.getById / some reload paths
-                format!("{owner}_{id}_{action}")
-            } else {
-                format!("{owner}_{id}")
-            }
-        })
-        .collect();
-    reload_audio_ids(cookie, user_id, &tokens)
+/// VK antibot often returns short "listen in the official app" placeholder audio
+/// when the request is not from a real browser session.
+fn is_restriction_stub(track: &VkTrack) -> bool {
+    let title = track.title.to_lowercase();
+    let artist = track.artist.to_lowercase();
+    let hay = format!("{title} {artist}");
+
+    const PATTERNS: &[&str] = &[
+        "недоступн",
+        "официальн",
+        "приложении",
+        "в приложении",
+        "слушайте в",
+        "не в том",
+        "only available",
+        "official app",
+        "official vk",
+        "audio is unavailable",
+        "track is unavailable",
+        "content is not available",
+        "listen in the",
+        "another app",
+        "other app",
+        "unavailable in your",
+        "not available in this",
+        "open the official",
+    ];
+    if PATTERNS.iter().any(|p| hay.contains(p)) {
+        return true;
+    }
+
+    // Typical stub stream: very short clip with empty/placeholder meta
+    if track.duration > 0
+        && track.duration <= 20
+        && (title.contains("music")
+            || title.contains("audio")
+            || title.contains("трек")
+            || title.contains("аудио")
+            || artist == "vk"
+            || artist == "vk music"
+            || artist.is_empty()
+            || artist == "unknown")
+        && (title.contains("доступ")
+            || title.contains("available")
+            || title.contains("app")
+            || title.contains("прилож"))
+    {
+        return true;
+    }
+
+    false
+}
+
+fn has_playable_stream(track: &VkTrack) -> bool {
+    track.url.starts_with("http") && !is_restriction_stub(track)
 }
 
 fn fetch_single_track(
@@ -1771,14 +1811,159 @@ fn fetch_single_track(
         })
 }
 
-fn fetch_playlist_tracks(
+/// Playlist entry from load_section — IDs + metadata. Stream URLs usually empty
+/// or restriction stubs when fetched over plain HTTP; resolve via WebView later.
+#[derive(Debug, Clone)]
+struct PlaylistEntry {
+    owner_id: i64,
+    id: u64,
+    /// action_hash / access_key for getById & reload_audio
+    access_key: String,
+    url_hash: String,
+    title: String,
+    artist: String,
+    duration: u32,
+    covers: Vec<String>,
+}
+
+fn playlist_entry_from_value(item: &Value, user_id: i64) -> Option<PlaylistEntry> {
+    // Prefer array form used by load_section
+    if let Some(arr) = item.as_array() {
+        if arr.len() < 2 {
+            return None;
+        }
+        let id = arr[0].as_u64().or_else(|| arr[0].as_i64().map(|v| v as u64))?;
+        let owner_id = arr[1].as_i64()?;
+        let title = strip_html(arr.get(3).and_then(|v| v.as_str()).unwrap_or("Unknown"));
+        let artist = strip_html(arr.get(4).and_then(|v| v.as_str()).unwrap_or("Unknown"));
+        let duration = arr.get(5).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let mut covers = arr
+            .get(14)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| s.starts_with("http"))
+            .collect::<Vec<_>>();
+        covers.reverse();
+
+        let hashes = arr
+            .get(13)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .split('/')
+            .collect::<Vec<_>>();
+        // actionHash ~ [2], urlHash ~ [5]; access_key sometimes sits alone
+        let action = hashes.get(2).copied().unwrap_or("").to_string();
+        let url_hash = hashes.get(5).copied().unwrap_or("").to_string();
+        let access_key = if !action.is_empty() {
+            action
+        } else {
+            hashes
+                .iter()
+                .find(|h| !h.is_empty())
+                .copied()
+                .unwrap_or("")
+                .to_string()
+        };
+
+        // If list already embeds a real stream, keep hashes from parse too
+        let _ = user_id;
+        return Some(PlaylistEntry {
+            owner_id,
+            id,
+            access_key,
+            url_hash,
+            title,
+            artist,
+            duration,
+            covers,
+        });
+    }
+
+    if let Some(obj) = item.as_object() {
+        let id = obj
+            .get("id")
+            .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|x| x as u64)))?;
+        let owner_id = obj
+            .get("owner_id")
+            .or_else(|| obj.get("ownerId"))
+            .and_then(|v| v.as_i64())?;
+        let title = strip_html(obj.get("title").and_then(|v| v.as_str()).unwrap_or("Unknown"));
+        let artist = strip_html(
+            obj.get("artist")
+                .or_else(|| obj.get("performer"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown"),
+        );
+        let duration = obj
+            .get("duration")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+        let covers = collect_cover_urls_from_object(obj);
+        let access_key = obj
+            .get("access_key")
+            .or_else(|| obj.get("accessKey"))
+            .or_else(|| obj.get("actionHash"))
+            .or_else(|| obj.get("action_hash"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let url_hash = obj
+            .get("urlHash")
+            .or_else(|| obj.get("url_hash"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        return Some(PlaylistEntry {
+            owner_id,
+            id,
+            access_key,
+            url_hash,
+            title,
+            artist,
+            duration,
+            covers,
+        });
+    }
+
+    None
+}
+
+fn entry_id_token(entry: &PlaylistEntry) -> String {
+    if !entry.access_key.is_empty() && !entry.url_hash.is_empty() {
+        format!(
+            "{}_{}_{}_{}",
+            entry.owner_id, entry.id, entry.access_key, entry.url_hash
+        )
+    } else if !entry.access_key.is_empty() {
+        format!("{}_{}_{}", entry.owner_id, entry.id, entry.access_key)
+    } else {
+        format!("{}_{}", entry.owner_id, entry.id)
+    }
+}
+
+fn entry_getbyid_tokens(entry: &PlaylistEntry) -> Vec<String> {
+    let mut tokens = Vec::new();
+    if !entry.access_key.is_empty() {
+        tokens.push(format!(
+            "{}_{}_{}",
+            entry.owner_id, entry.id, entry.access_key
+        ));
+    }
+    tokens.push(format!("{}_{}", entry.owner_id, entry.id));
+    tokens
+}
+
+/// Load playlist title/cover + track IDs via m.vk load_section (no stream resolve).
+fn fetch_playlist_catalog(
     cookie: &str,
-    user_id: i64,
     owner_id: i64,
     playlist_id: u64,
     access_hash: Option<&str>,
-) -> Result<(String, Option<String>, Vec<VkTrack>), String> {
-    let mut all_ids = Vec::new();
+    user_id: i64,
+) -> Result<(String, Option<String>, Vec<PlaylistEntry>), String> {
+    let mut entries = Vec::new();
     let mut title = format!("Playlist {owner_id}_{playlist_id}");
     let mut thumb: Option<String> = None;
     let mut offset = 0u32;
@@ -1823,20 +2008,21 @@ fn fetch_playlist_tracks(
         }
 
         for item in &list {
-            if let Some(arr) = item.as_array() {
-                if arr.len() > 13 {
-                    if let (Some(id), Some(owner)) = (
-                        arr[0].as_u64().or_else(|| arr[0].as_i64().map(|v| v as u64)),
-                        arr[1].as_i64(),
-                    ) {
-                        let hashes = arr[13].as_str().unwrap_or("").split('/').collect::<Vec<_>>();
-                        let action = hashes.get(2).unwrap_or(&"").to_string();
-                        let url_hash = hashes.get(5).unwrap_or(&"").to_string();
-                        if !action.is_empty() {
-                            all_ids.push((owner, id, action, url_hash));
-                        }
-                    }
+            if let Some(entry) = playlist_entry_from_value(item, user_id) {
+                // Skip obvious restriction placeholders from the catalog itself
+                let probe = VkTrack {
+                    owner_id: entry.owner_id,
+                    id: entry.id,
+                    title: entry.title.clone(),
+                    artist: entry.artist.clone(),
+                    duration: entry.duration,
+                    url: String::new(),
+                    covers: entry.covers.clone(),
+                };
+                if is_restriction_stub(&probe) {
+                    continue;
                 }
+                entries.push(entry);
             }
         }
 
@@ -1854,14 +2040,12 @@ fn fetch_playlist_tracks(
         std::thread::sleep(Duration::from_millis(500));
     }
 
-    if all_ids.is_empty() {
+    if entries.is_empty() {
         return Err("VK playlist is empty or unavailable".to_string());
     }
 
-    let tracks = reload_audio(cookie, user_id, &all_ids)?;
-    // Fallback: first track cover if playlist has no own art
-    let thumb = thumb.or_else(|| tracks.first().and_then(|t| t.covers.first().cloned()));
-    Ok((title, thumb, tracks))
+    let thumb = thumb.or_else(|| entries.first().and_then(|e| e.covers.first().cloned()));
+    Ok((title, thumb, entries))
 }
 
 /// Extract the best playlist/album cover URL from a VK load_section payload.
@@ -2351,96 +2535,81 @@ fn track_from_api_object(obj: &Value, user_id: i64) -> Option<VkTrack> {
     })
 }
 
-async fn webview_resolve_audio(
+/// Resolve many audio IDs inside the authenticated session WebView (getById +
+/// al_audio reload with browser cookies). Plain HTTP reload returns antibot stubs.
+async fn webview_resolve_audios_batch(
     app: &AppHandle,
-    owner_id: i64,
-    audio_id: u64,
-    access_key: Option<&str>,
+    id_tokens: &[String],
     user_id: i64,
-) -> Result<VkTrack, String> {
-    let window = ensure_session_webview(app).await?;
-    let ak = access_key.unwrap_or("").trim();
-
-    let mut id_candidates = Vec::new();
-    if !ak.is_empty() {
-        id_candidates.push(format!("{owner_id}_{audio_id}_{ak}"));
+) -> Result<Vec<VkTrack>, String> {
+    if id_tokens.is_empty() {
+        return Ok(Vec::new());
     }
-    id_candidates.push(format!("{owner_id}_{audio_id}"));
-    let ids_json = serde_json::to_string(&id_candidates).unwrap_or_else(|_| "[]".into());
+    let window = ensure_session_webview(app).await?;
+    let ids_json = serde_json::to_string(id_tokens).unwrap_or_else(|_| "[]".into());
 
     let start_js = format!(
         r#"
 (async function () {{
-  window.__muzeekaAudioResult = null;
+  window.__muzeekaAudioBatch = null;
   try {{
-    const candidates = {ids_json};
-    let track = null;
+    const ids = {ids_json};
+    let tracks = [];
     let lastText = '';
 
     if (window.vkApi && typeof window.vkApi.api === 'function') {{
-      for (const ids of candidates) {{
-        try {{
-          const res = await window.vkApi.api('audio.getById', {{ audios: ids, v: '5.204' }});
-          if (Array.isArray(res)) {{
-            for (const t of res) {{
-              if (t && t.url) {{ track = t; break; }}
-            }}
-          }}
-          if (track) break;
-        }} catch (e) {{}}
-      }}
+      try {{
+        const joined = ids.join(',');
+        const res = await window.vkApi.api('audio.getById', {{ audios: joined, v: '5.204' }});
+        if (Array.isArray(res)) {{
+          tracks = res.filter(t => t && t.url);
+        }} else if (res && Array.isArray(res.response)) {{
+          tracks = res.response.filter(t => t && t.url);
+        }}
+      }} catch (e) {{}}
     }}
 
-    if (!track) {{
-      const tryReload = async (idStr) => {{
-        const body = new URLSearchParams();
-        body.set('act', 'reload_audio');
-        body.set('al', '1');
-        body.set('ids', idStr);
-        const endpoints = [
-          (location.origin || 'https://vk.com') + '/al_audio.php',
-          'https://vk.com/al_audio.php',
-          'https://vk.ru/al_audio.php',
-          'https://m.vk.ru/audio'
-        ];
-        for (const ep of endpoints) {{
-          try {{
-            const r = await fetch(ep, {{
-              method: 'POST',
-              headers: {{
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'X-Requested-With': 'XMLHttpRequest'
-              }},
-              body: body.toString(),
-              credentials: 'include'
-            }});
-            const text = await r.text();
-            if (text && text.length > 2) return text;
-          }} catch (e) {{}}
-        }}
-        return '';
-      }};
-
-      for (const ids of candidates) {{
-        lastText = await tryReload(ids);
-        if (lastText) break;
+    if (!tracks.length) {{
+      const body = new URLSearchParams();
+      body.set('act', 'reload_audio');
+      body.set('al', '1');
+      body.set('ids', ids.join(','));
+      const endpoints = [
+        (location.origin || 'https://vk.com') + '/al_audio.php',
+        'https://vk.com/al_audio.php',
+        'https://vk.ru/al_audio.php',
+        'https://m.vk.ru/audio'
+      ];
+      for (const ep of endpoints) {{
+        try {{
+          const r = await fetch(ep, {{
+            method: 'POST',
+            headers: {{
+              'Content-Type': 'application/x-www-form-urlencoded',
+              'X-Requested-With': 'XMLHttpRequest'
+            }},
+            body: body.toString(),
+            credentials: 'include'
+          }});
+          const text = await r.text();
+          if (text && text.length > 2) {{ lastText = text; break; }}
+        }} catch (e) {{}}
       }}
-      window.__muzeekaAudioResult = JSON.stringify({{
+      window.__muzeekaAudioBatch = JSON.stringify({{
         ok: true,
         source: 'al_audio',
-        text: (lastText || '').slice(0, 200000),
-        candidates
+        text: (lastText || '').slice(0, 400000)
       }});
       return;
     }}
 
-    window.__muzeekaAudioResult = JSON.stringify({{
+    window.__muzeekaAudioBatch = JSON.stringify({{
       ok: true,
       source: 'vkApi',
-      track
+      tracks
     }});
   }} catch (e) {{
-    window.__muzeekaAudioResult = JSON.stringify({{ ok: false, error: String(e) }});
+    window.__muzeekaAudioBatch = JSON.stringify({{ ok: false, error: String(e) }});
   }}
 }})();
 true
@@ -2449,18 +2618,17 @@ true
 
     window
         .eval(&start_js)
-        .map_err(|e| format!("Failed to run VK resolve script: {e}"))?;
+        .map_err(|e| format!("Failed to run VK batch resolve script: {e}"))?;
 
-    for _ in 0..50 {
+    for _ in 0..60 {
         check_cancel()?;
         tokio::time::sleep(Duration::from_millis(200)).await;
-        let Some(raw) = eval_js_string(&window, "window.__muzeekaAudioResult").await else {
+        let Some(raw) = eval_js_string(&window, "window.__muzeekaAudioBatch").await else {
             continue;
         };
         let Some(value) = decode_eval_json(&raw) else {
             continue;
         };
-        // null while pending
         if value.is_null() {
             continue;
         }
@@ -2471,69 +2639,285 @@ true
                 .get("error")
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown webview error");
-            return Err(format!("VK webview resolve failed: {err}"));
+            return Err(format!("VK webview batch resolve failed: {err}"));
         }
 
-        if let Some(track_val) = value.get("track") {
-            if let Some(mut track) = track_from_api_object(track_val, user_id) {
-                if track.url.starts_with("http") {
-                    if track.owner_id == 0 {
-                        track.owner_id = owner_id;
+        let mut out = Vec::new();
+        if let Some(list) = value.get("tracks").and_then(|v| v.as_array()) {
+            for item in list {
+                if let Some(track) = track_from_api_object(item, user_id) {
+                    if has_playable_stream(&track) {
+                        out.push(track);
                     }
-                    if track.id == 0 {
-                        track.id = audio_id;
-                    }
-                    return Ok(track);
                 }
             }
         }
-
-        if let Some(text) = value.get("text").and_then(|v| v.as_str()) {
-            let tracks = tracks_from_reload_json(text, user_id);
-            if let Some(track) = tracks
-                .into_iter()
-                .find(|t| t.url.starts_with("http") && (t.id == audio_id || t.owner_id == owner_id))
-                .or_else(|| {
+        if out.is_empty() {
+            if let Some(text) = value.get("text").and_then(|v| v.as_str()) {
+                out.extend(
                     tracks_from_reload_json(text, user_id)
                         .into_iter()
-                        .find(|t| t.url.starts_with("http"))
-                })
-            {
-                return Ok(track);
+                        .filter(|t| has_playable_stream(t)),
+                );
             }
-            // Also try to find url field directly in payload text
-            if let Ok(re) = Regex::new(r#"https://[^"'\s]+(?:mp3|m3u8)[^"'\s]*"#) {
-                if let Some(m) = re.find(text) {
-                    let mut url = m.as_str().replace("\\/", "/");
-                    if url.contains("audio_api_unavailable") {
-                        if let Ok(decoded) = decode_audio_url(&url, user_id) {
-                            url = decoded;
-                        }
-                    }
-                    if url.contains("m3u8") {
-                        url = convert_m3u8_to_mp3(&url);
-                    }
-                    return Ok(VkTrack {
-                        owner_id,
-                        id: audio_id,
-                        title: format!("Track {audio_id}"),
-                        artist: "Unknown".into(),
-                        duration: 0,
-                        url,
-                        covers: Vec::new(),
-                    });
-                }
-            }
-            return Err(format!(
-                "VK returned no stream URL for audio{owner_id}_{audio_id} (webview). Response snippet: {}",
-                text.chars().take(180).collect::<String>()
-            ));
         }
-
-        return Err("VK webview resolve returned empty track data".to_string());
+        return Ok(out);
     }
 
-    Err("Timed out waiting for VK webview track resolve".to_string())
+    Err("Timed out waiting for VK webview batch resolve".to_string())
+}
+
+async fn webview_resolve_audio(
+    app: &AppHandle,
+    owner_id: i64,
+    audio_id: u64,
+    access_key: Option<&str>,
+    user_id: i64,
+) -> Result<VkTrack, String> {
+    let ak = access_key.unwrap_or("").trim();
+    let mut id_candidates = Vec::new();
+    if !ak.is_empty() {
+        id_candidates.push(format!("{owner_id}_{audio_id}_{ak}"));
+    }
+    id_candidates.push(format!("{owner_id}_{audio_id}"));
+
+    let tracks = webview_resolve_audios_batch(app, &id_candidates[..1], user_id).await?;
+    if let Some(mut track) = tracks.into_iter().find(|t| {
+        has_playable_stream(t) && (t.id == audio_id || (t.owner_id == owner_id && t.id != 0))
+    }) {
+        if track.owner_id == 0 {
+            track.owner_id = owner_id;
+        }
+        if track.id == 0 {
+            track.id = audio_id;
+        }
+        if has_playable_stream(&track) {
+            return Ok(track);
+        }
+    }
+
+    // Second try: alternate id form without access_key
+    if id_candidates.len() > 1 {
+        let tracks = webview_resolve_audios_batch(app, &id_candidates[1..], user_id).await?;
+        if let Some(mut track) = tracks.into_iter().find(has_playable_stream) {
+            if track.owner_id == 0 {
+                track.owner_id = owner_id;
+            }
+            if track.id == 0 {
+                track.id = audio_id;
+            }
+            return Ok(track);
+        }
+    }
+
+    Err(format!(
+        "VK returned no stream URL for audio{owner_id}_{audio_id} (webview)"
+    ))
+}
+
+fn merge_entry_meta(mut track: VkTrack, entry: &PlaylistEntry) -> VkTrack {
+    if (track.title.is_empty() || track.title == "Unknown" || track.title.starts_with("Track "))
+        && !entry.title.is_empty()
+        && entry.title != "Unknown"
+    {
+        track.title = entry.title.clone();
+    }
+    if (track.artist.is_empty() || track.artist == "Unknown")
+        && !entry.artist.is_empty()
+        && entry.artist != "Unknown"
+    {
+        track.artist = entry.artist.clone();
+    }
+    if track.duration == 0 && entry.duration > 0 {
+        track.duration = entry.duration;
+    }
+    if track.covers.is_empty() && !entry.covers.is_empty() {
+        track.covers = entry.covers.clone();
+    }
+    if track.owner_id == 0 {
+        track.owner_id = entry.owner_id;
+    }
+    if track.id == 0 {
+        track.id = entry.id;
+    }
+    track
+}
+
+/// Resolve playlist streams via session WebView (same path as single-track downloads).
+async fn fetch_playlist_tracks_async(
+    app: &AppHandle,
+    cookie: &str,
+    user_id: i64,
+    owner_id: i64,
+    playlist_id: u64,
+    access_hash: Option<&str>,
+) -> Result<(String, Option<String>, Vec<VkTrack>), String> {
+    let cookie = cookie.to_string();
+    let access_hash_owned = access_hash.map(|s| s.to_string());
+    let (title, thumb, entries) = tauri::async_runtime::spawn_blocking({
+        let cookie = cookie.clone();
+        move || {
+            fetch_playlist_catalog(
+                &cookie,
+                owner_id,
+                playlist_id,
+                access_hash_owned.as_deref(),
+                user_id,
+            )
+        }
+    })
+    .await
+    .map_err(|e| format!("Playlist catalog task failed: {e}"))??;
+
+    if entries.is_empty() {
+        return Err("VK playlist is empty or unavailable".to_string());
+    }
+
+    emit_progress(
+        app,
+        &format!("playlist:{owner_id}_{playlist_id}"),
+        &format!("Resolving {} tracks…", entries.len()),
+        Some(5.0),
+    );
+
+    let mut resolved: Vec<VkTrack> = Vec::new();
+    let mut unresolved: Vec<PlaylistEntry> = Vec::new();
+
+    // Prefer getById access_key form in batches of 8 (API is picky about long lists).
+    for (chunk_idx, chunk) in entries.chunks(8).enumerate() {
+        check_cancel()?;
+        let tokens: Vec<String> = chunk
+            .iter()
+            .flat_map(|e| {
+                // Prefer access_key form first for each track
+                let mut t = entry_getbyid_tokens(e);
+                // Also offer full reload token as last resort in same batch? No —
+                // mixed formats confuse getById. Use access tokens only here.
+                if t.is_empty() {
+                    t.push(format!("{}_{}", e.owner_id, e.id));
+                }
+                // Only first (best) token per track for batch
+                t.into_iter().take(1)
+            })
+            .collect();
+
+        let pct = 5.0 + (chunk_idx as f32 / (entries.len() as f32 / 8.0).max(1.0)) * 25.0;
+        emit_progress(
+            app,
+            &format!("playlist:{owner_id}_{playlist_id}"),
+            &format!(
+                "Resolving tracks {}–{}…",
+                chunk_idx * 8 + 1,
+                (chunk_idx * 8 + chunk.len()).min(entries.len())
+            ),
+            Some(pct.min(30.0)),
+        );
+
+        match webview_resolve_audios_batch(app, &tokens, user_id).await {
+            Ok(tracks) => {
+                let mut by_key: std::collections::HashMap<(i64, u64), VkTrack> =
+                    std::collections::HashMap::new();
+                for t in tracks {
+                    by_key.insert((t.owner_id, t.id), t);
+                }
+                for entry in chunk {
+                    if let Some(track) = by_key.remove(&(entry.owner_id, entry.id)) {
+                        if has_playable_stream(&track) {
+                            resolved.push(merge_entry_meta(track, entry));
+                            continue;
+                        }
+                    }
+                    // Match loosely if owner_id differs (rare)
+                    if let Some((_, track)) = by_key.iter().find(|(_, t)| t.id == entry.id) {
+                        let track = track.clone();
+                        if has_playable_stream(&track) {
+                            resolved.push(merge_entry_meta(track, entry));
+                            by_key.retain(|_, t| t.id != entry.id);
+                            continue;
+                        }
+                    }
+                    unresolved.push(entry.clone());
+                }
+            }
+            Err(err) => {
+                eprintln!("[vk_audio] batch resolve failed: {err}");
+                unresolved.extend(chunk.iter().cloned());
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+
+    // Per-track webview resolve for leftovers
+    let need_retry = std::mem::take(&mut unresolved);
+    let mut still_missing = Vec::new();
+    for entry in need_retry {
+        check_cancel()?;
+        match webview_resolve_audio(
+            app,
+            entry.owner_id,
+            entry.id,
+            if entry.access_key.is_empty() {
+                None
+            } else {
+                Some(entry.access_key.as_str())
+            },
+            user_id,
+        )
+        .await
+        {
+            Ok(track) if has_playable_stream(&track) => {
+                resolved.push(merge_entry_meta(track, &entry));
+            }
+            Ok(_) | Err(_) => {
+                still_missing.push(entry);
+            }
+        }
+    }
+
+    // Last resort: HTTP reload (often stubs — filter aggressively)
+    if !still_missing.is_empty() {
+        eprintln!(
+            "[vk_audio] {} playlist tracks left for HTTP fallback",
+            still_missing.len()
+        );
+        let tokens: Vec<String> = still_missing.iter().map(entry_id_token).collect();
+        let cookie2 = cookie.clone();
+        let http_tracks = tauri::async_runtime::spawn_blocking(move || {
+            reload_audio_ids(&cookie2, user_id, &tokens)
+        })
+        .await
+        .map_err(|e| format!("HTTP fallback task failed: {e}"))??;
+
+        let mut by_key: std::collections::HashMap<(i64, u64), VkTrack> =
+            std::collections::HashMap::new();
+        for t in http_tracks {
+            if has_playable_stream(&t) {
+                by_key.insert((t.owner_id, t.id), t);
+            }
+        }
+        for entry in &still_missing {
+            if let Some(track) = by_key.remove(&(entry.owner_id, entry.id)) {
+                resolved.push(merge_entry_meta(track, entry));
+            }
+        }
+    }
+
+    // Dedup by (owner, id), preserve order
+    let mut seen = std::collections::HashSet::new();
+    resolved.retain(|t| seen.insert((t.owner_id, t.id)));
+    resolved.retain(|t| has_playable_stream(t));
+
+    if resolved.is_empty() {
+        return Err(
+            "Could not resolve any playable streams for this VK playlist. \
+             Tracks look like restriction stubs — log out/in VK in Settings and try again."
+                .to_string(),
+        );
+    }
+
+    let thumb = thumb.or_else(|| resolved.first().and_then(|t| t.covers.first().cloned()));
+    Ok((title, thumb, resolved))
 }
 
 async fn fetch_single_track_async(
@@ -2546,13 +2930,27 @@ async fn fetch_single_track_async(
 ) -> Result<VkTrack, String> {
     // Primary: resolve inside authenticated WebView (same as VK Music Saver).
     match webview_resolve_audio(app, owner_id, audio_id, access_key, user_id).await {
-        Ok(track) if track.url.starts_with("http") => return Ok(track),
-        Ok(_) => {}
+        Ok(track) if has_playable_stream(&track) => return Ok(track),
+        Ok(track) => {
+            eprintln!(
+                "[vk_audio] webview returned stub/unplayable for {}_{}: {} — {}",
+                owner_id, audio_id, track.artist, track.title
+            );
+        }
         Err(err) => eprintln!("[vk_audio] webview resolve failed: {err}"),
     }
 
-    // Fallback: pure HTTP (often blocked by antibot)
-    fetch_single_track(cookie, user_id, owner_id, audio_id, access_key)
+    // Fallback: pure HTTP (often blocked by antibot / returns stubs)
+    let track = fetch_single_track(cookie, user_id, owner_id, audio_id, access_key)?;
+    if has_playable_stream(&track) {
+        Ok(track)
+    } else {
+        Err(format!(
+            "VK returned a restriction stub for audio{owner_id}_{audio_id} (\"{}\" — {}). \
+             Log out/in VK in Settings and try again.",
+            track.artist, track.title
+        ))
+    }
 }
 
 // ── Public API ───────────────────────────────────────────────────────────────
@@ -2600,16 +2998,21 @@ pub async fn probe_async(app: AppHandle, url: String) -> Result<YtdlpProbeResult
             playlist_id,
             access_hash,
         } => {
-            let cookie = load_cookie_header(&app)?;
-            let user_id = resolve_user_id_for_app(&app, &cookie).unwrap_or(0);
-            let (title, thumb, tracks) = tauri::async_runtime::spawn_blocking(move || {
-                fetch_playlist_tracks(
-                    &cookie,
-                    user_id,
-                    owner_id,
-                    playlist_id,
-                    access_hash.as_deref(),
-                )
+            let cookie = load_cookie_header(&app).unwrap_or(cookie);
+            let user_id = resolve_user_id_for_app(&app, &cookie).unwrap_or(user_id);
+            // Catalog only — no stream resolve (HTTP reload returns stubs).
+            let (title, thumb, entries) = tauri::async_runtime::spawn_blocking({
+                let cookie = cookie.clone();
+                let access_hash = access_hash.clone();
+                move || {
+                    fetch_playlist_catalog(
+                        &cookie,
+                        owner_id,
+                        playlist_id,
+                        access_hash.as_deref(),
+                        user_id,
+                    )
+                }
             })
             .await
             .map_err(|e| format!("Playlist task failed: {e}"))??;
@@ -2618,9 +3021,9 @@ pub async fn probe_async(app: AppHandle, url: String) -> Result<YtdlpProbeResult
                 title,
                 uploader: None,
                 duration_secs: None,
-                thumbnail: thumb.or_else(|| tracks.first().and_then(|t| t.covers.first().cloned())),
+                thumbnail: thumb.or_else(|| entries.first().and_then(|e| e.covers.first().cloned())),
                 is_playlist: true,
-                entry_count: Some(tracks.len() as u32),
+                entry_count: Some(entries.len() as u32),
             })
         }
     }
@@ -2670,24 +3073,47 @@ pub async fn download_async(
                     "This is a VK playlist. Confirm download to fetch all tracks.".to_string(),
                 );
             }
-            let cookie2 = cookie.clone();
-            tauri::async_runtime::spawn_blocking(move || {
-                fetch_playlist_tracks(
-                    &cookie2,
-                    user_id,
-                    owner_id,
-                    playlist_id,
-                    access_hash.as_deref(),
-                )
-                .map(|(_t, _th, tracks)| tracks)
-            })
-            .await
-            .map_err(|e| format!("Playlist task failed: {e}"))??
+            emit_progress(
+                &app,
+                &url,
+                "Loading VK playlist…",
+                Some(3.0),
+            );
+            let (_title, _thumb, tracks) = fetch_playlist_tracks_async(
+                &app,
+                &cookie,
+                user_id,
+                owner_id,
+                playlist_id,
+                access_hash.as_deref(),
+            )
+            .await?;
+            tracks
         }
     };
 
+    // Drop restriction stubs ("listen in the official app") if any slipped through.
+    let tracks: Vec<VkTrack> = tracks
+        .into_iter()
+        .filter(|t| {
+            if has_playable_stream(t) {
+                true
+            } else {
+                eprintln!(
+                    "[vk_audio] skip stub {}_{}: {} — {}",
+                    t.owner_id, t.id, t.artist, t.title
+                );
+                false
+            }
+        })
+        .collect();
+
     if tracks.is_empty() {
-        return Err("No VK tracks to download".to_string());
+        return Err(
+            "No playable VK tracks to download (all looked like restriction stubs). \
+             Re-login to VK in Settings and try again."
+                .to_string(),
+        );
     }
 
     let total = tracks.len();

@@ -28,6 +28,18 @@
   let vkAuthBusy = $state(false);
   let vkAuthError = $state<string | null>(null);
 
+  let coverRebuildBusy = $state(false);
+  let coverRebuildMsg = $state<string | null>(null);
+  let coverRebuildError = $state<string | null>(null);
+
+  interface CoverRebuildStats {
+    cleared_files: number;
+    track_covers: number;
+    unique_images: number;
+    playlist_covers: number;
+    errors: number;
+  }
+
   // Prevent white flash when the window becomes visible
   if (typeof document !== 'undefined') {
     document.documentElement.style.setProperty('background-color', '#0a0a0f', 'important');
@@ -129,6 +141,28 @@
     if (status.user_id) return `id${status.user_id}`;
     return 'Logged in';
   }
+
+  async function rebuildCovers() {
+    if (coverRebuildBusy) return;
+    coverRebuildBusy = true;
+    coverRebuildMsg = null;
+    coverRebuildError = null;
+    try {
+      const stats = await invoke<CoverRebuildStats>('library_rebuild_covers');
+      const parts = [
+        `cleared ${stats.cleared_files}`,
+        `tracks ${stats.track_covers}`,
+        `unique images ${stats.unique_images}`,
+        `playlists ${stats.playlist_covers}`,
+      ];
+      if (stats.errors > 0) parts.push(`errors ${stats.errors}`);
+      coverRebuildMsg = `Done — ${parts.join(' · ')}. Same album art is stored once.`;
+    } catch (e) {
+      coverRebuildError = typeof e === 'string' ? e : String(e);
+    } finally {
+      coverRebuildBusy = false;
+    }
+  }
 </script>
 
 <div class="settings-window" style="background-color: #0a0a0f;">
@@ -222,6 +256,30 @@
                 />
                 <span>Enabled</span>
               </label>
+            </div>
+            <div class="card-row card-row-stack">
+              <div>
+                <div class="card-label">Cover art cache</div>
+                <div class="card-value">
+                  Rebuild as WebP, dedupe identical album art (one file per unique image)
+                </div>
+                {#if coverRebuildMsg}
+                  <div class="card-value card-value-ok">{coverRebuildMsg}</div>
+                {/if}
+                {#if coverRebuildError}
+                  <div class="card-value card-value-error">{coverRebuildError}</div>
+                {/if}
+              </div>
+              <div class="card-actions">
+                <button
+                  type="button"
+                  class="action-btn"
+                  disabled={coverRebuildBusy}
+                  onclick={() => void rebuildCovers()}
+                >
+                  {coverRebuildBusy ? 'Rebuilding…' : 'Rebuild covers'}
+                </button>
+              </div>
             </div>
           </div>
 
@@ -388,6 +446,11 @@
 
   .card-value-error {
     color: #f07178;
+    margin-top: 4px;
+  }
+
+  .card-value-ok {
+    color: #7fd99a;
     margin-top: 4px;
   }
 

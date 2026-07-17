@@ -1,4 +1,4 @@
-import { prefetchCoverPaths } from '$lib/coverCache';
+import { clearCoverSrcCache, prefetchCoverPaths } from '$lib/coverCache';
 import { collectPlaylistCoverPaths } from '$lib/playlistCover';
 import { setupTaskbar } from '$lib/taskbar';
 import { invoke } from '@tauri-apps/api/core';
@@ -424,6 +424,48 @@ async function enrichTrackMetadata() {
     console.error('Failed to fetch track metadata:', e);
   }
 
+}
+
+/** Reload playlists + covers after Settings → Rebuild covers. */
+async function refreshCoversAfterRebuild() {
+  clearCoverSrcCache();
+  coverCacheValidated = false;
+  try {
+    const data = await invoke<PlaylistsData>('playlists_load');
+    const byId = new Map((data.playlists ?? []).map((p) => [p.id, p]));
+    playlists = playlists.map((local) => {
+      const remote = byId.get(local.id);
+      if (!remote) return local;
+      const remoteByPath = new Map(remote.tracks.map((t) => [t.path, t]));
+      return {
+        ...local,
+        cover_path: remote.cover_path ?? null,
+        tracks: local.tracks.map((t) => {
+          const r = remoteByPath.get(t.path);
+          if (!r) return { ...t, cover_path: null, cover_path_full: null };
+          return {
+            ...t,
+            cover_path: r.cover_path,
+            cover_path_full: r.cover_path_full,
+          };
+        }),
+      };
+    });
+    // Also pick up playlists that only exist on disk (shouldn't normally differ).
+    for (const remote of data.playlists ?? []) {
+      if (!playlists.some((p) => p.id === remote.id)) {
+        playlists = [...playlists, repairPlaylistTracks(remote)];
+      }
+    }
+    coverCacheValidated = false;
+    await enrichTrackMetadata();
+    prefetchCoverPaths([
+      ...playlists.flatMap((p) => p.tracks.map((t) => t.cover_path)),
+      ...collectPlaylistCoverPaths(playlists),
+    ]);
+  } catch (e) {
+    console.error('Failed to refresh covers after rebuild:', e);
+  }
 }
 
 function findPlaylistForTrack(path: string): string | null {
@@ -1530,6 +1572,10 @@ function setupListeners() {
 
   listen<{ is_playing: boolean; is_paused: boolean }>('player:state', (event) => {
     applyBackendPlaybackState(event.payload);
+  });
+
+  listen('covers:rebuilt', () => {
+    void refreshCoversAfterRebuild();
   });
 
   listen<{

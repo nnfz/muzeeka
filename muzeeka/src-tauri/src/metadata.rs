@@ -8,15 +8,20 @@ use lofty::file::{AudioFile, TaggedFile, TaggedFileExt};
 use lofty::picture::{MimeType, Picture, PictureType};
 use lofty::read_from_path;
 use lofty::tag::{Accessor, Tag, TagType};
+use serde::Serialize;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashSet;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::OnceLock;
 
 static COVER_CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();
 static PLAYLIST_COVER_DIR: OnceLock<PathBuf> = OnceLock::new();
+/// Bundled ffmpeg binary (for GIF → animated WebP). Set once at app startup.
+static FFMPEG_BIN: OnceLock<Option<PathBuf>> = OnceLock::new();
 
 const PLAYLIST_COVER_SIZE: u32 = 256;
 const MAX_PLAYLIST_GIF_BYTES: u64 = 20 * 1024 * 1024;
@@ -55,6 +60,15 @@ pub fn init_cover_cache(app_data_dir: PathBuf) {
     let playlist_covers = app_data_dir.join("playlist_covers");
     let _ = fs::create_dir_all(&playlist_covers);
     let _ = PLAYLIST_COVER_DIR.set(playlist_covers);
+}
+
+/// Register the ffmpeg binary used for animated GIF → WebP conversion.
+pub fn set_ffmpeg_bin(path: Option<PathBuf>) {
+    let _ = FFMPEG_BIN.set(path);
+}
+
+fn ffmpeg_bin() -> Option<&'static Path> {
+    FFMPEG_BIN.get().and_then(|p| p.as_deref())
 }
 
 fn clean_tag_value(value: &str) -> String {
@@ -121,21 +135,15 @@ fn is_cover_cache_path(path: &str) -> bool {
     Path::new(path).starts_with(cache_dir)
 }
 
-fn mime_to_ext(mime: &str) -> &str {
-    match mime {
-        "image/png" => "png",
-        "image/gif" => "gif",
-        "image/bmp" => "bmp",
-        "image/webp" => "webp",
-        _ => "jpg",
-    }
-}
-
 fn guess_mime(data: &[u8]) -> String {
     if data.len() >= 4 && data[..4] == [0x89, b'P', b'N', b'G'] {
         "image/png".to_string()
+    } else if data.len() >= 12 && data[..4] == *b"RIFF" && data[8..12] == *b"WEBP" {
+        "image/webp".to_string()
     } else if data.len() >= 3 && data[..3] == [0xFF, 0xD8, 0xFF] {
         "image/jpeg".to_string()
+    } else if data.len() >= 6 && (&data[..6] == b"GIF87a" || &data[..6] == b"GIF89a") {
+        "image/gif".to_string()
     } else {
         "image/jpeg".to_string()
     }
@@ -188,44 +196,151 @@ fn pick_cover_picture(tag: &Tag) -> Option<(&[u8], String)> {
     Some((data, mime))
 }
 
-fn thumb_cache_path(audio_path: &Path, suffix: &str) -> Option<PathBuf> {
-    let cache_dir = COVER_CACHE_DIR.get()?;
-    Some(
-        cache_dir.join(format!(
-            "{}-{}-thumb.jpg",
-            cache_key(audio_path),
-            suffix
-        )),
-    )
+/// Stable content id for cover bytes (FNV-1a 64 + length). Same APIC → same id
+/// across tracks, so album art is stored once.
+fn cover_content_id(data: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &b in data {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    // Mix length so equal-prefix images of different sizes never collide.
+    hash ^= data.len() as u64;
+    hash = hash.wrapping_mul(0x100000001b3);
+    format!("{hash:016x}")
 }
 
-fn full_cache_path(audio_path: &Path, suffix: &str, ext: &str) -> Option<PathBuf> {
+fn content_thumb_path(content_id: &str) -> Option<PathBuf> {
     let cache_dir = COVER_CACHE_DIR.get()?;
-    Some(
-        cache_dir.join(format!(
-            "{}-{}-full.{}",
-            cache_key(audio_path),
-            suffix,
-            ext
-        )),
-    )
+    Some(cache_dir.join(format!("c-{content_id}-thumb.webp")))
 }
 
-fn cache_full_cover_bytes(
-    audio_path: &Path,
-    data: &[u8],
-    mime: &str,
-    suffix: &str,
-) -> Option<String> {
-    let ext = mime_to_ext(mime);
-    let cache_path = full_cache_path(audio_path, suffix, ext)?;
+fn content_full_path(content_id: &str) -> Option<PathBuf> {
+    let cache_dir = COVER_CACHE_DIR.get()?;
+    Some(cache_dir.join(format!("c-{content_id}-full.webp")))
+}
 
-    if cache_path.exists() {
-        return Some(cache_path.to_string_lossy().to_string());
+/// Tiny per-track pointer so we can resolve covers without re-parsing tags
+/// when the audio file hasn't changed.
+fn track_cover_ref_path(audio_path: &Path, suffix: &str) -> Option<PathBuf> {
+    let cache_dir = COVER_CACHE_DIR.get()?;
+    Some(cache_dir.join(format!(
+        "t-{}-{suffix}.ref",
+        cache_key(audio_path)
+    )))
+}
+
+fn write_track_cover_ref(audio_path: &Path, suffix: &str, content_id: &str) {
+    let Some(ref_path) = track_cover_ref_path(audio_path, suffix) else {
+        return;
+    };
+    if let Some(parent) = ref_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(&ref_path, content_id.as_bytes());
+}
+
+fn read_track_cover_ref(audio_path: &Path, suffix: &str) -> Option<String> {
+    let ref_path = track_cover_ref_path(audio_path, suffix)?;
+    if !ref_path.is_file() {
+        return None;
     }
 
-    fs::write(&cache_path, data).ok()?;
-    Some(cache_path.to_string_lossy().to_string())
+    // Invalidate if the audio file is newer than the pointer (tags changed).
+    let audio_mtime = fs::metadata(audio_path).and_then(|m| m.modified()).ok();
+    let ref_mtime = fs::metadata(&ref_path).and_then(|m| m.modified()).ok();
+    if let (Some(audio_t), Some(ref_t)) = (audio_mtime, ref_mtime) {
+        if audio_t > ref_t {
+            return None;
+        }
+    }
+
+    let id = fs::read_to_string(&ref_path).ok()?;
+    let id = id.trim();
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(id.to_string())
+}
+
+fn paths_for_content_id(content_id: &str) -> Option<CoverPaths> {
+    let thumb = content_thumb_path(content_id)?;
+    if !thumb.is_file() {
+        return None;
+    }
+    let full = content_full_path(content_id)
+        .filter(|p| p.is_file())
+        .unwrap_or_else(|| thumb.clone());
+    Some(CoverPaths {
+        thumb: Some(thumb.to_string_lossy().to_string()),
+        full: Some(full.to_string_lossy().to_string()),
+    })
+}
+
+/// Ensure content-addressed full + thumb WebP exist for this image payload.
+fn ensure_content_cover_files(data: &[u8], _mime: &str) -> Option<(String, CoverPaths)> {
+    if data.is_empty() {
+        return None;
+    }
+    let content_id = cover_content_id(data);
+    let thumb_path = content_thumb_path(&content_id)?;
+    let full_path = content_full_path(&content_id)?;
+
+    // Both already on disk — shared by every track with this APIC.
+    if thumb_path.is_file() && full_path.is_file() {
+        return Some((
+            content_id,
+            CoverPaths {
+                thumb: Some(thumb_path.to_string_lossy().to_string()),
+                full: Some(full_path.to_string_lossy().to_string()),
+            },
+        ));
+    }
+
+    // Write full if missing
+    if !full_path.is_file() {
+        if data.len() >= 12 && data[..4] == *b"RIFF" && data[8..12] == *b"WEBP" {
+            if let Some(parent) = full_path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            fs::write(&full_path, data).ok()?;
+        } else {
+            let image = decode_image_bytes(data)?;
+            if !write_webp(&image, &full_path) {
+                return None;
+            }
+        }
+    }
+
+    // Write thumb if missing (decode once)
+    if !thumb_path.is_file() {
+        let image = if full_path.is_file() {
+            image::open(&full_path).ok().or_else(|| decode_image_bytes(data))
+        } else {
+            decode_image_bytes(data)
+        }?;
+        if !write_thumbnail_from_image(&image, &thumb_path) {
+            return None;
+        }
+    }
+
+    if !thumb_path.is_file() {
+        return None;
+    }
+
+    let full = if full_path.is_file() {
+        full_path.to_string_lossy().to_string()
+    } else {
+        thumb_path.to_string_lossy().to_string()
+    };
+
+    Some((
+        content_id,
+        CoverPaths {
+            thumb: Some(thumb_path.to_string_lossy().to_string()),
+            full: Some(full),
+        },
+    ))
 }
 
 fn decode_image_bytes(data: &[u8]) -> Option<image::DynamicImage> {
@@ -240,31 +355,26 @@ fn write_thumbnail_from_bytes(data: &[u8], dest: &Path) -> bool {
     write_thumbnail_from_image(&image, dest)
 }
 
-fn write_thumbnail_from_file(source: &Path, dest: &Path) -> bool {
-    let image = match image::open(source) {
-        Ok(image) => image,
-        Err(_) => return false,
-    };
-    write_thumbnail_from_image(&image, dest)
-}
-
 fn write_thumbnail_from_image(image: &image::DynamicImage, dest: &Path) -> bool {
-    write_resized_jpeg(image, dest, THUMB_SIZE)
+    write_resized_webp(image, dest, THUMB_SIZE)
 }
 
-fn write_resized_jpeg(image: &image::DynamicImage, dest: &Path, max_size: u32) -> bool {
+fn write_webp(image: &image::DynamicImage, dest: &Path) -> bool {
+    if let Some(parent) = dest.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    // image crate WebP encoder is lossless (VP8L) — smaller than PNG, no extra deps.
+    image.save_with_format(dest, ImageFormat::WebP).is_ok()
+}
+
+fn write_resized_webp(image: &image::DynamicImage, dest: &Path, max_size: u32) -> bool {
     let (width, height) = image.dimensions();
     let thumb = if width <= max_size && height <= max_size {
         image.clone()
     } else {
         image.resize(max_size, max_size, FilterType::Triangle)
     };
-
-    if let Some(parent) = dest.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-
-    thumb.save_with_format(dest, ImageFormat::Jpeg).is_ok()
+    write_webp(&thumb, dest)
 }
 
 fn sanitized_playlist_id(playlist_id: &str) -> Result<String, String> {
@@ -279,7 +389,11 @@ fn sanitized_playlist_id(playlist_id: &str) -> Result<String, String> {
     }
 }
 
-fn is_animated_gif(source: &Path) -> bool {
+fn is_gif_bytes(data: &[u8]) -> bool {
+    data.len() >= 6 && (&data[..6] == b"GIF87a" || &data[..6] == b"GIF89a")
+}
+
+fn is_gif_path(source: &Path) -> bool {
     if source
         .extension()
         .and_then(|ext| ext.to_str())
@@ -287,11 +401,7 @@ fn is_animated_gif(source: &Path) -> bool {
     {
         return true;
     }
-
-    let Ok(data) = fs::read(source) else {
-        return false;
-    };
-    data.len() >= 6 && (&data[..6] == b"GIF87a" || &data[..6] == b"GIF89a")
+    fs::read(source).map(|d| is_gif_bytes(&d)).unwrap_or(false)
 }
 
 fn clear_cached_playlist_covers(dir: &Path, safe_id: &str) {
@@ -303,8 +413,100 @@ fn clear_cached_playlist_covers(dir: &Path, safe_id: &str) {
     }
 }
 
+/// Convert a GIF (animated or still) to WebP. Prefers animated WebP via ffmpeg;
+/// falls back to a still WebP of the first frame.
+fn gif_file_to_webp(source_gif: &Path, dest_webp: &Path, max_edge: u32) -> Result<(), String> {
+    if let Some(ffmpeg) = ffmpeg_bin() {
+        if convert_gif_to_webp_ffmpeg(source_gif, dest_webp, ffmpeg, max_edge).is_ok() {
+            if dest_webp.is_file() {
+                return Ok(());
+            }
+        }
+    }
+
+    // Still fallback (first frame) when ffmpeg is missing or conversion fails.
+    let image = image::open(source_gif).map_err(|e| format!("Failed to open GIF: {e}"))?;
+    if !write_resized_webp(&image, dest_webp, max_edge) {
+        return Err("Failed to write still WebP from GIF".to_string());
+    }
+    Ok(())
+}
+
+fn convert_gif_to_webp_ffmpeg(
+    source_gif: &Path,
+    dest_webp: &Path,
+    ffmpeg: &Path,
+    max_edge: u32,
+) -> Result<(), String> {
+    if let Some(parent) = dest_webp.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    // Scale so the longer side ≤ max_edge; keep aspect ratio; preserve alpha when present.
+    let vf = format!(
+        "scale='min({max_edge},iw)':'min({max_edge},ih)':force_original_aspect_ratio=decrease:flags=lanczos"
+    );
+
+    let status = Command::new(ffmpeg)
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+        ])
+        .arg(source_gif)
+        .args(["-vf", &vf])
+        .args([
+            "-c:v",
+            "libwebp",
+            "-lossless",
+            "0",
+            "-q:v",
+            "80",
+            "-loop",
+            "0",
+            "-an",
+            "-vsync",
+            "0",
+        ])
+        .arg(dest_webp)
+        .status()
+        .map_err(|e| format!("Failed to run ffmpeg for WebP: {e}"))?;
+
+    if !status.success() {
+        // Retry without explicit codec (some builds auto-pick libwebp_anim).
+        let status2 = Command::new(ffmpeg)
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+            .arg(source_gif)
+            .args(["-vf", &vf, "-loop", "0", "-an", "-vsync", "0"])
+            .arg(dest_webp)
+            .status()
+            .map_err(|e| format!("Failed to run ffmpeg for WebP: {e}"))?;
+        if !status2.success() || !dest_webp.is_file() {
+            return Err("ffmpeg GIF→WebP conversion failed".to_string());
+        }
+    }
+
+    if !dest_webp.is_file() {
+        return Err("ffmpeg finished but WebP is missing".to_string());
+    }
+    Ok(())
+}
+
+fn gif_bytes_to_webp(gif_bytes: &[u8], dest_webp: &Path, max_edge: u32) -> Result<(), String> {
+    let tmp = std::env::temp_dir().join(format!(
+        "muzeeka-cover-{}.gif",
+        std::process::id()
+    ));
+    fs::write(&tmp, gif_bytes).map_err(|e| format!("Failed to write temp GIF: {e}"))?;
+    let result = gif_file_to_webp(&tmp, dest_webp, max_edge);
+    let _ = fs::remove_file(&tmp);
+    result
+}
+
 /// Copy and resize a user-picked image into the playlist cover cache.
-/// GIFs are copied as-is so animation is preserved.
+/// GIFs are converted to (animated) WebP.
 pub fn cache_playlist_cover(playlist_id: &str, source: &Path) -> Result<String, String> {
     if !source.is_file() {
         return Err("Cover image file not found".to_string());
@@ -316,8 +518,9 @@ pub fn cache_playlist_cover(playlist_id: &str, source: &Path) -> Result<String, 
         .ok_or_else(|| "Playlist cover cache not initialized".to_string())?;
 
     clear_cached_playlist_covers(dir, &safe_id);
+    let dest = dir.join(format!("{safe_id}.webp"));
 
-    if is_animated_gif(source) {
+    if is_gif_path(source) {
         let size = fs::metadata(source)
             .map_err(|e| format!("Failed to read cover file: {e}"))?
             .len();
@@ -327,15 +530,12 @@ pub fn cache_playlist_cover(playlist_id: &str, source: &Path) -> Result<String, 
                 MAX_PLAYLIST_GIF_BYTES / (1024 * 1024)
             ));
         }
-
-        let dest = dir.join(format!("{safe_id}.gif"));
-        fs::copy(source, &dest).map_err(|e| format!("Failed to copy GIF cover: {e}"))?;
+        gif_file_to_webp(source, &dest, PLAYLIST_COVER_SIZE)?;
         return Ok(dest.to_string_lossy().to_string());
     }
 
-    let dest = dir.join(format!("{safe_id}.jpg"));
     let image = image::open(source).map_err(|e| format!("Failed to open image: {e}"))?;
-    if !write_resized_jpeg(&image, &dest, PLAYLIST_COVER_SIZE) {
+    if !write_resized_webp(&image, &dest, PLAYLIST_COVER_SIZE) {
         return Err("Failed to write playlist cover".to_string());
     }
 
@@ -383,24 +583,22 @@ pub fn cache_playlist_cover_from_url(playlist_id: &str, url: &str) -> Result<Str
         .ok_or_else(|| "Playlist cover cache not initialized".to_string())?;
 
     clear_cached_playlist_covers(dir, &safe_id);
+    let dest = dir.join(format!("{safe_id}.webp"));
 
-    // Animated GIF: keep as-is
-    if bytes.len() >= 6 && (&bytes[0..6] == b"GIF87a" || &bytes[0..6] == b"GIF89a") {
+    if is_gif_bytes(&bytes) {
         if bytes.len() as u64 > MAX_PLAYLIST_GIF_BYTES {
             return Err(format!(
                 "GIF is too large (max {} MB)",
                 MAX_PLAYLIST_GIF_BYTES / (1024 * 1024)
             ));
         }
-        let dest = dir.join(format!("{safe_id}.gif"));
-        fs::write(&dest, &bytes).map_err(|e| format!("Failed to write GIF cover: {e}"))?;
+        gif_bytes_to_webp(&bytes, &dest, PLAYLIST_COVER_SIZE)?;
         return Ok(dest.to_string_lossy().to_string());
     }
 
-    let dest = dir.join(format!("{safe_id}.jpg"));
     let image =
         image::load_from_memory(&bytes).map_err(|e| format!("Failed to decode cover: {e}"))?;
-    if !write_resized_jpeg(&image, &dest, PLAYLIST_COVER_SIZE) {
+    if !write_resized_webp(&image, &dest, PLAYLIST_COVER_SIZE) {
         return Err("Failed to write playlist cover".to_string());
     }
 
@@ -417,73 +615,226 @@ pub fn remove_playlist_cover_file(playlist_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn cache_cover_bytes(audio_path: &Path, data: &[u8], mime: &str, suffix: &str) -> CoverPaths {
-    let mut paths = CoverPaths::default();
-    let cache_path = thumb_cache_path(audio_path, suffix);
+// ── Cover cache rebuild ──────────────────────────────────────────────────────
 
-    // Fast path: thumb + full already on disk — never re-decode the embedded JPEG.
-    // read_metadata is called often (Discord RPC, enrichment); decoding 1200² covers
-    // every time was a free main-thread stall for tracks with large APIC frames.
-    if let Some(ref thumb_path) = cache_path {
-        if thumb_path.exists() {
-            paths.thumb = Some(thumb_path.to_string_lossy().to_string());
-            paths.full = cache_full_cover_bytes(audio_path, data, mime, suffix)
-                .or_else(|| paths.thumb.clone());
-            return paths;
+#[derive(Debug, Clone, Serialize)]
+pub struct CoverRebuildStats {
+    pub cleared_files: u32,
+    pub track_covers: u32,
+    /// Unique full-size WebP images after dedup (c-*-full.webp).
+    pub unique_images: u32,
+    pub playlist_covers: u32,
+    pub errors: u32,
+}
+
+fn clear_dir_files(dir: &Path) -> u32 {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut n = 0u32;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() && fs::remove_file(&path).is_ok() {
+            n += 1;
         }
     }
+    n
+}
 
-    let Some(image) = decode_image_bytes(data) else {
-        return paths;
+/// Wipe track cover cache, re-extract from audio tags, convert playlist GIFs → WebP.
+/// Mutates `playlist_cover_updates` with playlist_id → new cover path.
+pub fn rebuild_cover_cache(
+    track_paths: &[String],
+    playlist_covers: &[(String, Option<String>)],
+) -> Result<(CoverRebuildStats, Vec<(String, Option<String>)>), String> {
+    let mut stats = CoverRebuildStats {
+        cleared_files: 0,
+        track_covers: 0,
+        unique_images: 0,
+        playlist_covers: 0,
+        errors: 0,
     };
 
-    if let Some(cache_path) = cache_path {
-        if !write_thumbnail_from_image(&image, &cache_path) {
-            return paths;
-        }
-        if cache_path.exists() {
-            paths.thumb = Some(cache_path.to_string_lossy().to_string());
+    if let Some(dir) = COVER_CACHE_DIR.get() {
+        stats.cleared_files += clear_dir_files(dir);
+        let _ = fs::create_dir_all(dir);
+    }
+
+    // Unique real audio paths (cue virtual paths → audio file).
+    let mut unique: HashSet<PathBuf> = HashSet::new();
+    for raw in track_paths {
+        let path = if crate::cue::is_cue_track_path(raw) {
+            crate::cue::parse_virtual_cue_path(raw)
+                .map(|(audio, _)| PathBuf::from(audio))
+                .unwrap_or_else(|| PathBuf::from(raw))
+        } else {
+            PathBuf::from(raw)
+        };
+        if path.is_file() {
+            unique.insert(path);
         }
     }
 
-    paths.full = cache_full_cover_bytes(audio_path, data, mime, suffix);
+    for path in &unique {
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("track");
+        let meta = read_metadata(path, file_name);
+        if meta.cover_path.is_some() || meta.cover_path_full.is_some() {
+            stats.track_covers += 1;
+        }
+    }
+
+    // Count shared content images after rebuild.
+    if let Some(dir) = COVER_CACHE_DIR.get() {
+        if let Ok(entries) = fs::read_dir(dir) {
+            stats.unique_images = entries
+                .flatten()
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .is_some_and(|n| n.starts_with("c-") && n.ends_with("-full.webp"))
+                })
+                .count() as u32;
+        }
+    }
+
+    // Playlist covers: convert legacy gif/jpg/png → webp, refresh paths.
+    let mut cover_updates: Vec<(String, Option<String>)> = Vec::new();
+    let pl_dir = PLAYLIST_COVER_DIR.get();
+
+    for (playlist_id, old_path) in playlist_covers {
+        let Ok(safe_id) = sanitized_playlist_id(playlist_id) else {
+            stats.errors += 1;
+            cover_updates.push((playlist_id.clone(), old_path.clone()));
+            continue;
+        };
+
+        let Some(dir) = pl_dir else {
+            cover_updates.push((playlist_id.clone(), old_path.clone()));
+            continue;
+        };
+
+        // Prefer existing file referenced by playlist; else look for any cached extension.
+        let mut source: Option<PathBuf> = old_path
+            .as_ref()
+            .map(PathBuf::from)
+            .filter(|p| p.is_file());
+
+        if source.is_none() {
+            for ext in ["webp", "gif", "jpg", "jpeg", "png", "bmp"] {
+                let candidate = dir.join(format!("{safe_id}.{ext}"));
+                if candidate.is_file() {
+                    source = Some(candidate);
+                    break;
+                }
+            }
+        }
+
+        let Some(source) = source else {
+            cover_updates.push((playlist_id.clone(), None));
+            continue;
+        };
+
+        let dest = dir.join(format!("{safe_id}.webp"));
+        let is_already_webp = source
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("webp"))
+            && source == dest;
+
+        let ok = if is_gif_path(&source) {
+            gif_file_to_webp(&source, &dest, PLAYLIST_COVER_SIZE).is_ok()
+        } else if is_already_webp {
+            true
+        } else {
+            match image::open(&source) {
+                Ok(img) => write_resized_webp(&img, &dest, PLAYLIST_COVER_SIZE),
+                Err(_) => false,
+            }
+        };
+
+        if ok && dest.is_file() {
+            // Drop legacy non-webp siblings for this playlist.
+            for ext in ["jpg", "jpeg", "gif", "png", "bmp"] {
+                let legacy = dir.join(format!("{safe_id}.{ext}"));
+                if legacy != dest && legacy.is_file() {
+                    let _ = fs::remove_file(legacy);
+                    stats.cleared_files += 1;
+                }
+            }
+            stats.playlist_covers += 1;
+            cover_updates.push((
+                playlist_id.clone(),
+                Some(dest.to_string_lossy().to_string()),
+            ));
+        } else {
+            stats.errors += 1;
+            cover_updates.push((playlist_id.clone(), old_path.clone()));
+        }
+    }
+
+    Ok((stats, cover_updates))
+}
+
+/// Re-read cover paths for a track after cache rebuild (for playlists.json update).
+pub fn fresh_cover_paths_for_track(track_path: &str) -> (Option<String>, Option<String>) {
+    let path = if crate::cue::is_cue_track_path(track_path) {
+        if let Some((audio, _)) = crate::cue::parse_virtual_cue_path(track_path) {
+            PathBuf::from(audio)
+        } else {
+            PathBuf::from(track_path)
+        }
+    } else {
+        PathBuf::from(track_path)
+    };
+
+    if !path.is_file() {
+        return (None, None);
+    }
+
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("track");
+    let meta = read_metadata(&path, file_name);
+    (meta.cover_path, meta.cover_path_full)
+}
+
+fn cache_cover_bytes(audio_path: &Path, data: &[u8], mime: &str, suffix: &str) -> CoverPaths {
+    // Content-addressed: identical embedded art (same album) → one pair of WebP files.
+    let Some((content_id, paths)) = ensure_content_cover_files(data, mime) else {
+        return CoverPaths::default();
+    };
+    write_track_cover_ref(audio_path, suffix, &content_id);
     paths
 }
 
 fn cache_cover_file(audio_path: &Path, source: &Path) -> CoverPaths {
-    let mut paths = CoverPaths::default();
-    let cache_path = thumb_cache_path(audio_path, "nearby");
-
-    if let Some(cache_path) = cache_path {
-        let source_modified = fs::metadata(source).and_then(|m| m.modified()).ok();
-        let cache_modified = fs::metadata(&cache_path).and_then(|m| m.modified()).ok();
-        let needs_refresh = !cache_path.exists()
-            || match (source_modified, cache_modified) {
-                (Some(src), Some(cache)) => src > cache,
-                _ => true,
-            };
-
-        if needs_refresh {
-            if !write_thumbnail_from_file(source, &cache_path) {
-                fs::copy(source, &cache_path).ok();
+    // Fast path via track ref if still valid and source hasn't changed.
+    if let Some(content_id) = read_track_cover_ref(audio_path, "nearby") {
+        let source_mtime = fs::metadata(source).and_then(|m| m.modified()).ok();
+        let ref_path = track_cover_ref_path(audio_path, "nearby");
+        let ref_mtime = ref_path
+            .as_ref()
+            .and_then(|p| fs::metadata(p).and_then(|m| m.modified()).ok());
+        let source_fresh = match (source_mtime, ref_mtime) {
+            (Some(src), Some(r)) => src <= r,
+            _ => true,
+        };
+        if source_fresh {
+            if let Some(paths) = paths_for_content_id(&content_id) {
+                return paths;
             }
         }
-
-        if cache_path.exists() {
-            paths.thumb = Some(cache_path.to_string_lossy().to_string());
-        }
     }
 
-    if let Ok(data) = fs::read(source) {
-        let mime = mime_from_path(source);
-        paths.full = cache_full_cover_bytes(audio_path, &data, mime, "nearby");
-    }
-
-    if paths.full.is_none() {
-        paths.full = paths.thumb.clone();
-    }
-
-    paths
+    let Ok(data) = fs::read(source) else {
+        return CoverPaths::default();
+    };
+    let mime = mime_from_path(source);
+    cache_cover_bytes(audio_path, &data, mime, "nearby")
 }
 
 
@@ -555,17 +906,9 @@ fn extract_embedded_cover_id3(path: &Path) -> Option<CoverPaths> {
 }
 
 fn existing_embedded_cover_cache(path: &Path) -> Option<CoverPaths> {
-    let thumb = thumb_cache_path(path, "embedded").filter(|p| p.is_file())?;
-    let full = ["jpg", "jpeg", "png", "webp", "bmp", "gif"]
-        .into_iter()
-        .find_map(|ext| full_cache_path(path, "embedded", ext).filter(|p| p.is_file()));
-
-    Some(CoverPaths {
-        thumb: Some(thumb.to_string_lossy().to_string()),
-        full: full
-            .map(|p| p.to_string_lossy().to_string())
-            .or_else(|| Some(thumb.to_string_lossy().to_string())),
-    })
+    // Track pointer → shared content file (no ID3 re-parse, no re-encode).
+    let content_id = read_track_cover_ref(path, "embedded")?;
+    paths_for_content_id(&content_id)
 }
 
 fn extract_nearby_cover(path: &Path) -> CoverPaths {
