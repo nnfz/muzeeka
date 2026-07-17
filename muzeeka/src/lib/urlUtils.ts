@@ -25,7 +25,8 @@ export function looksLikeMediaUrl(text: string): boolean {
     'soundcloud.com', 'bandcamp.com', 'vimeo.com',
     'twitch.tv', 'tiktok.com', 'instagram.com',
     'twitter.com', 'x.com', 'facebook.com',
-    'vk.com', 'rutube.ru', 'dailymotion.com',
+    'vk.com', 'vk.ru', 'm.vk.com', 'm.vk.ru',
+    'rutube.ru', 'dailymotion.com',
     'mixcloud.com', 'audiomack.com', 'deezer.com',
     'spotify.com', 'nicovideo.jp', 'bilibili.com',
   ];

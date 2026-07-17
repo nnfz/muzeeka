@@ -8,8 +8,15 @@
   type Section = 'general' | 'audio' | 'about';
   import { getVersion, getName } from '@tauri-apps/api/app';
   import { invoke } from '@tauri-apps/api/core';
+  import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { open } from '@tauri-apps/plugin-dialog';
   import { onMount } from 'svelte';
+
+  interface VkAuthStatus {
+    logged_in: boolean;
+    user_id: number | null;
+    user_name: string | null;
+  }
 
   const settings = getSettingsStore();
 
@@ -17,6 +24,9 @@
   let appVersion = $state('0.1.0');
   let appName = $state('muzeeka');
   let playlists = $state<{ id: string; name: string }[]>([]);
+  let vkAuth = $state<VkAuthStatus>({ logged_in: false, user_id: null, user_name: null });
+  let vkAuthBusy = $state(false);
+  let vkAuthError = $state<string | null>(null);
 
   // Prevent white flash when the window becomes visible
   if (typeof document !== 'undefined') {
@@ -26,20 +36,49 @@
     }
   }
 
-  onMount(async () => {
+  async function refreshVkAuth() {
     try {
-      appVersion = await getVersion();
-      appName = await getName();
-    } catch {
-      // fallback already set
+      vkAuth = await invoke<VkAuthStatus>('vk_auth_status');
+      vkAuthError = null;
+    } catch (e) {
+      vkAuth = { logged_in: false, user_id: null, user_name: null };
+      vkAuthError = typeof e === 'string' ? e : String(e);
     }
+  }
 
-    try {
-      const data = await invoke<{ playlists: { id: string; name: string }[] }>('playlists_load');
-      playlists = (data.playlists ?? []).map((p) => ({ id: p.id, name: p.name }));
-    } catch {
-      playlists = [];
-    }
+  onMount(() => {
+    let unlisten: UnlistenFn | null = null;
+
+    void (async () => {
+      try {
+        appVersion = await getVersion();
+        appName = await getName();
+      } catch {
+        // fallback already set
+      }
+
+      try {
+        const data = await invoke<{ playlists: { id: string; name: string }[] }>('playlists_load');
+        playlists = (data.playlists ?? []).map((p) => ({ id: p.id, name: p.name }));
+      } catch {
+        playlists = [];
+      }
+
+      await refreshVkAuth();
+
+      try {
+        unlisten = await listen<VkAuthStatus>('vk:auth-changed', (event) => {
+          vkAuth = event.payload;
+          vkAuthError = null;
+        });
+      } catch {
+        // non-fatal
+      }
+    })();
+
+    return () => {
+      unlisten?.();
+    };
   });
 
   async function pickDownloadFolder() {
@@ -51,6 +90,44 @@
 
   function clearDownloadFolder() {
     settings.setDownloadFolder(null);
+  }
+
+  async function vkLogin() {
+    if (vkAuthBusy) return;
+    vkAuthBusy = true;
+    vkAuthError = null;
+    try {
+      vkAuth = await invoke<VkAuthStatus>('vk_login');
+    } catch (e) {
+      vkAuthError = typeof e === 'string' ? e : String(e);
+      await refreshVkAuth();
+    } finally {
+      vkAuthBusy = false;
+    }
+  }
+
+  async function vkLogout() {
+    if (vkAuthBusy) return;
+    vkAuthBusy = true;
+    vkAuthError = null;
+    try {
+      vkAuth = await invoke<VkAuthStatus>('vk_logout');
+    } catch (e) {
+      vkAuthError = typeof e === 'string' ? e : String(e);
+      await refreshVkAuth();
+    } finally {
+      vkAuthBusy = false;
+    }
+  }
+
+  function vkStatusLabel(status: VkAuthStatus): string {
+    if (!status.logged_in) return 'Not logged in';
+    if (status.user_name && status.user_id) {
+      return `${status.user_name} (id${status.user_id})`;
+    }
+    if (status.user_name) return status.user_name;
+    if (status.user_id) return `id${status.user_id}`;
+    return 'Logged in';
   }
 </script>
 
@@ -145,6 +222,47 @@
                 />
                 <span>Enabled</span>
               </label>
+            </div>
+          </div>
+
+          <h2 class="section-title section-title-spaced">VK Music</h2>
+          <p class="section-desc">
+            Log in to download tracks and playlists from vk.com / vk.ru. Session is stored only on this device.
+          </p>
+
+          <div class="settings-card">
+            <div class="card-row card-row-stack">
+              <div>
+                <div class="card-label">Account</div>
+                <div class="card-value">
+                  {vkStatusLabel(vkAuth)}
+                </div>
+                {#if vkAuthError}
+                  <div class="card-value card-value-error">{vkAuthError}</div>
+                {/if}
+              </div>
+              <div class="card-actions">
+                {#if vkAuth.logged_in}
+                  <div class="card-badge">Connected</div>
+                  <button
+                    type="button"
+                    class="action-btn"
+                    disabled={vkAuthBusy}
+                    onclick={() => void vkLogout()}
+                  >
+                    {vkAuthBusy ? 'Working…' : 'Log out'}
+                  </button>
+                {:else}
+                  <button
+                    type="button"
+                    class="action-btn action-btn-primary"
+                    disabled={vkAuthBusy}
+                    onclick={() => void vkLogin()}
+                  >
+                    {vkAuthBusy ? 'Waiting…' : 'Log in with VK'}
+                  </button>
+                {/if}
+              </div>
             </div>
           </div>
 
@@ -263,6 +381,25 @@
 
 <style>
   @import './SettingsWindow.css';
+
+  .section-title-spaced {
+    margin-top: 22px;
+  }
+
+  .card-value-error {
+    color: #f07178;
+    margin-top: 4px;
+  }
+
+  .action-btn-primary {
+    background: var(--accent-soft);
+    color: var(--accent);
+    border-color: transparent;
+  }
+
+  .action-btn-primary:disabled {
+    opacity: 0.6;
+  }
 
   .card-row-stack {
     flex-wrap: wrap;

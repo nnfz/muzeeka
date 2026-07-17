@@ -39,6 +39,8 @@ discord-rich-presence = "1.1"
 ureq = { version = "3", features = ["json"] }
 urlencoding = "2"
 base64 = "0.22"
+regex = "1"
+rookie = "0.5"
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync"] }
 tower-http = { version = "0.6", features = ["cors"] }

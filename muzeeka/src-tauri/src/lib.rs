@@ -23,6 +23,7 @@ mod remote_control;
 mod remote_server;
 mod settings;
 mod taskbar_handler;
+mod vk_audio;
 mod ytdlp;
 
 use discord_rpc::DiscordPresence;
@@ -271,6 +272,9 @@ pub fn run() {
             commands::ytdlp_download,
             commands::ytdlp_cancel,
             commands::ytdlp_default_download_dir,
+            commands::vk_auth_status,
+            commands::vk_login,
+            commands::vk_logout,
             file_drag::start_file_drag,
         ])
         .run(tauri::generate_context!())

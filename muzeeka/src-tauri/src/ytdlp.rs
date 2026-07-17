@@ -67,11 +67,16 @@ static ACTIVE_CHILD: Mutex<Option<Child>> = Mutex::new(None);
 
 pub fn cancel_download() {
     DOWNLOAD_CANCELLED.store(true, Ordering::SeqCst);
+    crate::vk_audio::cancel();
     if let Ok(mut guard) = ACTIVE_CHILD.lock() {
         if let Some(mut child) = guard.take() {
             let _ = child.kill();
         }
     }
+}
+
+pub fn is_download_cancelled() -> bool {
+    DOWNLOAD_CANCELLED.load(Ordering::SeqCst)
 }
 
 fn ytdlp_binary_name() -> &'static str {
@@ -200,7 +205,8 @@ pub fn is_supported_url(url: &str) -> bool {
         "soundcloud.com", "bandcamp.com", "vimeo.com",
         "twitch.tv", "tiktok.com", "instagram.com",
         "twitter.com", "x.com", "facebook.com",
-        "vk.com", "rutube.ru", "dailymotion.com",
+        "vk.com", "vk.ru", "m.vk.com", "m.vk.ru",
+        "rutube.ru", "dailymotion.com",
         "mixcloud.com", "audiomack.com", "deezer.com",
         "spotify.com", "nicovideo.jp", "bilibili.com",
     ];
@@ -264,6 +270,8 @@ pub fn probe(app: &AppHandle, url: &str) -> Result<YtdlpProbeResult, String> {
     if !is_supported_url(trimmed) {
         return Err("URL is not recognized as a supported media link".to_string());
     }
+
+    // VK audio is handled asynchronously in commands (needs WebView session).
 
     let output = run_ytdlp(
         app,
@@ -360,6 +368,8 @@ pub fn download(
     if !is_supported_url(trimmed) {
         return Err("URL is not recognized as a supported media link".to_string());
     }
+
+    // VK audio is handled asynchronously in commands (needs WebView session).
 
     DOWNLOAD_CANCELLED.store(false, Ordering::SeqCst);
 

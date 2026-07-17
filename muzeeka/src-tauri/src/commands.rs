@@ -340,6 +340,9 @@ pub fn ytdlp_ffmpeg_available(app: AppHandle) -> bool {
 /// Probe a URL for title/metadata without downloading.
 #[tauri::command]
 pub async fn ytdlp_probe(app: AppHandle, url: String) -> Result<YtdlpProbeResult, String> {
+    if crate::vk_audio::is_vk_audio_url(&url) {
+        return crate::vk_audio::probe_async(app, url).await;
+    }
     tauri::async_runtime::spawn_blocking(move || ytdlp::probe(&app, &url))
         .await
         .map_err(|_| "Probe task failed".to_string())?
@@ -353,6 +356,15 @@ pub async fn ytdlp_download(
     output_dir: Option<String>,
     allow_playlist: Option<bool>,
 ) -> Result<YtdlpDownloadResult, String> {
+    if crate::vk_audio::is_vk_audio_url(&url) {
+        return crate::vk_audio::download_async(
+            app,
+            url,
+            output_dir,
+            allow_playlist.unwrap_or(false),
+        )
+        .await;
+    }
     tauri::async_runtime::spawn_blocking(move || {
         ytdlp::download(
             &app,
@@ -376,4 +388,23 @@ pub fn ytdlp_cancel() {
 pub fn ytdlp_default_download_dir(app: AppHandle) -> Result<String, String> {
     ytdlp::default_download_dir(&app)
         .map(|p| p.to_string_lossy().to_string())
+}
+
+// ── VK auth ───────────────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub fn vk_auth_status(app: AppHandle) -> crate::vk_audio::VkAuthStatus {
+    crate::vk_audio::auth_status(&app)
+}
+
+/// Open VK login window and wait until the user signs in.
+#[tauri::command]
+pub async fn vk_login(app: AppHandle) -> Result<crate::vk_audio::VkAuthStatus, String> {
+    crate::vk_audio::login(app).await
+}
+
+/// Clear saved VK session.
+#[tauri::command]
+pub async fn vk_logout(app: AppHandle) -> Result<crate::vk_audio::VkAuthStatus, String> {
+    crate::vk_audio::logout(app).await
 }
