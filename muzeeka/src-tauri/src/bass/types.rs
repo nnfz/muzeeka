@@ -99,6 +99,8 @@ pub const BASS_FX_FREESOURCE: DWORD = 0x10000;
 pub const BASS_ATTRIB_TEMPO: DWORD = 0x10000;
 pub const BASS_ATTRIB_TEMPO_PITCH: DWORD = 0x10001;
 pub const BASS_ATTRIB_TEMPO_FREQ: DWORD = 0x10002;
+/// SoundTouch option: reduce clicks when tempo changes (TRUE/FALSE as 1.0/0.0).
+pub const BASS_ATTRIB_TEMPO_OPTION_PREVENT_CLICK: DWORD = 0x10016;
 
 // ── Mixer (bassmix) ─────────────────────────────────────────────────────────
 pub const BASS_MIXER_END: DWORD = 0x10000;
