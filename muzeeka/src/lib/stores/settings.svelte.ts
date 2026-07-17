@@ -46,6 +46,9 @@ let discordRpcEnabled = $state(true);
 let defaultDownloadFolder = $state<string | null>(null);
 let isReady = $state(false);
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
+/** Coalesce slider spam so backend gets one settled target and a full smooth ramp. */
+let rateApplyTimer: ReturnType<typeof setTimeout> | null = null;
+let rateApplySeq = 0;
 
 function clampEqualizer(settings: EqualizerSettings): EqualizerSettings {
   return {
@@ -95,15 +98,44 @@ async function applyEqualizer(settings: EqualizerSettings) {
   scheduleSave();
 }
 
-async function applyPlaybackRate(rate: number) {
+/**
+ * Apply playback rate to the player.
+ * - UI updates immediately.
+ * - Backend is debounced while dragging so one full smooth ramp runs to the final value.
+ * - Pass `immediate: true` for presets / explicit commits.
+ */
+async function applyPlaybackRate(rate: number, opts?: { immediate?: boolean }) {
   const clamped = Math.max(0.25, Math.min(2, rate));
   playbackRate = clamped;
-  try {
-    await invoke('player_set_playback_rate', { rate: clamped });
-  } catch (e) {
-    console.error('Failed to set playback rate:', e);
+
+  const send = async (value: number) => {
+    const seq = ++rateApplySeq;
+    try {
+      await invoke('player_set_playback_rate', { rate: value });
+    } catch (e) {
+      console.error('Failed to set playback rate:', e);
+    }
+    // Only the latest request may schedule a settings write.
+    if (seq === rateApplySeq) {
+      scheduleSave();
+    }
+  };
+
+  if (rateApplyTimer) {
+    clearTimeout(rateApplyTimer);
+    rateApplyTimer = null;
   }
-  scheduleSave();
+
+  if (opts?.immediate) {
+    await send(clamped);
+    return;
+  }
+
+  // Trailing debounce: continuous slider input → one ramp after settle.
+  rateApplyTimer = setTimeout(() => {
+    rateApplyTimer = null;
+    void send(playbackRate);
+  }, 120);
 }
 
 async function applyPitchEnabled(enabled: boolean) {
@@ -255,8 +287,8 @@ export function createSettingsStore(ensurePlayerReady: () => Promise<void>) {
       scheduleSave();
     },
 
-    async setPlaybackRate(rate: number) {
-      await applyPlaybackRate(rate);
+    async setPlaybackRate(rate: number, opts?: { immediate?: boolean }) {
+      await applyPlaybackRate(rate, opts);
     },
     async setPitchEnabled(enabled: boolean) {
       await applyPitchEnabled(enabled);

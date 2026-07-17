@@ -26,10 +26,12 @@ pub struct BassLibrary {
     // ── Stream creation ───────────────────────────────────────────────────
     bass_stream_create_file:
         unsafe extern "system" fn(mem: BOOL, file: *const u16, offset: QWORD, length: QWORD, flags: DWORD) -> HSTREAM,
+    bass_stream_free: unsafe extern "system" fn(handle: HSTREAM) -> BOOL,
 
     // Music / tracker modules (MOD, XM, IT, S3M etc.)
     bass_music_load:
         unsafe extern "system" fn(mem: BOOL, file: *const u16, offset: QWORD, length: DWORD, flags: DWORD, freq: DWORD) -> HSTREAM,
+    bass_music_free: unsafe extern "system" fn(handle: HSTREAM) -> BOOL,
 
     // ── Channel control ───────────────────────────────────────────────────
     bass_channel_play: unsafe extern "system" fn(handle: DWORD, restart: BOOL) -> BOOL,
@@ -178,7 +180,9 @@ impl BassLibrary {
                 bass_free: load_fn!(lib, b"BASS_Free\0"),
                 bass_error_get_code: load_fn!(lib, b"BASS_ErrorGetCode\0"),
                 bass_stream_create_file: load_fn!(lib, b"BASS_StreamCreateFile\0"),
+                bass_stream_free: load_fn!(lib, b"BASS_StreamFree\0"),
                 bass_music_load: load_fn!(lib, b"BASS_MusicLoad\0"),
+                bass_music_free: load_fn!(lib, b"BASS_MusicFree\0"),
                 bass_channel_play: load_fn!(lib, b"BASS_ChannelPlay\0"),
                 bass_channel_pause: load_fn!(lib, b"BASS_ChannelPause\0"),
                 bass_channel_stop: load_fn!(lib, b"BASS_ChannelStop\0"),
@@ -339,6 +343,23 @@ impl BassLibrary {
     pub fn channel_stop(&self, handle: DWORD) -> Result<(), String> {
         let ok = unsafe { (self.bass_channel_stop)(handle) };
         if ok == 0 { Err(self.last_error_string()) } else { Ok(()) }
+    }
+
+    /// Free a stream or music handle. Tries StreamFree then MusicFree.
+    /// Tempo FX streams are also freed with StreamFree (without FREESOURCE the source stays).
+    pub fn channel_free(&self, handle: DWORD) -> Result<(), String> {
+        if handle == 0 {
+            return Ok(());
+        }
+        let ok = unsafe { (self.bass_stream_free)(handle) };
+        if ok != 0 {
+            return Ok(());
+        }
+        let ok = unsafe { (self.bass_music_free)(handle) };
+        if ok != 0 {
+            return Ok(());
+        }
+        Err(self.last_error_string())
     }
 
     pub fn channel_set_position(&self, handle: DWORD, pos: QWORD, mode: DWORD) -> Result<(), String> {

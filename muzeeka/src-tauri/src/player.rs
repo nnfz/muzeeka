@@ -34,10 +34,8 @@ pub struct TrackChangedPayload {
 // Spotify-like short musical fades (not on track changes)
 const PAUSE_FADE_MS: u32 = 220;
 const RESUME_FADE_MS: u32 = 180;
-/// Max duration for a smooth playback-rate transition (large jumps).
-const PLAYBACK_RATE_RAMP_MS: u32 = 600;
-/// Minimum slide time so BASS can interpolate FREQ/TEMPO without zipper noise.
-const PLAYBACK_RATE_SLIDE_MIN_MS: u32 = 30;
+/// Duration of a smooth playback-rate transition (presets, slider settle, etc.).
+const PLAYBACK_RATE_RAMP_MS: u32 = 1000;
 
 // For seek: we want it instant.
 // Very short hard mute only during the flush to hide any restart artifact.
@@ -1094,11 +1092,12 @@ impl Player {
             return;
         }
         if tracked_decode != 0 && tracked_decode != mixer_channel {
-            let _ = bass.channel_stop(mixer_channel);
-            let _ = bass.channel_stop(tracked_decode);
+            // Free tempo wrapper first (no FREESOURCE → source is not auto-freed).
+            let _ = bass.channel_free(mixer_channel);
+            let _ = bass.channel_free(tracked_decode);
             return;
         }
-        let _ = bass.channel_stop(mixer_channel);
+        let _ = bass.channel_free(mixer_channel);
     }
 
     fn decode_handle_for_channel(
@@ -1141,25 +1140,48 @@ impl Player {
         let _ = bass.channel_set_attribute(handle, bass::BASS_ATTRIB_FREQ, target);
     }
 
+    /// If FREQ is still the BASS default (0), materialize the real base Hz.
+    /// Sliding from 0 would ramp through near-silence instead of from 1.0×.
+    fn ensure_explicit_freq(bass: &BassLibrary, handle: u32) {
+        match bass.channel_get_attribute(handle, bass::BASS_ATTRIB_FREQ) {
+            Ok(freq) if freq > 1.0 => {}
+            _ => {
+                let base = Self::base_freq(bass, handle);
+                let _ = bass.channel_set_attribute(handle, bass::BASS_ATTRIB_FREQ, base);
+            }
+        }
+    }
+
     fn slide_freq_rate(bass: &BassLibrary, handle: u32, rate: f32, time_ms: u32) {
+        Self::ensure_explicit_freq(bass, handle);
         let target = Self::freq_rate_target(bass, handle, rate);
         if time_ms == 0 {
             let _ = bass.channel_set_attribute(handle, bass::BASS_ATTRIB_FREQ, target);
-        } else {
-            let _ = bass.channel_slide_attribute(handle, bass::BASS_ATTRIB_FREQ, target, time_ms);
+            return;
+        }
+        if bass
+            .channel_slide_attribute(handle, bass::BASS_ATTRIB_FREQ, target, time_ms)
+            .is_err()
+        {
+            let _ = bass.channel_set_attribute(handle, bass::BASS_ATTRIB_FREQ, target);
         }
     }
 
     fn slide_tempo_pct(bass: &BassLibrary, channel: u32, rate: f32, time_ms: u32) -> Result<(), String> {
         let tempo_pct = (rate - 1.0) * 100.0;
         if time_ms == 0 {
-            bass.channel_set_attribute(channel, bass::BASS_ATTRIB_TEMPO, tempo_pct)
-        } else {
-            bass.channel_slide_attribute(channel, bass::BASS_ATTRIB_TEMPO, tempo_pct, time_ms)
+            return bass.channel_set_attribute(channel, bass::BASS_ATTRIB_TEMPO, tempo_pct);
         }
+        if bass
+            .channel_slide_attribute(channel, bass::BASS_ATTRIB_TEMPO, tempo_pct, time_ms)
+            .is_err()
+        {
+            bass.channel_set_attribute(channel, bass::BASS_ATTRIB_TEMPO, tempo_pct)?;
+        }
+        Ok(())
     }
 
-    /// Read the rate BASS is currently at (including mid-slide), for proportional slide timing.
+    /// Read the rate BASS is currently producing (including mid-slide).
     fn read_current_rate(
         bass: &BassLibrary,
         channel: u32,
@@ -1183,18 +1205,6 @@ impl Player {
             Ok(freq) if freq <= 1.0 => 1.0,
             _ => fallback,
         }
-    }
-
-    fn rate_slide_ms(from: f32, to: f32) -> u32 {
-        let delta = (from - to).abs();
-        if delta < 0.0005 {
-            return 0;
-        }
-        // Scale duration by jump size so slider micro-steps stay tight but never hard-jump.
-        let scaled = (delta / 1.75) * PLAYBACK_RATE_RAMP_MS as f32;
-        scaled
-            .clamp(PLAYBACK_RATE_SLIDE_MIN_MS as f32, PLAYBACK_RATE_RAMP_MS as f32)
-            as u32
     }
 
     /// Build the channel that should be fed into the mixer for the given decode source.
@@ -1270,51 +1280,121 @@ impl Player {
         }
     }
 
-    fn refresh_playback_channel(
+    /// Absolute content position (seconds on the original file timeline).
+    ///
+    /// FREQ and tempo channels use different byte timelines at rate ≠ 1; the
+    /// underlying decode handle always reports true content time.
+    fn content_absolute_secs(
         bass: &BassLibrary,
-        mixer_handle: u32,
         mixer_channel: u32,
         tracked_decode: u32,
         in_mixer: bool,
-        rate: f32,
-        pitch_enabled: bool,
-    ) -> Result<(u32, u32), String> {
+    ) -> f64 {
         if mixer_channel == 0 {
-            return Ok((0, 0));
+            return 0.0;
         }
-
         let decode = Self::decode_handle_for_channel(bass, mixer_channel, tracked_decode);
-        let pos_bytes = if in_mixer {
+        let pos = if tracked_decode != 0 && tracked_decode != mixer_channel {
+            bass.channel_get_position(decode, bass::BASS_POS_BYTE)
+        } else if in_mixer {
             bass.mixer_channel_get_position(mixer_channel, bass::BASS_POS_BYTE)
         } else {
             bass.channel_get_position(mixer_channel, bass::BASS_POS_BYTE)
         };
+        bass.channel_bytes2seconds(decode, pos).max(0.0)
+    }
 
-        if in_mixer {
-            let _ = bass.mixer_channel_remove(mixer_channel);
+    /// Seek the mixer-facing channel so content is at `abs_secs` on the file timeline.
+    fn seek_content_absolute(
+        bass: &BassLibrary,
+        mixer_channel: u32,
+        tracked_decode: u32,
+        in_mixer: bool,
+        abs_secs: f64,
+    ) {
+        if mixer_channel == 0 || abs_secs <= 0.0 {
+            return;
         }
+        let decode = Self::decode_handle_for_channel(bass, mixer_channel, tracked_decode);
+        let content_len = Self::stream_duration_secs(bass, decode);
+        if content_len <= 0.001 {
+            return;
+        }
+        let clamped = abs_secs.clamp(0.0, (content_len - 0.05).max(0.0));
 
-        if Self::is_tempo_wrapped(bass, mixer_channel, tracked_decode) {
-            let _ = bass.channel_stop(mixer_channel);
+        // Tempo output timeline is shorter/longer than content; map by fraction.
+        let out_len = Self::stream_duration_secs(bass, mixer_channel);
+        let seek_secs = if out_len > 0.001 && (out_len - content_len).abs() > 0.02 {
+            (clamped / content_len) * out_len
         } else {
-            let _ = bass.channel_set_attribute(decode, bass::BASS_ATTRIB_FREQ, 0.0);
-        }
+            clamped
+        };
 
-        let (new_channel, new_decode) =
-            Self::wrap_decode_for_rate(bass, decode, rate, pitch_enabled)?;
-
+        let byte_pos = bass.channel_seconds2bytes(mixer_channel, seek_secs);
         if in_mixer {
-            if mixer_handle == 0 {
-                return Err("Mixer not created".to_string());
+            let _ = bass.mixer_channel_set_position(mixer_channel, byte_pos, bass::BASS_POS_BYTE);
+        } else {
+            let _ = bass.channel_set_position(mixer_channel, byte_pos, bass::BASS_POS_BYTE);
+        }
+    }
+
+    /// Full reopen of the current track at the same content position.
+    /// Used for pitch topology switches (FREQ ↔ tempo) which cannot be done in place safely.
+    fn reopen_current_preserving_position(inner: &mut PlayerInner) -> Result<(), String> {
+        let track_path = inner
+            .current_file
+            .clone()
+            .ok_or_else(|| "No current track".to_string())?;
+        let audio_path = inner.current_audio_path.clone();
+        let cue_start = inner.cue_start;
+        let cue_end = inner.cue_end;
+        let was_paused = inner.user_paused;
+
+        let abs_pos = if inner.current_source != 0 {
+            if let Some(bass) = inner.bass.as_ref() {
+                Self::content_absolute_secs(
+                    bass,
+                    inner.current_source,
+                    inner.current_decode,
+                    true,
+                )
+            } else {
+                cue_start.unwrap_or(0.0)
             }
-            let add_flags = bass::BASS_MIXER_CHAN_NORAMPIN;
-            bass.mixer_stream_add_channel(mixer_handle, new_channel, add_flags)?;
-            if pos_bytes > 0 {
-                let _ = bass.mixer_channel_set_position(new_channel, pos_bytes, bass::BASS_POS_BYTE);
+        } else {
+            cue_start.unwrap_or(0.0)
+        };
+
+        let playback = cue::resolve_playback(
+            &track_path,
+            audio_path.as_deref(),
+            cue_start,
+            cue_end,
+        )?;
+
+        // open_stream tears down old handles (now properly StreamFree'd) and wraps
+        // with the current pitch_enabled / playback_rate.
+        Self::open_stream(inner, &track_path, &playback)?;
+
+        if let Some(bass) = inner.bass.as_ref() {
+            Self::seek_content_absolute(
+                bass,
+                inner.current_source,
+                inner.current_decode,
+                true,
+                abs_pos,
+            );
+            let vol = if was_paused { 0.0 } else { inner.volume };
+            let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_VOL, vol);
+            if was_paused {
+                let _ = bass.channel_pause(inner.mixer_handle);
+            } else {
+                let _ = bass.channel_play(inner.mixer_handle, true);
+                let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_BUFFER, 0.0);
             }
         }
 
-        Ok((new_channel, new_decode))
+        Ok(())
     }
 
     fn reapply_at_rate(inner: &mut PlayerInner, rate: f32) {
@@ -1323,76 +1403,46 @@ impl Player {
 
     fn reapply_at_rate_with_slide(inner: &mut PlayerInner, rate: f32, slide_ms: u32) {
         let pitch_enabled = inner.pitch_enabled;
-        let mixer_handle = inner.mixer_handle;
         let current_source = inner.current_source;
         let current_decode = inner.current_decode;
-        let preloaded_source = inner.preloaded_source;
-        let preloaded_decode = inner.preloaded_decode;
-        let Some(bass) = inner.bass.as_ref() else {
-            return;
+        let had_preload = inner.preloaded_source != 0;
+
+        let in_place = if current_source != 0 {
+            if let Some(bass) = inner.bass.as_ref() {
+                Self::apply_rate_in_place(
+                    bass,
+                    current_source,
+                    current_decode,
+                    rate,
+                    pitch_enabled,
+                    slide_ms,
+                )
+            } else {
+                return;
+            }
+        } else {
+            Ok((0, 0))
         };
 
-        if current_source != 0 {
-            match Self::apply_rate_in_place(
-                bass,
-                current_source,
-                current_decode,
-                rate,
-                pitch_enabled,
-                slide_ms,
-            ) {
-                Ok((channel, decode)) => {
-                    inner.current_source = channel;
-                    inner.current_decode = decode;
-                }
-                Err(_) => {
-                    // Mode switch (pitch on/off): rebuild channel; no slide across topologies.
-                    inner.suppress_gapless_until = Self::now_millis().saturating_add(800);
-                    if let Ok((channel, decode)) = Self::refresh_playback_channel(
-                        bass,
-                        mixer_handle,
-                        current_source,
-                        current_decode,
-                        true,
-                        rate,
-                        pitch_enabled,
-                    ) {
-                        inner.current_source = channel;
-                        inner.current_decode = decode;
-                    }
+        match in_place {
+            Ok((channel, decode)) if current_source != 0 => {
+                inner.current_source = channel;
+                inner.current_decode = decode;
+            }
+            Ok(_) => {}
+            Err(_) => {
+                // Topology switch while changing rate: reopen at same position.
+                inner.suppress_gapless_until = Self::now_millis().saturating_add(2500);
+                if let Err(e) = Self::reopen_current_preserving_position(inner) {
+                    eprintln!("Rate mode reopen failed: {e}");
                 }
             }
         }
 
-        if preloaded_source != 0 {
-            // Preload is silent — apply instantly, no need to slide.
-            match Self::apply_rate_in_place(
-                bass,
-                preloaded_source,
-                preloaded_decode,
-                rate,
-                pitch_enabled,
-                0,
-            ) {
-                Ok((channel, decode)) => {
-                    inner.preloaded_source = channel;
-                    inner.preloaded_decode = decode;
-                }
-                Err(_) => {
-                    if let Ok((channel, decode)) = Self::refresh_playback_channel(
-                        bass,
-                        mixer_handle,
-                        preloaded_source,
-                        preloaded_decode,
-                        false,
-                        rate,
-                        pitch_enabled,
-                    ) {
-                        inner.preloaded_source = channel;
-                        inner.preloaded_decode = decode;
-                    }
-                }
-            }
+        if had_preload {
+            // Preload was built under a possibly different topology — rebuild.
+            Self::clear_preload(inner);
+            Self::refresh_pending_next(inner);
         }
     }
 
@@ -1585,13 +1635,15 @@ impl Player {
 
     /// Set playback rate (0.25 — 2.0).
     ///
-    /// Uses BASS attribute slides (FREQ or TEMPO) so the change is sample-accurate
-    /// instead of a stepped hard-set ramp that produces zipper/rattle artifacts.
+    /// Uses a fixed-duration BASS attribute slide (FREQ or TEMPO) so the change is
+    /// sample-accurate and always takes the same intentional time.
     pub fn set_playback_rate(&self, rate: f32) -> Result<(), String> {
         let rate = rate.clamp(0.25, 2.0);
         self.run_on_bass_thread(move |inner| {
             inner.playback_rate = rate;
 
+            // Prefer the live attribute (mid-slide). Do not trust applied alone —
+            // a second identical request while still ramping must keep sliding.
             let from = if let Some(bass) = inner.bass.as_ref() {
                 Self::read_current_rate(
                     bass,
@@ -1604,12 +1656,14 @@ impl Player {
             };
 
             if (from - rate).abs() < 0.0005 {
+                // Already there: snap to exact value (cancels any residual slide).
+                Self::reapply_at_rate_with_slide(inner, rate, 0);
                 inner.applied_playback_rate = rate;
                 return Ok(());
             }
 
-            let slide_ms = Self::rate_slide_ms(from, rate);
-            Self::reapply_at_rate_with_slide(inner, rate, slide_ms);
+            // Always full ramp so presets and settle feel consistent — not "too fast".
+            Self::reapply_at_rate_with_slide(inner, rate, PLAYBACK_RATE_RAMP_MS);
             inner.applied_playback_rate = rate;
             Ok(())
         })
@@ -1618,10 +1672,26 @@ impl Player {
     /// When enabled, playback speed also shifts pitch. When disabled, tempo FX preserves pitch.
     pub fn set_pitch_enabled(&self, enabled: bool) -> Result<(), String> {
         self.run_on_bass_thread(move |inner| {
+            if inner.pitch_enabled == enabled {
+                return Ok(());
+            }
             inner.pitch_enabled = enabled;
             let rate = inner.playback_rate;
-            // Topology change (FREQ ↔ tempo wrapper) cannot slide; snap cleanly.
-            Self::reapply_at_rate(inner, rate);
+
+            // FREQ ↔ tempo is a graph rebuild. In-place rebuild left the source
+            // STOPPED and gapless advanced the queue — reopen at content position.
+            if inner.current_source != 0 {
+                inner.suppress_gapless_until = Self::now_millis().saturating_add(2500);
+                if let Err(e) = Self::reopen_current_preserving_position(inner) {
+                    eprintln!("Pitch mode reopen failed: {e}");
+                    return Err(e);
+                }
+            }
+
+            // Preload was built under the old topology — drop and rebuild.
+            Self::clear_preload(inner);
+            Self::refresh_pending_next(inner);
+
             inner.applied_playback_rate = rate;
             Ok(())
         })
@@ -1860,10 +1930,13 @@ impl Player {
                     let stream_done = src_active == bass::BASS_ACTIVE_STOPPED || mixer_active == bass::BASS_ACTIVE_STOPPED;
 
                     let now = Self::now_millis();
-                    if Self::has_next_in_gapless_queue(inner)
-                        && (ending || stream_done)
-                        && now >= inner.suppress_gapless_until
-                    {
+                    // Pitch/rate topology rebuild and seeks can briefly look "ended".
+                    // Never advance or tear down during the suppress window.
+                    if now < inner.suppress_gapless_until {
+                        return Ok((None, POLL_INTERVAL_MS));
+                    }
+
+                    if Self::has_next_in_gapless_queue(inner) && (ending || stream_done) {
                         // Guard against spurious early advance after manual click in que (new track can briefly appear done).
                         // Use time since this track started (set in play()), not just pos (which can be small at legit end in recovery).
                         if now.saturating_sub(inner.current_track_start_time) > 1500 {
@@ -1968,10 +2041,12 @@ impl Player {
                                 if !Self::has_next_in_gapless_queue(inner) {
                                     return Ok(None);
                                 }
-                                let now = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_millis() as u64)
-                                    .unwrap_or(0);
+                                let now = Self::now_millis();
+                                // Same guards as the playing-path advance: pitch/rate
+                                // topology rebuilds can briefly look "stopped".
+                                if now < inner.suppress_gapless_until {
+                                    return Ok(None);
+                                }
                                 if now.saturating_sub(inner.current_track_start_time) > 1500 {
                                     Self::try_advance_gapless(inner).map(Some).map_err(|error| {
                                         eprintln!("Gapless recovery failed: {error}");

@@ -377,7 +377,7 @@
                   type="button"
                   class="preset-btn"
                   class:active={Math.abs(settings.playbackRate - r) < 0.01}
-                  onclick={() => void settings.setPlaybackRate(r)}
+                  onclick={() => void settings.setPlaybackRate(r, { immediate: true })}
                 >
                   {r.toFixed(r === 1 ? 1 : 2)}×
                 </button>
