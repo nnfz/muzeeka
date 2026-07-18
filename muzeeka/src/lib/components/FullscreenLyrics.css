@@ -1,14 +1,14 @@
 .fs-lyrics-panel {
-  --lyric-size: clamp(26px, 3.8vw, 42px);
+  --lyric-size: clamp(28px, 4vw, 44px);
   --lyric-weight: 700;
-  --lyric-line-height: 1.28;
-  --lyric-gap: 0.55em;
+  --lyric-line-height: 1.22;
+  --lyric-gap: 0.62em;
   --lyric-ease: cubic-bezier(0.22, 1, 0.36, 1);
-  --lyric-duration: 520ms;
+  --lyric-duration: 560ms;
   --lyric-color-active: #ffffff;
-  --lyric-color-past: rgba(255, 255, 255, 0.52);
-  --lyric-color-upcoming: rgba(255, 255, 255, 0.28);
-  --lyric-color-word-dim: rgba(255, 255, 255, 0.28);
+  --lyric-color-past: rgba(255, 255, 255, 0.48);
+  --lyric-color-upcoming: rgba(255, 255, 255, 0.26);
+  --lyric-color-word-dim: rgba(255, 255, 255, 0.26);
 
   position: relative;
   flex: 1;
@@ -34,17 +34,12 @@
 }
 
 .fs-lyrics-viewport {
-  --lyrics-pad-block: 0px;
-
   flex: 1;
   min-height: 0;
-  overflow-y: auto;
   overflow-x: clip;
-  padding:
-    0
-    max(1.5rem, 4vw)
-    0
-    max(1.5rem, calc(50vw - var(--fullscreen-side-width, 0px)));
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 0 max(1.5rem, 3.5vw) 0 max(1rem, 2vw);
   scroll-behavior: auto;
   -webkit-overflow-scrolling: touch;
   mask-image: linear-gradient(
@@ -61,20 +56,27 @@
   height: 0;
 }
 
+/* Height set in JS to half the viewport — outside the text block */
+.fs-lyrics-edge {
+  height: 0;
+  flex-shrink: 0;
+  pointer-events: none;
+}
+
 .fs-lyrics-container {
   font-size: var(--lyric-size);
   font-weight: var(--lyric-weight);
   line-height: var(--lyric-line-height);
-  letter-spacing: -0.01em;
+  letter-spacing: -0.015em;
   position: relative;
   width: 100%;
   max-width: 100%;
   box-sizing: border-box;
-  padding-top: var(--lyrics-pad-block);
-  padding-bottom: var(--lyrics-pad-block);
-  /* Avoid subpixel jitter while scrolling */
-  transform: translateZ(0);
+  /* Text block is only as tall as the lyrics */
+  padding: 0;
 }
+
+/* ── Lines (Apple Music: dim / bright / past) ──────────── */
 
 .fs-lyrics-line {
   display: block;
@@ -82,44 +84,40 @@
   max-width: 100%;
   box-sizing: border-box;
   margin: 0;
-  padding: var(--lyric-gap) 0.15em;
+  padding: var(--lyric-gap) 0.12em;
   line-height: var(--lyric-line-height);
   cursor: pointer;
   color: var(--lyric-color-upcoming);
-  opacity: 1;
   transform: scale(0.94);
   transform-origin: left center;
   transition:
     color var(--lyric-duration) var(--lyric-ease),
     transform var(--lyric-duration) var(--lyric-ease),
-    filter var(--lyric-duration) var(--lyric-ease);
-  /* Keep layout stable — scale does not reflow siblings */
+    opacity var(--lyric-duration) var(--lyric-ease);
   backface-visibility: hidden;
 }
 
-.fs-lyrics-line:hover:not(.is-active) {
-  color: rgba(255, 255, 255, 0.48);
+/* Line-level hover only for line-synced / plain text */
+.fs-lyrics-container:not([data-sync='richsync']) .fs-lyrics-line:hover:not(.is-active) {
+  color: rgba(255, 255, 255, 0.42);
 }
 
 .fs-lyrics-line.is-active {
   color: var(--lyric-color-active);
-  transform: scale(1.02);
+  transform: scale(1.03);
   cursor: default;
-  filter: drop-shadow(0 0 28px rgba(255, 255, 255, 0.12));
 }
 
 .fs-lyrics-line.is-past {
   color: var(--lyric-color-past);
   transform: scale(0.96);
-  filter: none;
 }
 
 .fs-lyrics-line.is-active.is-past {
   color: var(--lyric-color-active);
-  transform: scale(1.02);
+  transform: scale(1.03);
 }
 
-/* Agent alignment — match transform origin to text edge */
 .fs-lyrics-line[data-agent='v2'],
 .fs-lyrics-line[data-agent='v3'] {
   text-align: right;
@@ -139,18 +137,6 @@
   max-width: 100%;
   white-space: pre-wrap;
   overflow-wrap: break-word;
-  /* Inherit line color by default (line-synced / none) */
-  color: inherit;
-}
-
-/* Word-level: each token is independent */
-.fs-lyrics-container[data-sync='richsync'] .fs-lyrics-word-wrap {
-  display: inline;
-  color: var(--lyric-color-word-dim);
-}
-
-.fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line.is-past .fs-lyrics-word-wrap,
-.fs-lyrics-container[data-sync='richsync'] .fs-lyrics-word-wrap.is-sung {
   color: inherit;
 }
 
@@ -160,44 +146,196 @@
   white-space: inherit;
   overflow-wrap: inherit;
   color: inherit;
-  /* Single layer only — never duplicate text with ::after */
-  transition: color 320ms var(--lyric-ease);
 }
 
 .fs-lyrics-word.is-background {
   font-size: 0.78em;
-  opacity: 0.85;
 }
 
-/*
- * Richsync karaoke: words light up as they're sung.
- * Color-only (no scale/weight/::after) so neighbors never reflow or overlap.
- */
-.fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line.is-active {
-  color: var(--lyric-color-active);
-}
-
-.fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line.is-active .fs-lyrics-word-wrap:not(.is-sung) {
-  color: var(--lyric-color-word-dim);
-}
-
-.fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line.is-active .fs-lyrics-word-wrap.is-sung,
-.fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line.is-active .fs-lyrics-word.is-animating {
-  color: var(--lyric-color-active);
-}
-
-/* Soft pop on the current word */
-.fs-lyrics-container[data-sync='richsync'] .fs-lyrics-word.is-animating {
-  transition-duration: 180ms;
-}
-
-/* Line-synced / plain: inherit line color only */
+/* Line-synced / plain: whole line one color */
 .fs-lyrics-container[data-sync='synced'] .fs-lyrics-word,
 .fs-lyrics-container[data-sync='none'] .fs-lyrics-word {
   color: inherit;
 }
 
-/* ── Instrumental dots ─────────────────────────────────── */
+/* ── Richsync karaoke (fill + per-letter lift/scale) ───── */
+
+@property --word-fill {
+  syntax: '<number>';
+  /* Inherit so each letter can read the karaoke progress */
+  inherits: true;
+  initial-value: 0;
+}
+
+.fs-lyrics-container[data-sync='richsync'] .fs-lyrics-word-wrap {
+  display: inline;
+  color: inherit;
+}
+
+.fs-lyrics-container[data-sync='richsync'] .fs-lyrics-word {
+  --word-fill: 0;
+  display: inline-block;
+  color: var(--lyric-color-word-dim);
+  white-space: pre-wrap;
+  /* Visual-only motion — layout box stays stable */
+  transform: translate3d(0, 0, 0) scale(1);
+  transform-origin: 50% 85%;
+  cursor: pointer;
+  /* Smooth hover only — karaoke fill still drives --word-fill without CSS transition */
+  transition: color 240ms var(--lyric-ease);
+}
+
+/* Word-synced: seek/hover on words, not the whole line row */
+.fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line {
+  cursor: default;
+}
+
+/* Past / upcoming lines: solid inherited color, no motion */
+.fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line.is-past .fs-lyrics-word,
+.fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line:not(.is-active):not(.is-past) .fs-lyrics-word {
+  color: inherit;
+  background-image: none;
+  -webkit-text-fill-color: unset;
+  transform: none;
+}
+
+.fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line.is-past .fs-lyrics-char,
+.fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line:not(.is-active):not(.is-past) .fs-lyrics-char {
+  color: inherit;
+  transform: none;
+  text-shadow: none;
+  /* Inherit animated parent color on hover */
+  transition: color 240ms var(--lyric-ease);
+}
+
+/* Hover brightens only the word (chars inherit → smooth fade) */
+.fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line:not(.is-active) .fs-lyrics-word:hover,
+.fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line.is-past .fs-lyrics-word:hover,
+.fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line:not(.is-active):not(.is-past) .fs-lyrics-word:hover {
+  color: rgba(255, 255, 255, 0.55);
+}
+
+.fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line.is-active .fs-lyrics-word.is-upcoming {
+  transition: color 240ms var(--lyric-ease);
+}
+
+.fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line.is-active .fs-lyrics-word.is-upcoming .fs-lyrics-char {
+  transition: color 240ms var(--lyric-ease);
+}
+
+.fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line.is-active .fs-lyrics-word.is-upcoming:hover {
+  color: rgba(255, 255, 255, 0.48);
+}
+
+.fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line.is-active .fs-lyrics-word.is-upcoming:hover .fs-lyrics-char {
+  color: rgba(255, 255, 255, 0.48);
+}
+
+/* Active line: finished words settle flat and bright */
+.fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line.is-active .fs-lyrics-word.is-sung {
+  color: var(--lyric-color-active);
+  --word-fill: 1;
+  transform: translate3d(0, 0, 0) scale(1);
+  transition: transform 480ms var(--lyric-ease);
+}
+
+.fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line.is-active .fs-lyrics-word.is-sung .fs-lyrics-char {
+  color: var(--lyric-color-active);
+  transform: translate3d(0, 0, 0) scale(1);
+  text-shadow: none;
+  transition:
+    transform 620ms var(--lyric-ease),
+    color 320ms ease,
+    text-shadow 400ms ease;
+}
+
+/* Active line: upcoming words stay dim and flat */
+.fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line.is-active .fs-lyrics-word.is-upcoming {
+  color: var(--lyric-color-word-dim);
+  --word-fill: 0;
+  transform: none;
+}
+
+.fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line.is-active .fs-lyrics-word.is-upcoming .fs-lyrics-char {
+  color: var(--lyric-color-word-dim);
+  transform: none;
+  text-shadow: none;
+}
+
+/*
+ * Currently singing word — soft Apple-like motion.
+ * --word-fill (0..1) from rAF; letters ease up gently, no hard pops.
+ */
+.fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line.is-active .fs-lyrics-word.is-animating {
+  /* Whole word: very slight rise, almost imperceptible scale */
+  --word-pop: clamp(0, var(--word-fill) * 2.2, 1);
+  color: var(--lyric-color-word-dim);
+  background-image: none;
+  -webkit-text-fill-color: unset;
+  transform:
+    translate3d(0, calc(var(--word-pop) * -0.03em), 0)
+    scale(calc(1 + var(--word-pop) * 0.015));
+  transition: none;
+}
+
+/* Base glyph box — transform-friendly, preserves spaces */
+.fs-lyrics-char {
+  display: inline-block;
+  white-space: pre;
+  transform-origin: 50% 90%;
+  transform: translate3d(0, 0, 0) scale(1);
+  color: inherit;
+  backface-visibility: hidden;
+}
+
+.fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line.is-active .fs-lyrics-word.is-animating .fs-lyrics-char {
+  /*
+   * Soft wide wave (not a sharp spike):
+   * char-pos — glyph center along word [0, 1]
+   * ahead   — front relative to glyph
+   * lit     — smooth brightness ramp
+   * lift    — gentle rise, wide falloff so motion feels fluid
+   */
+  --char-n-safe: max(var(--char-n), 1);
+  --char-pos: calc((var(--char-i) + 0.5) / var(--char-n-safe));
+  --ahead: calc(var(--word-fill) - var(--char-pos));
+  /* Wider color blend — less snappy on/off */
+  --lit: clamp(0, var(--ahead) * 3.2 + 0.5, 1);
+  /* Soft hump: ~±0.35 of word width, not a knife-edge peak */
+  --peak: max(0, 1 - abs(var(--ahead) * 2.4));
+  --hold: clamp(0, var(--ahead) * 1.1, 0.18);
+  --lift: max(calc(var(--peak) * 0.85), var(--hold));
+  color: color-mix(
+    in srgb,
+    var(--lyric-color-active) calc(var(--lit) * 100%),
+    var(--lyric-color-word-dim)
+  );
+  transform:
+    translate3d(0, calc(var(--lift) * -0.08em), 0)
+    scale(calc(1 + var(--lift) * 0.055));
+  text-shadow:
+    0 0 calc(var(--peak) * 10px) rgba(255, 255, 255, calc(var(--peak) * 0.42)),
+    0 0 calc(var(--peak) * 22px) rgba(255, 255, 255, calc(var(--peak) * 0.22));
+  transition: none;
+}
+
+@supports not (color: color-mix(in srgb, white 50%, black)) {
+  .fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line.is-active .fs-lyrics-word.is-animating .fs-lyrics-char {
+    color: var(--lyric-color-word-dim);
+  }
+}
+
+/* Background vocals: quieter motion, softer glow */
+.fs-lyrics-container[data-sync='richsync'] .fs-lyrics-word.is-background.is-animating .fs-lyrics-char {
+  transform:
+    translate3d(0, calc(var(--lift) * -0.05em), 0)
+    scale(calc(1 + var(--lift) * 0.035));
+  text-shadow:
+    0 0 calc(var(--peak) * 8px) rgba(255, 255, 255, calc(var(--peak) * 0.28)),
+    0 0 calc(var(--peak) * 16px) rgba(255, 255, 255, calc(var(--peak) * 0.14));
+}
+
+/* ── Instrumental ──────────────────────────────────────── */
 
 .fs-lyrics-instrumental {
   display: inline-flex;
@@ -252,18 +390,14 @@
 
 @media (max-width: 900px) {
   .fs-lyrics-viewport {
-    padding:
-      0
-      20px
-      0
-      max(20px, 50vw);
+    padding: 0 20px;
   }
 
   .fs-lyrics-panel {
     flex: 1 1 auto;
     min-height: 0;
-    --lyric-size: clamp(22px, 6.2vw, 30px);
-    --lyric-gap: 0.45em;
+    --lyric-size: clamp(22px, 6.2vw, 32px);
+    --lyric-gap: 0.48em;
   }
 
   .fs-lyrics-line {
@@ -271,7 +405,7 @@
   }
 
   .fs-lyrics-line.is-active {
-    transform: scale(1.01);
+    transform: scale(1.015);
   }
 
   .fs-lyrics-line.is-past {
@@ -279,11 +413,9 @@
   }
 }
 
-/* Respect reduced motion */
 @media (prefers-reduced-motion: reduce) {
   .fs-lyrics-panel,
   .fs-lyrics-line,
-  .fs-lyrics-word,
   .fs-lyrics-status {
     animation: none !important;
     transition-duration: 0.01ms !important;
@@ -297,4 +429,18 @@
   .fs-lyrics-line {
     transform: none !important;
   }
+
+  .fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line.is-active .fs-lyrics-word.is-animating,
+  .fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line.is-active .fs-lyrics-word.is-animating .fs-lyrics-char {
+    transform: none !important;
+    text-shadow: none !important;
+    filter: none !important;
+  }
+}
+
+/* Spaces: keep width, no bounce/glow */
+.fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line.is-active .fs-lyrics-word.is-animating .fs-lyrics-char-space {
+  transform: none !important;
+  text-shadow: none !important;
+  /* Still light up with the wave */
 }

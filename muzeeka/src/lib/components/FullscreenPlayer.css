@@ -85,12 +85,13 @@
 }
 
 .fullscreen-layout {
-  --fullscreen-side-width: min(320px, 34vw);
+  --fullscreen-side-width: 40vw;
 
   position: absolute;
   inset: 0;
   z-index: 1;
-  display: flex;
+  display: grid;
+  grid-template-columns: var(--fullscreen-side-width) minmax(0, 1fr);
   align-items: stretch;
   gap: 0;
   padding:
@@ -102,36 +103,38 @@
 }
 
 .fullscreen-layout.lyrics-hidden {
-  justify-content: center;
+  grid-template-columns: 1fr;
+  justify-items: center;
 }
 
 .fullscreen-layout.lyrics-hidden .fullscreen-side {
-  flex: 0 0 auto;
-  max-width: min(360px, 42vw);
+  width: min(360px, 42vw);
+  max-width: 100%;
 }
 
+/* Cover + meta: left column, vertically centered */
 .fullscreen-side {
-  flex: 0 0 min(320px, 34vw);
   display: flex;
   flex-direction: column;
   align-items: center;
+  justify-self: center;
   justify-content: center;
-  gap: 20px;
-  padding: 0 28px 0 36px;
+  align-self: center;
+  gap: 18px;
+  width: max-content;
+  min-height: 0;
+  box-sizing: border-box;
   pointer-events: none;
   animation: fullscreen-side-in 560ms var(--fs-ease) both;
-  transition:
-    flex-basis 480ms var(--fs-ease),
-    max-width 480ms var(--fs-ease),
-    padding 480ms var(--fs-ease);
 }
 
 .fullscreen-art-wrap {
-  width: min(240px, 28vh, calc(34vw - 48px));
+  /* Cap on large screens; floor so mid/small desktop keeps a solid cover size */
+  width: clamp(180px, calc(var(--fullscreen-side-width) - 140px), 500px);
   aspect-ratio: 1;
-  border-radius: var(--radius-lg);
+  border-radius: var(--radius-sm);
   overflow: hidden;
-  box-shadow: var(--shadow-lg), 0 24px 80px rgba(0, 0, 0, 0.55);
+  box-shadow: var(--shadow-sm);
   animation: fullscreen-art-in 640ms var(--fs-ease) both;
   transition:
     width 480ms var(--fs-ease),
@@ -141,7 +144,7 @@
 }
 
 .fullscreen-layout.lyrics-hidden .fullscreen-art-wrap {
-  width: min(280px, 34vh, 42vw);
+  width: min(300px, 36vh, 42vw);
   box-shadow: var(--shadow-lg), 0 32px 100px rgba(0, 0, 0, 0.6);
 }
 
@@ -168,7 +171,7 @@
 
 .fullscreen-meta {
   width: 100%;
-  text-align: center;
+  text-align: left;
   animation: fullscreen-meta-in 600ms var(--fs-ease) 80ms both;
 }
 
@@ -401,20 +404,21 @@
 
 @media (max-width: 900px) {
   .fullscreen-layout {
-    --fullscreen-side-width: 0px;
+    --fullscreen-side-width: 100%;
 
-    flex-direction: column;
+    grid-template-columns: 1fr;
+    grid-template-rows: auto minmax(0, 1fr);
     padding-top: calc(var(--header-height) + 8px);
     padding-bottom: 132px;
   }
 
   .fullscreen-side {
-    flex: 0 0 auto;
     flex-direction: row;
     align-items: center;
     justify-content: flex-start;
+    align-self: stretch;
     gap: 16px;
-    width: 100%;
+    width: max-content;
     padding: 0 20px 8px;
   }
 

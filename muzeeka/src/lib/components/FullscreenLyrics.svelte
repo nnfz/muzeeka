@@ -7,6 +7,8 @@
     isPartActive,
     isPartSung,
     lineStartSec,
+    partDurationSec,
+    partStartSec,
   } from '$lib/lyrics/sync';
 
   interface Props {
@@ -37,25 +39,25 @@
   }: Props = $props();
 
   let viewportEl = $state<HTMLDivElement | undefined>();
+  let containerEl = $state<HTMLDivElement | undefined>();
+  let edgeTopEl = $state<HTMLDivElement | undefined>();
+  let edgeBottomEl = $state<HTMLDivElement | undefined>();
   let lastScrolledIndex = -1;
-  let centerYOffset = $state(0);
   let scrollRaf = 0;
   let scrollToken = 0;
 
+  /**
+   * Smooth media clock: player position only arrives ~every 50ms.
+   * Extrapolate with rAF while playing so word-fill runs at display refresh.
+   */
+  let clockPos = 0;
+  let clockWall = 0;
+  let clockPlaying = false;
+  let fillRaf = 0;
+  let fillWordEl: HTMLElement | null = null;
+  let fillWordId = '';
+
   let activeLineIndex = $derived(findActiveLineIndex(lines, currentTime));
-
-  function updateViewportMetrics() {
-    if (!viewportEl) return;
-
-    const height = viewportEl.clientHeight;
-    if (height <= 0) return;
-
-    // Keep active line optically centered; chrome fades over the bottom mask.
-    // No vertical "lift" transform — that was fighting scroll and felt jerky.
-    const pad = height / 2;
-    centerYOffset = pad;
-    viewportEl.style.setProperty('--lyrics-pad-block', `${pad}px`);
-  }
 
   function easeOutCubic(t: number): number {
     return 1 - (1 - t) ** 3;
@@ -69,11 +71,31 @@
     scrollToken += 1;
   }
 
-  function scrollLineToCenter(lineEl: HTMLElement, smooth: boolean) {
+  /** Half-viewport edges so first/last lines can sit in the optical center */
+  function updateEdgeSpacers() {
     if (!viewportEl) return;
+    const half = Math.max(0, viewportEl.clientHeight / 2);
+    const px = `${half}px`;
+    if (edgeTopEl) edgeTopEl.style.height = px;
+    if (edgeBottomEl) edgeBottomEl.style.height = px;
+  }
 
-    const lineCenter = lineEl.offsetTop + lineEl.offsetHeight / 2;
-    const targetScroll = Math.max(0, lineCenter - centerYOffset);
+  /**
+   * Scroll so the line's vertical center sits at the viewport center.
+   * Edge spacers provide room for first/last lines — not padding on the text block.
+   */
+  function scrollLineToCenter(lineEl: HTMLElement, smooth: boolean) {
+    if (!viewportEl || !containerEl) return;
+
+    const viewportH = viewportEl.clientHeight;
+    if (viewportH <= 0) return;
+
+    const viewportRect = viewportEl.getBoundingClientRect();
+    const lineRect = lineEl.getBoundingClientRect();
+    const lineCenter =
+      lineRect.top + lineRect.height / 2 - viewportRect.top + viewportEl.scrollTop;
+
+    const targetScroll = Math.max(0, lineCenter - viewportH / 2);
     const startScroll = viewportEl.scrollTop;
     const delta = targetScroll - startScroll;
 
@@ -110,10 +132,10 @@
   }
 
   function scrollActiveLine(smooth: boolean) {
-    if (!viewportEl || lines.length === 0 || syncType === 'none') return;
+    if (!viewportEl || !containerEl || lines.length === 0 || syncType === 'none') return;
     if (activeLineIndex < 0) return;
 
-    const lineEl = viewportEl.querySelector<HTMLElement>(`[data-line="${activeLineIndex}"]`);
+    const lineEl = containerEl.querySelector<HTMLElement>(`[data-line="${activeLineIndex}"]`);
     if (!lineEl) return;
 
     scrollLineToCenter(lineEl, smooth);
@@ -144,32 +166,129 @@
     onSeek?.(part.startTimeMs / 1000);
   }
 
+  function wordId(lineIndex: number, partIndex: number, part: LyricPart): string {
+    return `${lineIndex}:${partIndex}:${part.startTimeMs}`;
+  }
+
+  function setWordFill(el: HTMLElement, fill: number) {
+    el.style.setProperty('--word-fill', String(Math.min(1, Math.max(0, fill))));
+  }
+
+  function stopFillLoop() {
+    if (fillRaf) {
+      cancelAnimationFrame(fillRaf);
+      fillRaf = 0;
+    }
+  }
+
+  function clearWordFill() {
+    stopFillLoop();
+    if (fillWordEl) {
+      setWordFill(fillWordEl, 1);
+    }
+    fillWordEl = null;
+    fillWordId = '';
+  }
+
+  function mediaNow(): number {
+    if (!clockPlaying) return clockPos;
+    return clockPos + (performance.now() - clockWall) / 1000;
+  }
+
+  function findActiveWordTarget(mediaTime: number): {
+    id: string;
+    el: HTMLElement;
+    startSec: number;
+    durationSec: number;
+  } | null {
+    if (!viewportEl || syncType !== 'richsync' || lines.length === 0) return null;
+
+    const lineIndex = findActiveLineIndex(lines, mediaTime);
+    if (lineIndex < 0) return null;
+
+    const line = lines[lineIndex];
+    if (!line || line.isInstrumental) return null;
+
+    const parts = displayParts(line);
+    for (let partIndex = 0; partIndex < parts.length; partIndex++) {
+      const part = parts[partIndex];
+      if (!part.words) continue;
+
+      const active = isPartActive(part, partIndex, parts, line, lineIndex, lines, mediaTime);
+      const sung = isPartSung(part, partIndex, parts, line, lineIndex, lines, mediaTime);
+      if (!active || sung) continue;
+
+      const id = wordId(lineIndex, partIndex, part);
+      const el = viewportEl.querySelector<HTMLElement>(`[data-word="${id}"]`);
+      if (!el) return null;
+
+      return {
+        id,
+        el,
+        startSec: partStartSec(part),
+        durationSec: partDurationSec(part, partIndex, parts, line, lineIndex, lines),
+      };
+    }
+
+    return null;
+  }
+
+  function paintWordFill() {
+    if (syncType !== 'richsync' || !viewportEl) return;
+
+    const t = mediaNow();
+    const target = findActiveWordTarget(t);
+
+    if (!target) {
+      if (fillWordEl) {
+        setWordFill(fillWordEl, 1);
+        fillWordEl = null;
+        fillWordId = '';
+      }
+      return;
+    }
+
+    if (fillWordId !== target.id && fillWordEl && fillWordEl !== target.el) {
+      setWordFill(fillWordEl, 1);
+    }
+
+    fillWordId = target.id;
+    fillWordEl = target.el;
+
+    const safeDur = Math.max(target.durationSec, 0.05);
+    const progress = Math.min(Math.max((t - target.startSec) / safeDur, 0), 1);
+    setWordFill(target.el, progress);
+  }
+
   $effect(() => {
     if (!viewportEl) return;
+    void containerEl;
+    void edgeTopEl;
+    void edgeBottomEl;
 
-    updateViewportMetrics();
+    updateEdgeSpacers();
 
     const observer = new ResizeObserver(() => {
-      updateViewportMetrics();
+      updateEdgeSpacers();
       scrollActiveLine(false);
     });
     observer.observe(viewportEl);
+    if (containerEl) observer.observe(containerEl);
 
     return () => {
       observer.disconnect();
       cancelScrollAnim();
+      clearWordFill();
     };
   });
 
-  // chromeVisible kept in props for API stability; no layout lift.
+  // chromeVisible kept for API stability
   $effect(() => {
     void chromeVisible;
-    if (!viewportEl) return;
-    updateViewportMetrics();
   });
 
   $effect(() => {
-    if (!viewportEl || lines.length === 0 || syncType === 'none') return;
+    if (!viewportEl || !containerEl || lines.length === 0 || syncType === 'none') return;
     if (activeLineIndex < 0) return;
     if (activeLineIndex === lastScrolledIndex) return;
 
@@ -180,8 +299,35 @@
   $effect(() => {
     lines;
     lastScrolledIndex = -1;
-    updateViewportMetrics();
+    clearWordFill();
+    if (viewportEl) viewportEl.scrollTop = 0;
     scrollActiveLineAfterLayout(false);
+  });
+
+  $effect(() => {
+    clockPos = currentTime;
+    clockWall = performance.now();
+    clockPlaying = isPlaying;
+  });
+
+  $effect(() => {
+    if (syncType !== 'richsync' || !viewportEl) {
+      clearWordFill();
+      return;
+    }
+
+    void lines;
+
+    const tick = () => {
+      paintWordFill();
+      fillRaf = requestAnimationFrame(tick);
+    };
+
+    fillRaf = requestAnimationFrame(tick);
+
+    return () => {
+      stopFillLoop();
+    };
   });
 </script>
 
@@ -197,7 +343,13 @@
       class="fs-lyrics-viewport"
       bind:this={viewportEl}
     >
-      <div class="fs-lyrics-container" data-sync={syncType}>
+      <!-- Edge spacers = half viewport height (JS), not padding on the text block -->
+      <div class="fs-lyrics-edge" aria-hidden="true" bind:this={edgeTopEl}></div>
+      <div
+        class="fs-lyrics-container"
+        data-sync={syncType}
+        bind:this={containerEl}
+      >
         {#each lines as line, lineIndex (line.startTimeMs + ':' + lineIndex)}
           {@const lineActive = isLineActive(line, lineIndex, lines, currentTime)}
           {@const linePast = isLinePast(line, lineIndex, lines, currentTime)}
@@ -229,19 +381,29 @@
                   {@const partActive = isPartActive(part, partIndex, parts, line, lineIndex, lines, currentTime)}
                   {@const partSung = isPartSung(part, partIndex, parts, line, lineIndex, lines, currentTime)
                     || (linePast && !lineActive)}
-                  {@const partAnimating = partActive && !partSung}
-                  <span class="fs-lyrics-word-wrap" class:is-sung={partSung || partAnimating}>
+                  {@const partAnimating = lineIndex === activeLineIndex && partActive && !partSung}
+                  {@const partUpcoming = lineIndex === activeLineIndex && !partSung && !partAnimating}
+                  <span class="fs-lyrics-word-wrap">
                     <span
                       class="fs-lyrics-word"
                       class:is-background={part.isBackground}
                       class:is-sung={partSung}
                       class:is-animating={partAnimating}
+                      class:is-upcoming={partUpcoming}
+                      data-word={wordId(lineIndex, partIndex, part)}
                       onclick={(e) => {
                         e.stopPropagation();
                         seekToPart(part);
                       }}
                       role="presentation"
-                    >{part.words}</span>
+                    >{#each Array.from(part.words) as ch, charIndex}
+                      <span
+                        class="fs-lyrics-char"
+                        class:fs-lyrics-char-space={ch === ' ' || ch === '\t'}
+                        style:--char-i={charIndex}
+                        style:--char-n={part.words.length}
+                      >{ch}</span>
+                    {/each}</span>
                   </span>
                 {/if}
               {/each}
@@ -253,6 +415,7 @@
           </div>
         {/each}
       </div>
+      <div class="fs-lyrics-edge" aria-hidden="true" bind:this={edgeBottomEl}></div>
     </div>
   {/if}
 </div>
