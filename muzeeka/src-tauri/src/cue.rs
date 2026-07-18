@@ -38,14 +38,51 @@ pub fn parse_virtual_cue_path(path: &str) -> Option<(String, u32)> {
     Some((audio, track_no))
 }
 
-fn companion_cue_for_audio(audio_path: &Path) -> Option<PathBuf> {
-    let stem = audio_path.file_stem()?;
-    let cue_path = audio_path.with_file_name(format!("{}.cue", stem.to_string_lossy()));
-    if cue_path.is_file() {
-        Some(cue_path)
-    } else {
-        None
+/// Find a CUE sheet that sits next to an audio image.
+///
+/// Supports both common layouts:
+/// - `album.cue` beside `album.flac`
+/// - `album.flac.cue` beside `album.flac` (Exact Audio Copy and similar)
+pub fn companion_cue_for_audio(audio_path: &Path) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::with_capacity(2);
+    if let Some(stem) = audio_path.file_stem() {
+        candidates.push(audio_path.with_file_name(format!("{}.cue", stem.to_string_lossy())));
     }
+    if let Some(name) = audio_path.file_name() {
+        candidates.push(audio_path.with_file_name(format!("{}.cue", name.to_string_lossy())));
+    }
+
+    for cue_path in &candidates {
+        if cue_path.is_file() {
+            return Some(cue_path.clone());
+        }
+    }
+
+    // Case-insensitive match on Windows (FAT/NTFS folder listings can differ in case).
+    #[cfg(windows)]
+    {
+        let parent = audio_path.parent()?;
+        let targets: Vec<String> = candidates
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase()))
+            .collect();
+        if targets.is_empty() {
+            return None;
+        }
+        if let Ok(entries) = fs::read_dir(parent) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_lowercase();
+                if targets.iter().any(|t| t == &name) {
+                    let path = entry.path();
+                    if path.is_file() {
+                        return Some(path);
+                    }
+                }
+            }
+        }
+    }
+
+    None
 }
 
 fn expanded_track_for_audio(audio_path: &str, track_no: u32) -> Option<MusicFile> {
@@ -111,21 +148,34 @@ pub fn resolve_playback(
             return Err(format!("Audio file not found for CUE track: {audio}"));
         }
 
-        let expanded = expanded_track_for_audio(&audio, track_no).ok_or_else(|| {
-            format!("Failed to resolve CUE track #{track_no} for {audio}")
-        })?;
-
-        let resolved_audio = audio_path
+        let resolved_from_args = audio_path
             .filter(|value| !value.is_empty() && Path::new(value).is_file())
-            .map(str::to_string)
-            .or(expanded.audio_path.clone())
-            .unwrap_or(audio);
+            .map(str::to_string);
 
-        return Ok(PlaybackTarget {
-            audio_path: resolved_audio,
-            cue_start: expanded.cue_start_secs.or(cue_start),
-            cue_end: expanded.cue_end_secs.or(cue_end),
-        });
+        if let Some(expanded) = expanded_track_for_audio(&audio, track_no) {
+            let resolved_audio = resolved_from_args
+                .or(expanded.audio_path.clone())
+                .unwrap_or(audio);
+
+            return Ok(PlaybackTarget {
+                audio_path: resolved_audio,
+                cue_start: expanded.cue_start_secs.or(cue_start),
+                cue_end: expanded.cue_end_secs.or(cue_end),
+            });
+        }
+
+        // Companion .cue missing/unreadable, but playlist already has segment bounds.
+        if cue_start.is_some() {
+            return Ok(PlaybackTarget {
+                audio_path: resolved_from_args.unwrap_or(audio),
+                cue_start,
+                cue_end,
+            });
+        }
+
+        return Err(format!(
+            "Failed to resolve CUE track #{track_no} for {audio} (no companion .cue / .flac.cue and no cue times)"
+        ));
     }
 
     if let Some(audio) = audio_path.filter(|value| !value.is_empty()) {
@@ -195,7 +245,9 @@ fn track_index_start(track: &CUETrack) -> Option<f64> {
 
 fn parse_cue_file(cue_path: &Path) -> Option<(CUEFile, PathBuf)> {
     let content = fs::read_to_string(cue_path).ok()?;
-    let cue: CUEFile = content.as_str().try_into().ok()?;
+    // Strip UTF-8 BOM (common in Exact Audio Copy sheets).
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content.as_str());
+    let cue: CUEFile = content.try_into().ok()?;
     let cue_dir = cue_path.parent()?.to_path_buf();
     Some((cue, cue_dir))
 }
@@ -403,6 +455,56 @@ FILE "album.flac" WAVE
         let fallback = resolve_playback(&tracks[0].path, None, None, None).expect("fallback resolve");
         assert!(fallback.audio_path.ends_with("album.flac"));
         assert_eq!(fallback.cue_start, Some(0.0));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn companion_cue_finds_audio_dot_ext_dot_cue() {
+        let base = std::env::temp_dir().join(format!("muzeeka-cue-eac-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).expect("create dir");
+
+        let audio = base.join("album.flac");
+        write_bytes(&audio, &[1, 2, 3]);
+        // Exact Audio Copy style: audio.flac.cue (not audio.cue)
+        write_text(
+            &base.join("album.flac.cue"),
+            r#"PERFORMER "Artist"
+TITLE "Album"
+FILE "album.flac" WAVE
+  TRACK 01 AUDIO
+    TITLE "One"
+    PERFORMER "Artist"
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    TITLE "Two"
+    PERFORMER "Artist"
+    INDEX 01 01:00:00
+"#,
+        );
+
+        let companion = companion_cue_for_audio(&audio).expect("find .flac.cue");
+        assert!(
+            companion
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.eq_ignore_ascii_case("album.flac.cue"))
+        );
+
+        let tracks = expand_cue_file(&companion);
+        assert_eq!(tracks.len(), 2, "expand via .flac.cue companion");
+
+        // Prefer expanded virtual path (may include \\?\ canonicalize prefix on Windows).
+        let path = tracks[1].path.clone();
+        let target = resolve_playback(
+            &path,
+            tracks[1].audio_path.as_deref(),
+            None,
+            None,
+        )
+        .expect("resolve via companion .flac.cue");
+        assert_eq!(target.cue_start, Some(60.0));
 
         let _ = fs::remove_dir_all(&base);
     }

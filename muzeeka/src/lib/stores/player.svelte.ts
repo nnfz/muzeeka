@@ -1166,8 +1166,49 @@ async function prepareGaplessNext(filePath: string) {
 
 let playRequestId = 0;
 
+type PlayUiSnapshot = {
+  currentFile: string | null;
+  currentFileName: string | null;
+  isPlaying: boolean;
+  isPaused: boolean;
+  position: number;
+  duration: number;
+  playingPlaylistId: string | null;
+  lastPlayedFile: string | null;
+};
+
+function snapshotPlayUi(): PlayUiSnapshot {
+  return {
+    currentFile,
+    currentFileName,
+    isPlaying,
+    isPaused,
+    position,
+    duration,
+    playingPlaylistId,
+    lastPlayedFile,
+  };
+}
+
+function restorePlayUi(snap: PlayUiSnapshot) {
+  currentFile = snap.currentFile;
+  currentFileName = snap.currentFileName;
+  isPlaying = snap.isPlaying;
+  isPaused = snap.isPaused;
+  position = snap.position;
+  duration = snap.duration;
+  playingPlaylistId = snap.playingPlaylistId;
+  lastPlayedFile = snap.lastPlayedFile;
+  seekGuardUntil = 0;
+  syncTrackIndex();
+  scheduleSave();
+  syncWindowTitle();
+}
+
 async function play(filePath: string) {
   const requestId = ++playRequestId;
+  // Capture previous UI so a failed play can roll back (audio never switched).
+  const previousUi = snapshotPlayUi();
   try {
     await ensureInit();
     if (requestId !== playRequestId) return;
@@ -1246,19 +1287,16 @@ async function play(filePath: string) {
       queue: queueToSend,
     }).catch((e) => {
       if (requestId !== playRequestId) return;
-      seekGuardUntil = 0;
       const message = typeof e === 'string' ? e : String(e);
       console.error('Failed to play:', message);
-      isPlaying = false;
-      isPaused = false;
+      // Backend did not switch audio — restore previous track in the UI.
+      restorePlayUi(previousUi);
     });
   } catch (e) {
     if (requestId !== playRequestId) return;
-    seekGuardUntil = 0;
     const message = typeof e === 'string' ? e : String(e);
     console.error('Failed to play:', message);
-    isPlaying = false;
-    isPaused = false;
+    restorePlayUi(previousUi);
   }
 }
 

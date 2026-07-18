@@ -232,13 +232,7 @@ fn collect_paths_from_directory(root: &Path) -> Vec<PathBuf> {
 }
 
 fn companion_cue_path(audio_path: &Path) -> Option<PathBuf> {
-    let stem = audio_path.file_stem()?;
-    let cue_path = audio_path.with_file_name(format!("{}.cue", stem.to_string_lossy()));
-    if cue_path.is_file() {
-        Some(cue_path)
-    } else {
-        None
-    }
+    cue::companion_cue_for_audio(audio_path)
 }
 
 fn collect_cue_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
