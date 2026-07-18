@@ -31,10 +31,11 @@
   let coverSrc = $state<string | null>(null);
 
   let lyricsState = $state<LyricsResult | null>(null);
-  let lyricsLoading = $state(false);
-  let lyricsError = $state<string | null>(null);
   let lyricsLoadedForFile = $state<string | null>(null);
   let lyricsVisible = $state(true);
+  /** Prefer showing lyrics when available; layout still centers cover while empty / loading. */
+  let hasLyrics = $derived((lyricsState?.lines.length ?? 0) > 0);
+  let showLyricsPanel = $derived(lyricsVisible && hasLyrics);
   const CHROME_HIDE_DELAY = 3600;
 
   let chromeVisible = $state(true);
@@ -162,6 +163,7 @@
     };
   });
 
+  // Silent background fetch — no loading/error chrome; panel appears only when lines exist.
   $effect(() => {
     const track = player.currentTrack;
     const file = player.currentFile;
@@ -169,25 +171,16 @@
     if (!open || !track || !file) {
       lyricsState = null;
       lyricsLoadedForFile = null;
-      lyricsLoading = false;
-      lyricsError = null;
       return;
     }
 
-    if (!lyricsVisible) {
-      lyricsLoading = false;
-      return;
-    }
-
-    if (lyricsLoadedForFile === file && lyricsState) {
-      lyricsLoading = false;
+    if (lyricsLoadedForFile === file) {
       return;
     }
 
     let cancelled = false;
-    lyricsLoading = true;
-    lyricsError = null;
     lyricsLoadedForFile = file;
+    lyricsState = null;
 
     void fetchLyrics({
       title: trackDisplayTitle(track),
@@ -198,15 +191,10 @@
       .then((result) => {
         if (cancelled) return;
         lyricsState = result;
-        lyricsLoading = false;
       })
-      .catch((error: unknown) => {
+      .catch(() => {
         if (cancelled) return;
         lyricsState = null;
-        lyricsLoadedForFile = null;
-        lyricsLoading = false;
-        const message = error instanceof Error ? error.message : String(error);
-        lyricsError = message || 'Could not load lyrics';
       });
 
     return () => {
@@ -224,7 +212,7 @@
       <div class="fullscreen-backdrop-shade"></div>
     </div>
 
-    <div class="fullscreen-layout" class:lyrics-hidden={!lyricsVisible}>
+    <div class="fullscreen-layout" class:lyrics-hidden={!showLyricsPanel}>
       <aside class="fullscreen-side">
         <div class="fullscreen-art-wrap">
           {#if coverSrc}
@@ -248,14 +236,12 @@
         </div>
       </aside>
 
-      {#if lyricsVisible}
+      {#if showLyricsPanel}
         <FullscreenLyrics
           lines={lyricsState?.lines ?? []}
           syncType={lyricsState?.syncType ?? 'none'}
           currentTime={player.position}
           isPlaying={player.isPlaying}
-          loading={lyricsLoading}
-          error={lyricsError}
           chromeVisible={chromeVisible}
           onSeek={(time) => void player.seek(time)}
         />
@@ -355,13 +341,13 @@
           <div class="fullscreen-volume">
             <button
               type="button"
-              class="fs-control-btn mode-btn lyrics-toggle-btn"
+              class="lyrics-toggle-btn"
               class:active={lyricsVisible}
               onclick={toggleLyrics}
               aria-label={lyricsVisible ? 'Hide lyrics' : 'Show lyrics'}
               title={lyricsVisible ? 'Hide lyrics' : 'Show lyrics'}
             >
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
                 <path d="M4 6h16v2H4V6zm0 5h12v2H4v-2zm0 5h14v2H4v-2z"/>
               </svg>
             </button>

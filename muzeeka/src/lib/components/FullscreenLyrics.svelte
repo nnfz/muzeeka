@@ -17,8 +17,6 @@
     syncType?: SyncType;
     currentTime?: number;
     isPlaying?: boolean;
-    loading?: boolean;
-    error?: string | null;
     chromeVisible?: boolean;
     onSeek?: (timeSec: number) => void;
   }
@@ -33,8 +31,6 @@
     syncType = 'none',
     currentTime = 0,
     isPlaying = false,
-    loading = false,
-    error = null,
     chromeVisible = true,
     onSeek,
   }: Props = $props();
@@ -333,14 +329,8 @@
   });
 </script>
 
-<div class="fs-lyrics-panel">
-  {#if loading}
-    <div class="fs-lyrics-status">Loading lyrics…</div>
-  {:else if error}
-    <div class="fs-lyrics-status">{error}</div>
-  {:else if lines.length === 0}
-    <div class="fs-lyrics-status">No synced lyrics for this track</div>
-  {:else}
+{#if lines.length > 0}
+  <div class="fs-lyrics-panel">
     <div
       class="fs-lyrics-viewport"
       bind:this={viewportEl}
@@ -419,8 +409,8 @@
       </div>
       <div class="fs-lyrics-edge" aria-hidden="true" bind:this={edgeBottomEl}></div>
     </div>
-  {/if}
-</div>
+  </div>
+{/if}
 
 <style>
   @import './FullscreenLyrics.css';

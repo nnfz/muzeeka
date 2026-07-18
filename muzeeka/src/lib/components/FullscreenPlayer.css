@@ -107,30 +107,38 @@
   justify-items: center;
 }
 
-.fullscreen-layout.lyrics-hidden .fullscreen-side {
-  width: min(360px, 42vw);
-  max-width: 100%;
-}
-
-/* Cover + meta: left column, vertically centered */
+/*
+ * Cover + title: side is only as wide as the art.
+ * Block sits on the left of the column (not centered in it).
+ * Title matches cover width — no wider, no narrower.
+ */
 .fullscreen-side {
   display: flex;
   flex-direction: column;
-  align-items: center;
-  justify-self: center;
+  align-items: stretch;
+  justify-self: start;
   justify-content: center;
   align-self: center;
   gap: 18px;
   width: max-content;
+  max-width: calc(100% - 32px);
   min-height: 0;
   box-sizing: border-box;
+  margin-left: 28px;
   pointer-events: none;
   animation: fullscreen-side-in 560ms var(--fs-ease) both;
 }
 
+.fullscreen-layout.lyrics-hidden .fullscreen-side {
+  justify-self: center;
+  margin-left: 0;
+  max-width: min(500px, 90vw);
+}
+
 .fullscreen-art-wrap {
-  /* Cap on large screens; floor so mid/small desktop keeps a solid cover size */
-  width: clamp(180px, calc(var(--fullscreen-side-width) - 140px), 500px);
+  width: clamp(220px, calc(var(--fullscreen-side-width) - 96px), 500px);
+  max-width: 100%;
+  flex-shrink: 0;
   aspect-ratio: 1;
   border-radius: var(--radius-sm);
   overflow: hidden;
@@ -144,8 +152,7 @@
 }
 
 .fullscreen-layout.lyrics-hidden .fullscreen-art-wrap {
-  width: min(300px, 36vh, 42vw);
-  box-shadow: var(--shadow-lg), 0 32px 100px rgba(0, 0, 0, 0.6);
+  width: clamp(260px, min(46vw, 52vh), 500px);
 }
 
 .fullscreen-art,
@@ -169,8 +176,13 @@
   background: linear-gradient(135deg, rgba(255, 255, 255, 0.08), rgba(255, 255, 255, 0.03));
 }
 
+/* Same width as cover; text left + tiny inset */
 .fullscreen-meta {
-  width: 98%;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  padding-left: 4px;
   text-align: left;
   animation: fullscreen-meta-in 600ms var(--fs-ease) 80ms both;
 }
@@ -180,6 +192,7 @@
   font-weight: 700;
   line-height: 1.25;
   color: var(--text-primary);
+  text-align: left;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -191,6 +204,7 @@
   font-size: 16px;
   font-weight: 500;
   color: var(--text-secondary);
+  text-align: left;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -260,11 +274,29 @@
   gap: 10px;
 }
 
+/* Match MediaSlider .volume-btn */
+.lyrics-toggle-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  flex-shrink: 0;
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  transition: color var(--transition-fast), background var(--transition-fast);
+}
+
+.lyrics-toggle-btn:hover {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.06);
+}
+
 .lyrics-toggle-btn.active {
   color: var(--accent);
 }
 
-.lyrics-toggle-btn.active:hover:not(:disabled) {
+.lyrics-toggle-btn.active:hover {
   color: var(--accent);
   background: var(--accent-soft);
 }
@@ -274,7 +306,7 @@
   justify-self: end;
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
   min-width: 0;
   max-width: 240px;
 }
@@ -317,6 +349,7 @@
 
 .fs-control-btn.mode-btn {
   width: 34px;
+  aspect-ratio: 1;
   height: 34px;
 }
 
@@ -412,34 +445,70 @@
     padding-bottom: 132px;
   }
 
-  .fullscreen-side {
+  /* With lyrics: compact cover + title strip on top */
+  .fullscreen-layout:not(.lyrics-hidden) .fullscreen-side {
     flex-direction: row;
     align-items: center;
     justify-content: flex-start;
     align-self: stretch;
     gap: 16px;
-    width: max-content;
+    width: 100%;
+    max-width: 100%;
+    margin-left: 0;
     padding: 0 20px 8px;
   }
 
-  .fullscreen-art-wrap {
+  .fullscreen-layout:not(.lyrics-hidden) .fullscreen-art-wrap {
     width: 72px;
     height: 72px;
     flex-shrink: 0;
   }
 
-  .fullscreen-meta {
-    text-align: left;
+  .fullscreen-layout:not(.lyrics-hidden) .fullscreen-meta {
+    flex: 1;
     min-width: 0;
+    width: auto;
+    padding-left: 0;
   }
 
-  .fullscreen-title {
+  .fullscreen-layout:not(.lyrics-hidden) .fullscreen-title {
     font-size: 18px;
   }
 
-  .fullscreen-artist {
+  .fullscreen-layout:not(.lyrics-hidden) .fullscreen-artist {
     margin-top: 4px;
     font-size: 14px;
+  }
+
+  /* Without lyrics: stay vertically centered — do not jump to the top strip */
+  .fullscreen-layout.lyrics-hidden {
+    grid-template-rows: 1fr;
+    align-items: center;
+    justify-items: center;
+  }
+
+  .fullscreen-layout.lyrics-hidden .fullscreen-side {
+    flex-direction: column;
+    align-items: stretch;
+    align-self: center;
+    justify-self: center;
+    justify-content: center;
+    width: max-content;
+    max-width: min(500px, 90vw);
+    margin-left: 0;
+    padding: 0 12px;
+  }
+
+  .fullscreen-layout.lyrics-hidden .fullscreen-art-wrap {
+    width: clamp(220px, min(56vw, 42vh), 420px);
+    height: auto;
+    aspect-ratio: 1;
+  }
+
+  .fullscreen-layout.lyrics-hidden .fullscreen-meta {
+    flex: none;
+    width: 100%;
+    padding-left: 4px;
   }
 
   .fullscreen-toolbar {
