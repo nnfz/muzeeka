@@ -20,6 +20,7 @@ mod lyrics;
 mod metadata;
 mod player;
 mod playlists;
+mod process_util;
 mod remote_control;
 mod remote_server;
 mod settings;

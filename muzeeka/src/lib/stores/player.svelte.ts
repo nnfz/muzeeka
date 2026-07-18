@@ -102,6 +102,8 @@ let saveTimer: ReturnType<typeof setTimeout> | null = null;
 let lastGaplessChangeAt = 0;
 let lastManualPlayAt = 0;
 let lastPlayedFile = '';
+/** Paths last sent to the backend gapless queue (same order the player will advance). */
+let lastGaplessQueuePaths: string[] = [];
 let lastPauseRequestAt = 0;
 let applyingExternalSync = false;
 let listenersSetup = false;
@@ -503,6 +505,53 @@ function isNaturalQueueAdvance(fromPath: string, toPath: string): boolean {
     return playingTracks[idx + 1]?.path === toPath;
   }
   return repeatMode === 'all' && playingTracks[0]?.path === toPath;
+}
+
+/**
+ * True when `toPath` is the next entry after `fromPath` in the queue we last sent to the backend.
+ * Prefer this over UI play-order when deciding whether a track-changed event is a real gapless
+ * advance — the backend only knows the queue we sent (critical for sub-second tracks that
+ * finish inside the manual-play guard window).
+ */
+function isSentQueueAdvance(fromPath: string, toPath: string): boolean {
+  if (!fromPath || !toPath || fromPath === toPath || lastGaplessQueuePaths.length < 2) {
+    return false;
+  }
+  const fromIdx = lastGaplessQueuePaths.indexOf(fromPath);
+  const toIdx = lastGaplessQueuePaths.indexOf(toPath);
+  // Any forward step in the queue we sent counts — intermediate track-changed
+  // events can be missed when several sub-second tracks fire in one poll window.
+  return fromIdx >= 0 && toIdx > fromIdx;
+}
+
+/** Accept a track-changed event as a legitimate auto-advance (not a stale gapless poll). */
+function isLegitimateTrackAdvance(fromPath: string, toPath: string): boolean {
+  if (!fromPath || !toPath || fromPath === toPath) return false;
+  // Backend queue is authoritative for what gapless will actually play next.
+  if (isSentQueueAdvance(fromPath, toPath)) return true;
+  if (isNaturalQueueAdvance(fromPath, toPath)) return true;
+  // Also accept advance from the UI's current file (may lag lastPlayedFile by one event).
+  if (currentFile && currentFile !== fromPath && isSentQueueAdvance(currentFile, toPath)) {
+    return true;
+  }
+  if (currentFile && currentFile !== fromPath && isNaturalQueueAdvance(currentFile, toPath)) {
+    return true;
+  }
+  return false;
+}
+
+function rememberGaplessQueue(queue: { filePath?: string }[] | string[]) {
+  if (queue.length === 0) {
+    lastGaplessQueuePaths = [];
+    return;
+  }
+  if (typeof queue[0] === 'string') {
+    lastGaplessQueuePaths = queue as string[];
+    return;
+  }
+  lastGaplessQueuePaths = (queue as { filePath?: string }[])
+    .map((item) => item.filePath)
+    .filter((path): path is string => typeof path === 'string' && path.length > 0);
 }
 
 function shuffleIndices(count: number): number[] {
@@ -1172,15 +1221,20 @@ function buildGaplessQueue(filePath: string) {
     if (track) {
       return [gaplessArgsForTrack(track, filePath)];
     }
-    return [];
+    return [gaplessArgsForTrack({ path: filePath } as MusicFile, filePath)];
   }
-  return orderedTracksFrom(filePath).map((track) =>
+  const ordered = orderedTracksFrom(filePath).map((track) =>
     gaplessArgsForTrack(track, track.path)
   );
+  if (ordered.length > 0) return ordered;
+  // Fallback when the track is not yet in playingTracks (playlist switch race).
+  const track = trackByPath.get(filePath);
+  return [gaplessArgsForTrack(track ?? ({ path: filePath } as MusicFile), filePath)];
 }
 
 async function prepareGaplessNext(filePath: string) {
   const queue = buildGaplessQueue(filePath);
+  rememberGaplessQueue(queue);
   try {
     await invoke('player_prepare_next', { queue });
   } catch (e) {
@@ -1262,24 +1316,12 @@ async function play(filePath: string) {
       playingPlaylistId = playlistId;
     }
 
-    // Compute queue using explicit tracks from the playlist at click time to avoid stale derived
-    // playingTracks / currentTrackIndex. This fixes random jumps and wrong UI track after clicking
-    // different tracks in the playing ("que") list.
-    let queueToSend: any[];
-    if (repeatMode === 'one') {
-      queueToSend = [gaplessArgsForTrack(track || ({ path: filePath } as any), filePath)];
-    } else if (playlistId) {
-      const pl = playlistById.get(playlistId);
-      if (pl) {
-        const idx = pl.tracks.findIndex((t) => t.path === filePath);
-        const slice = (idx >= 0) ? pl.tracks.slice(idx, idx + MAX_GAPLESS_FOLLOWING) : [track || {path: filePath} as any];
-        queueToSend = slice.map((t) => gaplessArgsForTrack(t, t.path || filePath));
-      } else {
-        queueToSend = buildGaplessQueue(filePath);
-      }
-    } else {
-      queueToSend = buildGaplessQueue(filePath);
-    }
+    // Build gapless queue from the active play order (incl. shuffle). playingPlaylistId is
+    // already set above so derived playingTracks matches what next/prev and the UI use.
+    // Remember the exact paths we send — track-changed guards must match backend order,
+    // otherwise sub-second tracks finish inside the manual-play window and the UI never advances.
+    const queueToSend = buildGaplessQueue(filePath);
+    rememberGaplessQueue(queueToSend);
 
     // Block stale position events BEFORE the invoke so they can't flash
     // the seekbar. This is critical for CUE tracks: when switching backward
@@ -1493,8 +1535,7 @@ function toggleRepeat() {
   repeatMode = repeatMode === 'off' ? 'all' : repeatMode === 'all' ? 'one' : 'off';
   // Rebuild gapless queue so backend respects the new repeat mode (esp. 'one' to avoid unwanted advance)
   if (currentFile && (isPlaying || isPaused)) {
-    const q = buildGaplessQueue(currentFile);
-    void invoke('player_prepare_next', { queue: q }).catch(() => {});
+    void prepareGaplessNext(currentFile);
   }
   scheduleSave();
 }
@@ -1579,13 +1620,11 @@ function setupListeners() {
 
     // Protect recent manual plays from *stale* track-changed events (e.g. old gapless
     // poll advancing the previous queue right after the user clicked a different track).
-    // But allow a real gapless next after a short track: it ends inside this window and
-    // must update the UI even though path !== lastPlayedFile.
+    // Real gapless next after a short track ends inside this window and must update the UI.
+    // Match against the queue we actually sent to the backend — not only the UI play order
+    // (those can diverge under shuffle or right after playlist switches).
     if (Date.now() - lastManualPlayAt < 600 && lastPlayedFile && path !== lastPlayedFile) {
-      const natural =
-        isNaturalQueueAdvance(lastPlayedFile, path) ||
-        (!!currentFile && isNaturalQueueAdvance(currentFile, path));
-      if (!natural) {
+      if (!isLegitimateTrackAdvance(lastPlayedFile, path)) {
         return;
       }
     }
@@ -1597,6 +1636,9 @@ function setupListeners() {
       ? trackDisplayTitle(track)
       : path.split(/[\\/]/).pop()?.replace(/\.[^/.]+$/, '') ?? null;
     position = 0;
+    // Don't let seek-guard from the previous manual play swallow the next track's position.
+    seekGuardPosition = 0;
+    seekGuardUntil = Date.now() + 200;
     if (track?.duration_secs != null) {
       duration = track.duration_secs;
     }

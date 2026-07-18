@@ -22,6 +22,7 @@ use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
 use crate::library;
 use crate::metadata;
+use crate::process_util;
 use crate::ytdlp::{self, YtdlpDownloadResult, YtdlpProbeResult, YtdlpProgress};
 
 const USER_AGENT: &str =
@@ -2253,25 +2254,27 @@ fn download_with_ffmpeg(
     emit_progress(app, page_url, "Converting to 320 kbps MP3…", Some(start));
 
     // CBR 320 — not VBR q=0 (which often lands ~220–260 kbps from AAC HLS).
-    let status = std::process::Command::new(&ffmpeg)
-        .args([
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-i",
-            url,
-            "-vn",
-            "-c:a",
-            "libmp3lame",
-            "-b:a",
-            "320k",
-            "-ar",
-            "44100",
-            "-ac",
-            "2",
-            dest.to_string_lossy().as_ref(),
-        ])
+    let mut cmd = std::process::Command::new(&ffmpeg);
+    cmd.args([
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        url,
+        "-vn",
+        "-c:a",
+        "libmp3lame",
+        "-b:a",
+        "320k",
+        "-ar",
+        "44100",
+        "-ac",
+        "2",
+        dest.to_string_lossy().as_ref(),
+    ]);
+    process_util::hide_console(&mut cmd);
+    let status = cmd
         .status()
         .map_err(|e| format!("Failed to run ffmpeg: {e}"))?;
 

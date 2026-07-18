@@ -1,17 +1,12 @@
 <script lang="ts">
   import type { LyricLine, LyricPart, SyncType } from '$lib/lyrics/types';
   import {
-    animationDelay,
     findActiveLineIndex,
-    highlightAmounts,
     isLineActive,
     isLinePast,
     isPartActive,
     isPartSung,
-    lineHighlightProgress,
     lineStartSec,
-    partDurationSec,
-    partHighlightProgress,
   } from '$lib/lyrics/sync';
 
   interface Props {
@@ -25,12 +20,10 @@
     onSeek?: (timeSec: number) => void;
   }
 
-  /** Lift when bottom chrome is visible — keep subtle; layout already has bottom inset */
-  const CHROME_RESERVE_PX = 44;
-  const LIFT_SHOW_MS = 1100;
-  const LIFT_HIDE_MS = 950;
-  const LIFT_SHOW_DELAY_MS = 140;
-  const LIFT_EASING = 'cubic-bezier(0.16, 1, 0.3, 1)';
+  /** Apple-like scroll easing: soft ease-out, interruptible */
+  const SCROLL_MIN_MS = 420;
+  const SCROLL_MAX_MS = 820;
+  const SCROLL_PX_FACTOR = 0.65;
 
   let {
     lines = [],
@@ -44,63 +37,12 @@
   }: Props = $props();
 
   let viewportEl = $state<HTMLDivElement | undefined>();
-  let containerEl = $state<HTMLDivElement | undefined>();
   let lastScrolledIndex = -1;
   let centerYOffset = $state(0);
-  let liftAnimation: Animation | null = null;
+  let scrollRaf = 0;
+  let scrollToken = 0;
 
   let activeLineIndex = $derived(findActiveLineIndex(lines, currentTime));
-
-  function chromeLiftPx(): number {
-    return CHROME_RESERVE_PX / 2;
-  }
-
-  function readTranslateY(el: HTMLElement): number {
-    const transform = getComputedStyle(el).transform;
-    if (transform === 'none') return 0;
-    return new DOMMatrix(transform).m42;
-  }
-
-  function setContainerLift(px: number) {
-    if (!containerEl) return;
-    containerEl.style.transform = px === 0 ? '' : `translateY(${-px}px)`;
-  }
-
-  function animateChromeLift(visible: boolean, instant = false) {
-    if (!containerEl) return;
-
-    liftAnimation?.cancel();
-    liftAnimation = null;
-
-    const targetLift = visible ? chromeLiftPx() : 0;
-    const currentLift = Math.max(0, -readTranslateY(containerEl));
-
-    if (instant || currentLift === targetLift) {
-      setContainerLift(targetLift);
-      return;
-    }
-
-    liftAnimation = containerEl.animate(
-      [
-        { transform: `translateY(${-currentLift}px)` },
-        { transform: `translateY(${-targetLift}px)` },
-      ],
-      {
-        duration: visible ? LIFT_SHOW_MS : LIFT_HIDE_MS,
-        delay: visible ? LIFT_SHOW_DELAY_MS : 0,
-        easing: LIFT_EASING,
-        fill: 'forwards',
-      },
-    );
-
-    liftAnimation.onfinish = () => {
-      setContainerLift(targetLift);
-      liftAnimation = null;
-    };
-    liftAnimation.oncancel = () => {
-      liftAnimation = null;
-    };
-  }
 
   function updateViewportMetrics() {
     if (!viewportEl) return;
@@ -108,24 +50,63 @@
     const height = viewportEl.clientHeight;
     if (height <= 0) return;
 
+    // Keep active line optically centered; chrome fades over the bottom mask.
+    // No vertical "lift" transform — that was fighting scroll and felt jerky.
     const pad = height / 2;
-    centerYOffset = chromeVisible
-      ? (height - CHROME_RESERVE_PX) / 2
-      : pad;
-
+    centerYOffset = pad;
     viewportEl.style.setProperty('--lyrics-pad-block', `${pad}px`);
+  }
+
+  function easeOutCubic(t: number): number {
+    return 1 - (1 - t) ** 3;
+  }
+
+  function cancelScrollAnim() {
+    if (scrollRaf) {
+      cancelAnimationFrame(scrollRaf);
+      scrollRaf = 0;
+    }
+    scrollToken += 1;
   }
 
   function scrollLineToCenter(lineEl: HTMLElement, smooth: boolean) {
     if (!viewportEl) return;
 
     const lineCenter = lineEl.offsetTop + lineEl.offsetHeight / 2;
-    const targetScroll = lineCenter - centerYOffset;
+    const targetScroll = Math.max(0, lineCenter - centerYOffset);
+    const startScroll = viewportEl.scrollTop;
+    const delta = targetScroll - startScroll;
 
-    viewportEl.scrollTo({
-      top: Math.max(0, targetScroll),
-      behavior: smooth ? 'smooth' : 'instant',
-    });
+    if (Math.abs(delta) < 0.5) return;
+
+    if (!smooth) {
+      cancelScrollAnim();
+      viewportEl.scrollTop = targetScroll;
+      return;
+    }
+
+    cancelScrollAnim();
+    const token = scrollToken;
+    const duration = Math.min(
+      SCROLL_MAX_MS,
+      Math.max(SCROLL_MIN_MS, Math.abs(delta) * SCROLL_PX_FACTOR),
+    );
+    const startTime = performance.now();
+
+    const tick = (now: number) => {
+      if (token !== scrollToken || !viewportEl) return;
+
+      const t = Math.min(1, (now - startTime) / duration);
+      viewportEl.scrollTop = startScroll + delta * easeOutCubic(t);
+
+      if (t < 1) {
+        scrollRaf = requestAnimationFrame(tick);
+      } else {
+        scrollRaf = 0;
+      }
+    };
+
+    scrollRaf = requestAnimationFrame(tick);
   }
 
   function scrollActiveLine(smooth: boolean) {
@@ -163,9 +144,6 @@
     onSeek?.(part.startTimeMs / 1000);
   }
 
-  let prevChromeVisible: boolean | undefined = undefined;
-  let boundContainerEl: HTMLDivElement | undefined;
-
   $effect(() => {
     if (!viewportEl) return;
 
@@ -173,31 +151,21 @@
 
     const observer = new ResizeObserver(() => {
       updateViewportMetrics();
-      if (containerEl) {
-        animateChromeLift(chromeVisible, true);
-      }
       scrollActiveLine(false);
     });
     observer.observe(viewportEl);
 
-    return () => observer.disconnect();
+    return () => {
+      observer.disconnect();
+      cancelScrollAnim();
+    };
   });
 
+  // chromeVisible kept in props for API stability; no layout lift.
   $effect(() => {
-    const visible = chromeVisible;
+    void chromeVisible;
     if (!viewportEl) return;
     updateViewportMetrics();
-    if (!containerEl) {
-      boundContainerEl = undefined;
-      return;
-    }
-
-    const containerChanged = containerEl !== boundContainerEl;
-    boundContainerEl = containerEl;
-
-    const chromeChanged = prevChromeVisible !== undefined && prevChromeVisible !== visible;
-    animateChromeLift(visible, containerChanged || !chromeChanged);
-    prevChromeVisible = visible;
   });
 
   $effect(() => {
@@ -229,24 +197,18 @@
       class="fs-lyrics-viewport"
       bind:this={viewportEl}
     >
-      <div class="fs-lyrics-container" data-sync={syncType} bind:this={containerEl}>
+      <div class="fs-lyrics-container" data-sync={syncType}>
         {#each lines as line, lineIndex (line.startTimeMs + ':' + lineIndex)}
           {@const lineActive = isLineActive(line, lineIndex, lines, currentTime)}
           {@const linePast = isLinePast(line, lineIndex, lines, currentTime)}
-          {@const lineSyncedReveal = syncType === 'synced' && (linePast || lineActive)}
-          {@const lineRichAnimating = lineActive && syncType === 'richsync'}
-          {@const lineAnimating = lineActive && syncType === 'richsync'}
           {@const parts = displayParts(line)}
 
           <div
             class="fs-lyrics-line"
             class:is-active={lineIndex === activeLineIndex}
-            class:is-past={linePast}
-            class:is-animating={lineAnimating}
-            class:is-paused={lineAnimating && !isPlaying}
+            class:is-past={linePast && lineIndex !== activeLineIndex}
             data-line={lineIndex}
             data-agent={line.agent}
-            style:--blyrics-anim-delay={lineAnimating ? animationDelay(currentTime, lineStartSec(line)) : undefined}
             onclick={() => seekToLine(line)}
             onkeydown={(e) => {
               if (e.key === 'Enter' || e.key === ' ') {
@@ -261,38 +223,19 @@
               <span class="fs-lyrics-instrumental" aria-label="Instrumental">
                 <span></span><span></span><span></span>
               </span>
-            {:else if line.parts && line.parts.length > 0}
+            {:else if line.parts && line.parts.length > 0 && syncType === 'richsync'}
               {#each parts as part, partIndex (part.startTimeMs + ':' + partIndex)}
                 {#if part.words}
                   {@const partActive = isPartActive(part, partIndex, parts, line, lineIndex, lines, currentTime)}
-                  {@const partSung = lineSyncedReveal
-                    || isPartSung(part, partIndex, parts, line, lineIndex, lines, currentTime)}
-                  {@const partAnimating = partActive && syncType === 'richsync'}
-                  {@const partFill = partSung || partAnimating
-                    ? highlightAmounts(
-                      partAnimating
-                        ? partHighlightProgress(part, partIndex, parts, line, lineIndex, lines, currentTime)
-                        : 1,
-                    )
-                    : null}
-                  {@const partDurationMs = Math.round(
-                    partDurationSec(part, partIndex, parts, line, lineIndex, lines) * 1000,
-                  )}
-                  <span class="fs-lyrics-word-wrap" class:is-sung={partSung}>
+                  {@const partSung = isPartSung(part, partIndex, parts, line, lineIndex, lines, currentTime)
+                    || (linePast && !lineActive)}
+                  {@const partAnimating = partActive && !partSung}
+                  <span class="fs-lyrics-word-wrap" class:is-sung={partSung || partAnimating}>
                     <span
                       class="fs-lyrics-word"
                       class:is-background={part.isBackground}
                       class:is-sung={partSung}
-                      class:is-pre-animating={partAnimating && !partSung && !partActive}
                       class:is-animating={partAnimating}
-                      class:is-paused={partAnimating && !isPlaying}
-                      data-content={part.words}
-                      style:--blyrics-duration="{Math.max(partDurationMs, 300)}ms"
-                      style:--lyric-highlight-start={partFill?.start}
-                      style:--lyric-highlight-end={partFill?.end}
-                      style:--blyrics-anim-delay={partAnimating
-                        ? animationDelay(currentTime, part.startTimeMs / 1000)
-                        : undefined}
                       onclick={(e) => {
                         e.stopPropagation();
                         seekToPart(part);
@@ -303,29 +246,8 @@
                 {/if}
               {/each}
             {:else}
-              {@const lineFill = lineSyncedReveal
-                ? highlightAmounts(1)
-                : lineRichAnimating
-                  ? highlightAmounts(lineHighlightProgress(line, lineIndex, lines, currentTime))
-                  : null}
-              <span
-                class="fs-lyrics-word-wrap"
-                class:is-sung={lineSyncedReveal}
-              >
-                <span
-                  class="fs-lyrics-word"
-                  class:is-sung={lineSyncedReveal}
-                  class:is-pre-animating={lineRichAnimating && !linePast}
-                  class:is-animating={lineRichAnimating}
-                  class:is-paused={lineRichAnimating && !isPlaying}
-                  data-content={line.words}
-                  style:--blyrics-duration="{Math.max(line.durationMs, 800)}ms"
-                  style:--lyric-highlight-start={lineFill?.start}
-                  style:--lyric-highlight-end={lineFill?.end}
-                  style:--blyrics-anim-delay={lineRichAnimating
-                    ? animationDelay(currentTime, lineStartSec(line))
-                    : undefined}
-                >{line.words}</span>
+              <span class="fs-lyrics-word-wrap">
+                <span class="fs-lyrics-word">{line.words}</span>
               </span>
             {/if}
           </div>

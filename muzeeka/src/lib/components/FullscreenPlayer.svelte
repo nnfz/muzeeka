@@ -35,7 +35,7 @@
   let lyricsError = $state<string | null>(null);
   let lyricsLoadedForFile = $state<string | null>(null);
   let lyricsVisible = $state(true);
-  const CHROME_HIDE_DELAY = 3200;
+  const CHROME_HIDE_DELAY = 3600;
 
   let chromeVisible = $state(true);
   let hideTimer: ReturnType<typeof setTimeout> | null = null;

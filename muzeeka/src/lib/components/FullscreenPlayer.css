@@ -1,4 +1,7 @@
 .fullscreen-player {
+  --fs-ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --fs-ease-soft: cubic-bezier(0.33, 1, 0.68, 1);
+
   position: fixed;
   inset: 0;
   z-index: 300;
@@ -20,12 +23,47 @@
   }
 }
 
-@keyframes fullscreen-fade-in {
+@keyframes fullscreen-side-in {
   from {
     opacity: 0;
+    transform: translateY(18px) scale(0.96);
   }
   to {
     opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes fullscreen-art-in {
+  from {
+    opacity: 0;
+    transform: scale(0.92);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes fullscreen-meta-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes fullscreen-chrome-in {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
   }
 }
 
@@ -34,7 +72,7 @@
   inset: 0;
   overflow: hidden;
   background: var(--bg-deep);
-  animation: fullscreen-backdrop-in 160ms ease;
+  animation: fullscreen-backdrop-in 420ms var(--fs-ease-soft) both;
 }
 
 .fullscreen-backdrop-shade {
@@ -60,7 +98,7 @@
     0
     132px;
   pointer-events: none;
-  transition: justify-content 240ms ease;
+  transition: padding 480ms var(--fs-ease);
 }
 
 .fullscreen-layout.lyrics-hidden {
@@ -81,7 +119,11 @@
   gap: 20px;
   padding: 0 28px 0 36px;
   pointer-events: none;
-  animation: fullscreen-fade-in 180ms ease;
+  animation: fullscreen-side-in 560ms var(--fs-ease) both;
+  transition:
+    flex-basis 480ms var(--fs-ease),
+    max-width 480ms var(--fs-ease),
+    padding 480ms var(--fs-ease);
 }
 
 .fullscreen-art-wrap {
@@ -90,6 +132,17 @@
   border-radius: var(--radius-lg);
   overflow: hidden;
   box-shadow: var(--shadow-lg), 0 24px 80px rgba(0, 0, 0, 0.55);
+  animation: fullscreen-art-in 640ms var(--fs-ease) both;
+  transition:
+    width 480ms var(--fs-ease),
+    box-shadow 480ms var(--fs-ease),
+    transform 480ms var(--fs-ease);
+  will-change: transform;
+}
+
+.fullscreen-layout.lyrics-hidden .fullscreen-art-wrap {
+  width: min(280px, 34vh, 42vw);
+  box-shadow: var(--shadow-lg), 0 32px 100px rgba(0, 0, 0, 0.6);
 }
 
 .fullscreen-art,
@@ -102,6 +155,7 @@
 .fullscreen-art {
   object-fit: cover;
   image-rendering: auto;
+  transition: opacity 360ms var(--fs-ease-soft);
 }
 
 .fullscreen-art-placeholder {
@@ -115,6 +169,7 @@
 .fullscreen-meta {
   width: 100%;
   text-align: center;
+  animation: fullscreen-meta-in 600ms var(--fs-ease) 80ms both;
 }
 
 .fullscreen-title {
@@ -125,6 +180,7 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  letter-spacing: -0.01em;
 }
 
 .fullscreen-artist {
@@ -164,17 +220,22 @@
   flex-direction: column;
   align-items: center;
   gap: 16px;
+  opacity: 1;
+  transform: translateY(0);
+  filter: none;
   transition:
-    opacity 280ms ease,
-    transform 280ms ease,
-    filter 280ms ease;
-  will-change: opacity, transform, filter;
+    opacity 520ms var(--fs-ease),
+    transform 520ms var(--fs-ease),
+    filter 520ms var(--fs-ease);
+  will-change: opacity, transform;
+  animation: fullscreen-chrome-in 560ms var(--fs-ease) 60ms both;
 }
 
 .fullscreen-bottom-chrome-inner.chrome-hidden {
   opacity: 0;
-  transform: translateY(14px);
-  filter: blur(8px);
+  transform: translateY(18px);
+  /* Soft fade only — heavy blur was causing janky text/controls */
+  filter: none;
   pointer-events: none;
 }
 
@@ -231,7 +292,10 @@
   height: 38px;
   border-radius: 50%;
   color: var(--text-secondary);
-  transition: all var(--transition-fast);
+  transition:
+    color 200ms var(--fs-ease-soft),
+    background 200ms var(--fs-ease-soft),
+    transform 200ms var(--fs-ease);
 }
 
 .fs-control-btn:hover:not(:disabled) {

@@ -479,17 +479,7 @@ fn is_animated_webp(path: &Path) -> bool {
 }
 
 fn configure_ffmpeg_command(cmd: &mut Command) {
-    // Avoid flashing a console window when spawning ffmpeg on Windows GUI apps.
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = cmd;
-    }
+    crate::process_util::hide_console(cmd);
 }
 
 fn convert_gif_to_webp_ffmpeg(

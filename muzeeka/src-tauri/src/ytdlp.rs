@@ -17,6 +17,7 @@ use tauri::path::BaseDirectory;
 
 use crate::library::{self, MusicFile};
 use crate::metadata;
+use crate::process_util;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct YtdlpProbeResult {
@@ -223,11 +224,12 @@ fn run_ytdlp(app: &AppHandle, args: &[&str]) -> Result<std::process::Output, Str
 
     let full_args = build_ytdlp_args(app, args);
 
-    Command::new(&binary)
-        .args(&full_args)
+    let mut cmd = Command::new(&binary);
+    cmd.args(&full_args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
+        .stderr(Stdio::piped());
+    process_util::hide_console(&mut cmd);
+    cmd.output()
         .map_err(|e| format!("Failed to run yt-dlp: {}", e))
 }
 
@@ -463,10 +465,12 @@ pub fn download(
     }
     cmd_args.push(trimmed.to_string());
 
-    let mut child = Command::new(&binary)
-        .args(&cmd_args)
+    let mut cmd = Command::new(&binary);
+    cmd.args(&cmd_args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    process_util::hide_console(&mut cmd);
+    let mut child = cmd
         .spawn()
         .map_err(|e| format!("Failed to start yt-dlp: {}", e))?;
 

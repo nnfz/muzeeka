@@ -18,6 +18,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use tauri::path::BaseDirectory;
 
 use crate::library;
+use crate::process_util;
 use crate::ytdlp::{self, YtdlpDownloadResult, YtdlpProbeResult, YtdlpProgress};
 
 static CANCELLED: AtomicBool = AtomicBool::new(false);
@@ -489,28 +490,30 @@ pub fn download(
 
     emit_progress(app, trimmed, "Starting Spotify download…", Some(0.0));
 
-    let mut child = Command::new(&binary)
-        .args([
-            "download",
-            trimmed,
-            "--ffmpeg",
-            &ffmpeg.to_string_lossy(),
-            "--format",
-            "mp3",
-            "--bitrate",
-            "320k",
-            "--output",
-            &output_template,
-            "--overwrite",
-            "force",
-            "--threads",
-            "2",
-            "--log-level",
-            "INFO",
-            "--print-errors",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+    let mut cmd = Command::new(&binary);
+    cmd.args([
+        "download",
+        trimmed,
+        "--ffmpeg",
+        &ffmpeg.to_string_lossy(),
+        "--format",
+        "mp3",
+        "--bitrate",
+        "320k",
+        "--output",
+        &output_template,
+        "--overwrite",
+        "force",
+        "--threads",
+        "2",
+        "--log-level",
+        "INFO",
+        "--print-errors",
+    ])
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    process_util::hide_console(&mut cmd);
+    let mut child = cmd
         .spawn()
         .map_err(|e| format!("Failed to start spotDL: {e}"))?;
 
