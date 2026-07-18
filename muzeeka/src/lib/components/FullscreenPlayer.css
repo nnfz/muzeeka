@@ -170,13 +170,13 @@
 }
 
 .fullscreen-meta {
-  width: 100%;
+  width: 98%;
   text-align: left;
   animation: fullscreen-meta-in 600ms var(--fs-ease) 80ms both;
 }
 
 .fullscreen-title {
-  font-size: 24px;
+  font-size: 26px;
   font-weight: 700;
   line-height: 1.25;
   color: var(--text-primary);

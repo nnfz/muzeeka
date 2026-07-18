@@ -1,4 +1,5 @@
 import type { LyricLine, LyricPart } from './types';
+import { normalizePartSpaces } from './normalizeParts';
 
 const INSTRUMENTAL_GAP_MS = 3000;
 
@@ -196,7 +197,7 @@ function parseParagraphParts(
     return { parts: [], text, isWordSynced: false };
   }
 
-  return { parts, text, isWordSynced };
+  return { parts: normalizePartSpaces(parts), text, isWordSynced };
 }
 
 function finalizeDurations(lines: LyricLine[], songDurationMs: number) {

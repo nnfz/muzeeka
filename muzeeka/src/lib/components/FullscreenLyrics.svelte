@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { LyricLine, LyricPart, SyncType } from '$lib/lyrics/types';
+  import { normalizePartSpaces } from '$lib/lyrics/normalizeParts';
   import {
     findActiveLineIndex,
     isLineActive,
@@ -149,7 +150,8 @@
 
   function displayParts(line: LyricLine): LyricPart[] {
     if (line.parts && line.parts.length > 0) {
-      return line.parts;
+      // Trailing spaces (not leading) so a soft-wrapped row never starts with a space.
+      return normalizePartSpaces(line.parts.map((part) => ({ ...part, words: part.words })));
     }
     return [{
       startTimeMs: line.startTimeMs,
