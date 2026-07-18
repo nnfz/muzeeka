@@ -12,6 +12,33 @@
 @import '@fontsource/inter/600.css';
 @import '@fontsource/inter/700.css';
 
+/* Interpolate accent when cover-derived color changes */
+@property --accent {
+  syntax: '<color>';
+  inherits: true;
+  initial-value: #8b5cf6;
+}
+@property --accent-hover {
+  syntax: '<color>';
+  inherits: true;
+  initial-value: #7c3aed;
+}
+@property --accent-glow {
+  syntax: '<color>';
+  inherits: true;
+  initial-value: rgba(139, 92, 246, 0.35);
+}
+@property --accent-soft {
+  syntax: '<color>';
+  inherits: true;
+  initial-value: rgba(139, 92, 246, 0.12);
+}
+@property --border-accent {
+  syntax: '<color>';
+  inherits: true;
+  initial-value: rgba(139, 92, 246, 0.25);
+}
+
 /* --- CSS Custom Properties --- */
 :root {
   /* Background palette */
@@ -21,11 +48,17 @@
   --bg-glass: rgba(17, 17, 24, 0.65);
   --bg-glass-hover: rgba(26, 26, 36, 0.75);
 
-  /* Accent palette */
+  /* Accent palette (overridden from cover via coverAccent.ts) */
   --accent: #8b5cf6;
   --accent-hover: #7c3aed;
   --accent-glow: rgba(139, 92, 246, 0.35);
   --accent-soft: rgba(139, 92, 246, 0.12);
+  transition:
+    --accent 420ms ease,
+    --accent-hover 420ms ease,
+    --accent-glow 420ms ease,
+    --accent-soft 420ms ease,
+    --border-accent 420ms ease;
 
   /* Text palette */
   --text-primary: #f0f0f5;

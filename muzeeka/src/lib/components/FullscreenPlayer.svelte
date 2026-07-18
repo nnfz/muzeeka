@@ -1,5 +1,6 @@
 <script lang="ts">
   import { getCoverSrc, resolveCoverSrc } from '$lib/coverCache';
+  import { COVER_PLACEHOLDER_SRC } from '$lib/coverPlaceholder';
   import {
     getPlayerStore,
     trackDisplayArtist,
@@ -29,9 +30,115 @@
       ?? player.currentTrack?.cover_path_full
       ?? null
   );
-  /** Background may upgrade to full-res; art img stays locked (no mid-open src swap). */
+  /** Kawarp background URL (may upgrade to full-res independently). */
   let bgCoverSrc = $state<string | null>(null);
-  let artCoverSrc = $state<string | null>(null);
+
+  /**
+   * Cover art: base stays fully opaque; overlay fades in on top, then promotes.
+   * Old cover never fades out — that was the dissolve bug.
+   */
+  const ART_CROSSFADE_MS = 480;
+  let artBaseSrc = $state<string | null>(null);
+  let artOverlaySrc = $state<string | null>(null);
+  let artOverlayIn = $state(false);
+  /** Audio file the current art belongs to (thumb→full skips crossfade). */
+  let artFile = $state<string | null>(null);
+  let artToken = 0;
+  let artPromoteTimer: ReturnType<typeof setTimeout> | null = null;
+  let placeholderFailed = $state(false);
+
+  function clearArtPromoteTimer() {
+    if (artPromoteTimer) {
+      clearTimeout(artPromoteTimer);
+      artPromoteTimer = null;
+    }
+  }
+
+  function preloadImageOk(url: string): Promise<boolean> {
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.onload = () => resolve(true);
+      img.onerror = () => resolve(false);
+      img.src = url;
+    });
+  }
+
+  function clearArt() {
+    clearArtPromoteTimer();
+    artToken += 1;
+    artBaseSrc = null;
+    artOverlaySrc = null;
+    artOverlayIn = false;
+    artFile = null;
+  }
+
+  /** Instant base cover — used on open. No animation, no async. */
+  function setArtImmediate(src: string, file: string | null) {
+    artToken += 1;
+    clearArtPromoteTimer();
+    artBaseSrc = src;
+    artOverlaySrc = null;
+    artOverlayIn = false;
+    artFile = file;
+  }
+
+  /**
+   * Show / swap front cover.
+   * - Open / first image: hard set base (NO animation).
+   * - Same track URL upgrade: replace base pixels in place.
+   * - Track change only: preload, fade overlay on top (base never fades out).
+   */
+  async function setArtSrc(next: string | null, file: string | null) {
+    if (!next) {
+      clearArt();
+      return;
+    }
+
+    const settled =
+      artOverlayIn && artOverlaySrc ? artOverlaySrc : artBaseSrc;
+
+    if (settled === next || artOverlaySrc === next) {
+      artFile = file;
+      return;
+    }
+
+    // Same track, higher-res / other URL: swap pixels, no fade.
+    if (file && artFile === file && artBaseSrc) {
+      setArtImmediate(next, file);
+      return;
+    }
+
+    // First cover (open): solid, no animation.
+    if (!artBaseSrc) {
+      setArtImmediate(next, file);
+      return;
+    }
+
+    // Track change only: overlay fades in on top of solid base.
+    const token = ++artToken;
+    const ok = await preloadImageOk(next);
+    if (token !== artToken || !ok) return;
+    if (untrack(() => !open)) return;
+
+    clearArtPromoteTimer();
+    artOverlaySrc = next;
+    artOverlayIn = false;
+    artFile = file;
+
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        if (token !== artToken) return;
+        artOverlayIn = true;
+        artPromoteTimer = setTimeout(() => {
+          if (token !== artToken) return;
+          artBaseSrc = next;
+          artOverlaySrc = null;
+          artOverlayIn = false;
+          artPromoteTimer = null;
+        }, ART_CROSSFADE_MS);
+      });
+    });
+  }
 
   let lyricsState = $state<LyricsResult | null>(null);
   /** File path for which fetch finished (hit or miss). Not set while in-flight. */
@@ -47,7 +154,7 @@
   let lyricsLayoutActive = $state(false);
   let hasLyrics = $derived((lyricsState?.lines.length ?? 0) > 0);
   let showLyricsPanel = $derived(lyricsLayoutActive);
-  const CHROME_HIDE_DELAY = 3600;
+  const CHROME_HIDE_DELAY = 1800;
 
   let chromeVisible = $state(true);
   let hideTimer: ReturnType<typeof setTimeout> | null = null;
@@ -115,11 +222,12 @@
   $effect(() => {
     if (!open) {
       clearHideTimer();
+      clearArtPromoteTimer();
       chromeVisible = true;
       lyricsVisible = true;
       enterDone = false;
       lyricsLayoutActive = false;
-      artCoverSrc = null;
+      clearArt();
       bgCoverSrc = null;
       resolvedFullCoverPath = null;
       return;
@@ -129,6 +237,26 @@
     scheduleChromeHide();
     enterDone = false;
     lyricsLayoutActive = false;
+
+    // Seed once on open (untracked) — solid cover on first paint, zero animation.
+    untrack(() => {
+      const file = player.currentFile;
+      const path =
+        player.currentTrack?.cover_path
+        ?? player.currentTrack?.cover_path_full
+        ?? null;
+      if (file && path) {
+        const src = getCoverSrc(path);
+        if (src) {
+          setArtImmediate(src, file);
+          bgCoverSrc = src;
+          return;
+        }
+      }
+      // No cover — still feed placeholder into Kawarp
+      bgCoverSrc = COVER_PLACEHOLDER_SRC;
+    });
+
     const enterTimer = setTimeout(() => {
       enterDone = true;
     }, 200);
@@ -162,6 +290,7 @@
     };
   });
 
+  // File change: reset lyrics + resolve full cover (do not hard-clear art — crossfade handles swap).
   $effect(() => {
     const file = player.currentFile;
 
@@ -169,13 +298,18 @@
       return;
     }
 
+    resolvedFullCoverPath = null;
+    lyricsState = null;
+    lyricsSettledForFile = null;
+    lyricsLayoutActive = false;
+
     let cancelled = false;
 
     void invoke<string | null>('library_resolve_full_cover', { path: file })
-      .then((path) => {
-        if (!cancelled && path) {
-          resolvedFullCoverPath = path;
-        }
+      .then((fullPath) => {
+        if (cancelled || !fullPath) return;
+        if (untrack(() => player.currentFile) !== file) return;
+        resolvedFullCoverPath = fullPath;
       })
       .catch(() => {});
 
@@ -184,35 +318,40 @@
     };
   });
 
-  // Art cover: lock first bitmap for this open — never swap src (thumb→full was the jerk).
+  /**
+   * Sync art + bg from cover path.
+   * No path → placeholder (clear art). Never blank the base mid-load if path only upgrades.
+   */
   $effect(() => {
     if (!open) return;
-    if (artCoverSrc) return;
 
-    const path =
-      player.currentTrack?.cover_path
-      ?? player.currentTrack?.cover_path_full
-      ?? null;
-    if (!path) return;
-
-    const immediate = getCoverSrc(path);
-    if (immediate) {
-      artCoverSrc = immediate;
-      bgCoverSrc = immediate;
-    }
-  });
-
-  // Background only may upgrade to full-res after open (Kawarp), art stays locked.
-  $effect(() => {
-    if (!open || !enterDone) return;
+    const file = player.currentFile;
+    void player.currentTrack;
     const path = coverPath;
-    if (!path) return;
+
+    if (!file) return;
+
+    if (!path) {
+      // No cover — clear front art (placeholder UI) but keep Kawarp on placeholder image.
+      bgCoverSrc = COVER_PLACEHOLDER_SRC;
+      void setArtSrc(null, file);
+      return;
+    }
 
     let cancelled = false;
+
+    const apply = (src: string) => {
+      if (cancelled) return;
+      if (untrack(() => player.currentFile) !== file) return;
+      bgCoverSrc = src;
+      void setArtSrc(src, file);
+    };
+
+    const immediate = getCoverSrc(path);
+    if (immediate) apply(immediate);
+
     void resolveCoverSrc(path).then((src) => {
-      if (!cancelled && src) {
-        bgCoverSrc = src;
-      }
+      if (src) apply(src);
     });
 
     return () => {
@@ -296,22 +435,43 @@
     aria-modal="true"
     aria-label="Now playing"
   >
-    <!-- Only the backdrop fades; cover is never in an opacity/transform open chain -->
+    <!-- Persistent Kawarp (no #key) so texture crossfade works between tracks -->
     <div class="fullscreen-backdrop" aria-hidden="true">
-      <KawarpBackground src={bgCoverSrc} active={open && enterDone} />
+      <KawarpBackground src={bgCoverSrc} active={open} transitionDuration={700} />
       <div class="fullscreen-backdrop-shade"></div>
     </div>
 
     <div class="fullscreen-layout" class:lyrics-hidden={!showLyricsPanel}>
       <aside class="fullscreen-side">
         <div class="fullscreen-art-wrap">
-          {#if artCoverSrc}
+          {#if artBaseSrc}
             <img
-              class="fullscreen-art"
-              src={artCoverSrc}
+              class="fullscreen-art art-base"
+              src={artBaseSrc}
               alt=""
               draggable="false"
               decoding="async"
+            />
+            {#if artOverlaySrc}
+              <img
+                class="fullscreen-art art-overlay"
+                class:is-in={artOverlayIn}
+                src={artOverlaySrc}
+                alt=""
+                draggable="false"
+                decoding="async"
+              />
+            {/if}
+          {:else if !placeholderFailed}
+            <img
+              class="fullscreen-art art-base art-placeholder-img"
+              src={COVER_PLACEHOLDER_SRC}
+              alt=""
+              draggable="false"
+              decoding="async"
+              onerror={() => {
+                placeholderFailed = true;
+              }}
             />
           {:else}
             <div class="fullscreen-art-placeholder" aria-hidden="true">
@@ -368,9 +528,13 @@
             aria-label={player.shuffleEnabled ? 'Disable shuffle' : 'Enable shuffle'}
             title={player.shuffleEnabled ? 'Shuffle on' : 'Shuffle'}
           >
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-              <path d="M10.59 9.17 5.41 4 4 5.41l5.17 5.17 1.42-1.41zM14.5 4l2.04 2.04L4 18.59 5.41 20 17.96 7.46 20 9.5V4h-5.5zm.33 9.41-1.41 1.41 3.13 3.13L14.5 20H20v-5.51l-2.04 2.04-3.13-3.12z"/>
-            </svg>
+            <span
+              class="fs-icon"
+              style:--fs-icon={player.shuffleEnabled
+                ? "url('/icons/shuffle.svg')"
+                : "url('/icons/noshuffle.svg')"}
+              aria-hidden="true"
+            ></span>
           </button>
 
           <button
@@ -379,9 +543,7 @@
             disabled={!player.hasTrack}
             aria-label="Previous track"
           >
-            <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
-              <path d="M6 6h2v12H6zm3.5 6 8.5 6V6z"/>
-            </svg>
+            <span class="fs-icon" style:--fs-icon={"url('/icons/playbackward.svg')"} aria-hidden="true"></span>
           </button>
 
           <button
@@ -391,16 +553,13 @@
             disabled={!player.hasPlayingTracks && !player.hasTrack}
             aria-label={player.isPlaying ? 'Pause' : player.isPaused ? 'Resume' : 'Play'}
           >
-            {#if player.isPlaying}
-              <svg width="30" height="30" viewBox="0 0 24 24" fill="currentColor">
-                <rect x="6" y="4" width="4" height="16" rx="1"/>
-                <rect x="14" y="4" width="4" height="16" rx="1"/>
-              </svg>
-            {:else}
-              <svg width="30" height="30" viewBox="0 0 24 24" fill="currentColor">
-                <path d="M8 5v14l11-7z"/>
-              </svg>
-            {/if}
+            <span
+              class="fs-icon fs-icon-play"
+              style:--fs-icon={player.isPlaying
+                ? "url('/icons/pause.svg')"
+                : "url('/icons/play.svg')"}
+              aria-hidden="true"
+            ></span>
           </button>
 
           <button
@@ -409,15 +568,12 @@
             disabled={!player.hasNext}
             aria-label="Next track"
           >
-            <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
-              <path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z"/>
-            </svg>
+            <span class="fs-icon" style:--fs-icon={"url('/icons/playforward.svg')"} aria-hidden="true"></span>
           </button>
 
           <button
             class="fs-control-btn mode-btn"
             class:active={player.repeatMode !== 'off'}
-            class:repeat-one={player.repeatMode === 'one'}
             onclick={() => player.toggleRepeat()}
             disabled={!player.hasPlayingTracks}
             aria-label={
@@ -428,12 +584,17 @@
                   : 'Repeat all'
             }
           >
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-              <path d="M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4z"/>
-            </svg>
-            {#if player.repeatMode === 'one'}
-              <span class="repeat-one-badge" aria-hidden="true">1</span>
-            {/if}
+            <span
+              class="fs-icon"
+              style:--fs-icon={
+                player.repeatMode === 'one'
+                  ? "url('/icons/repeat.svg')"
+                  : player.repeatMode === 'all'
+                    ? "url('/icons/repeatplaylist.svg')"
+                    : "url('/icons/norepeat.svg')"
+              }
+              aria-hidden="true"
+            ></span>
           </button>
           </div>
 
@@ -446,11 +607,15 @@
               aria-label={lyricsVisible ? 'Hide lyrics' : 'Show lyrics'}
               title={lyricsVisible ? 'Hide lyrics' : 'Show lyrics'}
             >
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-                <path d="M4 6h16v2H4V6zm0 5h12v2H4v-2zm0 5h14v2H4v-2z"/>
-              </svg>
+              <span
+                class="fs-icon fs-icon-sm"
+                style:--fs-icon={lyricsVisible
+                  ? "url('/icons/text.svg')"
+                  : "url('/icons/textclose.svg')"}
+                aria-hidden="true"
+              ></span>
             </button>
-            <MediaSlider variant="volume" />
+            <MediaSlider variant="volume" useStaticIcons />
           </div>
         </div>
 

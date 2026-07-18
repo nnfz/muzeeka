@@ -42,6 +42,15 @@
   background: rgba(255, 255, 255, 0.08);
 }
 
+.header-static-icon {
+  display: block;
+  width: 16px;
+  height: 16px;
+  background-color: currentColor;
+  -webkit-mask: var(--header-icon) center / contain no-repeat;
+  mask: var(--header-icon) center / contain no-repeat;
+}
+
 .app-body {
   flex: 1;
   min-height: 0;

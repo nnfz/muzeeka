@@ -48,24 +48,33 @@
   transition: none !important;
 }
 
-/* Backdrop solid immediately — fading it made the cover look like it stuttered */
+/*
+ * Backdrop must form its own stacking context (isolation / z-index:0).
+ * Kawarp canvas uses z-index inside it — without isolation that canvas
+ * painted OVER the cover + title after image-ready (smooth “everything vanishes”).
+ */
 .fullscreen-backdrop {
   position: absolute;
   inset: 0;
+  z-index: 0;
+  isolation: isolate;
   overflow: hidden;
   background: var(--bg-deep);
   opacity: 1;
+  pointer-events: none;
 }
 
 .fullscreen-backdrop-shade {
   position: absolute;
   inset: 0;
+  z-index: 3;
   background:
     radial-gradient(ellipse at center, rgba(10, 10, 15, 0) 0%, rgba(10, 10, 15, 0.45) 78%),
     linear-gradient(180deg, rgba(10, 10, 15, 0.08) 0%, rgba(10, 10, 15, 0.42) 100%);
   pointer-events: none;
 }
 
+/* Always above backdrop / Kawarp — cover + meta + lyrics live here */
 .fullscreen-layout {
   position: absolute;
   inset: 0;
@@ -157,15 +166,16 @@
 }
 
 .fullscreen-art-wrap {
+  position: relative;
   width: 100%;
   aspect-ratio: 1;
   flex-shrink: 0;
   border-radius: var(--radius-sm);
   overflow: hidden;
   box-shadow: var(--shadow-sm);
-  /* Stable layer — no animated transform on the art itself */
   transform: translateZ(0);
   backface-visibility: hidden;
+  background: rgba(255, 255, 255, 0.04);
 }
 
 .fullscreen-art,
@@ -175,12 +185,39 @@
   display: block;
 }
 
+/*
+ * Cover:
+ * - open: no animation, solid immediately
+ * - track change only: overlay fades in on top (base never fades out)
+ */
 .fullscreen-art {
+  position: absolute;
+  inset: 0;
   object-fit: cover;
   image-rendering: auto;
+  pointer-events: none;
   opacity: 1;
-  /* Never animate the bitmap — src/opacity changes look like a jerk */
+  animation: none;
   transition: none;
+}
+
+.fullscreen-art.art-base {
+  z-index: 1;
+}
+
+.fullscreen-art.art-overlay {
+  z-index: 2;
+  opacity: 0;
+  transition: opacity 480ms var(--fs-ease-soft);
+  will-change: opacity;
+}
+
+.fullscreen-art.art-overlay.is-in {
+  opacity: 1;
+}
+
+.fullscreen-art.art-placeholder-img {
+  z-index: 1;
 }
 
 .fullscreen-art-placeholder {
@@ -254,8 +291,8 @@
   opacity: 1;
   transform: translate3d(0, 0, 0);
   filter: none;
-  transition: opacity 360ms var(--fs-ease-soft);
-  animation: fullscreen-chrome-in 360ms var(--fs-ease-soft) 60ms both;
+  transition: opacity 200ms var(--fs-ease-soft);
+  animation: none;
 }
 
 .fullscreen-bottom-chrome-inner.chrome-hidden {
@@ -280,7 +317,7 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 10px;
+  gap: 14px;
 }
 
 /* Match MediaSlider .volume-btn */
@@ -293,12 +330,16 @@
   flex-shrink: 0;
   border-radius: var(--radius-sm);
   color: var(--text-secondary);
-  transition: color var(--transition-fast), background var(--transition-fast);
+  background: transparent;
+  transition:
+    color 200ms var(--fs-ease-soft),
+    transform 200ms var(--fs-ease);
 }
 
 .lyrics-toggle-btn:hover {
   color: var(--text-primary);
-  background: rgba(255, 255, 255, 0.06);
+  background: transparent;
+  transform: scale(1.12);
 }
 
 .lyrics-toggle-btn.active {
@@ -307,7 +348,28 @@
 
 .lyrics-toggle-btn.active:hover {
   color: var(--accent);
-  background: var(--accent-soft);
+  background: transparent;
+}
+
+/* Mask icons from /static/icons — tinted via currentColor */
+.fs-icon {
+  display: block;
+  width: 26px;
+  height: 26px;
+  flex-shrink: 0;
+  background-color: currentColor;
+  -webkit-mask: var(--fs-icon) center / contain no-repeat;
+  mask: var(--fs-icon) center / contain no-repeat;
+}
+
+.fs-icon-sm {
+  width: 18px;
+  height: 18px;
+}
+
+.fs-icon-play {
+  width: 34px;
+  height: 34px;
 }
 
 .fullscreen-volume {
@@ -328,27 +390,41 @@
   width: 88px;
 }
 
+/* Volume mute: no hover plate, slight grow */
+.fullscreen-volume :global(.volume-btn) {
+  background: transparent;
+  transition:
+    color 200ms var(--fs-ease-soft),
+    transform 200ms var(--fs-ease);
+}
+
+.fullscreen-volume :global(.volume-btn:hover) {
+  background: transparent;
+  transform: scale(1.12);
+}
+
 .fs-control-btn {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 38px;
-  height: 38px;
-  border-radius: 50%;
+  width: 46px;
+  height: 46px;
+  border-radius: var(--radius-sm);
   color: var(--text-secondary);
+  background: transparent;
   transition:
     color 200ms var(--fs-ease-soft),
-    background 200ms var(--fs-ease-soft),
     transform 200ms var(--fs-ease);
 }
 
 .fs-control-btn:hover:not(:disabled) {
   color: var(--text-primary);
-  background: rgba(255, 255, 255, 0.08);
+  background: transparent;
+  transform: scale(1.12);
 }
 
 .fs-control-btn:active:not(:disabled) {
-  transform: scale(0.92);
+  transform: scale(0.94);
 }
 
 .fs-control-btn:disabled {
@@ -357,14 +433,9 @@
 }
 
 .fs-control-btn.mode-btn {
-  width: 34px;
+  width: 42px;
   aspect-ratio: 1;
-  height: 34px;
-}
-
-.fs-control-btn svg {
-  width: 20px;
-  height: 20px;
+  height: 42px;
 }
 
 .fs-control-btn.mode-btn.active {
@@ -373,42 +444,26 @@
 
 .fs-control-btn.mode-btn.active:hover:not(:disabled) {
   color: var(--accent);
-  background: var(--accent-soft);
+  background: transparent;
 }
 
-.fs-control-btn.mode-btn.repeat-one {
-  position: relative;
-}
-
+/* Play: icon only, no circle / accent fill */
 .fs-control-btn.play-btn {
-  width: 52px;
-  height: 52px;
-  background: var(--accent);
-  color: white;
-}
-
-.fs-control-btn.play-btn svg {
-  width: 26px;
-  height: 26px;
+  width: 56px;
+  height: 56px;
+  background: transparent;
+  color: var(--text-primary);
+  border-radius: var(--radius-sm);
 }
 
 .fs-control-btn.play-btn:hover:not(:disabled) {
-  background: var(--accent-hover);
-  color: white;
-  transform: scale(1.05);
+  background: transparent;
+  color: var(--text-primary);
+  transform: scale(1.12);
 }
 
 .fs-control-btn.play-btn:active:not(:disabled) {
-  transform: scale(0.96);
-}
-
-.repeat-one-badge {
-  position: absolute;
-  right: 4px;
-  bottom: 4px;
-  font-size: 8px;
-  font-weight: 700;
-  line-height: 1;
+  transform: scale(0.94);
 }
 
 .fullscreen-progress {
@@ -534,7 +589,8 @@
   .fullscreen-backdrop,
   .fullscreen-side,
   .fullscreen-lyrics-slot,
-  .fullscreen-bottom-chrome-inner {
+  .fullscreen-bottom-chrome-inner,
+  .fullscreen-art.art-overlay {
     animation: none !important;
     transition-duration: 0.01ms !important;
   }

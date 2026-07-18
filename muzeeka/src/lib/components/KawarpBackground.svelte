@@ -18,15 +18,15 @@
     src = null,
     active = true,
     class: className = '',
-    warpIntensity = 0.85,
-    blurPasses = 6,
+    warpIntensity = 3.85,
+    blurPasses = 8,
     animationSpeed = 1,
-    transitionDuration = 900,
+    transitionDuration = 700,
     saturation = 1.65,
     tintColor = BG_TINT,
     tintIntensity = 0.06,
-    dithering = 0.006,
-    scale = 1.05,
+    dithering = 0.01,
+    scale = 1.25,
   }: Props = $props();
 
   let containerEl = $state<HTMLDivElement | undefined>();
@@ -38,10 +38,18 @@
   );
 
   let kawarp: import('@kawarp/core').Kawarp | null = null;
+  let kawarpEpoch = $state(0);
   let currentSrc: string | null = null;
+  let loadToken = 0;
   let resizeObserver: ResizeObserver | null = null;
   let resizeTimeout: ReturnType<typeof setTimeout> | null = null;
   let initGeneration = 0;
+
+  // Dual-layer blurred fallback for smooth track switches
+  let fbA = $state<string | null>(null);
+  let fbB = $state<string | null>(null);
+  let fbShowB = $state(false);
+  let fbToken = 0;
 
   function getOptions(): KawarpOptions {
     return {
@@ -55,6 +63,43 @@
       dithering,
       scale,
     };
+  }
+
+  function preloadImageOk(url: string): Promise<boolean> {
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.onload = () => resolve(true);
+      img.onerror = () => resolve(false);
+      img.src = url;
+    });
+  }
+
+  async function crossfadeFallback(next: string | null) {
+    // Never clear existing fallback to null mid-session — only swap to a loaded URL.
+    if (!next) return;
+
+    const current = fbShowB ? fbB : fbA;
+    if (current === next) return;
+
+    // First paint: show immediately (no crossfade from empty).
+    if (!current) {
+      fbA = next;
+      fbB = null;
+      fbShowB = false;
+      return;
+    }
+
+    const token = ++fbToken;
+    const ok = await preloadImageOk(next);
+    if (token !== fbToken || !ok) return;
+
+    if (fbShowB) {
+      fbA = next;
+      fbShowB = false;
+    } else {
+      fbB = next;
+      fbShowB = true;
+    }
   }
 
   async function loadCover(
@@ -126,6 +171,18 @@
     kawarp = null;
     currentSrc = null;
     imageReady = false;
+    kawarpEpoch += 1;
+  }
+
+  async function applyCover(
+    instance: import('@kawarp/core').Kawarp,
+    url: string,
+    token: number,
+  ): Promise<void> {
+    await loadCover(instance, url);
+    if (token !== loadToken || kawarp !== instance) return;
+    currentSrc = url;
+    imageReady = true;
   }
 
   async function bootstrap(
@@ -154,6 +211,7 @@
     }
 
     kawarp = instance;
+    kawarpEpoch += 1;
 
     resizeObserver = new ResizeObserver(scheduleResize);
     resizeObserver.observe(container);
@@ -161,13 +219,11 @@
 
     const url = untrack(() => src?.trim() || null);
     if (url) {
+      const token = ++loadToken;
       try {
-        await loadCover(instance, url);
-        if (generation !== initGeneration) return;
-        currentSrc = url;
-        imageReady = true;
+        await applyCover(instance, url, token);
       } catch {
-        imageReady = false;
+        if (token === loadToken) imageReady = false;
       }
     }
 
@@ -181,15 +237,11 @@
   $effect(() => {
     const canvas = canvasEl;
     const container = containerEl;
-    const shouldRun = active && !webglFailed;
-
-    if (!shouldRun || !canvas || !container) {
-      kawarp?.stop();
+    if (webglFailed || !canvas || !container) {
       return;
     }
 
     const generation = ++initGeneration;
-
     void bootstrap(generation, canvas, container);
 
     return () => {
@@ -199,6 +251,9 @@
   });
 
   $effect(() => {
+    void kawarpEpoch;
+    void active;
+    void windowActive;
     syncAnimationState();
   });
 
@@ -218,31 +273,54 @@
     };
   });
 
+  // Blur fallback crossfade (always, even before WebGL is ready)
   $effect(() => {
-    if (!kawarp || webglFailed || !active) return;
-
     const next = src?.trim() || null;
-    if (!next || next === currentSrc) return;
+    void crossfadeFallback(next);
+  });
+
+  // WebGL texture update — Kawarp transitionDuration handles the GL crossfade
+  $effect(() => {
+    const next = src?.trim() || null;
+    const epoch = kawarpEpoch;
+    const failed = webglFailed;
+
+    if (failed || epoch === 0) return;
 
     const instance = kawarp;
-    const url = next;
-    imageReady = false;
+    if (!instance) return;
 
-    void loadCover(instance, url)
-      .then(() => {
-        if (kawarp !== instance) return;
-        currentSrc = url;
-        imageReady = true;
-      })
-      .catch(() => {
-        imageReady = false;
-      });
+    if (!next) {
+      currentSrc = null;
+      imageReady = false;
+      return;
+    }
+
+    if (next === currentSrc) return;
+
+    const token = ++loadToken;
+    void applyCover(instance, next, token).catch(() => {
+      if (token === loadToken) imageReady = false;
+    });
   });
 </script>
 
 <div class="kawarp-background {className}" bind:this={containerEl}>
-  {#if src && (!imageReady || webglFailed)}
-    <img class="kawarp-fallback" src={src} alt="" />
+  {#if fbA}
+    <img
+      class="kawarp-fallback"
+      class:is-visible={!fbShowB}
+      src={fbA}
+      alt=""
+    />
+  {/if}
+  {#if fbB}
+    <img
+      class="kawarp-fallback"
+      class:is-visible={fbShowB}
+      src={fbB}
+      alt=""
+    />
   {/if}
   {#if !webglFailed}
     <canvas
@@ -257,7 +335,11 @@
   .kawarp-background {
     position: absolute;
     inset: 0;
+    z-index: 0;
     overflow: hidden;
+    background: #0a0a0f;
+    /* Keep WebGL / fallback layers inside this box only */
+    isolation: isolate;
   }
 
   .kawarp-background canvas {
@@ -266,7 +348,8 @@
     width: 100%;
     height: 100%;
     opacity: 0;
-    transition: opacity 320ms ease;
+    transition: opacity 480ms ease;
+    z-index: 1;
   }
 
   .kawarp-background canvas.image-ready {
@@ -281,6 +364,13 @@
     object-fit: cover;
     filter: blur(48px) saturate(1.55);
     transform: scale(1.1);
-    opacity: 0.72;
+    opacity: 0;
+    z-index: 0;
+    transition: opacity 560ms cubic-bezier(0.33, 1, 0.68, 1);
+    will-change: opacity;
+  }
+
+  .kawarp-fallback.is-visible {
+    opacity: 0.88;
   }
 </style>

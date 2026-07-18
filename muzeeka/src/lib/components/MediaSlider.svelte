@@ -3,9 +3,11 @@
 
   interface Props {
     variant: 'progress' | 'volume';
+    /** Fullscreen: use /static/icons volume set instead of inline SVG. */
+    useStaticIcons?: boolean;
   }
 
-  let { variant }: Props = $props();
+  let { variant, useStaticIcons = false }: Props = $props();
 
   const player = getPlayerStore();
   const SEEK_STEP_SEC = 5;
@@ -18,7 +20,25 @@
 
   let isMuted = $derived(player.volume === 0);
   let volumeIcon = $derived(
-    isMuted ? 'muted' : player.volume > 0.5 ? 'high' : player.volume > 0 ? 'low' : 'muted'
+    isMuted
+      ? 'muted'
+      : player.volume > 0.66
+        ? 'high'
+        : player.volume > 0.33
+          ? 'med'
+          : player.volume > 0
+            ? 'low'
+            : 'muted'
+  );
+
+  let staticVolumeIconUrl = $derived(
+    volumeIcon === 'muted'
+      ? '/icons/mute.svg'
+      : volumeIcon === 'high'
+        ? '/icons/volmax.svg'
+        : volumeIcon === 'med'
+          ? '/icons/volmed.svg'
+          : '/icons/volmin.svg'
   );
 
   let activeRatio = $derived(
@@ -155,13 +175,19 @@
       onclick={toggleMute}
       aria-label={isMuted ? 'Unmute' : 'Mute'}
     >
-      {#if volumeIcon === 'muted'}
+      {#if useStaticIcons}
+        <span
+          class="volume-static-icon"
+          style:--vol-icon={"url('" + staticVolumeIconUrl + "')"}
+          aria-hidden="true"
+        ></span>
+      {:else if volumeIcon === 'muted'}
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
           <line x1="23" y1="9" x2="17" y2="15"/>
           <line x1="17" y1="9" x2="23" y2="15"/>
         </svg>
-      {:else if volumeIcon === 'low'}
+      {:else if volumeIcon === 'low' || volumeIcon === 'med'}
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
           <path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>

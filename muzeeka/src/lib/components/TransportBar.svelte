@@ -1,4 +1,7 @@
 <script lang="ts">
+  import { getCoverSrc, resolveCoverSrc } from '$lib/coverCache';
+  import { setAccentFromCoverSrc } from '$lib/coverAccent';
+  import { COVER_PLACEHOLDER_SRC } from '$lib/coverPlaceholder';
   import { getPlayerStore, trackDisplayArtist } from '$lib/stores/player.svelte';
   import { exportAudioPathForTrack } from '$lib/trackPaths';
   import { startFileDrag } from '$lib/fileDrag';
@@ -127,6 +130,43 @@
     document.documentElement.classList.toggle('fullscreen-active', fullscreenOpen);
     return () => {
       document.documentElement.classList.remove('fullscreen-active');
+    };
+  });
+
+  // Accent color from the juiciest hue on the current cover (or placeholder).
+  $effect(() => {
+    const track = player.currentTrack;
+    const hasTrack = player.hasTrack;
+    const path = track?.cover_path ?? track?.cover_path_full ?? null;
+
+    if (!hasTrack) {
+      void setAccentFromCoverSrc(null);
+      return;
+    }
+
+    let cancelled = false;
+
+    const apply = (src: string) => {
+      if (!cancelled) void setAccentFromCoverSrc(src);
+    };
+
+    if (!path) {
+      apply(COVER_PLACEHOLDER_SRC);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    const immediate = getCoverSrc(path);
+    if (immediate) apply(immediate);
+
+    void resolveCoverSrc(path).then((src) => {
+      if (src) apply(src);
+      else if (!cancelled) apply(COVER_PLACEHOLDER_SRC);
+    });
+
+    return () => {
+      cancelled = true;
     };
   });
 </script>
