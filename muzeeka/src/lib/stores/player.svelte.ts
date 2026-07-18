@@ -481,6 +481,30 @@ function syncTrackIndex() {
   syncShufflePosition();
 }
 
+/** True when `toPath` is the immediate next track after `fromPath` in the active play order. */
+function isNaturalQueueAdvance(fromPath: string, toPath: string): boolean {
+  if (!fromPath || !toPath || fromPath === toPath || !hasPlayingTracks) return false;
+
+  if (shuffleEnabled) {
+    ensureShuffleOrder();
+    const fromIdx = playingTracks.findIndex((t) => t.path === fromPath);
+    if (fromIdx < 0) return false;
+    const orderPos = shuffleOrder.indexOf(fromIdx);
+    if (orderPos < 0) return false;
+    if (orderPos < shuffleOrder.length - 1) {
+      return playingTracks[shuffleOrder[orderPos + 1]]?.path === toPath;
+    }
+    return repeatMode === 'all' && playingTracks[shuffleOrder[0]]?.path === toPath;
+  }
+
+  const idx = playingTracks.findIndex((t) => t.path === fromPath);
+  if (idx < 0) return false;
+  if (idx < playingTracks.length - 1) {
+    return playingTracks[idx + 1]?.path === toPath;
+  }
+  return repeatMode === 'all' && playingTracks[0]?.path === toPath;
+}
+
 function shuffleIndices(count: number): number[] {
   const indices = Array.from({ length: count }, (_, i) => i);
   for (let i = indices.length - 1; i > 0; i--) {
@@ -1553,14 +1577,21 @@ function setupListeners() {
   listen<{ path: string }>('player:track-changed', (event) => {
     const path = event.payload.path;
 
-    // Protect recent manual plays from stale track-changed events
-    // (e.g. old gapless poll deciding to advance right after user clicked a different track in the que list).
-    // This fixes UI showing wrong track (9) while playing the manually chosen one (4), and random jumps.
+    // Protect recent manual plays from *stale* track-changed events (e.g. old gapless
+    // poll advancing the previous queue right after the user clicked a different track).
+    // But allow a real gapless next after a short track: it ends inside this window and
+    // must update the UI even though path !== lastPlayedFile.
     if (Date.now() - lastManualPlayAt < 600 && lastPlayedFile && path !== lastPlayedFile) {
-      return;
+      const natural =
+        isNaturalQueueAdvance(lastPlayedFile, path) ||
+        (!!currentFile && isNaturalQueueAdvance(currentFile, path));
+      if (!natural) {
+        return;
+      }
     }
 
     currentFile = path;
+    lastPlayedFile = path;
     const track = trackByPath.get(path);
     currentFileName = track
       ? trackDisplayTitle(track)
@@ -1645,9 +1676,20 @@ function setupListeners() {
     }
   });
 
-  listen('player:track-ended', () => {
-    // Gapless advance emits track-changed; ignore a stale ended right after it.
-    if (Date.now() - lastGaplessChangeAt < 600) return;
+  listen<{ path?: string }>('player:track-ended', (event) => {
+    const endedPath = event.payload?.path;
+
+    // Stale ended from a previous track (manual skip / gapless already advanced).
+    // Prefer path match over a fixed time window so sub-second tracks can still
+    // auto-advance after they legitimately finish.
+    if (endedPath && currentFile && endedPath !== currentFile) {
+      return;
+    }
+    // Fallback when backend omits path: only ignore right after a gapless change,
+    // and never for short tracks that finish inside that window.
+    if (!endedPath && Date.now() - lastGaplessChangeAt < 600 && duration > 0.7) {
+      return;
+    }
 
     isPlaying = false;
     isPaused = false;

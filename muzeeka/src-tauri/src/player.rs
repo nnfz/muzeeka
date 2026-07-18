@@ -46,6 +46,10 @@ const GAPLESS_END_EPSILON_SECS: f64 = 0.008;
 const POLL_INTERVAL_MS: u64 = 50;
 /// Re-push Discord RPC timestamps while playing so progress stays in sync.
 const RPC_POSITION_SYNC_MS: u64 = 5000;
+/// After a manual play/seek, a new stream can briefly look "ended". Ignore end
+/// detection for this long on normal-length tracks. Short tracks cap the guard
+/// by their own duration so they can still auto-advance.
+const SPURIOUS_END_GUARD_MS: u64 = 1500;
 
 // ── Playback state enum ───────────────────────────────────────────────────────
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1011,6 +1015,9 @@ impl Player {
 
         inner.gapless_queue_index = next_index;
         inner.user_paused = false;
+        // Reset so the next track gets its own anti-spurious end window
+        // (critical for chains of sub-second tracks).
+        inner.current_track_start_time = Self::now_millis();
         Self::refresh_pending_next(inner);
         Ok(next.track_path)
     }
@@ -1464,6 +1471,39 @@ impl Player {
         }
         let end = Self::track_end_position(inner, bass, inner.current_source);
         absolute_secs + GAPLESS_END_EPSILON_SECS >= end
+    }
+
+    /// Segment length in ms (CUE bounds or full stream). 0 if unknown.
+    fn current_segment_duration_ms(inner: &PlayerInner, bass: &BassLibrary) -> u64 {
+        if inner.current_source == 0 {
+            return 0;
+        }
+        let absolute_duration = Self::stream_duration_secs(bass, inner.current_source);
+        let segment = Self::cue_segment_duration(inner, absolute_duration);
+        if segment.is_finite() && segment > 0.0 {
+            (segment * 1000.0).round() as u64
+        } else {
+            0
+        }
+    }
+
+    /// Whether enough time has passed since play() to trust an "ended" signal.
+    /// Long tracks keep a 1.5s anti-spurious window; sub-second tracks use a
+    /// duration-capped window so they can still gapless-advance / emit ended.
+    fn past_spurious_end_guard(inner: &PlayerInner, bass: &BassLibrary) -> bool {
+        let age = Self::now_millis().saturating_sub(inner.current_track_start_time);
+        let segment_ms = Self::current_segment_duration_ms(inner, bass);
+        let guard_ms = if segment_ms == 0 {
+            SPURIOUS_END_GUARD_MS
+        } else {
+            // Allow advance once we've roughly reached the real end (50ms slack),
+            // but never wait longer than the long-track spurious window.
+            // Floor at one poll interval so open-glitch frames are still ignored.
+            segment_ms
+                .saturating_sub(50)
+                .clamp(POLL_INTERVAL_MS, SPURIOUS_END_GUARD_MS)
+        };
+        age > guard_ms
     }
 
     pub fn pause(&self) -> Result<(), String> {
@@ -1946,9 +1986,10 @@ impl Player {
                     }
 
                     if Self::has_next_in_gapless_queue(inner) && (ending || stream_done) {
-                        // Guard against spurious early advance after manual click in que (new track can briefly appear done).
-                        // Use time since this track started (set in play()), not just pos (which can be small at legit end in recovery).
-                        if now.saturating_sub(inner.current_track_start_time) > 1500 {
+                        // Guard against spurious early advance after manual click in que
+                        // (new track can briefly appear done). Short tracks cap the guard
+                        // by their own duration so <1s files still auto-advance.
+                        if Self::past_spurious_end_guard(inner, bass) {
                             return Self::try_advance_gapless(inner)
                                 .map(|path| (Some(path), POLL_INTERVAL_MS))
                                 .map_err(|error| {
@@ -1958,8 +1999,13 @@ impl Player {
                         }
                     }
 
-                    if (ending || stream_done) && !Self::has_next_in_gapless_queue(inner) {
+                    if (ending || stream_done)
+                        && !Self::has_next_in_gapless_queue(inner)
+                        && Self::past_spurious_end_guard(inner, bass)
+                    {
                         // End of playlist: ensure source is gone (AUTOFREE usually handles it).
+                        // Wait for the duration-aware guard so short last tracks still emit
+                        // track-ended promptly (duration is known while the source lives).
                         // Do not stop the mixer — keep it running (silent) so next playback starts without device hiccup.
                         if inner.current_source != 0 {
                             let _ = bass.mixer_channel_remove(inner.current_source);
@@ -2056,7 +2102,11 @@ impl Player {
                                 if now < inner.suppress_gapless_until {
                                     return Ok(None);
                                 }
-                                if now.saturating_sub(inner.current_track_start_time) > 1500 {
+                                let bass = match inner.bass.as_ref() {
+                                    Some(b) => b,
+                                    None => return Ok(None),
+                                };
+                                if Self::past_spurious_end_guard(inner, bass) {
                                     Self::try_advance_gapless(inner).map(Some).map_err(|error| {
                                         eprintln!("Gapless recovery failed: {error}");
                                         error
@@ -2101,9 +2151,48 @@ impl Player {
                             return;
                         }
 
+                        // End-of-queue (or gapless failed): emit track-ended only after the
+                        // anti-spurious window, so sub-second tracks aren't torn down too early
+                        // and frontend can still advance once the guard elapses.
+                        let ended_path = player_for_main
+                            .run_on_bass_thread(|inner| {
+                                let now = Self::now_millis();
+                                if now < inner.suppress_gapless_until {
+                                    return Ok(None::<String>);
+                                }
+                                if let Some(bass) = inner.bass.as_ref() {
+                                    if !Self::past_spurious_end_guard(inner, bass) {
+                                        return Ok(None);
+                                    }
+                                } else if now.saturating_sub(inner.current_track_start_time)
+                                    <= SPURIOUS_END_GUARD_MS
+                                {
+                                    return Ok(None);
+                                }
+                                Ok(inner.current_file.clone())
+                            })
+                            .ok()
+                            .flatten();
+
+                        let Some(ended_path) = ended_path else {
+                            // Guard still active — keep *was so we retry on the next poll.
+                            Self::schedule_position_poll(
+                                app_for_next,
+                                player_for_next,
+                                was_for_next,
+                                rpc_for_next,
+                                rpc_sync_for_next,
+                                POLL_INTERVAL_MS,
+                            );
+                            return;
+                        };
+
                         player_for_main.release_ended_stream();
                         *was = false;
-                        let _ = app_emit.emit("player:track-ended", serde_json::json!({}));
+                        let _ = app_emit.emit(
+                            "player:track-ended",
+                            serde_json::json!({ "path": ended_path }),
+                        );
                         player_for_main.sync_discord_presence();
                         if let Ok(mut rpc_state) = rpc_for_main.lock() {
                             *rpc_state = Some(PlaybackState::Stopped);
