@@ -3,7 +3,7 @@
   --lyric-weight: 700;
   --lyric-line-height: 1.22;
   --lyric-gap: 0.62em;
-  --lyric-ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --lyric-ease: cubic-bezier(0.16, 1, 0.3, 1);
   --lyric-duration: 560ms;
   --lyric-color-active: #ffffff;
   --lyric-color-past: rgba(255, 255, 255, 0.48);
@@ -18,28 +18,17 @@
   flex-direction: column;
   z-index: 1;
   pointer-events: auto;
-  opacity: 0;
-  animation: fs-lyrics-panel-in 480ms var(--lyric-ease) forwards;
-}
-
-@keyframes fs-lyrics-panel-in {
-  from {
-    opacity: 0;
-    transform: translateY(10px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
+  /* Parent slot handles enter motion — keep panel solid to avoid double-fade jank */
+  opacity: 1;
 }
 
 .fs-lyrics-viewport {
   flex: 1;
   min-height: 0;
-  overflow-x: clip;
+  overflow-x: visible;
   overflow-y: auto;
   overscroll-behavior: contain;
-  padding: 0 max(1.5rem, 3.5vw) 0 max(1rem, 2vw);
+  padding: 0 1.5rem 0 0;
   scroll-behavior: auto;
   -webkit-overflow-scrolling: touch;
   mask-image: linear-gradient(
@@ -72,19 +61,20 @@
   width: 100%;
   max-width: 100%;
   box-sizing: border-box;
-  /* Text block is only as tall as the lyrics */
   padding: 0;
+  /* Indent lines away from the left edge of the lyrics column */
+  padding-left: clamp(0.5rem, 1.5vw, 1.25rem);
 }
 
 /* ── Lines (Apple Music: dim / bright / past) ──────────── */
 
 .fs-lyrics-line {
   display: block;
-  width: 100%;
+  width: fit-content;
   max-width: 100%;
   box-sizing: border-box;
   margin: 0;
-  padding: var(--lyric-gap) 0.12em;
+  padding: var(--lyric-gap) 0.35em;
   line-height: var(--lyric-line-height);
   cursor: pointer;
   color: var(--lyric-color-upcoming);
@@ -95,6 +85,8 @@
     transform var(--lyric-duration) var(--lyric-ease),
     opacity var(--lyric-duration) var(--lyric-ease);
   backface-visibility: hidden;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 /* Line-level hover only for line-synced / plain text */

@@ -60,6 +60,8 @@ async function fetchTtmlFromApi(url: string): Promise<string | null> {
 }
 
 async function fetchTtml(params: FetchLyricsParams, durationSecs: number | null): Promise<string | null> {
+  // Rust path tries Better Lyrics → LRCLIB → Unison. Do not fall through to a
+  // browser-only BL call on null — that just 401s on cache misses and confuses debugging.
   try {
     const ttml = await invoke<string | null>('lyrics_fetch', {
       title: params.title.trim(),
@@ -67,10 +69,7 @@ async function fetchTtml(params: FetchLyricsParams, durationSecs: number | null)
       album: params.album?.trim() || null,
       durationSecs,
     });
-
-    if (ttml?.trim()) {
-      return ttml;
-    }
+    return ttml?.trim() ? ttml : null;
   } catch (rustError) {
     const url = buildLyricsUrl(params, durationSecs);
     try {
@@ -81,9 +80,6 @@ async function fetchTtml(params: FetchLyricsParams, durationSecs: number | null)
       throw new Error(`${rustMessage} (browser fallback: ${browserMessage})`);
     }
   }
-
-  const url = buildLyricsUrl(params, durationSecs);
-  return fetchTtmlFromApi(url);
 }
 
 export async function fetchLyrics(params: FetchLyricsParams): Promise<LyricsResult | null> {

@@ -1,6 +1,11 @@
 .fullscreen-player {
-  --fs-ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --fs-ease: cubic-bezier(0.16, 1, 0.3, 1);
   --fs-ease-soft: cubic-bezier(0.33, 1, 0.68, 1);
+  --fs-move: 620ms;
+  --fs-fade: 320ms;
+  /* Cover column; lyrics start further right */
+  --fs-side-w: clamp(280px, min(36vw, 48vh), 480px);
+  --fs-lyrics-inset: max(46vw, calc(28px + var(--fs-side-w) + clamp(48px, 5vw, 96px)));
 
   position: fixed;
   inset: 0;
@@ -8,6 +13,8 @@
   display: flex;
   flex-direction: column;
   pointer-events: none;
+  /* Shell itself is always solid — animating it faded the cover and stuttered */
+  opacity: 1;
 }
 
 .fullscreen-player > :not(.fullscreen-bottom-chrome) {
@@ -23,56 +30,31 @@
   }
 }
 
-@keyframes fullscreen-side-in {
-  from {
-    opacity: 0;
-    transform: translateY(18px) scale(0.96);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0) scale(1);
-  }
-}
-
-@keyframes fullscreen-art-in {
-  from {
-    opacity: 0;
-    transform: scale(0.92);
-  }
-  to {
-    opacity: 1;
-    transform: scale(1);
-  }
-}
-
-@keyframes fullscreen-meta-in {
-  from {
-    opacity: 0;
-    transform: translateY(8px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-
 @keyframes fullscreen-chrome-in {
   from {
     opacity: 0;
-    transform: translateY(20px);
   }
   to {
     opacity: 1;
-    transform: translateY(0);
   }
 }
 
+/*
+ * Before enter-done: freeze layout (no accidental tween from wrong first paint).
+ * After enter-done + still lyrics-hidden: transitions are ON so the next class flip animates.
+ */
+.fullscreen-player:not(.enter-done) .fullscreen-side,
+.fullscreen-player:not(.enter-done) .fullscreen-lyrics-slot {
+  transition: none !important;
+}
+
+/* Backdrop solid immediately — fading it made the cover look like it stuttered */
 .fullscreen-backdrop {
   position: absolute;
   inset: 0;
   overflow: hidden;
   background: var(--bg-deep);
-  animation: fullscreen-backdrop-in 420ms var(--fs-ease-soft) both;
+  opacity: 1;
 }
 
 .fullscreen-backdrop-shade {
@@ -85,74 +67,105 @@
 }
 
 .fullscreen-layout {
-  --fullscreen-side-width: 40vw;
-
   position: absolute;
   inset: 0;
   z-index: 1;
-  display: grid;
-  grid-template-columns: var(--fullscreen-side-width) minmax(0, 1fr);
-  align-items: stretch;
-  gap: 0;
   padding:
     calc(var(--header-height) + 16px)
     0
     132px;
+  box-sizing: border-box;
   pointer-events: none;
-  transition: padding 480ms var(--fs-ease);
-}
-
-.fullscreen-layout.lyrics-hidden {
-  grid-template-columns: 1fr;
-  justify-items: center;
 }
 
 /*
- * Cover + title: side is only as wide as the art.
- * Block sits on the left of the column (not centered in it).
- * Title matches cover width — no wider, no narrower.
+ * Cover: center without lyrics → left with lyrics.
+ * Animate ONLY transform (one GPU property). Never left% + translate together.
+ * left:0 fixed; 50% in translate is half of cover width → true center.
  */
 .fullscreen-side {
+  position: absolute;
+  top: 50%;
+  left: 0;
   display: flex;
   flex-direction: column;
   align-items: stretch;
-  justify-self: start;
   justify-content: center;
-  align-self: center;
   gap: 18px;
-  width: max-content;
-  max-width: calc(100% - 32px);
-  min-height: 0;
+  width: var(--fs-side-w);
+  max-width: min(92vw, 520px);
+  min-width: 0;
   box-sizing: border-box;
-  margin-left: 28px;
   pointer-events: none;
-  animation: fullscreen-side-in 560ms var(--fs-ease) both;
+  opacity: 1;
+  /* centered: half viewport − half self width */
+  transform: translate3d(calc(50vw - 50%), -50%, 0);
+  transition: transform 720ms var(--fs-ease);
+  will-change: transform;
+  contain: layout style;
 }
 
-.fullscreen-layout.lyrics-hidden .fullscreen-side {
-  justify-self: center;
-  margin-left: 0;
-  max-width: min(500px, 90vw);
+/*
+ * With lyrics: center cover in the empty band left of the text
+ * (0 … --fs-lyrics-inset), not glued to the left edge.
+ * 50% = half of cover width (transform % is relative to self).
+ */
+.fullscreen-layout:not(.lyrics-hidden) .fullscreen-side {
+  transform: translate3d(calc(var(--fs-lyrics-inset) / 2 - 50%), -50%, 0);
+}
+
+/* Lyrics: well to the right of the cover (not glued to it) */
+.fullscreen-lyrics-slot {
+  position: absolute;
+  top: calc(var(--header-height) + 16px);
+  right: max(24px, 3vw);
+  bottom: 132px;
+  left: var(--fs-lyrics-inset);
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow-x: visible;
+  overflow-y: hidden;
+  opacity: 0;
+  transform: translate3d(36px, 0, 0);
+  pointer-events: none;
+  transition:
+    opacity 720ms var(--fs-ease),
+    transform 720ms var(--fs-ease);
+  will-change: opacity, transform;
+}
+
+.fullscreen-layout:not(.lyrics-hidden) .fullscreen-lyrics-slot {
+  opacity: 1;
+  transform: translate3d(0, 0, 0);
+  pointer-events: auto;
+}
+
+.fullscreen-layout.lyrics-hidden .fullscreen-lyrics-slot {
+  opacity: 0;
+  transform: translate3d(36px, 0, 0);
+  pointer-events: none;
+}
+
+.fullscreen-lyrics-slot > :global(.fs-lyrics-panel) {
+  flex: 1;
+  min-height: 0;
+  height: 100%;
+  width: 100%;
+  max-width: none;
 }
 
 .fullscreen-art-wrap {
-  width: clamp(220px, calc(var(--fullscreen-side-width) - 96px), 500px);
-  max-width: 100%;
-  flex-shrink: 0;
+  width: 100%;
   aspect-ratio: 1;
+  flex-shrink: 0;
   border-radius: var(--radius-sm);
   overflow: hidden;
   box-shadow: var(--shadow-sm);
-  animation: fullscreen-art-in 640ms var(--fs-ease) both;
-  transition:
-    width 480ms var(--fs-ease),
-    box-shadow 480ms var(--fs-ease),
-    transform 480ms var(--fs-ease);
-  will-change: transform;
-}
-
-.fullscreen-layout.lyrics-hidden .fullscreen-art-wrap {
-  width: clamp(260px, min(46vw, 52vh), 500px);
+  /* Stable layer — no animated transform on the art itself */
+  transform: translateZ(0);
+  backface-visibility: hidden;
 }
 
 .fullscreen-art,
@@ -165,7 +178,9 @@
 .fullscreen-art {
   object-fit: cover;
   image-rendering: auto;
-  transition: opacity 360ms var(--fs-ease-soft);
+  opacity: 1;
+  /* Never animate the bitmap — src/opacity changes look like a jerk */
+  transition: none;
 }
 
 .fullscreen-art-placeholder {
@@ -176,7 +191,7 @@
   background: linear-gradient(135deg, rgba(255, 255, 255, 0.08), rgba(255, 255, 255, 0.03));
 }
 
-/* Same width as cover; text left + tiny inset */
+/* Title matches cover width; left + tiny inset */
 .fullscreen-meta {
   width: 100%;
   max-width: 100%;
@@ -184,7 +199,6 @@
   box-sizing: border-box;
   padding-left: 4px;
   text-align: left;
-  animation: fullscreen-meta-in 600ms var(--fs-ease) 80ms both;
 }
 
 .fullscreen-title {
@@ -238,20 +252,15 @@
   align-items: center;
   gap: 16px;
   opacity: 1;
-  transform: translateY(0);
+  transform: translate3d(0, 0, 0);
   filter: none;
-  transition:
-    opacity 520ms var(--fs-ease),
-    transform 520ms var(--fs-ease),
-    filter 520ms var(--fs-ease);
-  will-change: opacity, transform;
-  animation: fullscreen-chrome-in 560ms var(--fs-ease) 60ms both;
+  transition: opacity 360ms var(--fs-ease-soft);
+  animation: fullscreen-chrome-in 360ms var(--fs-ease-soft) 60ms both;
 }
 
 .fullscreen-bottom-chrome-inner.chrome-hidden {
   opacity: 0;
-  transform: translateY(18px);
-  /* Soft fade only — heavy blur was causing janky text/controls */
+  transform: none;
   filter: none;
   pointer-events: none;
 }
@@ -437,31 +446,43 @@
 
 @media (max-width: 900px) {
   .fullscreen-layout {
-    --fullscreen-side-width: 100%;
-
-    grid-template-columns: 1fr;
-    grid-template-rows: auto minmax(0, 1fr);
-    padding-top: calc(var(--header-height) + 8px);
-    padding-bottom: 132px;
+    padding:
+      calc(var(--header-height) + 8px)
+      0
+      132px;
   }
 
-  /* With lyrics: compact cover + title strip on top */
+  /* No lyrics: big cover centered */
+  .fullscreen-side {
+    top: 50%;
+    left: 0;
+    width: min(78vw, 400px);
+    max-width: min(92vw, 420px);
+    flex-direction: column;
+    padding: 0 12px;
+    transform: translate3d(calc(50vw - 50%), -50%, 0);
+  }
+
+  /* With lyrics: top strip (size changes — no transform tween on mobile) */
   .fullscreen-layout:not(.lyrics-hidden) .fullscreen-side {
-    flex-direction: row;
-    align-items: center;
-    justify-content: flex-start;
-    align-self: stretch;
-    gap: 16px;
+    top: calc(var(--header-height) + 8px);
+    left: 0;
+    right: 0;
     width: 100%;
     max-width: 100%;
-    margin-left: 0;
+    flex-direction: row;
+    align-items: center;
+    gap: 16px;
     padding: 0 20px 8px;
+    transform: translate3d(0, 0, 0);
+    transition: none;
   }
 
   .fullscreen-layout:not(.lyrics-hidden) .fullscreen-art-wrap {
     width: 72px;
     height: 72px;
     flex-shrink: 0;
+    aspect-ratio: auto;
   }
 
   .fullscreen-layout:not(.lyrics-hidden) .fullscreen-meta {
@@ -480,35 +501,20 @@
     font-size: 14px;
   }
 
-  /* Without lyrics: stay vertically centered — do not jump to the top strip */
-  .fullscreen-layout.lyrics-hidden {
-    grid-template-rows: 1fr;
-    align-items: center;
-    justify-items: center;
+  .fullscreen-lyrics-slot {
+    left: 0;
+    right: 0;
+    top: calc(var(--header-height) + 96px);
+    bottom: 132px;
+    transform: translate3d(0, 16px, 0);
   }
 
-  .fullscreen-layout.lyrics-hidden .fullscreen-side {
-    flex-direction: column;
-    align-items: stretch;
-    align-self: center;
-    justify-self: center;
-    justify-content: center;
-    width: max-content;
-    max-width: min(500px, 90vw);
-    margin-left: 0;
-    padding: 0 12px;
+  .fullscreen-layout:not(.lyrics-hidden) .fullscreen-lyrics-slot {
+    transform: translate3d(0, 0, 0);
   }
 
-  .fullscreen-layout.lyrics-hidden .fullscreen-art-wrap {
-    width: clamp(220px, min(56vw, 42vh), 420px);
-    height: auto;
-    aspect-ratio: 1;
-  }
-
-  .fullscreen-layout.lyrics-hidden .fullscreen-meta {
-    flex: none;
-    width: 100%;
-    padding-left: 4px;
+  .fullscreen-layout.lyrics-hidden .fullscreen-lyrics-slot {
+    transform: translate3d(0, 16px, 0);
   }
 
   .fullscreen-toolbar {
@@ -521,5 +527,19 @@
 
   .fullscreen-volume :global(.media-slider.volume .slider-track) {
     width: 64px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .fullscreen-backdrop,
+  .fullscreen-side,
+  .fullscreen-lyrics-slot,
+  .fullscreen-bottom-chrome-inner {
+    animation: none !important;
+    transition-duration: 0.01ms !important;
+  }
+
+  .fullscreen-backdrop {
+    opacity: 1;
   }
 }

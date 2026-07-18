@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { resolveCoverSrc } from '$lib/coverCache';
+  import { getCoverSrc, resolveCoverSrc } from '$lib/coverCache';
   import {
     getPlayerStore,
     trackDisplayArtist,
@@ -11,6 +11,7 @@
   import FullscreenLyrics from './FullscreenLyrics.svelte';
   import KawarpBackground from './KawarpBackground.svelte';
   import MediaSlider from './MediaSlider.svelte';
+  import { untrack } from 'svelte';
 
   interface Props {
     open?: boolean;
@@ -28,14 +29,24 @@
       ?? player.currentTrack?.cover_path_full
       ?? null
   );
-  let coverSrc = $state<string | null>(null);
+  /** Background may upgrade to full-res; art img stays locked (no mid-open src swap). */
+  let bgCoverSrc = $state<string | null>(null);
+  let artCoverSrc = $state<string | null>(null);
 
   let lyricsState = $state<LyricsResult | null>(null);
-  let lyricsLoadedForFile = $state<string | null>(null);
+  /** File path for which fetch finished (hit or miss). Not set while in-flight. */
+  let lyricsSettledForFile = $state<string | null>(null);
   let lyricsVisible = $state(true);
-  /** Prefer showing lyrics when available; layout still centers cover while empty / loading. */
+  /** After open settle — transitions + Kawarp allowed. */
+  let enterDone = $state(false);
+  /**
+   * Drives cover left + lyrics visible. Set one frame AFTER enterDone so the browser
+   * paints the centered state with transitions enabled, then animates to lyrics layout.
+   * Same-frame enterDone+show skipped CSS transitions entirely (looked like "nothing changes").
+   */
+  let lyricsLayoutActive = $state(false);
   let hasLyrics = $derived((lyricsState?.lines.length ?? 0) > 0);
-  let showLyricsPanel = $derived(lyricsVisible && hasLyrics);
+  let showLyricsPanel = $derived(lyricsLayoutActive);
   const CHROME_HIDE_DELAY = 3600;
 
   let chromeVisible = $state(true);
@@ -106,28 +117,59 @@
       clearHideTimer();
       chromeVisible = true;
       lyricsVisible = true;
+      enterDone = false;
+      lyricsLayoutActive = false;
+      artCoverSrc = null;
+      bgCoverSrc = null;
+      resolvedFullCoverPath = null;
       return;
     }
 
     chromeVisible = true;
     scheduleChromeHide();
+    enterDone = false;
+    lyricsLayoutActive = false;
+    const enterTimer = setTimeout(() => {
+      enterDone = true;
+    }, 200);
 
     return () => {
       clearHideTimer();
+      clearTimeout(enterTimer);
+    };
+  });
+
+  // Two rAFs after we can show lyrics: paint "centered + transitions on", then flip layout.
+  $effect(() => {
+    if (!open || !enterDone || !hasLyrics || !lyricsVisible) {
+      lyricsLayoutActive = false;
+      return;
+    }
+
+    let cancelled = false;
+    let raf1 = 0;
+    let raf2 = 0;
+    raf1 = requestAnimationFrame(() => {
+      raf2 = requestAnimationFrame(() => {
+        if (!cancelled) lyricsLayoutActive = true;
+      });
+    });
+
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(raf1);
+      cancelAnimationFrame(raf2);
     };
   });
 
   $effect(() => {
     const file = player.currentFile;
-    const track = player.currentTrack;
 
     if (!open || !file) {
-      resolvedFullCoverPath = null;
       return;
     }
 
     let cancelled = false;
-    resolvedFullCoverPath = null;
 
     void invoke<string | null>('library_resolve_full_cover', { path: file })
       .then((path) => {
@@ -142,19 +184,34 @@
     };
   });
 
+  // Art cover: lock first bitmap for this open — never swap src (thumb→full was the jerk).
   $effect(() => {
-    const path = coverPath;
-    if (!open || !path) {
-      coverSrc = null;
-      return;
+    if (!open) return;
+    if (artCoverSrc) return;
+
+    const path =
+      player.currentTrack?.cover_path
+      ?? player.currentTrack?.cover_path_full
+      ?? null;
+    if (!path) return;
+
+    const immediate = getCoverSrc(path);
+    if (immediate) {
+      artCoverSrc = immediate;
+      bgCoverSrc = immediate;
     }
+  });
+
+  // Background only may upgrade to full-res after open (Kawarp), art stays locked.
+  $effect(() => {
+    if (!open || !enterDone) return;
+    const path = coverPath;
+    if (!path) return;
 
     let cancelled = false;
-    coverSrc = null;
-
     void resolveCoverSrc(path).then((src) => {
-      if (!cancelled) {
-        coverSrc = src;
+      if (!cancelled && src) {
+        bgCoverSrc = src;
       }
     });
 
@@ -163,42 +220,68 @@
     };
   });
 
-  // Silent background fetch — no loading/error chrome; panel appears only when lines exist.
+  // Silent background fetch — panel appears only when lines exist.
+  // Depend ONLY on open + file. Reading track/duration/settled reactively was
+  // re-running this effect mid-flight, cancelling the request, and leaving no lyrics.
   $effect(() => {
-    const track = player.currentTrack;
     const file = player.currentFile;
+    const isOpen = open;
 
-    if (!open || !track || !file) {
+    if (!isOpen || !file) {
       lyricsState = null;
-      lyricsLoadedForFile = null;
+      lyricsSettledForFile = null;
       return;
     }
 
-    if (lyricsLoadedForFile === file) {
+    if (untrack(() => lyricsSettledForFile === file)) {
       return;
     }
 
-    let cancelled = false;
-    lyricsLoadedForFile = file;
-    lyricsState = null;
+    let alive = true;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
-    void fetchLyrics({
-      title: trackDisplayTitle(track),
-      artist: trackDisplayArtist(track),
-      album: track.album,
-      durationSecs: track.duration_secs ?? player.duration,
-    })
-      .then((result) => {
-        if (cancelled) return;
-        lyricsState = result;
-      })
-      .catch(() => {
-        if (cancelled) return;
-        lyricsState = null;
+    const finish = (result: LyricsResult | null) => {
+      if (!alive) return;
+      if (untrack(() => player.currentFile) !== file) return;
+      lyricsState = result;
+      lyricsSettledForFile = file;
+    };
+
+    const run = () => {
+      if (!alive) return;
+
+      const params = untrack(() => {
+        const track = player.currentTrack;
+        if (!track) return null;
+        return {
+          title: trackDisplayTitle(track),
+          artist: trackDisplayArtist(track),
+          album: track.album,
+          durationSecs:
+            track.duration_secs
+            ?? (player.duration > 0 ? player.duration : null),
+        };
       });
 
+      // Track metadata not in the map yet — retry without cancelling a parent fetch.
+      if (!params) {
+        retryTimer = setTimeout(run, 80);
+        return;
+      }
+
+      void fetchLyrics(params)
+        .then((result) => finish(result))
+        .catch((error: unknown) => {
+          console.warn('[lyrics] fetch failed', error);
+          finish(null);
+        });
+    };
+
+    run();
+
     return () => {
-      cancelled = true;
+      alive = false;
+      if (retryTimer) clearTimeout(retryTimer);
     };
   });
 </script>
@@ -206,17 +289,30 @@
 <svelte:window onkeydown={handleKeydown} />
 
 {#if open && player.hasTrack}
-  <div class="fullscreen-player" role="dialog" aria-modal="true" aria-label="Now playing">
+  <div
+    class="fullscreen-player"
+    class:enter-done={enterDone}
+    role="dialog"
+    aria-modal="true"
+    aria-label="Now playing"
+  >
+    <!-- Only the backdrop fades; cover is never in an opacity/transform open chain -->
     <div class="fullscreen-backdrop" aria-hidden="true">
-      <KawarpBackground src={coverSrc} active={open} />
+      <KawarpBackground src={bgCoverSrc} active={open && enterDone} />
       <div class="fullscreen-backdrop-shade"></div>
     </div>
 
     <div class="fullscreen-layout" class:lyrics-hidden={!showLyricsPanel}>
       <aside class="fullscreen-side">
         <div class="fullscreen-art-wrap">
-          {#if coverSrc}
-            <img class="fullscreen-art" src={coverSrc} alt="" draggable="false" />
+          {#if artCoverSrc}
+            <img
+              class="fullscreen-art"
+              src={artCoverSrc}
+              alt=""
+              draggable="false"
+              decoding="async"
+            />
           {:else}
             <div class="fullscreen-art-placeholder" aria-hidden="true">
               <svg width="72" height="72" viewBox="0 0 24 24" fill="currentColor">
@@ -236,16 +332,19 @@
         </div>
       </aside>
 
-      {#if showLyricsPanel}
-        <FullscreenLyrics
-          lines={lyricsState?.lines ?? []}
-          syncType={lyricsState?.syncType ?? 'none'}
-          currentTime={player.position}
-          isPlaying={player.isPlaying}
-          chromeVisible={chromeVisible}
-          onSeek={(time) => void player.seek(time)}
-        />
-      {/if}
+      <div class="fullscreen-lyrics-slot" aria-hidden={!showLyricsPanel}>
+        <!-- Mount lyrics while still hidden so the slot can transition from opacity 0 → 1 -->
+        {#if hasLyrics && lyricsVisible}
+          <FullscreenLyrics
+            lines={lyricsState?.lines ?? []}
+            syncType={lyricsState?.syncType ?? 'none'}
+            currentTime={player.position}
+            isPlaying={player.isPlaying}
+            chromeVisible={chromeVisible}
+            onSeek={(time) => void player.seek(time)}
+          />
+        {/if}
+      </div>
     </div>
 
     <!-- svelte-ignore a11y_no_static_element_interactions -->

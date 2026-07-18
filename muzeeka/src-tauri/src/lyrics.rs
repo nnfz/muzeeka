@@ -14,7 +14,7 @@ const USER_AGENT: &str = "Muzeeka/0.1.0 (https://github.com/muzeeka/muzeeka)";
 const NO_LYRICS_SENTINEL: &str = "__NO_LYRICS__";
 const MISS_CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// Bump when new lyrics providers are added so stale negative cache entries are ignored.
-const MISS_CACHE_VERSION: &str = "unison-v1";
+const MISS_CACHE_VERSION: &str = "unison-v2";
 
 static LYRICS_CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();
 
