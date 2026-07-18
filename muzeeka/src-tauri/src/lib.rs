@@ -17,6 +17,7 @@ mod library;
 mod lrc;
 mod lrclib;
 mod lyrics;
+mod unison;
 mod metadata;
 mod player;
 mod playlists;

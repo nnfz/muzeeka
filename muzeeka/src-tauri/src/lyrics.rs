@@ -14,7 +14,7 @@ const USER_AGENT: &str = "Muzeeka/0.1.0 (https://github.com/muzeeka/muzeeka)";
 const NO_LYRICS_SENTINEL: &str = "__NO_LYRICS__";
 const MISS_CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// Bump when new lyrics providers are added so stale negative cache entries are ignored.
-const MISS_CACHE_VERSION: &str = "lrclib-v1";
+const MISS_CACHE_VERSION: &str = "unison-v1";
 
 static LYRICS_CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();
 
@@ -206,12 +206,20 @@ fn fetch_uncached(
     album: Option<&str>,
     duration_secs: Option<u32>,
 ) -> Result<Option<String>, String> {
+    // 1) Better Lyrics API — word-level TTML when cache-hit (or with API key).
     if let Some(ttml) = fetch_from_better_lyrics(title, artist, album, duration_secs)? {
         return Ok(Some(ttml));
     }
 
     let duration = duration_secs.unwrap_or(0);
+
+    // 2) LRCLIB — free LRC line-sync fallback.
     if let Some(ttml) = crate::lrclib::fetch_lrclib_ttml(title, artist, duration)? {
+        return Ok(Some(ttml));
+    }
+
+    // 3) Unison — crowdsourced public read API (ttml/lrc).
+    if let Some(ttml) = crate::unison::fetch_unison_ttml(title, artist, album, duration)? {
         return Ok(Some(ttml));
     }
 
