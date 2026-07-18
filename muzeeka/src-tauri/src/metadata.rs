@@ -423,11 +423,33 @@ fn clear_cached_playlist_covers(dir: &Path, safe_id: &str) {
 /// falls back to a still WebP of the first frame.
 fn gif_file_to_webp(source_gif: &Path, dest_webp: &Path, max_edge: u32) -> Result<(), String> {
     if let Some(ffmpeg) = ffmpeg_bin() {
-        if convert_gif_to_webp_ffmpeg(source_gif, dest_webp, ffmpeg, max_edge).is_ok() {
-            if dest_webp.is_file() {
+        match convert_gif_to_webp_ffmpeg(source_gif, dest_webp, ffmpeg, max_edge) {
+            Ok(()) if dest_webp.is_file() => {
+                eprintln!(
+                    "[cover] GIF → animated WebP OK: {}",
+                    source_gif.display()
+                );
                 return Ok(());
             }
+            Ok(()) => {
+                eprintln!(
+                    "[cover] ffmpeg finished but WebP missing, falling back to first frame: {}",
+                    source_gif.display()
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "[cover] ffmpeg GIF→WebP failed ({}), falling back to first frame: {}",
+                    e,
+                    source_gif.display()
+                );
+            }
         }
+    } else {
+        eprintln!(
+            "[cover] ffmpeg not available, GIF will lose animation: {}",
+            source_gif.display()
+        );
     }
 
     // Still fallback (first frame) when ffmpeg is missing or conversion fails.
@@ -436,6 +458,38 @@ fn gif_file_to_webp(source_gif: &Path, dest_webp: &Path, max_edge: u32) -> Resul
         return Err("Failed to write still WebP from GIF".to_string());
     }
     Ok(())
+}
+
+fn is_webp_file(path: &Path) -> bool {
+    let Ok(data) = fs::read(path) else {
+        return false;
+    };
+    // RIFF....WEBP
+    data.len() >= 12 && &data[..4] == b"RIFF" && &data[8..12] == b"WEBP"
+}
+
+/// True if the WebP contains an animation (ANIM chunk). Still WebP is OK for
+/// single-frame GIFs, but multi-frame GIF→still means conversion lost animation.
+fn is_animated_webp(path: &Path) -> bool {
+    let Ok(data) = fs::read(path) else {
+        return false;
+    };
+    // Chunk fourCCs are ASCII; a simple search is enough for our small covers.
+    data.windows(4).any(|w| w == b"ANIM")
+}
+
+fn configure_ffmpeg_command(cmd: &mut Command) {
+    // Avoid flashing a console window when spawning ffmpeg on Windows GUI apps.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = cmd;
+    }
 }
 
 fn convert_gif_to_webp_ffmpeg(
@@ -448,61 +502,133 @@ fn convert_gif_to_webp_ffmpeg(
         let _ = fs::create_dir_all(parent);
     }
 
-    // Scale so the longer side ≤ max_edge; keep aspect ratio; preserve alpha when present.
+    // Scale longer side ≤ max_edge, force even dims (needed for yuva420p), keep alpha.
+    // format=yuva420p avoids the slower RGB→YUV path inside libwebp for lossy encode.
     let vf = format!(
-        "scale='min({max_edge},iw)':'min({max_edge},ih)':force_original_aspect_ratio=decrease:flags=lanczos"
+        "scale='min({max_edge},iw)':'min({max_edge},ih)':force_original_aspect_ratio=decrease:flags=lanczos,scale=trunc(iw/2)*2:trunc(ih/2)*2:flags=lanczos,format=yuva420p"
     );
 
-    let status = Command::new(ffmpeg)
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-i",
-        ])
-        .arg(source_gif)
-        .args(["-vf", &vf])
-        .args([
-            "-c:v",
+    // Prefer the dedicated animated encoder; fall back to libwebp / auto-select.
+    // Note: modern ffmpeg (post-vsync removal) needs -fps_mode, not -vsync.
+    let attempts: &[(&str, &[&str])] = &[
+        (
+            "libwebp_anim",
+            &[
+                "-c:v",
+                "libwebp_anim",
+                "-lossless",
+                "0",
+                "-quality",
+                "80",
+                "-compression_level",
+                "4",
+                "-loop",
+                "0",
+                "-an",
+                "-fps_mode",
+                "passthrough",
+            ],
+        ),
+        (
             "libwebp",
-            "-lossless",
-            "0",
-            "-q:v",
-            "80",
-            "-loop",
-            "0",
-            "-an",
-            "-vsync",
-            "0",
-        ])
-        .arg(dest_webp)
-        .status()
-        .map_err(|e| format!("Failed to run ffmpeg for WebP: {e}"))?;
+            &[
+                "-c:v",
+                "libwebp",
+                "-lossless",
+                "0",
+                "-quality",
+                "80",
+                "-compression_level",
+                "4",
+                "-loop",
+                "0",
+                "-an",
+                "-fps_mode",
+                "passthrough",
+            ],
+        ),
+        (
+            "auto",
+            &[
+                "-lossless",
+                "0",
+                "-quality",
+                "80",
+                "-loop",
+                "0",
+                "-an",
+                "-fps_mode",
+                "passthrough",
+            ],
+        ),
+        // Last resort for older ffmpeg without -fps_mode / -quality on this path.
+        (
+            "libwebp_anim-legacy",
+            &[
+                "-c:v",
+                "libwebp_anim",
+                "-lossless",
+                "0",
+                "-q:v",
+                "80",
+                "-loop",
+                "0",
+                "-an",
+            ],
+        ),
+    ];
 
-    if !status.success() {
-        // Retry without explicit codec (some builds auto-pick libwebp_anim).
-        let status2 = Command::new(ffmpeg)
-            .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
-            .arg(source_gif)
-            .args(["-vf", &vf, "-loop", "0", "-an", "-vsync", "0"])
-            .arg(dest_webp)
-            .status()
-            .map_err(|e| format!("Failed to run ffmpeg for WebP: {e}"))?;
-        if !status2.success() || !dest_webp.is_file() {
-            return Err("ffmpeg GIF→WebP conversion failed".to_string());
+    let mut last_err = String::from("no encoder attempts ran");
+
+    for (name, extra) in attempts {
+        let _ = fs::remove_file(dest_webp);
+
+        let mut cmd = Command::new(ffmpeg);
+        configure_ffmpeg_command(&mut cmd);
+        cmd.args(["-hide_banner", "-loglevel", "error", "-y", "-i"]);
+        cmd.arg(source_gif);
+        cmd.args(["-vf", &vf]);
+        cmd.args(*extra);
+        cmd.arg(dest_webp);
+
+        let output = match cmd.output() {
+            Ok(o) => o,
+            Err(e) => {
+                last_err = format!("Failed to run ffmpeg for WebP: {e}");
+                eprintln!("[cover] ffmpeg spawn failed ({name}): {last_err}");
+                continue;
+            }
+        };
+
+        if output.status.success() && is_webp_file(dest_webp) {
+            let animated = is_animated_webp(dest_webp);
+            eprintln!(
+                "[cover] ffmpeg GIF→WebP OK codec={name} animated={animated}: {}",
+                source_gif.display()
+            );
+            return Ok(());
         }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        last_err = format!(
+            "codec={name} exit={} stderr={}",
+            output.status,
+            stderr.trim()
+        );
+        eprintln!("[cover] ffmpeg GIF→WebP attempt failed: {last_err}");
+        let _ = fs::remove_file(dest_webp);
     }
 
-    if !dest_webp.is_file() {
-        return Err("ffmpeg finished but WebP is missing".to_string());
-    }
-    Ok(())
+    Err(format!("ffmpeg GIF→WebP conversion failed: {last_err}"))
 }
 
 fn gif_bytes_to_webp(gif_bytes: &[u8], dest_webp: &Path, max_edge: u32) -> Result<(), String> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
     let tmp = std::env::temp_dir().join(format!(
-        "muzeeka-cover-{}.gif",
+        "muzeeka-cover-{}-{nanos}.gif",
         std::process::id()
     ));
     fs::write(&tmp, gif_bytes).map_err(|e| format!("Failed to write temp GIF: {e}"))?;

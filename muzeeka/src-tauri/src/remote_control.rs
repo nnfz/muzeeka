@@ -416,9 +416,9 @@ impl RemoteController {
 
     fn cover_url_for_track(track: &MusicFile) -> Option<String> {
         let cover_path = track
-            .cover_path
+            .cover_path_full
             .as_deref()
-            .or(track.cover_path_full.as_deref())?;
+            .or(track.cover_path.as_deref())?;
         Some(format!(
             "/api/cover?path={}",
             urlencoding::encode(cover_path)

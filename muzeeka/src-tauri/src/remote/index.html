@@ -493,8 +493,8 @@
     </div>
   </div>
 
-  <!-- Near-silent micro-loop keeps lock-screen / shade controls alive (sound plays on PC). -->
-  <audio id="silentKeeper" loop playsinline webkit-playsinline preload="auto" style="display:none"></audio>
+  <!-- Near-silent audio keeps lock-screen / Control Center controls alive (duration-matched per track). -->
+  <audio id="silentKeeper" playsinline webkit-playsinline preload="auto" style="display:none"></audio>
 
   <script>
     const $ = (id) => document.getElementById(id);
@@ -515,8 +515,10 @@
     let mediaSessionReady = false;
     let mediaSessionEnabled = false;
     let silentBlobUrl = null;
+    let silentBlobDuration = 0;
     let wakeLock = null;
     let lastMediaPositionSync = 0;
+    let keeperSyncRAF = null;
 
     function fmt(sec) {
       if (!sec || sec < 0) return '0:00';
@@ -589,6 +591,13 @@
       if (mediaSessionReady) return;
       if (!('mediaSession' in navigator)) return;
 
+      bindMediaHandlers();
+      mediaSessionReady = true;
+    }
+
+    function bindMediaHandlers() {
+      if (!('mediaSession' in navigator)) return;
+
       const bind = (actionName, handler) => {
         try {
           navigator.mediaSession.setActionHandler(actionName, handler);
@@ -603,18 +612,7 @@
       bind('previoustrack', () => { void mediaAction('/api/prev'); });
       bind('nexttrack', () => { void mediaAction('/api/next'); });
 
-      const unbind = (actionName) => {
-        try {
-          navigator.mediaSession.setActionHandler(actionName, null);
-        } catch (_) {}
-      };
-
-      if (IS_IOS) {
-        // iOS shows ±10s skip buttons when these handlers are set — hide them to get prev/next.
-        unbind('seekbackward');
-        unbind('seekforward');
-        unbind('seekto');
-      } else {
+      if (!IS_IOS) {
         bind('seekbackward', () => {
           const pos = Math.max(0, (state?.position ?? 0) - 10);
           void mediaAction('/api/seek', { position: pos });
@@ -630,8 +628,6 @@
           }
         });
       }
-
-      mediaSessionReady = true;
     }
 
     async function requestWakeLock() {
@@ -642,17 +638,17 @@
     }
 
     function syncKeeperClock(force = false) {
-      if (!IS_IOS) return;
       const keeper = $('silentKeeper');
       const pos = state?.position ?? 0;
       if (!keeper || !Number.isFinite(pos) || !keeper.duration || keeper.duration <= 0) return;
 
       const now = Date.now();
-      if (!force && now - lastMediaPositionSync < 1500) return;
+      if (!force && now - lastMediaPositionSync < 800) return;
       lastMediaPositionSync = now;
 
-      const target = pos % keeper.duration;
-      if (Math.abs(keeper.currentTime - target) > 0.25) {
+      // Clamp to keeper duration so we don't exceed the audio length
+      const target = Math.min(pos, keeper.duration - 0.1);
+      if (target >= 0 && Math.abs(keeper.currentTime - target) > 0.3) {
         try {
           keeper.currentTime = target;
         } catch (_) {}
@@ -663,10 +659,24 @@
       const keeper = $('silentKeeper');
       if (!keeper || !mediaSessionEnabled) return;
 
-      keeper.volume = 0.02;
+      keeper.volume = 0.01;
       const hasTrack = !!state?.track;
       const playing = !!state?.isPlaying;
       const paused = !!state?.isPaused;
+      const dur = state?.duration ?? 0;
+
+      // Regenerate silent audio when track duration changes significantly
+      if (dur > 0 && Math.abs(dur - silentBlobDuration) > 1) {
+        const newUrl = createSilentBlobUrl(dur);
+        if (keeper.src !== newUrl) {
+          const wasPlaying = !keeper.paused;
+          keeper.src = newUrl;
+          keeper.load();
+          if (wasPlaying || playing) {
+            try { await keeper.play(); } catch (_) {}
+          }
+        }
+      }
 
       if (hasTrack && playing) {
         syncKeeperClock(true);
@@ -675,13 +685,34 @@
             await keeper.play();
           } catch (_) {}
         }
+        startKeeperSync();
       } else if (hasTrack && paused) {
         syncKeeperClock(true);
         if (!keeper.paused) {
           keeper.pause();
         }
-      } else if (!keeper.paused) {
-        keeper.pause();
+        stopKeeperSync();
+      } else {
+        if (!keeper.paused) {
+          keeper.pause();
+        }
+        stopKeeperSync();
+      }
+    }
+
+    function startKeeperSync() {
+      if (keeperSyncRAF) return;
+      const tick = () => {
+        syncKeeperClock(false);
+        keeperSyncRAF = requestAnimationFrame(tick);
+      };
+      keeperSyncRAF = requestAnimationFrame(tick);
+    }
+
+    function stopKeeperSync() {
+      if (keeperSyncRAF) {
+        cancelAnimationFrame(keeperSyncRAF);
+        keeperSyncRAF = null;
       }
     }
 
@@ -730,6 +761,9 @@
 
       setMediaMetadata(track);
 
+      // iOS Safari resets action handlers when metadata is updated — re-bind them.
+      if (IS_IOS) bindMediaHandlers();
+
       try {
         navigator.mediaSession.playbackState = playing
           ? 'playing'
@@ -761,12 +795,23 @@
     }
 
     function createSilentBlobUrl(durationSec = 0.5) {
-      if (silentBlobUrl) return silentBlobUrl;
+      // Always regenerate when duration changes so iOS gets correct track length
+      if (silentBlobUrl && Math.abs(silentBlobDuration - durationSec) < 1) {
+        return silentBlobUrl;
+      }
 
-      const sampleRate = 8000;
+      // Revoke old blob to avoid memory leaks
+      if (silentBlobUrl) {
+        URL.revokeObjectURL(silentBlobUrl);
+        silentBlobUrl = null;
+      }
+
+      // Use low sample rate to keep the blob small even for long tracks
+      const sampleRate = 1000;
       const channels = 1;
       const bits = 16;
-      const samples = Math.max(1, Math.floor(sampleRate * durationSec));
+      const clampedDuration = Math.max(0.5, Math.min(durationSec, 7200));
+      const samples = Math.max(1, Math.floor(sampleRate * clampedDuration));
       const dataSize = samples * channels * (bits / 8);
       const buffer = new ArrayBuffer(44 + dataSize);
       const view = new DataView(buffer);
@@ -792,17 +837,28 @@
       view.setUint32(40, dataSize, true);
 
       silentBlobUrl = URL.createObjectURL(new Blob([buffer], { type: 'audio/wav' }));
+      silentBlobDuration = clampedDuration;
       return silentBlobUrl;
     }
 
     function prepareSilentKeeper() {
       const keeper = $('silentKeeper');
       if (!keeper) return;
-      keeper.src = createSilentBlobUrl(0.5);
-      keeper.loop = true;
-      keeper.volume = 0.001;
+      // Initial short silent audio; will be replaced with track-duration one
+      const dur = state?.duration ?? 0.5;
+      keeper.src = createSilentBlobUrl(dur > 0 ? dur : 0.5);
+      keeper.loop = false;
+      keeper.volume = 0.01;
       keeper.muted = false;
       keeper.preload = 'auto';
+
+      // When the keeper ends, restart if we're still playing (prevents iOS killing the session)
+      keeper.addEventListener('ended', () => {
+        if (state?.isPlaying && mediaSessionEnabled) {
+          syncKeeperClock(true);
+          try { keeper.play(); } catch (_) {}
+        }
+      });
     }
 
     async function tryEnableSystemMedia() {

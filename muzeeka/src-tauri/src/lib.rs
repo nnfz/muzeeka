@@ -210,6 +210,10 @@ pub fn run() {
                 });
                 bin.is_file().then_some(bin)
             });
+            match &ffmpeg {
+                Some(path) => eprintln!("[init] ffmpeg for GIF→WebP: {}", path.display()),
+                None => eprintln!("[init] ffmpeg NOT found — animated GIF covers will lose animation"),
+            }
             metadata::set_ffmpeg_bin(ffmpeg);
 
             if let Some(window) = app.get_webview_window("main") {
