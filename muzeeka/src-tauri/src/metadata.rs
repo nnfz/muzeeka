@@ -26,7 +26,7 @@ static FFMPEG_BIN: OnceLock<Option<PathBuf>> = OnceLock::new();
 const PLAYLIST_COVER_SIZE: u32 = 256;
 const MAX_PLAYLIST_GIF_BYTES: u64 = 20 * 1024 * 1024;
 
-const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp", "gif"];
+const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp", "gif", "tif", "tiff"];
 const COVER_NAMES: &[&str] = &[
     "cover", "folder", "front", "album", "albumart", "artwork", "albumartsmall",
 ];
@@ -124,6 +124,7 @@ pub(crate) fn mime_from_path(path: &Path) -> &'static str {
         Some("webp") => "image/webp",
         Some("gif") => "image/gif",
         Some("bmp") => "image/bmp",
+        Some("tif") | Some("tiff") => "image/tiff",
         _ => "image/jpeg",
     }
 }
@@ -144,6 +145,11 @@ fn guess_mime(data: &[u8]) -> String {
         "image/jpeg".to_string()
     } else if data.len() >= 6 && (&data[..6] == b"GIF87a" || &data[..6] == b"GIF89a") {
         "image/gif".to_string()
+    } else if data.len() >= 4
+        && (data[..4] == *b"II*\0" || data[..4] == *b"MM\0*")
+    {
+        // TIFF little-endian (II) or big-endian (MM)
+        "image/tiff".to_string()
     } else {
         "image/jpeg".to_string()
     }
@@ -405,7 +411,7 @@ fn is_gif_path(source: &Path) -> bool {
 }
 
 fn clear_cached_playlist_covers(dir: &Path, safe_id: &str) {
-    for ext in ["jpg", "jpeg", "gif", "png", "webp", "bmp"] {
+    for ext in ["jpg", "jpeg", "gif", "png", "webp", "bmp", "tif", "tiff"] {
         let path = dir.join(format!("{safe_id}.{ext}"));
         if path.is_file() {
             let _ = fs::remove_file(path);

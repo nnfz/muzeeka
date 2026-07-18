@@ -10,7 +10,7 @@ fn is_image_path(path: &Path) -> bool {
         .is_some_and(|ext| {
             matches!(
                 ext.to_lowercase().as_str(),
-                "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "ico"
+                "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "ico" | "tif" | "tiff"
             )
         })
 }
