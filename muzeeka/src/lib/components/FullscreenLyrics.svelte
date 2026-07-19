@@ -278,7 +278,7 @@
     const raw = Math.min(Math.max((t - target.startSec) / safeDur, 0), 1);
     const eased = easeInFill(raw);
     // Light EMA — kills micro-jitter from clock resync without lagging behind
-    smoothWordFill = smoothWordFill + (eased - smoothWordFill) * 0.45;
+    smoothWordFill = smoothWordFill + (eased - smoothWordFill) * 0.6;
     if (raw >= 0.999) smoothWordFill = 1;
     setWordFill(target.el, smoothWordFill);
   }

@@ -4,7 +4,7 @@
   --lyric-line-height: 1.22;
   --lyric-gap: 0.42em;
   /* braccato-inspired line motion (word/char karaoke untouched below) */
-  --lyric-ease: ease;
+  --lyric-ease: cubic-bezier(0.25, 0.1, 0.25, 1);
   --lyric-duration: 0.5s;
   /* No scale-up on active — only opacity/blur for past (avoids grow-then-leave) */
   --lyric-scale: 1;
@@ -103,8 +103,7 @@
   transition:
     transform var(--lyric-scale-duration) var(--lyric-ease),
     opacity var(--lyric-leave-opacity-duration) var(--lyric-ease) var(--lyric-leave-opacity-delay),
-    filter var(--lyric-leave-filter-duration) var(--lyric-ease) var(--lyric-leave-filter-delay),
-    color var(--lyric-leave-opacity-duration) var(--lyric-ease) var(--lyric-leave-opacity-delay);
+    filter var(--lyric-leave-filter-duration) var(--lyric-ease) var(--lyric-leave-filter-delay);
   backface-visibility: hidden;
   overflow-wrap: anywhere;
   word-break: break-word;
@@ -115,7 +114,7 @@
   opacity: 1 !important;
   filter: blur(0) !important;
   color: var(--lyric-color-active);
-  transition: all 0.3s ease;
+  transition: all 0.3s var(--lyric-ease);
 }
 
 .fs-lyrics-line.is-active {
@@ -124,12 +123,12 @@
   transform: scale(var(--lyric-active-scale));
   filter: blur(0);
   cursor: default;
-  /* Enter active without leave delays */
+  /* Enter active without leave delays — smooth cubic-bezier */
   transition:
     transform var(--lyric-scale-duration) var(--lyric-ease),
-    opacity 0.2s ease,
-    filter 0.2s ease,
-    color 0.2s ease;
+    opacity 0.22s var(--lyric-ease),
+    filter 0.22s var(--lyric-ease),
+    color 0.22s var(--lyric-ease);
 }
 
 /* Past lines (before active): dim + blur — delayed via base transition */
@@ -145,7 +144,7 @@
   opacity: 1 !important;
   filter: blur(0) !important;
   color: var(--lyric-color-active);
-  transition: all 0.3s ease;
+  transition: all 0.3s var(--lyric-ease);
 }
 
 .fs-lyrics-line[data-agent='v2'],
@@ -234,7 +233,7 @@
   color: inherit;
   transform: none;
   text-shadow: none;
-  transition: color 240ms ease;
+  transition: color 240ms var(--lyric-ease);
 }
 
 /* Word hover on non-active lines — brighten; line blur cleared by line:hover */
@@ -271,7 +270,7 @@
   color: var(--lyric-color-active);
   --word-fill: 1;
   transform: translate3d(0, -0.04em, 0) scale(1);
-  transition: color 140ms ease, transform 180ms ease;
+  transition: color 140ms var(--lyric-ease), transform 180ms var(--lyric-ease);
 }
 
 .fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line.is-active .fs-lyrics-word.is-sung .fs-lyrics-char {
@@ -279,9 +278,9 @@
   transform: translate3d(0, -0.035em, 0) scale(1);
   text-shadow: none;
   transition:
-    transform 160ms ease,
-    color 120ms ease,
-    text-shadow 120ms ease;
+    transform 160ms var(--lyric-ease),
+    color 120ms var(--lyric-ease),
+    text-shadow 120ms var(--lyric-ease);
 }
 
 /* Active line: upcoming words stay dim and flat */
@@ -303,12 +302,14 @@
  */
 .fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line.is-active .fs-lyrics-word.is-animating {
   --word-pop: clamp(0, var(--word-fill) * 1.5, 1);
+  /* Fade pop as fill completes — stops micro-jitter near end */
+  --fade-pop: clamp(0, 4 * (1 - var(--word-fill)), 1);
   color: var(--lyric-color-word-dim);
   background-image: none;
   -webkit-text-fill-color: unset;
   transform:
-    translate3d(0, calc(var(--word-pop) * -0.045em), 0)
-    scale(calc(1 + var(--word-pop) * 0.012));
+    translate3d(0, calc(var(--word-pop) * var(--fade-pop) * -0.045em), 0)
+    scale(calc(1 + var(--word-pop) * var(--fade-pop) * 0.012));
   transition: none;
 }
 
@@ -325,6 +326,7 @@
 .fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line.is-active .fs-lyrics-word.is-animating .fs-lyrics-char {
   /*
    * Wider, softer wave — no +0.5 bias (that made first glyphs flash half-lit).
+   * Fade wave out as fill completes — stops post-animation jitter.
    */
   --char-n-safe: max(var(--char-n), 1);
   --char-pos: calc((var(--char-i) + 0.5) / var(--char-n-safe));
@@ -336,17 +338,19 @@
   --hold: clamp(0, var(--ahead) * 0.85, 0.22);
   /* Higher lift while singing; hold keeps letter up after the wave passes */
   --lift: max(calc(var(--peak) * 0.85), var(--hold));
+  /* Fade wave out as fill completes — eliminates post-animation jitter */
+  --fade-wave: clamp(0, 4 * (1 - var(--word-fill)), 1);
   color: color-mix(
     in srgb,
     var(--lyric-color-active) calc(var(--lit) * 100%),
     var(--lyric-color-word-dim)
   );
   transform:
-    translate3d(0, calc(var(--lift) * -0.09em), 0)
-    scale(calc(1 + var(--lift) * 0.04));
+    translate3d(0, calc(var(--lift) * var(--fade-wave) * -0.09em), 0)
+    scale(calc(1 + var(--lift) * var(--fade-wave) * 0.04));
   text-shadow:
-    0 0 calc(var(--peak) * 7px) rgba(255, 255, 255, calc(var(--peak) * 0.3)),
-    0 0 calc(var(--peak) * 16px) rgba(255, 255, 255, calc(var(--peak) * 0.14));
+    0 0 calc(var(--peak) * var(--fade-wave) * 7px) rgba(255, 255, 255, calc(var(--peak) * var(--fade-wave) * 0.3)),
+    0 0 calc(var(--peak) * var(--fade-wave) * 16px) rgba(255, 255, 255, calc(var(--peak) * var(--fade-wave) * 0.14));
   transition: none;
 }
 
@@ -358,12 +362,14 @@
 
 /* Background vocals: quieter motion, softer glow */
 .fs-lyrics-container[data-sync='richsync'] .fs-lyrics-word.is-background.is-animating .fs-lyrics-char {
+  /* Fade wave out as fill completes */
+  --fade-wave: clamp(0, 4 * (1 - var(--word-fill)), 1);
   transform:
-    translate3d(0, calc(var(--lift) * -0.055em), 0)
-    scale(calc(1 + var(--lift) * 0.028));
+    translate3d(0, calc(var(--lift) * var(--fade-wave) * -0.055em), 0)
+    scale(calc(1 + var(--lift) * var(--fade-wave) * 0.028));
   text-shadow:
-    0 0 calc(var(--peak) * 5px) rgba(255, 255, 255, calc(var(--peak) * 0.18)),
-    0 0 calc(var(--peak) * 10px) rgba(255, 255, 255, calc(var(--peak) * 0.08));
+    0 0 calc(var(--peak) * var(--fade-wave) * 5px) rgba(255, 255, 255, calc(var(--peak) * var(--fade-wave) * 0.18)),
+    0 0 calc(var(--peak) * var(--fade-wave) * 10px) rgba(255, 255, 255, calc(var(--peak) * var(--fade-wave) * 0.08));
 }
 
 .fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line.is-active .fs-lyrics-word.is-background.is-sung,
