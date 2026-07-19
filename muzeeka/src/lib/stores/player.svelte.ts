@@ -420,7 +420,10 @@ async function enrichTrackMetadata() {
   try {
     const enriched = await invoke<MusicFile[]>('library_fetch_metadata', { paths });
     mergeMetadataIntoPlaylists(enriched);
-    prefetchCoverPaths(enriched.map((track) => track.cover_path));
+    prefetchCoverPaths([
+      ...enriched.map((track) => track.cover_path_full),
+      ...enriched.map((track) => track.cover_path),
+    ]);
     scheduleSave();
   } catch (e) {
     console.error('Failed to fetch track metadata:', e);
@@ -728,7 +731,9 @@ async function loadPlaylists() {
       syncShufflePosition();
     }
     prefetchCoverPaths([
-      ...playlists.flatMap((playlist) => playlist.tracks.map((track) => track.cover_path)),
+      ...playlists.flatMap((playlist) =>
+        playlist.tracks.flatMap((track) => [track.cover_path_full, track.cover_path])
+      ),
       ...collectPlaylistCoverPaths(playlists),
     ]);
     void enrichTrackMetadata();
@@ -1306,6 +1311,23 @@ async function play(filePath: string) {
     // which prevents the CUE reuse optimization and causes glitches/delays.
 
     const track = trackByPath.get(filePath);
+    // Warm covers + shrink legacy multi‑MB fulls so fullscreen opens instantly.
+    if (track) {
+      prefetchCoverPaths([track.cover_path_full, track.cover_path], 2);
+    }
+    void invoke<string | null>('library_resolve_full_cover', { path: filePath })
+      .then((fullPath) => {
+        if (!fullPath) return;
+        prefetchCoverPaths([fullPath], 1);
+        // Keep playlist metadata in sync if we just created/shrank a full cover.
+        const t = trackByPath.get(filePath);
+        if (t && t.cover_path_full !== fullPath) {
+          mergeMetadataIntoPlaylists([
+            { ...t, cover_path_full: fullPath },
+          ]);
+        }
+      })
+      .catch(() => {});
     // Prefer the currently viewed playlist (incl. virtual All/Liked) so that next/prev
     // operate over the collected list when playing from All or Liked views.
     let playlistId = activePlaylistId;

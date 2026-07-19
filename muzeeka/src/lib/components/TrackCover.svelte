@@ -3,7 +3,6 @@
   import { COVER_PLACEHOLDER_SRC } from '$lib/coverPlaceholder';
   import type { MusicFile } from '$lib/stores/player.svelte';
 
-
   interface Props {
     track: MusicFile | null;
   }
@@ -29,7 +28,15 @@
 
 <div class="track-cover">
   {#if src}
-    <img {src} alt="" loading="lazy" decoding="async" draggable="false" onerror={handleImageError} ondragstart={(e) => e.preventDefault()} />
+    <img
+      {src}
+      alt=""
+      loading="lazy"
+      decoding="async"
+      draggable="false"
+      onerror={handleImageError}
+      ondragstart={(e) => e.preventDefault()}
+    />
   {:else if !placeholderFailed}
     <img
       class="cover-placeholder-img"

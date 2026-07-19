@@ -25,6 +25,15 @@
   align-self: stretch;
 }
 
+@keyframes header-btn-appear {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
 .header-btn {
   display: flex;
   align-items: center;
@@ -34,12 +43,20 @@
   border-radius: var(--radius-sm);
   color: var(--text-secondary);
   flex-shrink: 0;
-  transition: color var(--transition-fast), background var(--transition-fast);
+  opacity: 1;
+  animation: header-btn-appear 220ms ease;
+  transition: color var(--transition-normal), background var(--transition-normal);
 }
 
 .header-btn:hover {
   color: var(--text-primary);
-  background: rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .header-btn {
+    animation: none;
+  }
 }
 
 .header-static-icon {

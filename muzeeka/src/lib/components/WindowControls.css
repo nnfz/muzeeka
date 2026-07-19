@@ -13,7 +13,7 @@
   justify-content: center;
   color: var(--text-secondary);
   border-radius: var(--radius-sm);
-  transition: background var(--transition-fast), color var(--transition-fast);
+  transition: all var(--transition-normal);
 }
 
 .win-btn:hover {
@@ -33,4 +33,19 @@
   background-color: currentColor;
   -webkit-mask: var(--win-icon) center / contain no-repeat;
   mask: var(--win-icon) center / contain no-repeat;
+}
+
+:global(html.fullscreen-active)  {
+  .win-btn {
+    color: var(--text-primary-md);
+  }
+  .win-btn:hover {
+    background: rgba(255, 255, 255, 0.1);
+    color: var(--text-primary);
+    backdrop-filter: saturate(130%);
+  }
+  .win-btn.close:hover {
+    background: #e81123;
+    color: white;
+  }
 }

@@ -1,5 +1,10 @@
 <script lang="ts">
-  import { getCoverSrc, resolveCoverSrc } from '$lib/coverCache';
+  import {
+    getCoverSrc,
+    preferFullCoverPath,
+    resolveCoverSrc,
+    warmImageSrc,
+  } from '$lib/coverCache';
   import { COVER_PLACEHOLDER_SRC } from '$lib/coverPlaceholder';
   import {
     getPlayerStore,
@@ -25,126 +30,76 @@
 
   let resolvedFullCoverPath = $state<string | null>(null);
 
-  let coverPath = $derived(
+  /** Small list cover — always show first (fast). */
+  let thumbPath = $derived(player.currentTrack?.cover_path?.trim() || null);
+  /** Sharper fullscreen cover (capped on disk at ~720px). */
+  let fullPath = $derived(
     resolvedFullCoverPath
-      ?? player.currentTrack?.cover_path
-      ?? player.currentTrack?.cover_path_full
-      ?? null
+      ?? preferFullCoverPath(
+        player.currentTrack?.cover_path,
+        player.currentTrack?.cover_path_full,
+      )
   );
-  /** Kawarp background URL (may upgrade to full-res independently). */
+
+  /** Kawarp background URL. */
   let bgCoverSrc = $state<string | null>(null);
 
-  /**
-   * Cover art: base stays fully opaque; overlay fades in on top, then promotes.
-   * Old cover never fades out — that was the dissolve bug.
-   */
-  const ART_CROSSFADE_MS = 480;
-  let artBaseSrc = $state<string | null>(null);
-  let artOverlaySrc = $state<string | null>(null);
-  let artOverlayIn = $state(false);
-  /** Audio file the current art belongs to (thumb→full skips crossfade). */
+  /** Front cover src — thumb first, then full when decoded. */
+  let artSrc = $state(COVER_PLACEHOLDER_SRC);
   let artFile = $state<string | null>(null);
-  let artToken = 0;
-  let artPromoteTimer: ReturnType<typeof setTimeout> | null = null;
   let placeholderFailed = $state(false);
-
-  function clearArtPromoteTimer() {
-    if (artPromoteTimer) {
-      clearTimeout(artPromoteTimer);
-      artPromoteTimer = null;
-    }
-  }
-
-  function preloadImageOk(url: string): Promise<boolean> {
-    return new Promise((resolve) => {
-      const img = new Image();
-      img.onload = () => resolve(true);
-      img.onerror = () => resolve(false);
-      img.src = url;
-    });
-  }
+  let artLoadToken = 0;
 
   function clearArt() {
-    clearArtPromoteTimer();
-    artToken += 1;
-    artBaseSrc = null;
-    artOverlaySrc = null;
-    artOverlayIn = false;
+    artLoadToken += 1;
+    artSrc = COVER_PLACEHOLDER_SRC;
     artFile = null;
+    placeholderFailed = false;
   }
 
-  /** Instant base cover — used on open. No animation, no async. */
-  function setArtImmediate(src: string, file: string | null) {
-    artToken += 1;
-    clearArtPromoteTimer();
-    artBaseSrc = src;
-    artOverlaySrc = null;
-    artOverlayIn = false;
+  function setArtSrc(next: string | null, file: string | null) {
+    const target = next ?? COVER_PLACEHOLDER_SRC;
+
+    // Keep real art if path briefly empty while full-res resolve is in flight.
+    if (
+      !next
+      && file
+      && artFile === file
+      && artSrc !== COVER_PLACEHOLDER_SRC
+    ) {
+      return;
+    }
+
+    artSrc = target;
     artFile = file;
+    if (target !== COVER_PLACEHOLDER_SRC) placeholderFailed = false;
   }
 
   /**
-   * Show / swap front cover.
-   * - Open / first image: hard set base (NO animation).
-   * - Same track URL upgrade: replace base pixels in place.
-   * - Track change only: preload, fade overlay on top (base never fades out).
+   * Apply src only after the browser has decoded it — avoids a long blank
+   * while a large cover streams in. Callers may paint a smaller stand-in first.
    */
-  async function setArtSrc(next: string | null, file: string | null) {
-    if (!next) {
-      clearArt();
-      return;
-    }
-
-    const settled =
-      artOverlayIn && artOverlaySrc ? artOverlaySrc : artBaseSrc;
-
-    if (settled === next || artOverlaySrc === next) {
-      artFile = file;
-      return;
-    }
-
-    // Same track, higher-res / other URL: swap pixels, no fade.
-    if (file && artFile === file && artBaseSrc) {
-      setArtImmediate(next, file);
-      return;
-    }
-
-    // First cover (open): solid, no animation.
-    if (!artBaseSrc) {
-      setArtImmediate(next, file);
-      return;
-    }
-
-    // Track change only: overlay fades in on top of solid base.
-    const token = ++artToken;
-    const ok = await preloadImageOk(next);
-    if (token !== artToken || !ok) return;
-    if (untrack(() => !open)) return;
-
-    clearArtPromoteTimer();
-    artOverlaySrc = next;
-    artOverlayIn = false;
-    artFile = file;
-
-    requestAnimationFrame(() => {
-      requestAnimationFrame(() => {
-        if (token !== artToken) return;
-        artOverlayIn = true;
-        artPromoteTimer = setTimeout(() => {
-          if (token !== artToken) return;
-          artBaseSrc = next;
-          artOverlaySrc = null;
-          artOverlayIn = false;
-          artPromoteTimer = null;
-        }, ART_CROSSFADE_MS);
-      });
-    });
+  async function setArtSrcWhenReady(next: string, file: string) {
+    const token = ++artLoadToken;
+    const ok = await warmImageSrc(next);
+    if (token !== artLoadToken) return;
+    if (untrack(() => player.currentFile) !== file) return;
+    if (!ok) return;
+    setArtSrc(next, file);
   }
 
   let lyricsState = $state<LyricsResult | null>(null);
   /** File path for which fetch finished (hit or miss). Not set while in-flight. */
   let lyricsSettledForFile = $state<string | null>(null);
   let lyricsVisible = $state(true);
+  /**
+   * Keep FullscreenLyrics mounted through the hide transition so opacity + fly-right
+   * can finish (unmounting on lyricsVisible=false killed the text mid-frame).
+   */
+  let lyricsMounted = $state(true);
+  let lyricsUnmountTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Match .fullscreen-lyrics-slot leave transition (hide) */
+  const LYRICS_EXIT_MS = 280;
   /** After open settle — transitions + Kawarp allowed. */
   let enterDone = $state(false);
   /**
@@ -156,6 +111,13 @@
   let hasLyrics = $derived((lyricsState?.lines.length ?? 0) > 0);
   let showLyricsPanel = $derived(lyricsLayoutActive);
   const CHROME_HIDE_DELAY = 1800;
+
+  function clearLyricsUnmountTimer() {
+    if (lyricsUnmountTimer) {
+      clearTimeout(lyricsUnmountTimer);
+      lyricsUnmountTimer = null;
+    }
+  }
 
   let chromeVisible = $state(true);
   /** Reactive: drives class so chrome cannot hide under the cursor. */
@@ -229,7 +191,19 @@
   }
 
   function toggleLyrics() {
-    lyricsVisible = !lyricsVisible;
+    if (lyricsVisible) {
+      // Start CSS leave (opacity → 0, translateX → right); unmount after it finishes.
+      lyricsVisible = false;
+      clearLyricsUnmountTimer();
+      lyricsUnmountTimer = setTimeout(() => {
+        lyricsUnmountTimer = null;
+        if (!lyricsVisible) lyricsMounted = false;
+      }, LYRICS_EXIT_MS);
+    } else {
+      clearLyricsUnmountTimer();
+      lyricsMounted = true;
+      lyricsVisible = true;
+    }
     showChrome();
   }
 
@@ -256,14 +230,43 @@
     }
   });
 
+  /** Seed cover before first paint when opening — thumb first (already warm from list). */
+  $effect.pre(() => {
+    if (!open) return;
+
+    untrack(() => {
+      if (artFile && artFile === player.currentFile) return;
+
+      const file = player.currentFile;
+      const thumb = player.currentTrack?.cover_path?.trim() || null;
+      const full = preferFullCoverPath(
+        player.currentTrack?.cover_path,
+        player.currentTrack?.cover_path_full,
+      );
+      // Prefer thumb for first paint — full may still be multi‑MB until re-encoded.
+      const path = thumb || full;
+      if (file && path) {
+        const src = getCoverSrc(path);
+        if (src) {
+          setArtSrc(src, file);
+          bgCoverSrc = src;
+          return;
+        }
+      }
+      if (file) setArtSrc(COVER_PLACEHOLDER_SRC, file);
+      bgCoverSrc = COVER_PLACEHOLDER_SRC;
+    });
+  });
+
   $effect(() => {
     if (!open) {
       clearHideTimer();
-      clearArtPromoteTimer();
+      clearLyricsUnmountTimer();
       chromeVisible = true;
       pointerOverChrome = false;
       sawPointerMove = false;
       lyricsVisible = true;
+      lyricsMounted = true;
       enterDone = false;
       lyricsLayoutActive = false;
       clearArt();
@@ -278,25 +281,6 @@
     scheduleChromeHide();
     enterDone = false;
     lyricsLayoutActive = false;
-
-    // Seed once on open (untracked) — solid cover on first paint, zero animation.
-    untrack(() => {
-      const file = player.currentFile;
-      const path =
-        player.currentTrack?.cover_path
-        ?? player.currentTrack?.cover_path_full
-        ?? null;
-      if (file && path) {
-        const src = getCoverSrc(path);
-        if (src) {
-          setArtImmediate(src, file);
-          bgCoverSrc = src;
-          return;
-        }
-      }
-      // No cover — still feed placeholder into Kawarp
-      bgCoverSrc = COVER_PLACEHOLDER_SRC;
-    });
 
     const enterTimer = setTimeout(() => {
       enterDone = true;
@@ -331,7 +315,7 @@
     };
   });
 
-  // File change: reset lyrics + resolve full cover (do not hard-clear art — crossfade handles swap).
+  // File change: lyrics reset + resolve/shrink full cover on disk.
   $effect(() => {
     const file = player.currentFile;
 
@@ -339,7 +323,14 @@
       return;
     }
 
-    resolvedFullCoverPath = null;
+    const knownFull = untrack(() =>
+      preferFullCoverPath(
+        player.currentTrack?.cover_path,
+        player.currentTrack?.cover_path_full,
+      )
+    );
+    resolvedFullCoverPath = knownFull;
+
     lyricsState = null;
     lyricsSettledForFile = null;
     lyricsLayoutActive = false;
@@ -350,7 +341,9 @@
       .then((fullPath) => {
         if (cancelled || !fullPath) return;
         if (untrack(() => player.currentFile) !== file) return;
-        resolvedFullCoverPath = fullPath;
+        if (untrack(() => resolvedFullCoverPath) !== fullPath) {
+          resolvedFullCoverPath = fullPath;
+        }
       })
       .catch(() => {});
 
@@ -360,40 +353,55 @@
   });
 
   /**
-   * Sync art + bg from cover path.
-   * No path → placeholder (clear art). Never blank the base mid-load if path only upgrades.
+   * Paint cover fast:
+   * 1) thumb immediately (usually already in browser cache from the list)
+   * 2) full after decode (capped ~720px on disk — no multi‑MB waits)
    */
   $effect(() => {
     if (!open) return;
 
     const file = player.currentFile;
     void player.currentTrack;
-    const path = coverPath;
+    const thumb = thumbPath;
+    const full = fullPath;
 
     if (!file) return;
 
-    if (!path) {
-      // No cover — clear front art (placeholder UI) but keep Kawarp on placeholder image.
+    if (!thumb && !full) {
       bgCoverSrc = COVER_PLACEHOLDER_SRC;
-      void setArtSrc(null, file);
+      setArtSrc(COVER_PLACEHOLDER_SRC, file);
       return;
     }
 
     let cancelled = false;
 
-    const apply = (src: string) => {
-      if (cancelled) return;
+    const showFull = async (path: string) => {
+      const immediate = getCoverSrc(path);
+      const src = immediate ?? (await resolveCoverSrc(path));
+      if (cancelled || !src) return;
       if (untrack(() => player.currentFile) !== file) return;
       bgCoverSrc = src;
-      void setArtSrc(src, file);
+      await setArtSrcWhenReady(src, file);
     };
 
-    const immediate = getCoverSrc(path);
-    if (immediate) apply(immediate);
+    // 1) Instant stand-in (thumb is ~96px WebP, usually already decoded in the list).
+    if (thumb) {
+      const src = getCoverSrc(thumb);
+      if (src) {
+        setArtSrc(src, file);
+        bgCoverSrc = src;
+      }
+    } else {
+      setArtSrc(COVER_PLACEHOLDER_SRC, file);
+      bgCoverSrc = COVER_PLACEHOLDER_SRC;
+    }
 
-    void resolveCoverSrc(path).then((src) => {
-      if (src) apply(src);
-    });
+    // 2) Upgrade to full after decode (on-disk full is capped ~720px / ≤400KB).
+    if (full && full !== thumb) {
+      void showFull(full);
+    } else if (!thumb && full) {
+      void showFull(full);
+    }
 
     return () => {
       cancelled = true;
@@ -508,33 +516,16 @@
     <div class="fullscreen-layout" class:lyrics-hidden={!showLyricsPanel}>
       <aside class="fullscreen-side">
         <div class="fullscreen-art-wrap">
-          {#if artBaseSrc}
+          {#if !placeholderFailed}
             <img
-              class="fullscreen-art art-base"
-              src={artBaseSrc}
-              alt=""
-              draggable="false"
-              decoding="async"
-            />
-            {#if artOverlaySrc}
-              <img
-                class="fullscreen-art art-overlay"
-                class:is-in={artOverlayIn}
-                src={artOverlaySrc}
-                alt=""
-                draggable="false"
-                decoding="async"
-              />
-            {/if}
-          {:else if !placeholderFailed}
-            <img
-              class="fullscreen-art art-base art-placeholder-img"
-              src={COVER_PLACEHOLDER_SRC}
+              class="fullscreen-art"
+              src={artSrc}
               alt=""
               draggable="false"
               decoding="async"
               onerror={() => {
-                placeholderFailed = true;
+                if (artSrc === COVER_PLACEHOLDER_SRC) placeholderFailed = true;
+                else setArtSrc(COVER_PLACEHOLDER_SRC, artFile);
               }}
             />
           {:else}
@@ -557,8 +548,11 @@
       </aside>
 
       <div class="fullscreen-lyrics-slot" aria-hidden={!showLyricsPanel}>
-        <!-- Mount lyrics while still hidden so the slot can transition from opacity 0 → 1 -->
-        {#if hasLyrics && lyricsVisible}
+        <!--
+          Mount while hidden so open can fade/slide in.
+          Keep mounted during hide so opacity + fly-right can finish.
+        -->
+        {#if hasLyrics && lyricsMounted}
           <FullscreenLyrics
             lines={lyricsState?.lines ?? []}
             syncType={lyricsState?.syncType ?? 'none'}

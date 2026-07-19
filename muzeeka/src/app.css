@@ -61,7 +61,9 @@
     --border-accent 420ms ease;
 
   /* Text palette */
+  --text-primary-solid: #f0f0f5;
   --text-primary: rgba(240, 240, 245, .9);
+  --text-primary-md: rgba(240, 240, 245, .7);
   --text-secondary: #9ca3af;
   --text-muted: #6b7280;
 
@@ -160,6 +162,16 @@ html.fullscreen-active .app-header .window-controls,
 html.fullscreen-active .app-header .app-header-spacer,
 html.fullscreen-active .app-header .search-area {
   pointer-events: auto;
+}
+
+html.fullscreen-active .header-btn {
+  color: var(--text-primary-md);
+}
+
+html.fullscreen-active .header-btn:hover {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.1);
+  backdrop-filter: saturate(130%);
 }
 
 html.fullscreen-active .transport-bar {

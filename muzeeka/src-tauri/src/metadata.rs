@@ -30,7 +30,14 @@ const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp", "gif", 
 const COVER_NAMES: &[&str] = &[
     "cover", "folder", "front", "album", "albumart", "artwork", "albumartsmall",
 ];
+/// List / transport cover.
 const THUMB_SIZE: u32 = 96;
+/// Fullscreen cover — capped so retina UI stays sharp without multi‑MB assets.
+/// (Old unlimited lossless dumps hit 10–15MB and felt like “cover never loads”.)
+const FULL_SIZE: u32 = 720;
+/// If an existing `*-full.webp` is larger, re-encode at FULL_SIZE on next access.
+/// 720px lossless WebP of photos is typically 100–500KB; 15MB dumps are the bug.
+const MAX_FULL_CACHE_BYTES: u64 = 800 * 1024;
 
 #[derive(Debug, Clone, Default)]
 pub struct TrackMetadata {
@@ -274,16 +281,41 @@ fn paths_for_content_id(content_id: &str) -> Option<CoverPaths> {
     if !thumb.is_file() {
         return None;
     }
-    let full = content_full_path(content_id)
-        .filter(|p| p.is_file())
-        .unwrap_or_else(|| thumb.clone());
+    let full_path = content_full_path(content_id)?;
+
+    // Shrink legacy multi‑MB fulls in place (decode cache file — no MP3 re-parse).
+    if full_path.is_file() && !full_cache_is_ok(&full_path) {
+        if let Ok(img) = image::open(&full_path) {
+            let _ = write_resized_webp(&img, &full_path, FULL_SIZE);
+        }
+        // If still bad / unreadable, fall through to thumb-only and let extract rewrite later.
+        if !full_cache_is_ok(&full_path) {
+            let _ = fs::remove_file(&full_path);
+        }
+    }
+
+    let full = if full_cache_is_ok(&full_path) {
+        full_path
+    } else if full_path.is_file() {
+        full_path
+    } else {
+        thumb.clone()
+    };
     Some(CoverPaths {
         thumb: Some(thumb.to_string_lossy().to_string()),
         full: Some(full.to_string_lossy().to_string()),
     })
 }
 
+fn full_cache_is_ok(path: &Path) -> bool {
+    match fs::metadata(path) {
+        Ok(m) => m.is_file() && m.len() > 0 && m.len() <= MAX_FULL_CACHE_BYTES,
+        Err(_) => false,
+    }
+}
+
 /// Ensure content-addressed full + thumb WebP exist for this image payload.
+/// Full is always max FULL_SIZE (never dump multi‑MB originals).
 fn ensure_content_cover_files(data: &[u8], _mime: &str) -> Option<(String, CoverPaths)> {
     if data.is_empty() {
         return None;
@@ -292,8 +324,11 @@ fn ensure_content_cover_files(data: &[u8], _mime: &str) -> Option<(String, Cover
     let thumb_path = content_thumb_path(&content_id)?;
     let full_path = content_full_path(&content_id)?;
 
-    // Both already on disk — shared by every track with this APIC.
-    if thumb_path.is_file() && full_path.is_file() {
+    let thumb_ok = thumb_path.is_file();
+    let full_ok = full_cache_is_ok(&full_path);
+
+    // Shared by every track with this APIC — only when both are usable.
+    if thumb_ok && full_ok {
         return Some((
             content_id,
             CoverPaths {
@@ -303,28 +338,22 @@ fn ensure_content_cover_files(data: &[u8], _mime: &str) -> Option<(String, Cover
         ));
     }
 
-    // Write full if missing
-    if !full_path.is_file() {
-        if data.len() >= 12 && data[..4] == *b"RIFF" && data[8..12] == *b"WEBP" {
-            if let Some(parent) = full_path.parent() {
-                let _ = fs::create_dir_all(parent);
-            }
-            fs::write(&full_path, data).ok()?;
-        } else {
-            let image = decode_image_bytes(data)?;
-            if !write_webp(&image, &full_path) {
-                return None;
-            }
+    // Decode once when we need to (re)write anything.
+    let image = if !full_ok || !thumb_ok {
+        decode_image_bytes(data)?
+    } else {
+        // unreachable, both ok handled above
+        return None;
+    };
+
+    if !full_ok {
+        // Always resize — never write raw embedded WebP/JPEG (were 5–15MB).
+        if !write_resized_webp(&image, &full_path, FULL_SIZE) {
+            return None;
         }
     }
 
-    // Write thumb if missing (decode once)
     if !thumb_path.is_file() {
-        let image = if full_path.is_file() {
-            image::open(&full_path).ok().or_else(|| decode_image_bytes(data))
-        } else {
-            decode_image_bytes(data)
-        }?;
         if !write_thumbnail_from_image(&image, &thumb_path) {
             return None;
         }
