@@ -61,7 +61,7 @@
     --border-accent 420ms ease;
 
   /* Text palette */
-  --text-primary: #f0f0f5;
+  --text-primary: rgba(240, 240, 245, .9);
   --text-secondary: #9ca3af;
   --text-muted: #6b7280;
 

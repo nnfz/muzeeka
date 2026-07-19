@@ -251,7 +251,7 @@
 }
 
 .fullscreen-artist {
-  margin-top: 8px;
+  margin-top: 4px;
   font-size: 16px;
   font-weight: 500;
   color: var(--text-secondary);
@@ -268,7 +268,7 @@
   bottom: 0;
   z-index: 305;
   width: 100%;
-  height: 120px;
+  height: 140px;
   pointer-events: auto;
 }
 
@@ -300,6 +300,13 @@
   transform: none;
   filter: none;
   pointer-events: none;
+}
+
+/* While the cursor is on the control strip, force chrome visible even if JS timed out. */
+.fullscreen-bottom-chrome:hover .fullscreen-bottom-chrome-inner,
+.fullscreen-bottom-chrome:hover .fullscreen-bottom-chrome-inner.chrome-hidden {
+  opacity: 1 !important;
+  pointer-events: auto !important;
 }
 
 .fullscreen-toolbar {
@@ -355,7 +362,7 @@
 .fs-icon {
   display: block;
   width: 26px;
-  height: 26px;
+  aspect-ratio: 1;
   flex-shrink: 0;
   background-color: currentColor;
   -webkit-mask: var(--fs-icon) center / contain no-repeat;
@@ -368,8 +375,8 @@
 }
 
 .fs-icon-play {
-  width: 34px;
-  height: 34px;
+  width: 44px;
+  aspect-ratio: 1;
 }
 
 .fullscreen-volume {
@@ -419,7 +426,7 @@
   width: 46px;
   height: 46px;
   border-radius: var(--radius-sm);
-  color: var(--text-secondary);
+  color: var(--text-primary);
   background: transparent;
   transition:
     color 200ms var(--fs-ease-soft),
@@ -458,8 +465,7 @@
 
 /* Play: icon only, no circle / accent fill */
 .fs-control-btn.play-btn {
-  width: 56px;
-  height: 56px;
+  aspect-ratio: 1;
   background: transparent;
   color: var(--text-primary);
   border-radius: var(--radius-sm);

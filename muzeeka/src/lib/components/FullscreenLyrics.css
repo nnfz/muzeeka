@@ -377,43 +377,136 @@
   transform: translate3d(0, -0.025em, 0) scale(1);
 }
 
-/* ── Instrumental ──────────────────────────────────────── */
+/* ── Instrumental (soft gradient wipe across the break) ── */
+
+@property --instrumental-fill {
+  syntax: '<number>';
+  inherits: true;
+  initial-value: 0;
+}
 
 .fs-lyrics-instrumental {
+  --instrumental-fill: 0;
   display: inline-flex;
   align-items: center;
-  gap: 0.4em;
-  color: inherit;
-  letter-spacing: 0.15em;
+  width: min(11em, 52%);
+  min-width: 4.5em;
   min-height: 1em;
+  color: inherit;
+  vertical-align: middle;
 }
 
-.fs-lyrics-instrumental span {
-  width: 0.32em;
-  height: 0.32em;
-  border-radius: 50%;
-  background: currentColor;
-  opacity: 0.4;
-  animation: fs-lyrics-pulse 1.5s ease-in-out infinite;
+.fs-lyrics-instrumental-track {
+  position: relative;
+  display: block;
+  width: 100%;
+  height: 0.22em;
+  border-radius: 999px;
+  /* Empty rest of the break */
+  background: color-mix(in srgb, currentColor 16%, transparent);
+  overflow: hidden;
 }
 
-.fs-lyrics-instrumental span:nth-child(2) {
-  animation-delay: 0.18s;
+/*
+ * Full-width layer, revealed by a soft mask edge that travels with --instrumental-fill.
+ * Not a hard rectangle growing in width — a smooth karaoke-style wipe.
+ */
+.fs-lyrics-instrumental-fill {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  overflow: hidden;
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, currentColor 55%, transparent) 0%,
+    color-mix(in srgb, currentColor 82%, transparent) 55%,
+    currentColor 100%
+  );
+  opacity: 0.88;
+  /* Soft leading edge: solid left → transparent after the progress point */
+  -webkit-mask-image: linear-gradient(
+    90deg,
+    #000 0%,
+    #000 max(0%, calc(var(--instrumental-fill) * 100% - 10%)),
+    rgba(0, 0, 0, 0.55) calc(var(--instrumental-fill) * 100%),
+    transparent min(100%, calc(var(--instrumental-fill) * 100% + 12%))
+  );
+  mask-image: linear-gradient(
+    90deg,
+    #000 0%,
+    #000 max(0%, calc(var(--instrumental-fill) * 100% - 10%)),
+    rgba(0, 0, 0, 0.55) calc(var(--instrumental-fill) * 100%),
+    transparent min(100%, calc(var(--instrumental-fill) * 100% + 12%))
+  );
+  will-change: mask-image, -webkit-mask-image;
 }
 
-.fs-lyrics-instrumental span:nth-child(3) {
-  animation-delay: 0.36s;
+/* Occasional light sweep over the filled portion (clipped by soft mask above) */
+.fs-lyrics-instrumental-fill::after {
+  content: '';
+  position: absolute;
+  top: -40%;
+  bottom: -40%;
+  left: 0;
+  width: 42%;
+  background: linear-gradient(
+    100deg,
+    transparent 0%,
+    rgba(255, 255, 255, 0.05) 32%,
+    rgba(255, 255, 255, 0.55) 48%,
+    rgba(255, 255, 255, 0.95) 50%,
+    rgba(255, 255, 255, 0.55) 52%,
+    rgba(255, 255, 255, 0.05) 68%,
+    transparent 100%
+  );
+  transform: translateX(-160%) skewX(-18deg);
+  opacity: 0;
+  pointer-events: none;
+  animation: fs-lyrics-instrumental-sweep 4.4s cubic-bezier(0.4, 0, 0.2, 1) infinite;
 }
 
-@keyframes fs-lyrics-pulse {
+.fs-lyrics-line.is-active .fs-lyrics-instrumental-fill {
+  opacity: 1;
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, currentColor 50%, transparent) 0%,
+    color-mix(in srgb, currentColor 88%, white) 60%,
+    #ffffff 100%
+  );
+}
+
+.fs-lyrics-line.is-active .fs-lyrics-instrumental-fill::after {
+  animation-duration: 3.6s;
+  background: linear-gradient(
+    100deg,
+    transparent 0%,
+    rgba(255, 255, 255, 0.08) 30%,
+    rgba(255, 255, 255, 0.7) 47%,
+    #ffffff 50%,
+    rgba(255, 255, 255, 0.7) 53%,
+    rgba(255, 255, 255, 0.08) 70%,
+    transparent 100%
+  );
+}
+
+/* Rest most of the cycle; short bright pass occasionally */
+@keyframes fs-lyrics-instrumental-sweep {
   0%,
-  100% {
-    opacity: 0.28;
-    transform: scale(0.88);
+  62% {
+    transform: translateX(-160%) skewX(-18deg);
+    opacity: 0;
   }
-  50% {
+  68% {
+    opacity: 0.85;
+  }
+  78% {
+    transform: translateX(260%) skewX(-18deg);
     opacity: 0.95;
-    transform: scale(1);
+  }
+  84%,
+  100% {
+    transform: translateX(260%) skewX(-18deg);
+    opacity: 0;
   }
 }
 
@@ -460,6 +553,11 @@
     transform: none !important;
     text-shadow: none !important;
     filter: none !important;
+  }
+
+  .fs-lyrics-instrumental-fill::after {
+    animation: none !important;
+    opacity: 0 !important;
   }
 }
 

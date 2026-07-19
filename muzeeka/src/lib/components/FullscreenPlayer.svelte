@@ -158,7 +158,14 @@
   const CHROME_HIDE_DELAY = 1800;
 
   let chromeVisible = $state(true);
+  /** Reactive: drives class so chrome cannot hide under the cursor. */
+  let pointerOverChrome = $state(false);
+  let chromeEl = $state<HTMLDivElement | null>(null);
   let hideTimer: ReturnType<typeof setTimeout> | null = null;
+  let pointerX = 0;
+  let pointerY = 0;
+  /** Don't auto-hide until we know where the cursor is (open under cursor has no :hover). */
+  let sawPointerMove = false;
 
   function clearHideTimer() {
     if (hideTimer) {
@@ -167,11 +174,34 @@
     }
   }
 
+  /** Prefer :hover; fall back to last pointer coords (mouseenter is unreliable). */
+  function computePointerOverChrome(): boolean {
+    if (!chromeEl) return false;
+    try {
+      if (chromeEl.matches(':hover')) return true;
+    } catch {
+      /* ignore */
+    }
+    const r = chromeEl.getBoundingClientRect();
+    // Small pad so buttons/volume near the top edge of the strip still count.
+    const pad = 8;
+    return (
+      pointerX >= r.left - pad &&
+      pointerX <= r.right + pad &&
+      pointerY >= r.top - pad &&
+      pointerY <= r.bottom + pad
+    );
+  }
+
   function scheduleChromeHide() {
     clearHideTimer();
+    if (!sawPointerMove || pointerOverChrome || computePointerOverChrome()) return;
     hideTimer = setTimeout(() => {
-      chromeVisible = false;
       hideTimer = null;
+      const over = computePointerOverChrome();
+      pointerOverChrome = over;
+      if (over) return;
+      chromeVisible = false;
     }, CHROME_HIDE_DELAY);
   }
 
@@ -180,12 +210,18 @@
     scheduleChromeHide();
   }
 
-  function onChromeEnter() {
-    showChrome();
-  }
-
-  function onChromeLeave() {
-    scheduleChromeHide();
+  function onPlayerPointerMove(e: PointerEvent) {
+    sawPointerMove = true;
+    pointerX = e.clientX;
+    pointerY = e.clientY;
+    const over = computePointerOverChrome();
+    pointerOverChrome = over;
+    chromeVisible = true;
+    if (over) {
+      clearHideTimer();
+    } else {
+      scheduleChromeHide();
+    }
   }
 
   function close() {
@@ -225,6 +261,8 @@
       clearHideTimer();
       clearArtPromoteTimer();
       chromeVisible = true;
+      pointerOverChrome = false;
+      sawPointerMove = false;
       lyricsVisible = true;
       enterDone = false;
       lyricsLayoutActive = false;
@@ -235,6 +273,8 @@
     }
 
     chromeVisible = true;
+    pointerOverChrome = false;
+    sawPointerMove = false;
     scheduleChromeHide();
     enterDone = false;
     lyricsLayoutActive = false;
@@ -446,7 +486,10 @@
   });
 </script>
 
-<svelte:window onkeydown={handleKeydown} />
+<svelte:window
+  onkeydown={handleKeydown}
+  onpointermove={open ? onPlayerPointerMove : undefined}
+/>
 
 {#if open && player.hasTrack}
   <div
@@ -528,16 +571,10 @@
       </div>
     </div>
 
-    <!-- svelte-ignore a11y_no_static_element_interactions -->
-    <div
-      class="fullscreen-bottom-chrome"
-      onmouseenter={onChromeEnter}
-      onmouseleave={onChromeLeave}
-    >
+    <div class="fullscreen-bottom-chrome" bind:this={chromeEl}>
       <div
         class="fullscreen-bottom-chrome-inner"
-        class:chrome-hidden={!chromeVisible}
-        onpointerdown={showChrome}
+        class:chrome-hidden={!chromeVisible && !pointerOverChrome}
       >
         <div class="fullscreen-toolbar">
           <div class="fullscreen-controls">

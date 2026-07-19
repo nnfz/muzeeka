@@ -19,6 +19,9 @@
   width: 100px;
   flex-shrink: 0;
   overflow: visible;
+  min-height: 28px;
+  display: flex;
+  align-items: center;
 }
 
 .volume-pct {
@@ -83,6 +86,17 @@
   position: relative;
   transition: height var(--transition-fast);
   touch-action: none;
+}
+
+/* Invisible hit pad — bar stays 4px, grab zone ~28px tall */
+.slider-track::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 28px;
+  transform: translateY(-50%);
 }
 
 .media-slider.progress .slider-track {

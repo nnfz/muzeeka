@@ -6,6 +6,7 @@
     findDisplayActiveLineIndex,
     isPartActive,
     isPartSung,
+    lineEndSec,
     lineStartSec,
     partDurationSec,
     partStartSec,
@@ -167,6 +168,14 @@
     return `${lineIndex}:${partIndex}:${part.startTimeMs}`;
   }
 
+  /** 0…1 progress through an instrumental break (past = full, future = empty). */
+  function instrumentalProgress(line: LyricLine, lineIndex: number, time: number): number {
+    const start = lineStartSec(line);
+    const end = lineEndSec(line, lines[lineIndex + 1]);
+    const dur = Math.max(end - start, 0.001);
+    return Math.min(1, Math.max(0, (time - start) / dur));
+  }
+
   function setWordFill(el: HTMLElement, fill: number) {
     el.style.setProperty('--word-fill', String(Math.min(1, Math.max(0, fill))));
   }
@@ -186,6 +195,24 @@
     }
     fillWordId = '';
     smoothWordFill = 0;
+  }
+
+  function paintInstrumentalFill() {
+    if (!viewportEl || lines.length === 0 || syncType === 'none') return;
+
+    const t = mediaNow();
+    const bars = viewportEl.querySelectorAll<HTMLElement>('.fs-lyrics-instrumental');
+    for (const el of bars) {
+      const lineEl = el.closest<HTMLElement>('[data-line]');
+      if (!lineEl) continue;
+      const i = Number(lineEl.dataset.line);
+      const line = lines[i];
+      if (!line?.isInstrumental) continue;
+      el.style.setProperty(
+        '--instrumental-fill',
+        String(instrumentalProgress(line, i, t)),
+      );
+    }
   }
 
   /** Soft media clock: avoid hard resync every position tick (causes fill jitter). */
@@ -345,15 +372,17 @@
   });
 
   $effect(() => {
-    if (syncType !== 'richsync' || !viewportEl) {
+    if (!viewportEl || lines.length === 0 || syncType === 'none') {
       clearWordFill();
       return;
     }
 
     void lines;
+    void syncType;
 
     const tick = () => {
-      paintWordFill();
+      if (syncType === 'richsync') paintWordFill();
+      paintInstrumentalFill();
       fillRaf = requestAnimationFrame(tick);
     };
 
@@ -399,7 +428,9 @@
           >
             {#if line.isInstrumental}
               <span class="fs-lyrics-instrumental" aria-label="Instrumental">
-                <span></span><span></span><span></span>
+                <span class="fs-lyrics-instrumental-track">
+                  <span class="fs-lyrics-instrumental-fill"></span>
+                </span>
               </span>
             {:else if line.parts && line.parts.length > 0 && syncType === 'richsync'}
               {#each parts as part, partIndex (part.startTimeMs + ':' + partIndex)}

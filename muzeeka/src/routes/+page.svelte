@@ -139,6 +139,17 @@
     }
   }
 
+  /** Reclaim document focus after Windows/WebView Alt menu mode steals it. */
+  function ensureWebviewFocus() {
+    if (typeof document === 'undefined') return;
+    if (document.hasFocus()) return;
+    try {
+      window.focus();
+    } catch {
+      /* ignore */
+    }
+  }
+
   function handleKeydown(e: KeyboardEvent) {
     if (isSecondaryWindow || !player) return;
     if (isTypingTarget(e.target)) return;
@@ -176,6 +187,13 @@
   $effect(() => {
     if (isSecondaryWindow) return;
 
+    // Capture: bare Alt activates Windows/WebView menu accelerators and can
+    // leave the document unfocused (animations + hotkeys die) until a click.
+    function handleAltKeydown(e: KeyboardEvent) {
+      if (e.key !== 'Alt' || e.ctrlKey || e.metaKey || e.shiftKey) return;
+      e.preventDefault();
+    }
+
     function handleWheel(e: WheelEvent) {
       if (!e.altKey || !player) return;
 
@@ -184,10 +202,24 @@
       const step = 0.05;
       const delta = e.deltaY < 0 ? step : -step;
       void player.setVolume(Math.max(0, Math.min(1, player.volume + delta)));
+
+      // Alt+wheel can still drop document focus mid-gesture on WebView2.
+      ensureWebviewFocus();
     }
 
+    function handleKeyup(e: KeyboardEvent) {
+      if (e.key !== 'Alt' && e.code !== 'AltLeft' && e.code !== 'AltRight') return;
+      ensureWebviewFocus();
+    }
+
+    window.addEventListener('keydown', handleAltKeydown, { capture: true });
     window.addEventListener('wheel', handleWheel, { passive: false });
-    return () => window.removeEventListener('wheel', handleWheel);
+    window.addEventListener('keyup', handleKeyup);
+    return () => {
+      window.removeEventListener('keydown', handleAltKeydown, { capture: true } as EventListenerOptions);
+      window.removeEventListener('wheel', handleWheel);
+      window.removeEventListener('keyup', handleKeyup);
+    };
   });
 </script>
 

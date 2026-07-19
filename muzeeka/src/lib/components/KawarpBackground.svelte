@@ -33,8 +33,10 @@
   let canvasEl = $state<HTMLCanvasElement | undefined>();
   let webglFailed = $state(false);
   let imageReady = $state(false);
+  // OS window focus (not document.hasFocus): Alt menu mode on Windows blurs the
+  // document without the app window actually deactivating.
   let windowActive = $state(
-    typeof document === 'undefined' ? true : document.visibilityState === 'visible' && document.hasFocus()
+    typeof document === 'undefined' ? true : document.visibilityState === 'visible'
   );
 
   let kawarp: import('@kawarp/core').Kawarp | null = null;
@@ -258,18 +260,60 @@
   });
 
   $effect(() => {
-    const updateActive = () => {
-      windowActive = document.visibilityState === 'visible' && document.hasFocus();
+    let disposed = false;
+    let unlistenFocus: (() => void) | undefined;
+    let osFocused = true;
+
+    const sync = () => {
+      if (disposed) return;
+      windowActive = document.visibilityState === 'visible' && osFocused;
     };
 
-    updateActive();
-    window.addEventListener('focus', updateActive);
-    window.addEventListener('blur', updateActive);
-    document.addEventListener('visibilitychange', updateActive);
+    sync();
+    document.addEventListener('visibilitychange', sync);
+
+    void (async () => {
+      try {
+        const { getCurrentWindow } = await import('@tauri-apps/api/window');
+        if (disposed) return;
+        const win = getCurrentWindow();
+        osFocused = await win.isFocused();
+        if (disposed) return;
+        sync();
+        const unlisten = await win.onFocusChanged(({ payload: focused }) => {
+          osFocused = focused;
+          sync();
+        });
+        if (disposed) {
+          unlisten();
+          return;
+        }
+        unlistenFocus = unlisten;
+      } catch {
+        if (disposed) return;
+        // Browser / non-Tauri: fall back to window focus events.
+        // Avoid document.hasFocus() — Alt steals it without real deactivation.
+        const onWinFocus = () => {
+          osFocused = true;
+          sync();
+        };
+        const onWinBlur = () => {
+          osFocused = false;
+          sync();
+        };
+        window.addEventListener('focus', onWinFocus);
+        window.addEventListener('blur', onWinBlur);
+        unlistenFocus = () => {
+          window.removeEventListener('focus', onWinFocus);
+          window.removeEventListener('blur', onWinBlur);
+        };
+      }
+    })();
+
     return () => {
-      window.removeEventListener('focus', updateActive);
-      window.removeEventListener('blur', updateActive);
-      document.removeEventListener('visibilitychange', updateActive);
+      disposed = true;
+      document.removeEventListener('visibilitychange', sync);
+      unlistenFocus?.();
     };
   });
 
