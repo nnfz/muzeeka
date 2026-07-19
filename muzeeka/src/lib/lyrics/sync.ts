@@ -107,6 +107,19 @@ export function isLinePast(
   return currentTime >= end - 0.02;
 }
 
+/**
+ * Line highlight lead (braccato: --braccato-timing-offset ~0.115s,
+ * richsync ~0.15s). Scroll can feel slightly earlier than the sung word.
+ */
+export const LINE_ACTIVE_LEAD_SEC = 0.15;
+
+/**
+ * Active line index with braccato-style timing offset.
+ */
+export function findDisplayActiveLineIndex(lines: LyricLine[], currentTime: number): number {
+  return findActiveLineIndex(lines, currentTime + LINE_ACTIVE_LEAD_SEC);
+}
+
 export function animationDelay(currentTime: number, startSec: number): string {
   return `${-(currentTime - startSec)}s`;
 }

@@ -3,11 +3,21 @@
   --lyric-weight: 700;
   --lyric-line-height: 1.22;
   --lyric-gap: 0.62em;
-  --lyric-ease: cubic-bezier(0.16, 1, 0.3, 1);
-  --lyric-duration: 560ms;
+  /* braccato-inspired line motion (word/char karaoke untouched below) */
+  --lyric-ease: ease;
+  --lyric-duration: 0.5s;
+  --lyric-scale: 0.95;
+  --lyric-active-scale: 1;
+  --lyric-scale-duration: 0.166s;
+  /* Leave: filter/opacity ease out with delay so dim+blur “continues” after scale */
+  --lyric-leave-filter-duration: calc(var(--lyric-duration) / 3);
+  --lyric-leave-filter-delay: 0.4s;
+  --lyric-leave-opacity-duration: calc(var(--lyric-duration) / 2);
+  --lyric-leave-opacity-delay: 0.166s;
   --lyric-color-active: #ffffff;
-  --lyric-color-past: rgba(255, 255, 255, 0.48);
-  --lyric-color-upcoming: rgba(255, 255, 255, 0.26);
+  /* Dim via opacity (braccato), not grey color */
+  --lyric-color-upcoming: #ffffff;
+  --lyric-color-past: #ffffff;
   --lyric-color-word-dim: rgba(255, 255, 255, 0.26);
 
   position: relative;
@@ -66,7 +76,7 @@
   padding-left: clamp(0.5rem, 1.5vw, 1.25rem);
 }
 
-/* ── Lines (Apple Music: dim / bright / past) ──────────── */
+/* ── Lines (braccato-style: past blur+dim with delay, scale 0.95→1) ─ */
 
 .fs-lyrics-line {
   display: block;
@@ -77,37 +87,66 @@
   padding: var(--lyric-gap) 0.35em;
   line-height: var(--lyric-line-height);
   cursor: pointer;
+  /* Upcoming (after active): opacity 0.66, no blur — braccato */
   color: var(--lyric-color-upcoming);
-  transform: scale(0.94);
+  opacity: 0.66;
+  transform: scale(var(--lyric-scale));
   transform-origin: left center;
+  filter: blur(0);
+  /*
+   * braccato leave pattern:
+   *   transform  — quick (scale settles first)
+   *   opacity    — medium, delayed 0.166s
+   *   filter     — shorter, delayed 0.4s  → blur “continues” after leave
+   */
   transition:
-    color var(--lyric-duration) var(--lyric-ease),
-    transform var(--lyric-duration) var(--lyric-ease),
-    opacity var(--lyric-duration) var(--lyric-ease);
+    transform var(--lyric-scale-duration) var(--lyric-ease),
+    opacity var(--lyric-leave-opacity-duration) var(--lyric-ease) var(--lyric-leave-opacity-delay),
+    filter var(--lyric-leave-filter-duration) var(--lyric-ease) var(--lyric-leave-filter-delay),
+    color var(--lyric-leave-opacity-duration) var(--lyric-ease) var(--lyric-leave-opacity-delay);
   backface-visibility: hidden;
   overflow-wrap: anywhere;
   word-break: break-word;
 }
 
-/* Line-level hover only for line-synced / plain text */
+/* Line-level hover (synced / plain) */
 .fs-lyrics-container:not([data-sync='richsync']) .fs-lyrics-line:hover:not(.is-active) {
-  color: rgba(255, 255, 255, 0.42);
+  opacity: 1 !important;
+  filter: blur(0) !important;
+  color: var(--lyric-color-active);
+  transform: scale(1.01);
+  transition: all 0.3s ease;
 }
 
 .fs-lyrics-line.is-active {
   color: var(--lyric-color-active);
-  transform: scale(1.03);
+  opacity: 1;
+  transform: scale(var(--lyric-active-scale));
+  filter: blur(0);
   cursor: default;
+  /* Enter active without leave delays */
+  transition:
+    transform var(--lyric-scale-duration) var(--lyric-ease),
+    opacity 0.2s ease,
+    filter 0.2s ease,
+    color 0.2s ease;
 }
 
+/* Past lines (before active): dim + blur — delayed via base transition */
 .fs-lyrics-line.is-past {
   color: var(--lyric-color-past);
-  transform: scale(0.96);
+  opacity: 0.33;
+  transform: scale(var(--lyric-scale));
+  filter: blur(2.5px);
 }
 
-.fs-lyrics-line.is-active.is-past {
+/* Hover past: clear blur, full opacity (braccato) */
+.fs-lyrics-line.is-past:hover {
+  opacity: 1 !important;
+  filter: blur(0) !important;
   color: var(--lyric-color-active);
-  transform: scale(1.03);
+  transform: scale(1.01);
+  transition: all 0.3s ease;
 }
 
 .fs-lyrics-line[data-agent='v2'],
@@ -182,7 +221,7 @@
   cursor: default;
 }
 
-/* Past / upcoming lines: solid inherited color, no motion */
+/* Past / upcoming lines: solid inherited color, no word motion (karaoke only on active) */
 .fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line.is-past .fs-lyrics-word,
 .fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line:not(.is-active):not(.is-past) .fs-lyrics-word {
   color: inherit;
@@ -196,15 +235,20 @@
   color: inherit;
   transform: none;
   text-shadow: none;
-  /* Inherit animated parent color on hover */
-  transition: color 240ms var(--lyric-ease);
+  transition: color 240ms ease;
 }
 
-/* Hover brightens only the word (chars inherit → smooth fade) */
+/* Word hover on non-active lines — brighten; line blur cleared by line:hover */
 .fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line:not(.is-active) .fs-lyrics-word:hover,
 .fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line.is-past .fs-lyrics-word:hover,
 .fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line:not(.is-active):not(.is-past) .fs-lyrics-word:hover {
-  color: rgba(255, 255, 255, 0.55);
+  color: rgba(255, 255, 255, 0.7);
+}
+
+.fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line.is-past:hover,
+.fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line.is-past:has(.fs-lyrics-word:hover) {
+  opacity: 1 !important;
+  filter: blur(0) !important;
 }
 
 .fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line.is-active .fs-lyrics-word.is-upcoming {
@@ -384,11 +428,11 @@
   }
 
   .fs-lyrics-line.is-active {
-    transform: scale(1.015);
+    transform: scale(1);
   }
 
   .fs-lyrics-line.is-past {
-    transform: scale(0.97);
+    filter: blur(1.8px);
   }
 }
 
@@ -406,6 +450,11 @@
 
   .fs-lyrics-line {
     transform: none !important;
+  }
+
+  .fs-lyrics-line.is-past {
+    filter: none !important;
+    opacity: 0.4 !important;
   }
 
   .fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line.is-active .fs-lyrics-word.is-animating,

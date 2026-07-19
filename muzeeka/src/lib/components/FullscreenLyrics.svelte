@@ -3,8 +3,7 @@
   import { normalizePartSpaces } from '$lib/lyrics/normalizeParts';
   import {
     findActiveLineIndex,
-    isLineActive,
-    isLinePast,
+    findDisplayActiveLineIndex,
     isPartActive,
     isPartSung,
     lineStartSec,
@@ -21,10 +20,9 @@
     onSeek?: (timeSec: number) => void;
   }
 
-  /** Apple-like scroll easing: soft ease-out, interruptible */
-  const SCROLL_MIN_MS = 420;
-  const SCROLL_MAX_MS = 820;
-  const SCROLL_PX_FACTOR = 0.65;
+  const SCROLL_MIN_MS = 520;
+  const SCROLL_MAX_MS = 750;
+  const SCROLL_PX_FACTOR = 0.55;
 
   let {
     lines = [],
@@ -54,10 +52,11 @@
   let fillWordEl: HTMLElement | null = null;
   let fillWordId = '';
 
-  let activeLineIndex = $derived(findActiveLineIndex(lines, currentTime));
+  let activeLineIndex = $derived(findDisplayActiveLineIndex(lines, currentTime));
 
-  function easeOutCubic(t: number): number {
-    return 1 - (1 - t) ** 3;
+  function easeScroll(t: number): number {
+    const u = 1 - t;
+    return 1 - u * u * u * (1 + 2.2 * t);
   }
 
   function cancelScrollAnim() {
@@ -116,7 +115,7 @@
       if (token !== scrollToken || !viewportEl) return;
 
       const t = Math.min(1, (now - startTime) / duration);
-      viewportEl.scrollTop = startScroll + delta * easeOutCubic(t);
+      viewportEl.scrollTop = startScroll + delta * easeScroll(t);
 
       if (t < 1) {
         scrollRaf = requestAnimationFrame(tick);
@@ -335,7 +334,6 @@
       class="fs-lyrics-viewport"
       bind:this={viewportEl}
     >
-      <!-- Edge spacers = half viewport height (JS), not padding on the text block -->
       <div class="fs-lyrics-edge" aria-hidden="true" bind:this={edgeTopEl}></div>
       <div
         class="fs-lyrics-container"
@@ -343,14 +341,13 @@
         bind:this={containerEl}
       >
         {#each lines as line, lineIndex (line.startTimeMs + ':' + lineIndex)}
-          {@const lineActive = isLineActive(line, lineIndex, lines, currentTime)}
-          {@const linePast = isLinePast(line, lineIndex, lines, currentTime)}
+          {@const lineActive = lineIndex === activeLineIndex}
+          {@const linePast = lineIndex < activeLineIndex}
           {@const parts = displayParts(line)}
-
           <div
             class="fs-lyrics-line"
-            class:is-active={lineIndex === activeLineIndex}
-            class:is-past={linePast && lineIndex !== activeLineIndex}
+            class:is-active={lineActive}
+            class:is-past={linePast}
             data-line={lineIndex}
             data-agent={line.agent}
             onclick={() => seekToLine(line)}
@@ -373,8 +370,8 @@
                   {@const partActive = isPartActive(part, partIndex, parts, line, lineIndex, lines, currentTime)}
                   {@const partSung = isPartSung(part, partIndex, parts, line, lineIndex, lines, currentTime)
                     || (linePast && !lineActive)}
-                  {@const partAnimating = lineIndex === activeLineIndex && partActive && !partSung}
-                  {@const partUpcoming = lineIndex === activeLineIndex && !partSung && !partAnimating}
+                  {@const partAnimating = lineActive && partActive && !partSung}
+                  {@const partUpcoming = lineActive && !partSung && !partAnimating}
                   <span class="fs-lyrics-word-wrap">
                     <span
                       class="fs-lyrics-word"
