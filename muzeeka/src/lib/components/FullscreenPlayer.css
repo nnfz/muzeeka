@@ -394,7 +394,7 @@
 }
 
 .fullscreen-volume :global(.volume-track-wrap) {
-  width: 88px;
+  width: 108px;
 }
 
 .fullscreen-volume :global(.volume-pct) {
