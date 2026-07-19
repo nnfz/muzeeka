@@ -479,6 +479,7 @@
   font-size: 11px;
   min-width: 36px;
   flex-shrink: 0;
+  color: var(--text-primary-md);
 }
 
 .fullscreen-progress :global(.slider-time.current) {
