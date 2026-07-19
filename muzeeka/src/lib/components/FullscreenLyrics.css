@@ -6,7 +6,8 @@
   /* braccato-inspired line motion (word/char karaoke untouched below) */
   --lyric-ease: ease;
   --lyric-duration: 0.5s;
-  --lyric-scale: 0.95;
+  /* No scale-up on active — only opacity/blur for past (avoids grow-then-leave) */
+  --lyric-scale: 1;
   --lyric-active-scale: 1;
   --lyric-scale-duration: 0.166s;
   /* Leave: filter/opacity ease out with delay so dim+blur “continues” after scale */
@@ -114,7 +115,6 @@
   opacity: 1 !important;
   filter: blur(0) !important;
   color: var(--lyric-color-active);
-  transform: scale(1.01);
   transition: all 0.3s ease;
 }
 
@@ -140,12 +140,11 @@
   filter: blur(2.5px);
 }
 
-/* Hover past: clear blur, full opacity (braccato) */
+/* Hover past: clear blur, full opacity */
 .fs-lyrics-line.is-past:hover {
   opacity: 1 !important;
   filter: blur(0) !important;
   color: var(--lyric-color-active);
-  transform: scale(1.01);
   transition: all 0.3s ease;
 }
 
@@ -421,14 +420,6 @@
     min-height: 0;
     --lyric-size: clamp(22px, 6.2vw, 32px);
     --lyric-gap: 0.48em;
-  }
-
-  .fs-lyrics-line {
-    transform: scale(0.96);
-  }
-
-  .fs-lyrics-line.is-active {
-    transform: scale(1);
   }
 
   .fs-lyrics-line.is-past {
