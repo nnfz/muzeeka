@@ -2,7 +2,7 @@
   --lyric-size: clamp(28px, 4vw, 44px);
   --lyric-weight: 700;
   --lyric-line-height: 1.22;
-  --lyric-gap: 0.62em;
+  --lyric-gap: 0.42em;
   /* braccato-inspired line motion (word/char karaoke untouched below) */
   --lyric-ease: ease;
   --lyric-duration: 0.5s;
