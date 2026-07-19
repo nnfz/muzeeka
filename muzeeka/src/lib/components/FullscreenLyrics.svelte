@@ -181,16 +181,27 @@
   function clearWordFill() {
     stopFillLoop();
     if (fillWordEl) {
-      setWordFill(fillWordEl, 1);
+      // Leave at current visual state — snapping to 1 causes a white flash
+      fillWordEl = null;
     }
-    fillWordEl = null;
     fillWordId = '';
+    smoothWordFill = 0;
   }
 
+  /** Soft media clock: avoid hard resync every position tick (causes fill jitter). */
   function mediaNow(): number {
     if (!clockPlaying) return clockPos;
     return clockPos + (performance.now() - clockWall) / 1000;
   }
+
+  /** Ease-in so word highlight doesn't pop at t=0. */
+  function easeInFill(p: number): number {
+    const x = Math.min(1, Math.max(0, p));
+    // smootherstep-ish: slow start, natural finish
+    return x * x * (3 - 2 * x);
+  }
+
+  let smoothWordFill = 0;
 
   function findActiveWordTarget(mediaTime: number): {
     id: string;
@@ -237,24 +248,39 @@
     const target = findActiveWordTarget(t);
 
     if (!target) {
+      // Finish current word gently instead of a hard flash to full white
       if (fillWordEl) {
-        setWordFill(fillWordEl, 1);
-        fillWordEl = null;
-        fillWordId = '';
+        smoothWordFill = Math.min(1, smoothWordFill + 0.12);
+        setWordFill(fillWordEl, smoothWordFill);
+        if (smoothWordFill >= 0.999) {
+          fillWordEl = null;
+          fillWordId = '';
+          smoothWordFill = 0;
+        }
       }
       return;
     }
 
-    if (fillWordId !== target.id && fillWordEl && fillWordEl !== target.el) {
-      setWordFill(fillWordEl, 1);
+    if (fillWordId !== target.id) {
+      // Previous word: settle without snap
+      if (fillWordEl && fillWordEl !== target.el) {
+        setWordFill(fillWordEl, 1);
+      }
+      fillWordId = target.id;
+      fillWordEl = target.el;
+      smoothWordFill = 0;
     }
 
-    fillWordId = target.id;
     fillWordEl = target.el;
 
-    const safeDur = Math.max(target.durationSec, 0.05);
-    const progress = Math.min(Math.max((t - target.startSec) / safeDur, 0), 1);
-    setWordFill(target.el, progress);
+    const safeDur = Math.max(target.durationSec, 0.08);
+    // Small lead so first glyph doesn't jump from dim→lit in one frame
+    const raw = Math.min(Math.max((t - target.startSec) / safeDur, 0), 1);
+    const eased = easeInFill(raw);
+    // Light EMA — kills micro-jitter from clock resync without lagging behind
+    smoothWordFill = smoothWordFill + (eased - smoothWordFill) * 0.45;
+    if (raw >= 0.999) smoothWordFill = 1;
+    setWordFill(target.el, smoothWordFill);
   }
 
   $effect(() => {
@@ -302,8 +328,19 @@
   });
 
   $effect(() => {
-    clockPos = currentTime;
-    clockWall = performance.now();
+    const next = currentTime;
+    const now = performance.now();
+    const extrapolated = clockPlaying ? clockPos + (now - clockWall) / 1000 : clockPos;
+    const drift = next - extrapolated;
+
+    // Only hard-snap on seek / big desync; soft-correct otherwise (stops text jitter)
+    if (!clockPlaying || Math.abs(drift) > 0.12) {
+      clockPos = next;
+      clockWall = now;
+    } else {
+      clockPos = extrapolated + drift * 0.35;
+      clockWall = now;
+    }
     clockPlaying = isPlaying;
   });
 
@@ -368,8 +405,7 @@
               {#each parts as part, partIndex (part.startTimeMs + ':' + partIndex)}
                 {#if part.words}
                   {@const partActive = isPartActive(part, partIndex, parts, line, lineIndex, lines, currentTime)}
-                  {@const partSung = isPartSung(part, partIndex, parts, line, lineIndex, lines, currentTime)
-                    || (linePast && !lineActive)}
+                  {@const partSung = isPartSung(part, partIndex, parts, line, lineIndex, lines, currentTime)}
                   {@const partAnimating = lineActive && partActive && !partSung}
                   {@const partUpcoming = lineActive && !partSung && !partAnimating}
                   <span class="fs-lyrics-word-wrap">

@@ -10,11 +10,11 @@
   --lyric-scale: 1;
   --lyric-active-scale: 1;
   --lyric-scale-duration: 0.166s;
-  /* Leave: filter/opacity ease out with delay so dim+blur “continues” after scale */
-  --lyric-leave-filter-duration: calc(var(--lyric-duration) / 3);
-  --lyric-leave-filter-delay: 0.4s;
-  --lyric-leave-opacity-duration: calc(var(--lyric-duration) / 2);
-  --lyric-leave-opacity-delay: 0.166s;
+  /* Leave: filter/opacity ease out with delay — snappier fade than braccato defaults */
+  --lyric-leave-filter-duration: 0.12s;
+  --lyric-leave-filter-delay: 0.18s;
+  --lyric-leave-opacity-duration: 0.18s;
+  --lyric-leave-opacity-delay: 0.08s;
   --lyric-color-active: #ffffff;
   /* Dim via opacity (braccato), not grey color */
   --lyric-color-upcoming: #ffffff;
@@ -266,50 +266,49 @@
   color: rgba(255, 255, 255, 0.48);
 }
 
-/* Active line: finished words settle flat and bright */
+/* Active line: finished words — stay slightly lifted after the letter played */
 .fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line.is-active .fs-lyrics-word.is-sung {
   color: var(--lyric-color-active);
   --word-fill: 1;
-  transform: translate3d(0, 0, 0) scale(1);
-  transition: transform 480ms var(--lyric-ease);
+  transform: translate3d(0, -0.04em, 0) scale(1);
+  transition: color 140ms ease, transform 180ms ease;
 }
 
 .fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line.is-active .fs-lyrics-word.is-sung .fs-lyrics-char {
   color: var(--lyric-color-active);
-  transform: translate3d(0, 0, 0) scale(1);
+  transform: translate3d(0, -0.035em, 0) scale(1);
   text-shadow: none;
   transition:
-    transform 620ms var(--lyric-ease),
-    color 320ms ease,
-    text-shadow 400ms ease;
+    transform 160ms ease,
+    color 120ms ease,
+    text-shadow 120ms ease;
 }
 
 /* Active line: upcoming words stay dim and flat */
 .fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line.is-active .fs-lyrics-word.is-upcoming {
   color: var(--lyric-color-word-dim);
   --word-fill: 0;
-  transform: none;
+  transform: translate3d(0, 0, 0) scale(1);
 }
 
 .fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line.is-active .fs-lyrics-word.is-upcoming .fs-lyrics-char {
   color: var(--lyric-color-word-dim);
-  transform: none;
+  transform: translate3d(0, 0, 0) scale(1);
   text-shadow: none;
 }
 
 /*
- * Currently singing word — soft Apple-like motion.
- * --word-fill (0..1) from rAF; letters ease up gently, no hard pops.
+ * Currently singing word — gentler start (fill is ease-in from JS).
+ * Keep motion small so class switch upcoming→animating doesn't pop.
  */
 .fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line.is-active .fs-lyrics-word.is-animating {
-  /* Whole word: very slight rise, almost imperceptible scale */
-  --word-pop: clamp(0, var(--word-fill) * 2.2, 1);
+  --word-pop: clamp(0, var(--word-fill) * 1.5, 1);
   color: var(--lyric-color-word-dim);
   background-image: none;
   -webkit-text-fill-color: unset;
   transform:
-    translate3d(0, calc(var(--word-pop) * -0.03em), 0)
-    scale(calc(1 + var(--word-pop) * 0.015));
+    translate3d(0, calc(var(--word-pop) * -0.045em), 0)
+    scale(calc(1 + var(--word-pop) * 0.012));
   transition: none;
 }
 
@@ -325,20 +324,17 @@
 
 .fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line.is-active .fs-lyrics-word.is-animating .fs-lyrics-char {
   /*
-   * Soft wide wave (not a sharp spike):
-   * char-pos — glyph center along word [0, 1]
-   * ahead   — front relative to glyph
-   * lit     — smooth brightness ramp
-   * lift    — gentle rise, wide falloff so motion feels fluid
+   * Wider, softer wave — no +0.5 bias (that made first glyphs flash half-lit).
    */
   --char-n-safe: max(var(--char-n), 1);
   --char-pos: calc((var(--char-i) + 0.5) / var(--char-n-safe));
   --ahead: calc(var(--word-fill) - var(--char-pos));
-  /* Wider color blend — less snappy on/off */
-  --lit: clamp(0, var(--ahead) * 3.2 + 0.5, 1);
-  /* Soft hump: ~±0.35 of word width, not a knife-edge peak */
-  --peak: max(0, 1 - abs(var(--ahead) * 2.4));
-  --hold: clamp(0, var(--ahead) * 1.1, 0.18);
+  /* Gentle ramp: need fill to reach glyph before full bright */
+  --lit: clamp(0, var(--ahead) * 1.65 + 0.15, 1);
+  /* Wide soft peak — less spike at the front */
+  --peak: max(0, 1 - abs(var(--ahead) * 1.7));
+  --hold: clamp(0, var(--ahead) * 0.85, 0.22);
+  /* Higher lift while singing; hold keeps letter up after the wave passes */
   --lift: max(calc(var(--peak) * 0.85), var(--hold));
   color: color-mix(
     in srgb,
@@ -346,11 +342,11 @@
     var(--lyric-color-word-dim)
   );
   transform:
-    translate3d(0, calc(var(--lift) * -0.08em), 0)
-    scale(calc(1 + var(--lift) * 0.055));
+    translate3d(0, calc(var(--lift) * -0.09em), 0)
+    scale(calc(1 + var(--lift) * 0.04));
   text-shadow:
-    0 0 calc(var(--peak) * 10px) rgba(255, 255, 255, calc(var(--peak) * 0.42)),
-    0 0 calc(var(--peak) * 22px) rgba(255, 255, 255, calc(var(--peak) * 0.22));
+    0 0 calc(var(--peak) * 7px) rgba(255, 255, 255, calc(var(--peak) * 0.3)),
+    0 0 calc(var(--peak) * 16px) rgba(255, 255, 255, calc(var(--peak) * 0.14));
   transition: none;
 }
 
@@ -363,11 +359,16 @@
 /* Background vocals: quieter motion, softer glow */
 .fs-lyrics-container[data-sync='richsync'] .fs-lyrics-word.is-background.is-animating .fs-lyrics-char {
   transform:
-    translate3d(0, calc(var(--lift) * -0.05em), 0)
-    scale(calc(1 + var(--lift) * 0.035));
+    translate3d(0, calc(var(--lift) * -0.055em), 0)
+    scale(calc(1 + var(--lift) * 0.028));
   text-shadow:
-    0 0 calc(var(--peak) * 8px) rgba(255, 255, 255, calc(var(--peak) * 0.28)),
-    0 0 calc(var(--peak) * 16px) rgba(255, 255, 255, calc(var(--peak) * 0.14));
+    0 0 calc(var(--peak) * 5px) rgba(255, 255, 255, calc(var(--peak) * 0.18)),
+    0 0 calc(var(--peak) * 10px) rgba(255, 255, 255, calc(var(--peak) * 0.08));
+}
+
+.fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line.is-active .fs-lyrics-word.is-background.is-sung,
+.fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line.is-active .fs-lyrics-word.is-background.is-sung .fs-lyrics-char {
+  transform: translate3d(0, -0.025em, 0) scale(1);
 }
 
 /* ── Instrumental ──────────────────────────────────────── */
