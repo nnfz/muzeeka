@@ -10,6 +10,54 @@
 
 .media-slider.volume {
   gap: 8px;
+  align-items: center;
+}
+
+/* Track aligned with mute icon; % floats above the fill edge */
+.volume-track-wrap {
+  position: relative;
+  width: 100px;
+  flex-shrink: 0;
+  overflow: visible;
+}
+
+.volume-pct {
+  position: absolute;
+  left: 0;
+  bottom: calc(100% + 8px);
+  transform: translateX(-50%);
+  min-width: 2.5em;
+  padding: 1px 4px;
+  font-size: 11px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.2;
+  text-align: center;
+  color: var(--text-primary);
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  pointer-events: none;
+  user-select: none;
+  z-index: 6;
+  opacity: 1;
+  /* Auto-hide without JS timers (timers were getting cleared and leaving % stuck). */
+  animation: volume-pct-hold-fade 0.85s ease forwards;
+}
+
+/* While dragging: stay fully visible, no fade */
+.volume-pct.sticky {
+  animation: none;
+  opacity: 1;
+}
+
+@keyframes volume-pct-hold-fade {
+  0%,
+  70% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+  }
 }
 
 .slider-time {
@@ -42,7 +90,7 @@
 }
 
 .media-slider.volume .slider-track {
-  width: 100px;
+  width: 100%;
   flex-shrink: 0;
 }
 
@@ -72,6 +120,11 @@
   transition: width 80ms linear;
   min-width: 0;
   max-width: 100%;
+}
+
+/* Volume: no width animation — % and fill move in lockstep */
+.media-slider.volume .slider-fill {
+  transition: none;
 }
 
 .slider-track.is-dragging .slider-fill,

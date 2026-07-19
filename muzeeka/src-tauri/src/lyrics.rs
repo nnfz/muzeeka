@@ -226,6 +226,36 @@ fn fetch_uncached(
     Ok(None)
 }
 
+/// Import a local TTML (or plain TTML string) into the on-disk lyrics cache
+/// under the same key used by network fetch (title/artist/album/duration).
+pub fn import_lyrics_ttml(
+    title: &str,
+    artist: &str,
+    album: Option<&str>,
+    duration_secs: Option<u32>,
+    ttml: &str,
+) -> Result<(), String> {
+    let title = title.trim();
+    let artist = artist.trim();
+    if title.is_empty() && artist.is_empty() {
+        return Err("Track has no title or artist for lyrics cache key".to_string());
+    }
+
+    let ttml = ttml.trim();
+    if ttml.is_empty() {
+        return Err("TTML file is empty".to_string());
+    }
+    // Basic sanity — accept TTML or Apple-style timed text roots.
+    let lower = ttml.to_ascii_lowercase();
+    if !lower.contains("<tt") && !lower.contains("<transcript") {
+        return Err("File does not look like TTML lyrics".to_string());
+    }
+
+    let album = album.map(str::trim).filter(|value| !value.is_empty());
+    let key = cache_key(title, artist, album, duration_secs);
+    write_cached_hit(&key, ttml)
+}
+
 pub fn fetch_lyrics_ttml(
     title: &str,
     artist: &str,

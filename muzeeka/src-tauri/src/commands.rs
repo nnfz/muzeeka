@@ -340,6 +340,40 @@ pub async fn lyrics_fetch(
     .map_err(|error| format!("Lyrics fetch task failed: {error}"))?
 }
 
+/// Import a local TTML file into the lyrics cache for a track.
+#[tauri::command]
+pub async fn lyrics_import_ttml(
+    app: AppHandle,
+    title: String,
+    artist: String,
+    album: Option<String>,
+    duration_secs: Option<u32>,
+    path: String,
+    track_path: Option<String>,
+) -> Result<(), String> {
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let ttml = std::fs::read_to_string(&path)
+            .map_err(|e| format!("Failed to read TTML file: {e}"))?;
+        crate::lyrics::import_lyrics_ttml(
+            &title,
+            &artist,
+            album.as_deref(),
+            duration_secs,
+            &ttml,
+        )?;
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|error| format!("Lyrics import task failed: {error}"))?;
+
+    result?;
+    let _ = app.emit(
+        "lyrics:imported",
+        track_path.unwrap_or_default(),
+    );
+    Ok(())
+}
+
 // ── Playlist persistence ──────────────────────────────────────────────────────
 
 /// Load saved playlists from disk.

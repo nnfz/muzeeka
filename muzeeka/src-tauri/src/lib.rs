@@ -282,6 +282,7 @@ pub fn run() {
             commands::library_cover_data_url,
             commands::library_rebuild_covers,
             commands::lyrics_fetch,
+            commands::lyrics_import_ttml,
             commands::playlists_load,
             commands::playlists_save,
             commands::playlist_cache_cover,

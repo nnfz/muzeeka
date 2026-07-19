@@ -386,8 +386,17 @@
   width: 100%;
 }
 
-.fullscreen-volume :global(.media-slider.volume .slider-track) {
+.fullscreen-volume :global(.volume-track-wrap) {
   width: 88px;
+}
+
+.fullscreen-volume :global(.volume-pct) {
+  color: #fff;
+  text-shadow: 0 1px 4px rgba(0, 0, 0, 0.65);
+}
+
+.fullscreen-volume {
+  overflow: visible;
 }
 
 /* Volume mute: no hover plate, slight grow */

@@ -20,6 +20,7 @@
   import { openContextMenuFromEvent, type ContextMenuItem } from '$lib/contextMenu';
   import { open } from '@tauri-apps/plugin-dialog';
   import { revealItemInDir } from '@tauri-apps/plugin-opener';
+  import { invoke } from '@tauri-apps/api/core';
   import { audioPathsForDrag, startFileDrag } from '$lib/fileDrag';
   import { exportAudioPathForTrack } from '$lib/trackPaths';
   import TrackCover from './TrackCover.svelte';
@@ -211,6 +212,15 @@
       disabled: affectedTracks.length === 0,
       onSelect: () => revealTracksOnDisk(affectedTracks),
     });
+
+    // Import TTML — single track only (lyrics cache key is per-title/artist).
+    if (!multi) {
+      items.push({
+        id: 'import-ttml',
+        label: 'Импорт TTML',
+        onSelect: () => void importTtmlForTrack(target.track),
+      });
+    }
 
     const availableTargetPlaylists = player.playlists.filter((playlist) => playlist.id !== target.playlistId);
     items.push({
@@ -491,6 +501,46 @@
     }
   }
 
+  async function importTtmlForTrack(track: MusicFile) {
+    const selected = await open({
+      multiple: false,
+      filters: [
+        { name: 'TTML lyrics', extensions: ['ttml', 'xml'] },
+        { name: 'All files', extensions: ['*'] },
+      ],
+    });
+    const path = typeof selected === 'string' ? selected : null;
+    if (!path) return;
+
+    try {
+      await invoke('lyrics_import_ttml', {
+        title: trackDisplayTitle(track),
+        artist: trackDisplayArtist(track),
+        album: track.album ?? null,
+        durationSecs:
+          track.duration_secs != null && track.duration_secs > 0
+            ? Math.round(track.duration_secs)
+            : null,
+        path,
+        trackPath: track.path,
+      });
+      dragToast = 'TTML импортирован';
+      if (dragToastTimer) clearTimeout(dragToastTimer);
+      dragToastTimer = setTimeout(() => {
+        dragToast = null;
+        dragToastTimer = null;
+      }, 2200);
+    } catch (e) {
+      console.error('Failed to import TTML:', e);
+      dragToast = e instanceof Error ? e.message : 'Не удалось импортировать TTML';
+      if (dragToastTimer) clearTimeout(dragToastTimer);
+      dragToastTimer = setTimeout(() => {
+        dragToast = null;
+        dragToastTimer = null;
+      }, 3200);
+    }
+  }
+
   function closeContextMenu() {
     contextMenu = null;
     playlistSubmenu = null;
@@ -616,7 +666,7 @@
       selectedPaths = new Set();
       selectionAnchor = index;
     }
-    const position = openContextMenuFromEvent(e, { width: 220, height: 160 });
+    const position = openContextMenuFromEvent(e, { width: 220, height: 196 });
     contextMenu = { item, ...position };
   }
 

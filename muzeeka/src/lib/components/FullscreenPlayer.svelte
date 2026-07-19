@@ -7,6 +7,7 @@
     trackDisplayTitle,
   } from '$lib/stores/player.svelte';
   import { invoke } from '@tauri-apps/api/core';
+  import { listen } from '@tauri-apps/api/event';
   import { fetchLyrics } from '$lib/lyrics/fetchLyrics';
   import type { LyricsResult } from '$lib/lyrics/types';
   import FullscreenLyrics from './FullscreenLyrics.svelte';
@@ -359,12 +360,32 @@
     };
   });
 
+  // After manual TTML import — drop settled flag so lyrics re-fetch from cache.
+  $effect(() => {
+    let unlisten: (() => void) | undefined;
+    void listen<string>('lyrics:imported', (event) => {
+      const importedPath = event.payload?.trim() || '';
+      const current = untrack(() => player.currentFile);
+      if (!importedPath || !current || importedPath === current) {
+        lyricsSettledForFile = null;
+        lyricsState = null;
+      }
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => {
+      unlisten?.();
+    };
+  });
+
   // Silent background fetch — panel appears only when lines exist.
   // Depend ONLY on open + file. Reading track/duration/settled reactively was
   // re-running this effect mid-flight, cancelling the request, and leaving no lyrics.
   $effect(() => {
     const file = player.currentFile;
     const isOpen = open;
+    // Re-run when settled flag is cleared after import.
+    void lyricsSettledForFile;
 
     if (!isOpen || !file) {
       lyricsState = null;
