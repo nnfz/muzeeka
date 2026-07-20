@@ -8,7 +8,7 @@
   --lyric-duration: 0.5s;
   /* No scale-up on active — only opacity/blur for past (avoids grow-then-leave) */
   --lyric-scale: 1;
-  --lyric-active-scale: 1.05;
+  --lyric-active-scale: 1.15;
   --lyric-scale-duration: 0.166s;
   /* Leave: filter/opacity ease out with delay — snappier fade than braccato defaults */
   --lyric-leave-filter-duration: 0.12s;
@@ -105,6 +105,7 @@
     opacity var(--lyric-leave-opacity-duration) var(--lyric-ease) var(--lyric-leave-opacity-delay),
     filter var(--lyric-leave-filter-duration) var(--lyric-ease) var(--lyric-leave-filter-delay);
   backface-visibility: hidden;
+  /* Soft breaks are precomputed at active (bold+scale) width — avoid mid-anim rewrap */
   overflow-wrap: anywhere;
   word-break: break-word;
 }
@@ -207,9 +208,14 @@
 
 .fs-lyrics-container[data-sync='richsync'] .fs-lyrics-word {
   --word-fill: 0;
-  display: inline-block;
+  /*
+   * inline-flex (not inline-block): glyph spans are flex items, so any leftover
+   * template whitespace between them is ignored — only real space chars count.
+   */
+  display: inline-flex;
+  flex-wrap: wrap;
   color: var(--lyric-color-word-dim);
-  white-space: pre-wrap;
+  white-space: pre;
   /* Visual-only motion — layout box stays stable */
   transform: translate3d(0, 0, 0) scale(1);
   transform-origin: 50% 85%;

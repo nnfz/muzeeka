@@ -2,6 +2,13 @@
   import type { LyricLine, LyricPart, SyncType } from '$lib/lyrics/types';
   import { normalizePartSpaces } from '$lib/lyrics/normalizeParts';
   import {
+    isRowStart,
+    layoutAllLines,
+    tokenizePlain,
+    type LayoutToken,
+    type LineLayout,
+  } from '$lib/lyrics/layoutLines';
+  import {
     findActiveLineIndex,
     findDisplayActiveLineIndex,
     isPartActive,
@@ -24,6 +31,10 @@
   const SCROLL_MIN_MS = 520;
   const SCROLL_MAX_MS = 750;
   const SCROLL_PX_FACTOR = 0.55;
+  /** Matches .fs-lyrics-line horizontal padding (0.35em each side). */
+  const LINE_PAD_EM = 0.35;
+  const DEFAULT_ACTIVE_SCALE = 1.05;
+  const ACTIVE_FONT_WEIGHT = '700';
 
   let {
     lines = [],
@@ -38,9 +49,12 @@
   let containerEl = $state<HTMLDivElement | undefined>();
   let edgeTopEl = $state<HTMLDivElement | undefined>();
   let edgeBottomEl = $state<HTMLDivElement | undefined>();
+  /** Precomputed soft wraps (active/bold metrics) so scale/weight don't reflow mid-anim. */
+  let lineLayouts = $state<LineLayout[]>([]);
   let lastScrolledIndex = -1;
   let scrollRaf = 0;
   let scrollToken = 0;
+  let layoutRaf = 0;
 
   /**
    * Smooth media clock: player position only arrives ~every 50ms.
@@ -154,6 +168,93 @@
       words: line.words,
       durationMs: line.durationMs,
     }];
+  }
+
+  function tokensForLine(line: LyricLine): LayoutToken[] {
+    if (line.isInstrumental) return [];
+    // Keep indices aligned with the richsync {#each parts} loop (empty parts width 0).
+    if (line.parts && line.parts.length > 0 && syncType === 'richsync') {
+      return displayParts(line).map((p) => ({
+        text: p.words ?? '',
+        isBackground: p.isBackground,
+      }));
+    }
+    return tokenizePlain(line.words ?? '');
+  }
+
+  function readActiveScale(): number {
+    if (!containerEl) return DEFAULT_ACTIVE_SCALE;
+    const panel = containerEl.closest('.fs-lyrics-panel') as HTMLElement | null;
+    const raw = panel
+      ? getComputedStyle(panel).getPropertyValue('--lyric-active-scale').trim()
+      : '';
+    const n = parseFloat(raw);
+    return Number.isFinite(n) && n > 0 ? n : DEFAULT_ACTIVE_SCALE;
+  }
+
+  /**
+   * Measure wraps with active font-weight + reserved scale width so when a line
+   * becomes bold/scaled it already occupies the final number of visual rows.
+   */
+  function recomputeLineLayouts() {
+    if (!containerEl || lines.length === 0) {
+      lineLayouts = [];
+      return;
+    }
+
+    const width = containerEl.clientWidth;
+    if (width <= 0) {
+      lineLayouts = [];
+      return;
+    }
+
+    const cs = getComputedStyle(containerEl);
+    const fontSizePx = parseFloat(cs.fontSize);
+    if (!Number.isFinite(fontSizePx) || fontSizePx <= 0) {
+      lineLayouts = [];
+      return;
+    }
+
+    const padX = LINE_PAD_EM * fontSizePx * 2;
+    const contentWidth = Math.max(0, width - padX);
+    const activeScale = readActiveScale();
+
+    const linesTokens = lines.map((line) => tokensForLine(line));
+    lineLayouts = layoutAllLines(linesTokens, {
+      contentWidth,
+      activeScale,
+      styles: {
+        fontFamily: cs.fontFamily,
+        fontSizePx,
+        fontWeight: ACTIVE_FONT_WEIGHT,
+        letterSpacing: cs.letterSpacing,
+        fontStyle: cs.fontStyle,
+        // Richsync words are per-glyph inline-block (wider than kerned runs)
+        perCharInlineBlock: syncType === 'richsync',
+      },
+    });
+  }
+
+  function scheduleLayoutRecompute() {
+    if (layoutRaf) cancelAnimationFrame(layoutRaf);
+    layoutRaf = requestAnimationFrame(() => {
+      layoutRaf = 0;
+      recomputeLineLayouts();
+      // Heights change once soft-breaks apply — re-center without smooth scroll
+      if (activeLineIndex >= 0) {
+        requestAnimationFrame(() => scrollActiveLine(false));
+      }
+    });
+  }
+
+  function plainRows(lineIndex: number, fallback: string): string[] {
+    const layout = lineLayouts[lineIndex];
+    if (layout?.rows?.length) return layout.rows;
+    return fallback ? [fallback] : [];
+  }
+
+  function richPartRowBreak(lineIndex: number, partIndex: number): boolean {
+    return partIndex > 0 && isRowStart(lineLayouts[lineIndex], partIndex);
   }
 
   function seekToLine(line: LyricLine) {
@@ -317,19 +418,39 @@
     void edgeBottomEl;
 
     updateEdgeSpacers();
+    scheduleLayoutRecompute();
+
+    // Geist may load after first paint — remeasure once metrics are final
+    let fontsAlive = true;
+    document.fonts?.ready?.then(() => {
+      if (fontsAlive) scheduleLayoutRecompute();
+    });
 
     const observer = new ResizeObserver(() => {
       updateEdgeSpacers();
+      scheduleLayoutRecompute();
       scrollActiveLine(false);
     });
     observer.observe(viewportEl);
     if (containerEl) observer.observe(containerEl);
 
     return () => {
+      fontsAlive = false;
       observer.disconnect();
+      if (layoutRaf) {
+        cancelAnimationFrame(layoutRaf);
+        layoutRaf = 0;
+      }
       cancelScrollAnim();
       clearWordFill();
     };
+  });
+
+  $effect(() => {
+    // lines / syncType change → rebuild token wraps after DOM settles
+    void lines;
+    void syncType;
+    scheduleLayoutRecompute();
   });
 
   // chromeVisible kept for API stability
@@ -433,14 +554,12 @@
                 </span>
               </span>
             {:else if line.parts && line.parts.length > 0 && syncType === 'richsync'}
-              {#each parts as part, partIndex (part.startTimeMs + ':' + partIndex)}
-                {#if part.words}
-                  {@const partActive = isPartActive(part, partIndex, parts, line, lineIndex, lines, currentTime)}
-                  {@const partSung = isPartSung(part, partIndex, parts, line, lineIndex, lines, currentTime)}
-                  {@const partAnimating = lineActive && partActive && !partSung}
-                  {@const partUpcoming = lineActive && !partSung && !partAnimating}
-                  <span class="fs-lyrics-word-wrap">
-                    <span
+              <!--
+                Keep richsync markup whitespace-free between words/glyphs.
+                Spaces already live as trailing chars on the previous part;
+                extra HTML text nodes between inline/inline-flex boxes double gaps.
+              -->
+              {#each parts as part, partIndex (part.startTimeMs + ':' + partIndex)}{#if part.words}{@const partActive = isPartActive(part, partIndex, parts, line, lineIndex, lines, currentTime)}{@const partSung = isPartSung(part, partIndex, parts, line, lineIndex, lines, currentTime)}{@const partAnimating = lineActive && partActive && !partSung}{@const partUpcoming = lineActive && !partSung && !partAnimating}{#if richPartRowBreak(lineIndex, partIndex)}<br class="fs-lyrics-soft-break" aria-hidden="true" />{/if}<span class="fs-lyrics-word-wrap"><span
                       class="fs-lyrics-word"
                       class:is-background={part.isBackground}
                       class:is-sung={partSung}
@@ -452,20 +571,15 @@
                         seekToPart(part);
                       }}
                       role="presentation"
-                    >{#each Array.from(part.words) as ch, charIndex}
-                      <span
+                    >{#each Array.from(part.words) as ch, charIndex}<span
                         class="fs-lyrics-char"
                         class:fs-lyrics-char-space={ch === ' ' || ch === '\t'}
                         style:--char-i={charIndex}
                         style:--char-n={part.words.length}
-                      >{ch}</span>
-                    {/each}</span>
-                  </span>
-                {/if}
-              {/each}
+                      >{ch}</span>{/each}</span></span>{/if}{/each}
             {:else}
               <span class="fs-lyrics-word-wrap">
-                <span class="fs-lyrics-word">{line.words}</span>
+                <span class="fs-lyrics-word">{#each plainRows(lineIndex, line.words) as row, rowIndex}{#if rowIndex > 0}<br class="fs-lyrics-soft-break" aria-hidden="true" />{/if}{row}{/each}</span>
               </span>
             {/if}
           </div>
