@@ -221,6 +221,14 @@ pub fn settings_save(
     settings::save_settings(&app, &data)
 }
 
+// ── Input helpers ─────────────────────────────────────────────────────────────
+
+/// Whether Ctrl is currently held (works during OS file drag; WebView often misses key events).
+#[tauri::command]
+pub fn input_is_ctrl_held() -> bool {
+    crate::drop_handler::is_ctrl_held()
+}
+
 // ── Library commands ──────────────────────────────────────────────────────────
 
 /// Scan a directory recursively for music files.

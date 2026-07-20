@@ -2,13 +2,13 @@
   --lyric-size: clamp(28px, 4vw, 44px);
   --lyric-weight: 700;
   --lyric-line-height: 1.22;
-  --lyric-gap: 0.42em;
+  --lyric-gap: 0.36em;
   /* braccato-inspired line motion (word/char karaoke untouched below) */
   --lyric-ease: cubic-bezier(0.25, 0.1, 0.25, 1);
   --lyric-duration: 0.5s;
   /* No scale-up on active — only opacity/blur for past (avoids grow-then-leave) */
   --lyric-scale: 1;
-  --lyric-active-scale: 1;
+  --lyric-active-scale: 1.05;
   --lyric-scale-duration: 0.166s;
   /* Leave: filter/opacity ease out with delay — snappier fade than braccato defaults */
   --lyric-leave-filter-duration: 0.12s;
@@ -45,7 +45,7 @@
   mask-image: linear-gradient(
     180deg,
     transparent 0%,
-    #000 8%,
+    #000 16%,
     #000 88%,
     transparent 100%
   );
@@ -73,8 +73,6 @@
   max-width: 100%;
   box-sizing: border-box;
   padding: 0;
-  /* Indent lines away from the left edge of the lyrics column */
-  padding-left: clamp(0.5rem, 1.5vw, 1.25rem);
 }
 
 /* ── Lines (braccato-style: past blur+dim with delay, scale 0.95→1) ─ */
@@ -92,6 +90,7 @@
   color: var(--lyric-color-upcoming);
   opacity: 0.66;
   transform: scale(var(--lyric-scale));
+  font-weight: 600;
   transform-origin: left center;
   filter: blur(0);
   /*
@@ -101,6 +100,7 @@
    *   filter     — shorter, delayed 0.4s  → blur “continues” after leave
    */
   transition:
+    font-weight var(--lyric-scale-duration) var(--lyric-ease),
     transform var(--lyric-scale-duration) var(--lyric-ease),
     opacity var(--lyric-leave-opacity-duration) var(--lyric-ease) var(--lyric-leave-opacity-delay),
     filter var(--lyric-leave-filter-duration) var(--lyric-ease) var(--lyric-leave-filter-delay);
@@ -120,11 +120,13 @@
 .fs-lyrics-line.is-active {
   color: var(--lyric-color-active);
   opacity: 1;
+  font-weight: 700;
   transform: scale(var(--lyric-active-scale));
   filter: blur(0);
   cursor: default;
   /* Enter active without leave delays — smooth cubic-bezier */
   transition:
+    font-weight var(--lyric-scale-duration) var(--lyric-ease),
     transform var(--lyric-scale-duration) var(--lyric-ease),
     opacity 0.22s var(--lyric-ease),
     filter 0.22s var(--lyric-ease),
@@ -137,6 +139,8 @@
   opacity: 0.33;
   transform: scale(var(--lyric-scale));
   filter: blur(2.5px);
+  transition: var(--transition-normal);
+  font-weight: 600;
 }
 
 /* Hover past: clear blur, full opacity */

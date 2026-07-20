@@ -2,15 +2,14 @@
    Muzeeka — Global Design System
    ============================================ */
 
-/* Self-hosted Inter (via @fontsource) so that dev and production builds
-   use *exactly* the same font files and rendering. External Google Fonts
-   were being blocked (or not available) in the Tauri production bundle
-   because of CSP and offline packaging. */
-@import '@fontsource/inter/300.css';
-@import '@fontsource/inter/400.css';
-@import '@fontsource/inter/500.css';
-@import '@fontsource/inter/600.css';
-@import '@fontsource/inter/700.css';
+/* Self-hosted Geist (static/) so Tauri packs the font and CSP stays offline-friendly. */
+@font-face {
+  font-family: 'Geist';
+  src: url('/Geist-VariableFont.ttf') format('truetype');
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
 
 /* Interpolate accent when cover-derived color changes */
 @property --accent {
@@ -64,8 +63,9 @@
   --text-primary-solid: #f0f0f5;
   --text-primary: rgba(240, 240, 245, .9);
   --text-primary-md: rgba(240, 240, 245, .7);
-  --text-secondary: #9ca3af;
-  --text-muted: #6b7280;
+  --text-tertiary: rgba(240, 240, 245, .4);
+  --text-secondary: rgba(203, 203, 203, 0.9);
+  --text-muted: rgba(126, 126, 126, 0.9);
 
   /* Borders */
   --border-subtle: rgba(255, 255, 255, 0.06);
@@ -74,6 +74,7 @@
   /* Shadows */
   --shadow-sm: 0 2px 8px rgba(0, 0, 0, 0.3);
   --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.4);
+  --shadow-md-transp: 0 4px 32px rgba(0, 0, 0, 0.2);
   --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.5);
   --shadow-glow: 0 0 20px var(--accent-glow);
 
@@ -97,7 +98,7 @@
   --margin: 8px;
 
   /* Typography */
-  --font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-family: 'Geist', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
 }
 
 /* --- Reset & Base --- */

@@ -15,6 +15,30 @@ use crate::library;
 
 const EXPORT_DROP_SUPPRESS_FOR: Duration = Duration::from_secs(8);
 
+/// Ctrl state during OS file drag — WebView often does not receive key events while
+/// Explorer owns the drag, so we read the real keyboard state here.
+pub fn is_ctrl_held() -> bool {
+    #[cfg(windows)]
+    {
+        #[link(name = "user32")]
+        extern "system" {
+            fn GetAsyncKeyState(vKey: i32) -> i16;
+        }
+        // VK_CONTROL covers left/right in most cases; also check L/R explicitly.
+        const VK_CONTROL: i32 = 0x11;
+        const VK_LCONTROL: i32 = 0xA2;
+        const VK_RCONTROL: i32 = 0xA3;
+        unsafe {
+            let down = |vk: i32| (GetAsyncKeyState(vk) as u16 & 0x8000) != 0;
+            down(VK_CONTROL) || down(VK_LCONTROL) || down(VK_RCONTROL)
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 #[derive(Default)]
 pub struct DropState {
     pub last_paths: Mutex<Vec<PathBuf>>,
@@ -156,6 +180,9 @@ pub struct DroppedTracksPayload {
     /// Original drop paths (files and/or folders), before scanning.
     #[serde(default)]
     pub paths: Vec<String>,
+    /// Whether Ctrl was held at drop time (import-into-playlist mode).
+    #[serde(default)]
+    pub ctrl: bool,
 }
 
 /// Hover state while dragging files over the window (physical pixel coords).
@@ -164,6 +191,9 @@ pub struct DragActivePayload {
     pub active: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub position: Option<[f64; 2]>,
+    /// Whether Ctrl is currently held (for import-into-playlist highlight).
+    #[serde(default)]
+    pub ctrl: bool,
 }
 
 fn effective_paths(drop_paths: &[PathBuf], fallback: &[PathBuf]) -> Vec<String> {
@@ -186,24 +216,28 @@ fn effective_paths(drop_paths: &[PathBuf], fallback: &[PathBuf]) -> Vec<String> 
 
 fn emit_drop_result(window: &Window, position: [f64; 2], paths: Vec<String>) {
     let source_paths = paths.clone();
+    let ctrl = is_ctrl_held();
     let payload = match library::scan_paths(&paths) {
         Ok(files) if files.is_empty() => DroppedTracksPayload {
             files,
             position,
             message: Some("No supported audio files found".into()),
             paths: source_paths,
+            ctrl,
         },
         Ok(files) => DroppedTracksPayload {
             files,
             position,
             message: None,
             paths: source_paths,
+            ctrl,
         },
         Err(error) => DroppedTracksPayload {
             files: Vec::new(),
             position,
             message: Some(error),
             paths: source_paths,
+            ctrl,
         },
     };
 
@@ -213,7 +247,11 @@ fn emit_drop_result(window: &Window, position: [f64; 2], paths: Vec<String>) {
 fn emit_drag_active(window: &Window, active: bool, position: Option<[f64; 2]>) {
     let _ = window.emit(
         "muzeeka:drag-active",
-        &DragActivePayload { active, position },
+        &DragActivePayload {
+            active,
+            position,
+            ctrl: active && is_ctrl_held(),
+        },
     );
 }
 
@@ -255,6 +293,7 @@ fn handle_drag_drop(window: &Window, state: &DropState, drag: &DragDropEvent) {
                         position: [position.x, position.y],
                         message: Some("Could not read dropped files or folders".into()),
                         paths: Vec::new(),
+                        ctrl: is_ctrl_held(),
                     },
                 );
                 return;

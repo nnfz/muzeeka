@@ -275,6 +275,7 @@ pub fn run() {
             commands::load_addon,
             commands::settings_load,
             commands::settings_save,
+            commands::input_is_ctrl_held,
             commands::library_scan,
             commands::library_scan_paths,
             commands::library_fetch_metadata,

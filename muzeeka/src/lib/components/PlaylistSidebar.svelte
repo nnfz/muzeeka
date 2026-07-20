@@ -224,9 +224,6 @@
   class:external-create-target={
     externalDrop.active && externalDrop.zone === 'sidebar' && !externalDrop.ctrlHeld
   }
-  class:external-import-target={
-    externalDrop.active && externalDrop.zone === 'sidebar' && externalDrop.ctrlHeld
-  }
   data-playlist-sidebar
   style:width="{sidebarWidth}px"
 >

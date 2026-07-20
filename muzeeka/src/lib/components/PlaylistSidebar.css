@@ -18,10 +18,6 @@
   background: color-mix(in srgb, var(--accent) 6%, transparent);
 }
 
-.sidebar.external-import-target {
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 30%, transparent);
-}
-
 .resize-handle {
   position: absolute;
   top: 0;
@@ -196,9 +192,13 @@
 }
 
 .playlist-row.drop-target {
-  background: rgba(124, 92, 255, 0.14);
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent);
+  background: rgba(124, 92, 255, 0.28);
+  box-shadow:
+    inset 0 0 0 2px color-mix(in srgb, var(--accent) 80%, transparent),
+    0 0 0 1px color-mix(in srgb, var(--accent) 35%, transparent);
   border-radius: var(--radius-sm);
+  position: relative;
+  z-index: 1;
 }
 
 .rename-input {
