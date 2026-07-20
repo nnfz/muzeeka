@@ -1,27 +1,24 @@
-.drop-overlay {
+.drop-zone-hint {
   position: fixed;
-  inset: 0;
-  z-index: 200;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: rgba(10, 10, 15, 0.55);
-  backdrop-filter: blur(2px);
+  z-index: 210;
+  transform: translate(-50%, -50%);
   pointer-events: none;
-}
-
-.drop-card {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 10px;
-  padding: 28px 36px;
-  border-radius: var(--radius-lg);
-  border: 2px dashed var(--border-accent);
-  background: rgba(17, 17, 24, 0.9);
-  color: var(--accent);
-  box-shadow: var(--shadow-lg), 0 0 30px var(--accent-glow);
-  animation: fade-in 0.2s ease;
+  gap: 4px;
+  padding: 12px 14px;
+  border-radius: var(--radius-md);
+  border: 1.5px dashed var(--border-accent);
+  background: rgba(17, 17, 24, 0.94);
+  box-shadow: var(--shadow-md), 0 0 24px var(--accent-glow);
+  animation: fade-in 0.15s ease;
+  text-align: center;
+}
+
+.drop-zone-hint.import-mode {
+  border-color: color-mix(in srgb, var(--accent) 70%, white 10%);
+  box-shadow: var(--shadow-md), 0 0 22px color-mix(in srgb, var(--accent) 35%, transparent);
 }
 
 .drop-title {

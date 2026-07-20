@@ -44,6 +44,7 @@
  * After enter-done + still lyrics-hidden: transitions are ON so the next class flip animates.
  */
 .fullscreen-player:not(.enter-done) .fullscreen-side,
+.fullscreen-player:not(.enter-done) .fullscreen-side-scale,
 .fullscreen-player:not(.enter-done) .fullscreen-lyrics-slot {
   transition: none !important;
 }
@@ -100,16 +101,15 @@
   flex-direction: column;
   align-items: stretch;
   justify-content: center;
-  gap: 18px;
   width: var(--fs-side-w);
   max-width: min(92vw, 520px);
   min-width: 0;
   box-sizing: border-box;
   pointer-events: none;
   opacity: 1;
-  /* centered: half viewport − half self width */
+  /* centered: half viewport − half self width — position only */
   transform: translate3d(calc(50vw - 50%), -50%, 0);
-  transition: var(--transition-slow);
+  transition: all 400ms var(--fs-ease-soft);
   will-change: transform;
   contain: layout style;
 }
@@ -121,6 +121,29 @@
  */
 .fullscreen-layout:not(.lyrics-hidden) .fullscreen-side {
   transform: translate3d(calc(var(--fs-lyrics-inset) / 2 - 50%), -50%, 0);
+}
+
+/*
+ * Pause scale on an inner node so it never competes with the position translate
+ * (and media-query transform overrides on .fullscreen-side).
+ * Use explicit scale() values (not only a CSS var) so transition: transform actually tweens.
+ */
+.fullscreen-side-scale {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: center;
+  gap: 18px;
+  width: 100%;
+  min-width: 0;
+  transform: scale3d(1, 1, 1);
+  transform-origin: center center;
+  transition: transform 500ms var(--fs-ease);
+  will-change: transform;
+}
+
+.fullscreen-side-scale.is-paused {
+  transform: scale3d(0.88, 0.88, 1);
 }
 
 /* Lyrics: well to the right of the cover (not glued to it) */
@@ -140,9 +163,7 @@
   opacity: 0;
   pointer-events: none;
   /* Default = leave (hide): snappy fade + fly-right */
-  transition:
-    opacity 260ms var(--fs-ease),
-    transform 260ms var(--fs-ease);
+  transition: all 400ms var(--fs-ease-soft);
   will-change: opacity, transform;
 }
 
@@ -152,7 +173,7 @@
   pointer-events: auto;
 
   /* Enter can stay a bit softer than leave */
-  transition: all var(--transition-slow);
+  transition: all 400ms var(--fs-ease-soft);
 }
 
 .fullscreen-layout.lyrics-hidden .fullscreen-lyrics-slot {
@@ -160,7 +181,7 @@
   transform: translate3d(196px, 0, 0);
   filter: blur(5px);
   pointer-events: none; 
-  transition: all var(--transition-slow);
+  transition: all 400ms var(--fs-ease-soft);
 }
 
 .fullscreen-lyrics-slot > :global(.fs-lyrics-panel) {
@@ -210,14 +231,22 @@
   background: linear-gradient(135deg, rgba(255, 255, 255, 0.08), rgba(255, 255, 255, 0.03));
 }
 
-/* Title matches cover width; left + tiny inset */
+/* Title matches cover width; left + tiny inset; like button to the right */
 .fullscreen-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
   width: 100%;
   max-width: 100%;
   min-width: 0;
   box-sizing: border-box;
   padding-left: 4px;
   text-align: left;
+}
+
+.fullscreen-meta-text {
+  flex: 1;
+  min-width: 0;
 }
 
 .fullscreen-title {
@@ -241,6 +270,38 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.like-btn-fullscreen {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  flex-shrink: 0;
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  opacity: 0.7;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.like-btn-fullscreen:hover {
+  opacity: 1;
+  color: #e25555;
+  background: rgba(226, 85, 85, 0.12);
+}
+
+.like-btn-fullscreen.liked {
+  color: #e25555;
+  opacity: 0.95;
+}
+
+.like-btn-fullscreen.liked:hover {
+  color: #c93f3f;
+  background: rgba(226, 85, 85, 0.18);
 }
 
 .fullscreen-bottom-chrome {
@@ -518,12 +579,15 @@
     right: 0;
     width: 100%;
     max-width: 100%;
-    flex-direction: row;
-    align-items: center;
-    gap: 16px;
     padding: 0 20px 8px;
     transform: translate3d(0, 0, 0);
     transition: none;
+  }
+
+  .fullscreen-layout:not(.lyrics-hidden) .fullscreen-side-scale {
+    flex-direction: row;
+    align-items: center;
+    gap: 16px;
   }
 
   .fullscreen-layout:not(.lyrics-hidden) .fullscreen-art-wrap {
@@ -581,6 +645,7 @@
 @media (prefers-reduced-motion: reduce) {
   .fullscreen-backdrop,
   .fullscreen-side,
+  .fullscreen-side-scale,
   .fullscreen-lyrics-slot,
   .fullscreen-bottom-chrome-inner,
   .fullscreen-art {

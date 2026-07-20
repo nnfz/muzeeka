@@ -374,6 +374,63 @@ pub async fn lyrics_import_ttml(
     Ok(())
 }
 
+/// Remove cached lyrics for a track (and stop auto-refetch until re-import).
+#[tauri::command]
+pub async fn lyrics_clear(
+    app: AppHandle,
+    title: String,
+    artist: String,
+    album: Option<String>,
+    duration_secs: Option<u32>,
+    track_path: Option<String>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::lyrics::clear_lyrics_ttml(
+            &title,
+            &artist,
+            album.as_deref(),
+            duration_secs,
+        )
+    })
+    .await
+    .map_err(|error| format!("Lyrics clear task failed: {error}"))??;
+
+    let _ = app.emit(
+        "lyrics:cleared",
+        track_path.unwrap_or_default(),
+    );
+    Ok(())
+}
+
+/// Force network search for lyrics (ignores hit/miss/cleared cache).
+#[tauri::command]
+pub async fn lyrics_refetch(
+    app: AppHandle,
+    title: String,
+    artist: String,
+    album: Option<String>,
+    duration_secs: Option<u32>,
+    track_path: Option<String>,
+) -> Result<bool, String> {
+    let found = tauri::async_runtime::spawn_blocking(move || {
+        crate::lyrics::refetch_lyrics_ttml(
+            &title,
+            &artist,
+            album.as_deref(),
+            duration_secs,
+        )
+    })
+    .await
+    .map_err(|error| format!("Lyrics refetch task failed: {error}"))??
+    .is_some();
+
+    let _ = app.emit(
+        "lyrics:refetched",
+        track_path.unwrap_or_default(),
+    );
+    Ok(found)
+}
+
 // ── Playlist persistence ──────────────────────────────────────────────────────
 
 /// Load saved playlists from disk.

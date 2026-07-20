@@ -408,21 +408,28 @@
     };
   });
 
-  // After manual TTML import — drop settled flag so lyrics re-fetch from cache.
+  // After manual TTML import / clear — drop settled flag so lyrics re-fetch from cache.
   $effect(() => {
-    let unlisten: (() => void) | undefined;
-    void listen<string>('lyrics:imported', (event) => {
-      const importedPath = event.payload?.trim() || '';
+    const unlisteners: Array<() => void> = [];
+    const onLyricsCacheChanged = (payload: string | undefined) => {
+      const changedPath = payload?.trim() || '';
       const current = untrack(() => player.currentFile);
-      if (!importedPath || !current || importedPath === current) {
+      if (!changedPath || !current || changedPath === current) {
         lyricsSettledForFile = null;
         lyricsState = null;
       }
-    }).then((fn) => {
-      unlisten = fn;
-    });
+    };
+
+    for (const eventName of ['lyrics:imported', 'lyrics:cleared', 'lyrics:refetched'] as const) {
+      void listen<string>(eventName, (event) => {
+        onLyricsCacheChanged(event.payload);
+      }).then((fn) => {
+        unlisteners.push(fn);
+      });
+    }
+
     return () => {
-      unlisten?.();
+      for (const unlisten of unlisteners) unlisten();
     };
   });
 
@@ -509,41 +516,64 @@
   >
     <!-- Persistent Kawarp (no #key) so texture crossfade works between tracks -->
     <div class="fullscreen-backdrop" aria-hidden="true">
-      <KawarpBackground src={bgCoverSrc} active={open} transitionDuration={700} />
+      <KawarpBackground
+        src={bgCoverSrc}
+        active={open}
+        paused={player.isPaused}
+        switchKey={player.currentFile}
+        transitionDuration={700}
+      />
       <div class="fullscreen-backdrop-shade"></div>
     </div>
 
     <div class="fullscreen-layout" class:lyrics-hidden={!showLyricsPanel}>
       <aside class="fullscreen-side">
-        <div class="fullscreen-art-wrap">
-          {#if !placeholderFailed}
-            <img
-              class="fullscreen-art"
-              src={artSrc}
-              alt=""
-              draggable="false"
-              decoding="async"
-              onerror={() => {
-                if (artSrc === COVER_PLACEHOLDER_SRC) placeholderFailed = true;
-                else setArtSrc(COVER_PLACEHOLDER_SRC, artFile);
-              }}
-            />
-          {:else}
-            <div class="fullscreen-art-placeholder" aria-hidden="true">
-              <svg width="72" height="72" viewBox="0 0 24 24" fill="currentColor">
-                <path d="M12 3v10.55A4 4 0 1 0 14 17V7h4V3h-6z"/>
-              </svg>
-            </div>
-          {/if}
-        </div>
+        <div class="fullscreen-side-scale" class:is-paused={player.isPaused}>
+          <div class="fullscreen-art-wrap">
+            {#if !placeholderFailed}
+              <img
+                class="fullscreen-art"
+                src={artSrc}
+                alt=""
+                draggable="false"
+                decoding="async"
+                onerror={() => {
+                  if (artSrc === COVER_PLACEHOLDER_SRC) placeholderFailed = true;
+                  else setArtSrc(COVER_PLACEHOLDER_SRC, artFile);
+                }}
+              />
+            {:else}
+              <div class="fullscreen-art-placeholder" aria-hidden="true">
+                <svg width="72" height="72" viewBox="0 0 24 24" fill="currentColor">
+                  <path d="M12 3v10.55A4 4 0 1 0 14 17V7h4V3h-6z"/>
+                </svg>
+              </div>
+            {/if}
+          </div>
 
-        <div class="fullscreen-meta">
-          <h2 class="fullscreen-title">
-            {player.currentTrack ? trackDisplayTitle(player.currentTrack) : player.currentFileName ?? ''}
-          </h2>
-          {#if player.currentTrack}
-            <p class="fullscreen-artist">{trackDisplayArtist(player.currentTrack)}</p>
-          {/if}
+          <div class="fullscreen-meta">
+            <div class="fullscreen-meta-text">
+              <h2 class="fullscreen-title">
+                {player.currentTrack ? trackDisplayTitle(player.currentTrack) : player.currentFileName ?? ''}
+              </h2>
+              {#if player.currentTrack}
+                <p class="fullscreen-artist">{trackDisplayArtist(player.currentTrack)}</p>
+              {/if}
+            </div>
+            {#if player.hasTrack && player.currentFile}
+              <button
+                class="like-btn-fullscreen"
+                class:liked={player.isLiked(player.currentFile)}
+                onclick={() => { if (player.currentFile) player.toggleLike(player.currentFile); }}
+                title={player.isLiked(player.currentFile) ? 'Remove from Liked' : 'Add to Liked'}
+                aria-label={player.isLiked(player.currentFile) ? 'Unlike current track' : 'Like current track'}
+              >
+                <svg width="20" height="20" viewBox="0 0 24 24" fill={player.isLiked(player.currentFile) ? 'currentColor' : 'none'} stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z" />
+                </svg>
+              </button>
+            {/if}
+          </div>
         </div>
       </aside>
 

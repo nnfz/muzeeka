@@ -4,9 +4,13 @@
 use serde::Deserialize;
 
 use crate::lrc::lrc_to_ttml;
-use crate::lyrics::http_get_json;
+use crate::lyrics::{
+    duration_close_enough, http_get_json, track_identity_matches,
+};
 
 const UNISON_API: &str = "https://unison.boidu.dev";
+/// Unison search is very fuzzy; require duration within this window when known.
+const SEARCH_DURATION_TOLERANCE_SECS: u32 = 8;
 
 #[derive(Debug, Deserialize)]
 struct UnisonEnvelope<T> {
@@ -19,11 +23,15 @@ struct UnisonLyrics {
     lyrics: Option<String>,
     format: Option<String>,
     duration: Option<u32>,
+    song: Option<String>,
+    artist: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct UnisonSearchHit {
     id: Option<u64>,
+    song: Option<String>,
+    artist: Option<String>,
     duration: Option<u32>,
     format: Option<String>,
     #[serde(rename = "matchScore")]
@@ -86,6 +94,20 @@ fn try_unison_get(
         return Ok(None);
     };
 
+    // Unison GET is fuzzy and often returns a completely different track.
+    let result_title = data.song.as_deref().unwrap_or("");
+    let result_artist = data.artist.as_deref().unwrap_or("");
+    if result_title.is_empty()
+        || result_artist.is_empty()
+        || !track_identity_matches(title, artist, result_title, result_artist)
+    {
+        return Ok(None);
+    }
+
+    if !duration_close_enough(duration_secs, data.duration, SEARCH_DURATION_TOLERANCE_SECS) {
+        return Ok(None);
+    }
+
     let Some(lyrics) = data.lyrics.filter(|value| !value.trim().is_empty()) else {
         return Ok(None);
     };
@@ -96,7 +118,12 @@ fn try_unison_get(
     Ok(lyrics_to_ttml(&lyrics, format, resolved_duration))
 }
 
-fn try_unison_by_id(id: u64, duration_secs: u32) -> Result<Option<String>, String> {
+fn try_unison_by_id(
+    id: u64,
+    query_title: &str,
+    query_artist: &str,
+    duration_secs: u32,
+) -> Result<Option<String>, String> {
     let url = format!("{UNISON_API}/lyrics/{id}");
     let body: UnisonEnvelope<UnisonLyrics> = match http_get_json(&url)? {
         Some(body) => body,
@@ -110,6 +137,15 @@ fn try_unison_by_id(id: u64, duration_secs: u32) -> Result<Option<String>, Strin
     let Some(data) = body.data else {
         return Ok(None);
     };
+
+    let result_title = data.song.as_deref().unwrap_or("");
+    let result_artist = data.artist.as_deref().unwrap_or("");
+    if result_title.is_empty()
+        || result_artist.is_empty()
+        || !track_identity_matches(query_title, query_artist, result_title, result_artist)
+    {
+        return Ok(None);
+    }
 
     let Some(lyrics) = data.lyrics.filter(|value| !value.trim().is_empty()) else {
         return Ok(None);
@@ -147,11 +183,28 @@ fn fetch_unison_search(
     }
 
     // Prefer timed formats, then duration closeness, then community score.
+    // Always require title+artist identity — Unison search returns unrelated tracks.
     let mut ranked: Vec<(i32, f64, f64, u64)> = Vec::new();
     for hit in hits {
         let Some(id) = hit.id else {
             continue;
         };
+
+        let result_title = hit.song.as_deref().unwrap_or("");
+        let result_artist = hit.artist.as_deref().unwrap_or("");
+        if result_title.is_empty()
+            || result_artist.is_empty()
+            || !track_identity_matches(title, artist, result_title, result_artist)
+        {
+            continue;
+        }
+
+        // matchScore is often missing; when present, ignore clearly weak hits.
+        if let Some(score) = hit.match_score {
+            if score < 0.55 {
+                continue;
+            }
+        }
 
         let format = hit.format.as_deref().unwrap_or("").to_ascii_lowercase();
         let format_rank = match format.as_str() {
@@ -163,9 +216,13 @@ fn fetch_unison_search(
             continue;
         }
 
+        if !duration_close_enough(duration_secs, hit.duration, SEARCH_DURATION_TOLERANCE_SECS) {
+            continue;
+        }
+
         let result_duration = hit.duration.unwrap_or(duration_secs);
         let distance = if duration_secs > 0 {
-            (result_duration as i32 - duration_secs as i32).abs()
+            result_duration.abs_diff(duration_secs) as i32
         } else {
             0
         };
@@ -184,7 +241,7 @@ fn fetch_unison_search(
     });
 
     for (_, _, _, id) in ranked.into_iter().take(3) {
-        if let Some(ttml) = try_unison_by_id(id, duration_secs)? {
+        if let Some(ttml) = try_unison_by_id(id, title, artist, duration_secs)? {
             return Ok(Some(ttml));
         }
     }
@@ -209,13 +266,14 @@ pub fn fetch_unison_ttml(
         return Ok(Some(ttml));
     }
 
-    // Exact get often 404s on sparse corpus; search is more forgiving.
+    // Exact get often 404s on sparse corpus; search is more forgiving but validated.
     fetch_unison_search(title, artist, duration_secs)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{fetch_unison_ttml, lyrics_to_ttml};
+    use crate::lyrics::track_identity_matches;
 
     #[test]
     fn ttml_passthrough() {
@@ -230,11 +288,35 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unrelated_identity() {
+        assert!(!track_identity_matches(
+            "Погано",
+            "Пу Пу Пу",
+            "Сильно",
+            "СЛИВНЯКА"
+        ));
+        assert!(!track_identity_matches(
+            "Погано",
+            "Пу Пу Пу",
+            "風と行く道",
+            "大原ゆい子"
+        ));
+    }
+
+    #[test]
     #[ignore = "hits live Unison API"]
     fn fetch_give_it_up_via_unison() {
         let ttml = fetch_unison_ttml("Give It Up", "Don Toliver", None, 131)
             .expect("unison fetch should not error")
             .expect("give it up should be available on unison");
         assert!(ttml.contains("<p"), "expected TTML paragraphs in response");
+    }
+
+    #[test]
+    #[ignore = "hits live Unison API"]
+    fn fetch_pogano_has_no_false_positive() {
+        let ttml = fetch_unison_ttml("Погано", "Пу Пу Пу", None, 180)
+            .expect("unison fetch should not error");
+        assert!(ttml.is_none(), "must not invent lyrics for unknown tracks");
     }
 }

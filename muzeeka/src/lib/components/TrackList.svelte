@@ -17,6 +17,7 @@
     setTrackDragCopyTarget,
     trackDrag as trackDragUi,
   } from '$lib/stores/trackDrag.svelte';
+  import { externalDrop } from '$lib/stores/externalDrop.svelte';
   import { openContextMenuFromEvent, type ContextMenuItem } from '$lib/contextMenu';
   import { open } from '@tauri-apps/plugin-dialog';
   import { revealItemInDir } from '@tauri-apps/plugin-opener';
@@ -213,12 +214,22 @@
       onSelect: () => revealTracksOnDisk(affectedTracks),
     });
 
-    // Import TTML — single track only (lyrics cache key is per-title/artist).
+    // Lyrics actions — single track only (lyrics cache key is per-title/artist).
     if (!multi) {
       items.push({
         id: 'import-ttml',
         label: 'Импорт TTML',
         onSelect: () => void importTtmlForTrack(target.track),
+      });
+      items.push({
+        id: 'refetch-lyrics',
+        label: 'Найти текст',
+        onSelect: () => void refetchLyricsForTrack(target.track),
+      });
+      items.push({
+        id: 'clear-lyrics',
+        label: 'Убрать текст',
+        onSelect: () => void clearLyricsForTrack(target.track),
       });
     }
 
@@ -501,6 +512,15 @@
     }
   }
 
+  function showDragToast(message: string, ms = 2400) {
+    dragToast = message;
+    if (dragToastTimer) clearTimeout(dragToastTimer);
+    dragToastTimer = setTimeout(() => {
+      dragToast = null;
+      dragToastTimer = null;
+    }, ms);
+  }
+
   async function importTtmlForTrack(track: MusicFile) {
     const selected = await open({
       multiple: false,
@@ -524,20 +544,49 @@
         path,
         trackPath: track.path,
       });
-      dragToast = 'TTML импортирован';
-      if (dragToastTimer) clearTimeout(dragToastTimer);
-      dragToastTimer = setTimeout(() => {
-        dragToast = null;
-        dragToastTimer = null;
-      }, 2200);
+      showDragToast('TTML импортирован');
     } catch (e) {
       console.error('Failed to import TTML:', e);
-      dragToast = e instanceof Error ? e.message : 'Не удалось импортировать TTML';
-      if (dragToastTimer) clearTimeout(dragToastTimer);
-      dragToastTimer = setTimeout(() => {
-        dragToast = null;
-        dragToastTimer = null;
-      }, 3200);
+      showDragToast(e instanceof Error ? e.message : 'Не удалось импортировать TTML', 3200);
+    }
+  }
+
+  async function clearLyricsForTrack(track: MusicFile) {
+    try {
+      await invoke('lyrics_clear', {
+        title: trackDisplayTitle(track),
+        artist: trackDisplayArtist(track),
+        album: track.album ?? null,
+        durationSecs:
+          track.duration_secs != null && track.duration_secs > 0
+            ? Math.round(track.duration_secs)
+            : null,
+        trackPath: track.path,
+      });
+      showDragToast('Текст убран');
+    } catch (e) {
+      console.error('Failed to clear lyrics:', e);
+      showDragToast(e instanceof Error ? e.message : 'Не удалось убрать текст', 3200);
+    }
+  }
+
+  async function refetchLyricsForTrack(track: MusicFile) {
+    showDragToast('Ищем текст…', 8000);
+    try {
+      const found = await invoke<boolean>('lyrics_refetch', {
+        title: trackDisplayTitle(track),
+        artist: trackDisplayArtist(track),
+        album: track.album ?? null,
+        durationSecs:
+          track.duration_secs != null && track.duration_secs > 0
+            ? Math.round(track.duration_secs)
+            : null,
+        trackPath: track.path,
+      });
+      showDragToast(found ? 'Текст найден' : 'Текст не найден', found ? 2400 : 3200);
+    } catch (e) {
+      console.error('Failed to refetch lyrics:', e);
+      showDragToast(e instanceof Error ? e.message : 'Не удалось найти текст', 3200);
     }
   }
 
@@ -666,7 +715,7 @@
       selectedPaths = new Set();
       selectionAnchor = index;
     }
-    const position = openContextMenuFromEvent(e, { width: 220, height: 196 });
+    const position = openContextMenuFromEvent(e, { width: 220, height: 264 });
     contextMenu = { item, ...position };
   }
 
@@ -701,15 +750,6 @@
 
   function handleAddToPlaylistDialogKeydown(e: KeyboardEvent) {
     handleTrackMenuWindowKeydown(e);
-  }
-
-  function showDragToast(message: string) {
-    dragToast = message;
-    if (dragToastTimer) clearTimeout(dragToastTimer);
-    dragToastTimer = setTimeout(() => {
-      dragToast = null;
-      dragToastTimer = null;
-    }, 2400);
   }
 
   function pathsForDrag(item: ListedTrack): string[] {
@@ -1001,7 +1041,13 @@
   }
 </script>
 
-<section class="track-panel">
+<section
+  class="track-panel"
+  class:external-drop-target={
+    externalDrop.active && externalDrop.zone === 'tracks'
+  }
+  data-track-drop-zone
+>
   <div class="track-list">
     {#if !player.activePlaylistId}
       <div class="empty-state" data-tauri-drag-region>

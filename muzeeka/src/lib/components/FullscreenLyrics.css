@@ -15,10 +15,10 @@
   --lyric-leave-filter-delay: 0.18s;
   --lyric-leave-opacity-duration: 0.18s;
   --lyric-leave-opacity-delay: 0.08s;
-  --lyric-color-active: #ffffff;
+  --lyric-color-active: var(--text-primary);
   /* Dim via opacity (braccato), not grey color */
-  --lyric-color-upcoming: #ffffff;
-  --lyric-color-past: #ffffff;
+  --lyric-color-upcoming: var(--text-secondary);
+  --lyric-color-past: var(--text-tertiary);
   --lyric-color-word-dim: rgba(255, 255, 255, 0.26);
 
   position: relative;

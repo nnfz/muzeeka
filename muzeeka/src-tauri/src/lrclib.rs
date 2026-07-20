@@ -3,16 +3,23 @@
 use serde::Deserialize;
 
 use crate::lrc::lrc_to_ttml;
-use crate::lyrics::http_get_json;
+use crate::lyrics::{
+    duration_close_enough, http_get_json, track_identity_matches,
+};
 
 const LRCLIB_GET: &str = "https://lrclib.net/api/get";
 const LRCLIB_SEARCH: &str = "https://lrclib.net/api/search";
+const SEARCH_DURATION_TOLERANCE_SECS: u32 = 8;
 
 #[derive(Debug, Deserialize)]
 struct LrclibResponse {
     #[serde(rename = "syncedLyrics")]
     synced_lyrics: Option<String>,
     duration: Option<f64>,
+    #[serde(rename = "trackName")]
+    track_name: Option<String>,
+    #[serde(rename = "artistName")]
+    artist_name: Option<String>,
 }
 
 fn synced_lyrics_to_ttml(synced: &str, duration_secs: u32) -> Option<String> {
@@ -49,6 +56,15 @@ fn try_lrclib_get(title: &str, artist: &str, duration_secs: u32) -> Result<Optio
         Some(body) => body,
         None => return Ok(None),
     };
+
+    // Exact /get is keyed by title/artist/duration; still verify when names are present.
+    if let (Some(result_title), Some(result_artist)) =
+        (body.track_name.as_deref(), body.artist_name.as_deref())
+    {
+        if !track_identity_matches(title, artist, result_title, result_artist) {
+            return Ok(None);
+        }
+    }
 
     let Some(synced) = body.synced_lyrics else {
         return Ok(None);
@@ -91,6 +107,15 @@ fn fetch_lrclib_search(
     let mut best: Option<(i32, String, u32)> = None;
 
     for result in results {
+        let result_title = result.track_name.as_deref().unwrap_or("");
+        let result_artist = result.artist_name.as_deref().unwrap_or("");
+        if result_title.is_empty()
+            || result_artist.is_empty()
+            || !track_identity_matches(title, artist, result_title, result_artist)
+        {
+            continue;
+        }
+
         let Some(synced) = result
             .synced_lyrics
             .filter(|lyrics| !lyrics.trim().is_empty())
@@ -100,11 +125,15 @@ fn fetch_lrclib_search(
 
         let result_duration = result
             .duration
-            .map(|value| value.round().max(1.0) as u32)
-            .unwrap_or(duration_secs);
+            .map(|value| value.round().max(1.0) as u32);
 
+        if !duration_close_enough(duration_secs, result_duration, SEARCH_DURATION_TOLERANCE_SECS) {
+            continue;
+        }
+
+        let resolved_duration = result_duration.unwrap_or(duration_secs);
         let distance = if duration_secs > 0 {
-            (result_duration as i32 - duration_secs as i32).abs()
+            resolved_duration.abs_diff(duration_secs) as i32
         } else {
             0
         };
@@ -115,7 +144,7 @@ fn fetch_lrclib_search(
         };
 
         if replace {
-            best = Some((distance, synced, result_duration));
+            best = Some((distance, synced, resolved_duration));
         }
     }
 
@@ -149,6 +178,7 @@ pub fn fetch_lrclib_ttml(
 #[cfg(test)]
 mod tests {
     use super::{duration_candidates, fetch_lrclib_ttml};
+    use crate::lyrics::track_identity_matches;
 
     #[test]
     fn duration_candidates_include_tolerance() {
@@ -157,6 +187,22 @@ mod tests {
         assert!(candidates.contains(&266));
         assert!(candidates.contains(&268));
         assert!(candidates.len() <= 5);
+    }
+
+    #[test]
+    fn identity_requires_title_and_artist() {
+        assert!(track_identity_matches(
+            "Hotline Bling",
+            "Drake",
+            "Hotline Bling",
+            "Drake"
+        ));
+        assert!(!track_identity_matches(
+            "Hotline Bling",
+            "Drake",
+            "One Dance",
+            "Drake"
+        ));
     }
 
     #[test]

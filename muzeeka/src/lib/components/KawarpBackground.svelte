@@ -5,6 +5,16 @@
   interface Props extends KawarpOptions {
     src?: string | null;
     active?: boolean;
+    /**
+     * When true, warp eases toward a near-stop then freezes the render loop.
+     * When false again, animation resumes at `animationSpeed`.
+     */
+    paused?: boolean;
+    /**
+     * Track identity (file path). Changing it briefly raises warp speed
+     * for the cover crossfade (not thumb→full of the same track).
+     */
+    switchKey?: string | null;
     class?: string;
   }
 
@@ -14,13 +24,22 @@
     15 / 255,
   ];
 
+  /** Kawarp public API clamps animationSpeed to [0.1, 5]. */
+  const PAUSE_SPEED = 0.1;
+  const CRUISE_SPEED_DEFAULT = 1;
+  const SWITCH_SPEED = 2.4;
+  const PAUSE_HOLD_MS = 420;
+  const SWITCH_HOLD_MS = 680;
+
   let {
     src = null,
     active = true,
+    paused = false,
+    switchKey = null,
     class: className = '',
     warpIntensity = 3.85,
     blurPasses = 8,
-    animationSpeed = 1,
+    animationSpeed = CRUISE_SPEED_DEFAULT,
     transitionDuration = 700,
     saturation = 1.65,
     tintColor = BG_TINT,
@@ -46,6 +65,11 @@
   let resizeObserver: ResizeObserver | null = null;
   let resizeTimeout: ReturnType<typeof setTimeout> | null = null;
   let initGeneration = 0;
+
+  /** Single timer for pause-hold / switch-boost; never rAF-polls internals. */
+  let motionTimer: ReturnType<typeof setTimeout> | null = null;
+  let motionGen = 0;
+  let lastSwitchKey: string | null | undefined = undefined;
 
   // Dual-layer blurred fallback for smooth track switches
   let fbA = $state<string | null>(null);
@@ -147,20 +171,99 @@
     resizeTimeout = setTimeout(updateSize, 100);
   }
 
-  function shouldAnimate(): boolean {
-    return active && windowActive;
-  }
-
-  function syncAnimationState() {
-    if (!kawarp || webglFailed) return;
-    if (shouldAnimate()) {
-      kawarp.start();
-    } else {
-      kawarp.stop();
+  function clearMotionTimer() {
+    if (motionTimer) {
+      clearTimeout(motionTimer);
+      motionTimer = null;
     }
   }
 
+  function shouldRunLoop(): boolean {
+    return active && windowActive;
+  }
+
+  /**
+   * Apply start/stop + speed.
+   * Must NOT write any Svelte $state (would re-enter effects).
+   */
+  function applyMotion() {
+    if (!kawarp || webglFailed) return;
+
+    clearMotionTimer();
+    const gen = ++motionGen;
+    const instance = kawarp;
+
+    if (!shouldRunLoop()) {
+      instance.stop();
+      return;
+    }
+
+    if (paused) {
+      // Ease toward min public speed, then stop rAF.
+      // If the loop was never running (e.g. open fullscreen already paused),
+      // do not start WebGL just to shut it down — that hitch felt like a freeze.
+      try {
+        instance.animationSpeed = PAUSE_SPEED;
+        const running =
+          (instance as unknown as { isPlaying?: boolean }).isPlaying === true;
+        if (!running) {
+          instance.stop();
+          return;
+        }
+        // already running — keep frames so speed can ease down
+      } catch {
+        return;
+      }
+      motionTimer = setTimeout(() => {
+        motionTimer = null;
+        if (gen !== motionGen || kawarp !== instance) return;
+        try {
+          instance.stop();
+        } catch {
+          /* disposed */
+        }
+      }, PAUSE_HOLD_MS);
+      return;
+    }
+
+    try {
+      instance.animationSpeed = animationSpeed;
+      instance.start();
+    } catch {
+      /* disposed */
+    }
+  }
+
+  function boostForSwitch() {
+    if (!kawarp || webglFailed || paused || !shouldRunLoop()) return;
+
+    clearMotionTimer();
+    const gen = ++motionGen;
+    const instance = kawarp;
+
+    try {
+      instance.animationSpeed = SWITCH_SPEED;
+      instance.start();
+    } catch {
+      return;
+    }
+
+    motionTimer = setTimeout(() => {
+      motionTimer = null;
+      if (gen !== motionGen || kawarp !== instance) return;
+      if (paused || !shouldRunLoop()) return;
+      try {
+        instance.animationSpeed = animationSpeed;
+      } catch {
+        /* disposed */
+      }
+    }, SWITCH_HOLD_MS);
+  }
+
   function disposeKawarp() {
+    clearMotionTimer();
+    motionGen += 1;
+
     resizeObserver?.disconnect();
     resizeObserver = null;
 
@@ -192,8 +295,10 @@
     canvas: HTMLCanvasElement,
     container: HTMLDivElement,
   ) {
+    // Let fullscreen chrome paint before creating WebGL (avoids open hitch).
     await tick();
     await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
     if (generation !== initGeneration) return;
 
     const { Kawarp } = await import('@kawarp/core');
@@ -231,9 +336,7 @@
 
     if (generation !== initGeneration) return;
 
-    if (untrack(() => shouldAnimate())) {
-      instance.start();
-    }
+    untrack(() => applyMotion());
   }
 
   $effect(() => {
@@ -256,7 +359,9 @@
     void kawarpEpoch;
     void active;
     void windowActive;
-    syncAnimationState();
+    void paused;
+    void animationSpeed;
+    applyMotion();
   });
 
   $effect(() => {
@@ -315,6 +420,18 @@
       document.removeEventListener('visibilitychange', sync);
       unlistenFocus?.();
     };
+  });
+
+  // Track change → temporary speed-up (skip first seed on mount).
+  $effect(() => {
+    const key = switchKey ?? null;
+    if (lastSwitchKey === undefined) {
+      lastSwitchKey = key;
+      return;
+    }
+    if (key === lastSwitchKey) return;
+    lastSwitchKey = key;
+    if (key) boostForSwitch();
   });
 
   // Blur fallback crossfade (always, even before WebGL is ready)

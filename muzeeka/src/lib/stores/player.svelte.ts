@@ -1066,6 +1066,163 @@ function addScannedTracks(files: MusicFile[], playlistId?: string | null): numbe
   return mergeTracksIntoPlaylist(targetId, files);
 }
 
+/** Basename of a filesystem path (folder or file). */
+function pathBasename(path: string): string {
+  const cleaned = path.replace(/[\\/]+$/, '').trim();
+  if (!cleaned) return path;
+  const parts = cleaned.split(/[\\/]/);
+  return parts[parts.length - 1] || cleaned;
+}
+
+const MEDIA_DROP_EXTENSIONS = new Set([
+  'mp3', 'flac', 'ogg', 'wav', 'aac', 'm4a', 'wma', 'opus', 'ape',
+  'mod', 's3m', 'xm', 'it', 'ay', 'ym', 'vgm', 'vgz', 'nsf', 'nsfe',
+  'gbs', 'hes', 'sap', 'kss', 'pt2', 'pt3', 'stc', 'stp', 'asc', 'sqt', 'psg',
+  'cue',
+]);
+
+function looksLikeMediaFile(path: string): boolean {
+  const base = pathBasename(path);
+  const dot = base.lastIndexOf('.');
+  if (dot <= 0) return false;
+  return MEDIA_DROP_EXTENSIONS.has(base.slice(dot + 1).toLowerCase());
+}
+
+function normalizePathPrefix(path: string): string {
+  return path.trim().replace(/[\\/]+$/, '').replace(/\//g, '\\').toLowerCase();
+}
+
+export interface CreatePlaylistsFromDropResult {
+  playlists: number;
+  tracks: number;
+  names: string[];
+}
+
+/**
+ * Create one playlist per dropped folder (named after the folder).
+ * Loose audio/cue files are gathered into a single new playlist.
+ */
+async function createPlaylistsFromDroppedPaths(
+  paths: string[],
+): Promise<CreatePlaylistsFromDropResult> {
+  const normalizedPaths = paths.map((path) => path.trim()).filter(Boolean);
+  if (normalizedPaths.length === 0) {
+    return { playlists: 0, tracks: 0, names: [] };
+  }
+
+  let playlistCount = 0;
+  let trackCount = 0;
+  const names: string[] = [];
+  const filePaths: string[] = [];
+  let lastId: string | null = null;
+
+  for (const path of normalizedPaths) {
+    if (looksLikeMediaFile(path)) {
+      filePaths.push(path);
+      continue;
+    }
+
+    try {
+      const files: MusicFile[] = await invoke('library_scan', { directory: path });
+      if (files.length === 0) continue;
+      const name = pathBasename(path) || nextPlaylistName();
+      const id = ensurePlaylist(name, { select: true });
+      trackCount += mergeTracksIntoPlaylist(id, files);
+      playlistCount += 1;
+      names.push(name);
+      lastId = id;
+    } catch {
+      // Not a directory — treat as a file path
+      filePaths.push(path);
+    }
+  }
+
+  if (filePaths.length > 0) {
+    try {
+      const files: MusicFile[] = await invoke('library_scan_paths', { paths: filePaths });
+      if (files.length > 0) {
+        const name = nextPlaylistName();
+        const id = ensurePlaylist(name, { select: true });
+        const added = mergeTracksIntoPlaylist(id, files);
+        trackCount += added;
+        playlistCount += 1;
+        names.push(name);
+        lastId = id;
+      }
+    } catch (e) {
+      console.error('Failed to create playlist from dropped files:', e);
+    }
+  }
+
+  if (lastId) {
+    activePlaylistId = lastId;
+  }
+
+  return { playlists: playlistCount, tracks: trackCount, names };
+}
+
+/**
+ * Create playlists from already-scanned tracks, grouping by original drop paths when available.
+ */
+function createPlaylistsFromScannedTracks(
+  files: MusicFile[],
+  sourcePaths?: string[] | null,
+): CreatePlaylistsFromDropResult {
+  if (files.length === 0) {
+    return { playlists: 0, tracks: 0, names: [] };
+  }
+
+  const paths = (sourcePaths ?? []).map((p) => p.trim()).filter(Boolean);
+  if (paths.length === 0) {
+    const name = nextPlaylistName();
+    const id = ensurePlaylist(name, { select: true });
+    const added = mergeTracksIntoPlaylist(id, files);
+    return { playlists: 1, tracks: added, names: [name] };
+  }
+
+  const claimed = new Set<string>();
+  let playlistCount = 0;
+  let trackCount = 0;
+  const names: string[] = [];
+  let lastId: string | null = null;
+
+  for (const source of paths) {
+    if (looksLikeMediaFile(source)) continue;
+    const prefix = normalizePathPrefix(source);
+    if (!prefix) continue;
+
+    const group = files.filter((file) => {
+      const fileKey = normalizePathPrefix(file.path);
+      return fileKey === prefix || fileKey.startsWith(`${prefix}\\`);
+    });
+    if (group.length === 0) continue;
+
+    for (const file of group) claimed.add(file.path);
+    const name = pathBasename(source) || nextPlaylistName();
+    const id = ensurePlaylist(name, { select: true });
+    trackCount += mergeTracksIntoPlaylist(id, group);
+    playlistCount += 1;
+    names.push(name);
+    lastId = id;
+  }
+
+  const rest = files.filter((file) => !claimed.has(file.path));
+  if (rest.length > 0) {
+    const name = nextPlaylistName();
+    const id = ensurePlaylist(name, { select: true });
+    trackCount += mergeTracksIntoPlaylist(id, rest);
+    playlistCount += 1;
+    names.push(name);
+    lastId = id;
+  }
+
+  if (lastId) {
+    activePlaylistId = lastId;
+  }
+
+  return { playlists: playlistCount, tracks: trackCount, names };
+}
+
 async function addFolderToActivePlaylist(directory: string) {
   if (!activePlaylistId) return;
 
@@ -1845,6 +2002,8 @@ export function createPlayerStore() {
     addFolderToActivePlaylist,
     addDroppedPaths,
     addScannedTracks,
+    createPlaylistsFromDroppedPaths,
+    createPlaylistsFromScannedTracks,
 
     // Player actions
     play,

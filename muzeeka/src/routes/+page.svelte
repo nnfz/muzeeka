@@ -199,7 +199,7 @@
 
       e.preventDefault();
 
-      const step = 0.05;
+      const step = 0.01;
       const delta = e.deltaY < 0 ? step : -step;
       void player.setVolume(Math.max(0, Math.min(1, player.volume + delta)));
 

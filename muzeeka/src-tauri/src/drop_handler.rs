@@ -153,6 +153,17 @@ pub struct DroppedTracksPayload {
     pub files: Vec<library::MusicFile>,
     pub position: [f64; 2],
     pub message: Option<String>,
+    /// Original drop paths (files and/or folders), before scanning.
+    #[serde(default)]
+    pub paths: Vec<String>,
+}
+
+/// Hover state while dragging files over the window (physical pixel coords).
+#[derive(Clone, Serialize)]
+pub struct DragActivePayload {
+    pub active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position: Option<[f64; 2]>,
 }
 
 fn effective_paths(drop_paths: &[PathBuf], fallback: &[PathBuf]) -> Vec<String> {
@@ -174,41 +185,52 @@ fn effective_paths(drop_paths: &[PathBuf], fallback: &[PathBuf]) -> Vec<String> 
 }
 
 fn emit_drop_result(window: &Window, position: [f64; 2], paths: Vec<String>) {
+    let source_paths = paths.clone();
     let payload = match library::scan_paths(&paths) {
         Ok(files) if files.is_empty() => DroppedTracksPayload {
             files,
             position,
             message: Some("No supported audio files found".into()),
+            paths: source_paths,
         },
         Ok(files) => DroppedTracksPayload {
             files,
             position,
             message: None,
+            paths: source_paths,
         },
         Err(error) => DroppedTracksPayload {
             files: Vec::new(),
             position,
             message: Some(error),
+            paths: source_paths,
         },
     };
 
     let _ = window.emit("muzeeka:dropped-tracks", &payload);
 }
 
+fn emit_drag_active(window: &Window, active: bool, position: Option<[f64; 2]>) {
+    let _ = window.emit(
+        "muzeeka:drag-active",
+        &DragActivePayload { active, position },
+    );
+}
+
 fn handle_drag_drop(window: &Window, state: &DropState, drag: &DragDropEvent) {
     let export_state = window.state::<ExportDragState>();
 
     match drag {
-        DragDropEvent::Enter { paths, .. } => {
+        DragDropEvent::Enter { paths, position } => {
             *state.last_paths.lock() = paths.clone();
             let entered: Vec<String> = paths
                 .iter()
                 .map(|path| path.to_string_lossy().into_owned())
                 .collect();
             let active = !export_state.should_suppress_import_ui(&entered);
-            let _ = window.emit("muzeeka:drag-active", active);
+            emit_drag_active(window, active, Some([position.x, position.y]));
         }
-        DragDropEvent::Over { .. } => {
+        DragDropEvent::Over { position } => {
             let entered: Vec<String> = state
                 .last_paths
                 .lock()
@@ -216,14 +238,14 @@ fn handle_drag_drop(window: &Window, state: &DropState, drag: &DragDropEvent) {
                 .map(|path| path.to_string_lossy().into_owned())
                 .collect();
             if !export_state.should_suppress_import_ui(&entered) {
-                let _ = window.emit("muzeeka:drag-active", true);
+                emit_drag_active(window, true, Some([position.x, position.y]));
             }
         }
         DragDropEvent::Drop { paths, position } => {
             let fallback = state.last_paths.lock().clone();
             let resolved = effective_paths(paths, &fallback);
             state.last_paths.lock().clear();
-            let _ = window.emit("muzeeka:drag-active", false);
+            emit_drag_active(window, false, None);
 
             if resolved.is_empty() {
                 let _ = window.emit(
@@ -232,6 +254,7 @@ fn handle_drag_drop(window: &Window, state: &DropState, drag: &DragDropEvent) {
                         files: Vec::new(),
                         position: [position.x, position.y],
                         message: Some("Could not read dropped files or folders".into()),
+                        paths: Vec::new(),
                     },
                 );
                 return;
@@ -246,7 +269,7 @@ fn handle_drag_drop(window: &Window, state: &DropState, drag: &DragDropEvent) {
         }
         DragDropEvent::Leave => {
             state.last_paths.lock().clear();
-            let _ = window.emit("muzeeka:drag-active", false);
+            emit_drag_active(window, false, None);
         }
         _ => {}
     }

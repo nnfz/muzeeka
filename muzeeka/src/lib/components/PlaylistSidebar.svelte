@@ -4,6 +4,7 @@
   import { openContextMenuFromEvent, type ContextMenuItem } from '$lib/contextMenu';
   import { resolvePlaylistCoverTrack } from '$lib/playlistCover';
   import { getPlayerStore, type Playlist, VIRTUAL_ALL_ID, VIRTUAL_LIKED_ID } from '$lib/stores/player.svelte';
+  import { externalDrop } from '$lib/stores/externalDrop.svelte';
   import { trackDrag } from '$lib/stores/trackDrag.svelte';
   import { open } from '@tauri-apps/plugin-dialog';
 
@@ -220,6 +221,13 @@
 <aside
   class="sidebar glass"
   class:resizing={isResizing}
+  class:external-create-target={
+    externalDrop.active && externalDrop.zone === 'sidebar' && !externalDrop.ctrlHeld
+  }
+  class:external-import-target={
+    externalDrop.active && externalDrop.zone === 'sidebar' && externalDrop.ctrlHeld
+  }
+  data-playlist-sidebar
   style:width="{sidebarWidth}px"
 >
   <div class="sidebar-header">
@@ -325,7 +333,12 @@
           class:active={isActive}
           class:playing={isPlayingFrom}
           class:has-current={hasCurrentStopped}
-          class:drop-target={trackDrag.isDraggingTracks && trackDrag.copyTargetPlaylistId === playlist.id}
+          class:drop-target={
+            (trackDrag.isDraggingTracks && trackDrag.copyTargetPlaylistId === playlist.id) ||
+            (externalDrop.active &&
+              externalDrop.ctrlHeld &&
+              externalDrop.targetPlaylistId === playlist.id)
+          }
           data-playlist-id={playlist.id}
           data-playlist-name={playlist.name}
           onmouseenter={() => (hoveredPlaylistId = playlist.id)}
