@@ -60,7 +60,7 @@
   font-size: 12px;
   font-family: var(--font-family);
   outline: none;
-  font-weight: 100;
+  font-weight: 300;
 }
 
 .search-input::placeholder {
