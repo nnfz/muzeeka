@@ -8,6 +8,7 @@
   import SettingsWindow from '$lib/components/SettingsWindow.svelte';
   import DownloadWindow from '$lib/components/DownloadWindow.svelte';
   import SearchBar from '$lib/components/SearchBar.svelte';
+  import ImportProgressBar from '$lib/components/ImportProgressBar.svelte';
   import { precreateDownloadWindow } from '$lib/stores/download.svelte';
   import { invoke } from '@tauri-apps/api/core';
   import { getPlayerStore } from '$lib/stores/player.svelte';
@@ -231,6 +232,7 @@
   <DownloadWindow />
 {:else}
   <div class="app-layout">
+    <ImportProgressBar />
     <header class="app-header glass">
       <SearchBar bind:searchQuery />
 

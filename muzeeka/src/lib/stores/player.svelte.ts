@@ -4,6 +4,12 @@ import { setupTaskbar } from '$lib/taskbar';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
+import { setImportProgress, resetImportProgress } from '$lib/stores/importProgress.svelte';
+
+// Yield to the browser event loop so the UI stays responsive
+function yieldToUI() {
+  return new Promise<void>((resolve) => queueMicrotask(resolve));
+}
 
 // --- Types ---
 
@@ -1048,7 +1054,6 @@ function mergeTracksIntoPlaylist(playlistId: string, files: MusicFile[]): number
   if (shuffleEnabled) rebuildShuffleOrder(currentTrackIndex >= 0);
   prefetchCoverPaths(newTracks.map((track) => track.cover_path));
   scheduleSave();
-  void enrichTrackMetadata();
   return newTracks.length;
 }
 
@@ -1116,7 +1121,13 @@ async function createPlaylistsFromDroppedPaths(
   const filePaths: string[] = [];
   let lastId: string | null = null;
 
-  for (const path of normalizedPaths) {
+  // Count directory paths for progress
+  const dirPaths = normalizedPaths.filter((p) => !looksLikeMediaFile(p));
+  const dirCount = dirPaths.length;
+  const CHUNK_SIZE = 5;
+
+  for (let i = 0; i < normalizedPaths.length; i++) {
+    const path = normalizedPaths[i];
     if (looksLikeMediaFile(path)) {
       filePaths.push(path);
       continue;
@@ -1135,10 +1146,18 @@ async function createPlaylistsFromDroppedPaths(
       // Not a directory — treat as a file path
       filePaths.push(path);
     }
+
+    // Report progress and yield to UI every CHUNK_SIZE dirs
+    const progress = Math.floor(((i + 1) / Math.max(dirCount, 1)) * 100);
+    setImportProgress({ active: true, current: i + 1, total: Math.max(dirCount, 1), label: pathBasename(path) });
+    if ((i + 1) % CHUNK_SIZE === 0) {
+      await yieldToUI();
+    }
   }
 
   if (filePaths.length > 0) {
     try {
+      setImportProgress({ active: true, total: 1, label: 'Processing files...' });
       const files: MusicFile[] = await invoke('library_scan_paths', { paths: filePaths });
       if (files.length > 0) {
         const name = nextPlaylistName();
@@ -1149,6 +1168,8 @@ async function createPlaylistsFromDroppedPaths(
         names.push(name);
         lastId = id;
       }
+      setImportProgress({ active: true, current: 1, total: 1, label: 'Finishing up...' });
+      await yieldToUI();
     } catch (e) {
       console.error('Failed to create playlist from dropped files:', e);
     }
@@ -1158,6 +1179,12 @@ async function createPlaylistsFromDroppedPaths(
     activePlaylistId = lastId;
   }
 
+  // Batch metadata enrichment once at the end
+  if (trackCount > 0) {
+    await enrichTrackMetadata();
+  }
+
+  resetImportProgress();
   return { playlists: playlistCount, tracks: trackCount, names };
 }
 
@@ -1227,10 +1254,17 @@ async function addFolderToActivePlaylist(directory: string) {
   if (!activePlaylistId) return;
 
   try {
+    setImportProgress({ active: true, current: 0, total: 1, label: 'Scanning folder...' });
+    await yieldToUI();
     const files: MusicFile[] = await invoke('library_scan', { directory });
-    mergeTracksIntoPlaylist(activePlaylistId, files);
+    const added = mergeTracksIntoPlaylist(activePlaylistId, files);
+    if (added > 0) {
+      await enrichTrackMetadata();
+    }
+    resetImportProgress();
   } catch (e) {
     console.error('Failed to add folder to playlist:', e);
+    resetImportProgress();
   }
 }
 
@@ -1239,10 +1273,23 @@ async function addDroppedPaths(paths: string[], playlistId?: string | null) {
   if (normalizedPaths.length === 0) return 0;
 
   try {
+    setImportProgress({ active: true, current: 0, total: 1, label: 'Scanning files...' });
+    await yieldToUI();
     const files: MusicFile[] = await invoke('library_scan_paths', { paths: normalizedPaths });
-    return addScannedTracks(files, playlistId);
+    setImportProgress({ active: true, current: 1, total: 1, label: 'Adding to playlist...' });
+    await yieldToUI();
+    const added = addScannedTracks(files, playlistId);
+
+    // Batch metadata enrichment once
+    if (added > 0) {
+      await enrichTrackMetadata();
+    }
+
+    resetImportProgress();
+    return added;
   } catch (e) {
     console.error('Failed to add dropped paths:', e);
+    resetImportProgress();
     return 0;
   }
 }
