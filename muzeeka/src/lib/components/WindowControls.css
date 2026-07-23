@@ -17,7 +17,7 @@
 }
 
 .win-btn:hover {
-  background: rgba(255, 255, 255, 0.08);
+  background: var(--bg-glass-hover);
   color: var(--text-primary);
 }
 

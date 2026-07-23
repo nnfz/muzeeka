@@ -15,37 +15,38 @@
 @property --accent {
   syntax: '<color>';
   inherits: true;
-  initial-value: #8b5cf6;
+  initial-value: var(--accent);
 }
 @property --accent-hover {
   syntax: '<color>';
   inherits: true;
-  initial-value: #7c3aed;
+  initial-value: var(--accent-hover);
 }
 @property --accent-glow {
   syntax: '<color>';
   inherits: true;
-  initial-value: rgba(139, 92, 246, 0.35);
+  initial-value: var(--accent-glow);
 }
 @property --accent-soft {
   syntax: '<color>';
   inherits: true;
-  initial-value: rgba(139, 92, 246, 0.12);
+  initial-value: var(--accent-soft);
 }
 @property --border-accent {
   syntax: '<color>';
   inherits: true;
-  initial-value: rgba(139, 92, 246, 0.25);
+  initial-value: var(--border-accent);
 }
 
 /* --- CSS Custom Properties --- */
 :root {
   /* Background palette */
-  --bg-deep: #0a0a0f;
-  --bg-surface: #111118;
-  --bg-elevated: #1a1a24;
-  --bg-glass: rgba(17, 17, 24, 0.65);
-  --bg-glass-hover: rgba(26, 26, 36, 0.75);
+  --bg-deep: #0a0a0a;
+  --bg-surface: #111111;
+  --bg-elevated: #1a1a1a;
+  --bg-glass: rgba(18, 18, 18);
+  --bg-glass-hover: rgba(26, 26, 26);
+
 
   /* Accent palette (overridden from cover via coverAccent.ts) */
   --accent: #8b5cf6;
@@ -140,12 +141,13 @@ body.track-table-resizing {
 }
 
 ::-webkit-scrollbar-thumb {
-  background: rgba(139, 92, 246, 0.25);
+  background: rgba(28, 28, 28);
   border-radius: var(--radius-full);
+  transition: var(--transition-normal);
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(139, 92, 246, 0.45);
+  background: rgba(38, 38, 38);
 }
 
 /* Fullscreen: layer header + transport controls above overlay without moving layout */
@@ -171,9 +173,10 @@ html.fullscreen-active .header-btn {
 
 html.fullscreen-active .header-btn:hover {
   color: var(--text-primary);
-  background: rgba(255, 255, 255, 0.1);
+  background: rgba(225, 225, 225, 0.1);
   backdrop-filter: saturate(130%);
 }
+
 
 html.fullscreen-active .transport-bar {
   visibility: hidden;
@@ -183,8 +186,6 @@ html.fullscreen-active .transport-bar {
 /* --- Glassmorphism utility --- */
 .glass {
   background: var(--bg-glass);
-  backdrop-filter: blur(20px) saturate(1.2);
-  -webkit-backdrop-filter: blur(20px) saturate(1.2);
 }
 
 /* --- Animations --- */

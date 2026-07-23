@@ -1,8 +1,3 @@
-/**
- * Extract the juiciest (most vibrant) color from a cover image
- * and push it into the global CSS accent variables.
- */
-
 const DEFAULT_ACCENT = {
   accent: '#8b5cf6',
   hover: '#7c3aed',
@@ -75,26 +70,19 @@ function toHex(r: number, g: number, b: number): string {
   );
 }
 
-/** Score how “juicy” a pixel is — high sat, mid lightness wins. */
 function juicyScore(r: number, g: number, b: number): number {
   const [, s, l] = rgbToHsl(r, g, b);
   if (s < 0.18) return 0;
   if (l < 0.08 || l > 0.92) return 0;
-  // Prefer vivid mid-tones (not muddy darks / pastel lights)
   const lightPref = 1 - Math.abs(l - 0.48) * 1.4;
   if (lightPref <= 0) return 0;
-  // Saturation squared emphasizes the “juiciest”
   return s * s * lightPref * (0.55 + s * 0.45);
 }
 
-/**
- * Nudge extracted color so it works as a UI accent on a dark theme:
- * keep hue, boost saturation a bit, clamp lightness.
- */
 function tuneForAccent(r: number, g: number, b: number): [number, number, number] {
   let [h, s, l] = rgbToHsl(r, g, b);
-  s = clamp01(Math.max(s, 0.52) * 1.08);
-  l = clamp01(Math.min(0.62, Math.max(0.42, l)));
+  s = clamp01(Math.max(s, 0.65) * 1.25);
+  l = clamp01(Math.min(0.66, Math.max(0.46, l)) * 1.06);
   return hslToRgb(h, s, l);
 }
 
@@ -131,7 +119,6 @@ export function resetCoverAccent() {
 function loadImage(src: string): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
     const img = new Image();
-    // Asset / convertFileSrc URLs are same-origin in Tauri; data: needs no CORS.
     if (!src.startsWith('data:')) {
       img.crossOrigin = 'anonymous';
     }
@@ -141,9 +128,6 @@ function loadImage(src: string): Promise<HTMLImageElement> {
   });
 }
 
-/**
- * Sample a downscaled cover and return the juiciest RGB, or null.
- */
 export async function extractVibrantFromCover(
   imageSrc: string,
 ): Promise<[number, number, number] | null> {
@@ -160,11 +144,9 @@ export async function extractVibrantFromCover(
   try {
     data = ctx.getImageData(0, 0, size, size);
   } catch {
-    // Tainted canvas — can't sample
     return null;
   }
 
-  // Quantize into buckets so we pick a dominant juicy cluster, not a single noisy pixel.
   const buckets = new Map<string, { r: number; g: number; b: number; score: number; n: number }>();
 
   const { data: px } = data;
@@ -177,7 +159,6 @@ export async function extractVibrantFromCover(
     const score = juicyScore(r, g, b);
     if (score <= 0) continue;
 
-    // 5-bit quantization (~32 levels)
     const key = `${r >> 3},${g >> 3},${b >> 3}`;
     const bucket = buckets.get(key);
     if (bucket) {
@@ -192,7 +173,6 @@ export async function extractVibrantFromCover(
   }
 
   if (buckets.size === 0) {
-    // Fallback: average mid-tone non-extreme pixels
     let sr = 0;
     let sg = 0;
     let sb = 0;
@@ -215,7 +195,6 @@ export async function extractVibrantFromCover(
 
   let best: { r: number; g: number; b: number; score: number; n: number } | null = null;
   for (const bucket of buckets.values()) {
-    // Weight by total juicy score (frequency * vibrance)
     if (!best || bucket.score > best.score) best = bucket;
   }
   if (!best) return null;
@@ -226,10 +205,6 @@ export async function extractVibrantFromCover(
   ];
 }
 
-/**
- * Update global accent from a cover image URL (asset path, convertFileSrc, or data URL).
- * Pass null to restore the default purple.
- */
 export async function setAccentFromCoverSrc(src: string | null | undefined) {
   const next = src?.trim() || null;
   if (next === lastSrc) return;
@@ -245,12 +220,10 @@ export async function setAccentFromCoverSrc(src: string | null | undefined) {
     const rgb = await extractVibrantFromCover(next);
     if (token !== applyToken) return;
     if (!rgb) {
-      // Keep previous accent if sampling failed mid-track
       return;
     }
     applyRgb(rgb[0], rgb[1], rgb[2]);
   } catch {
     if (token !== applyToken) return;
-    // Leave current accent; don't thrash to default on one bad load
   }
 }

@@ -24,14 +24,19 @@
   min-height: 0;
   display: flex;
   flex-direction: column;
-  padding: 0 8px;
+  padding: 0;
   justify-content: center;
 }
 
 /* --- Table layout --- */
 
+.track-list-rows {
+  padding: 8px;
+}
+
+
 .track-table {
-  --col-gap: 16px;
+  --col-gap: 6px;
   display: flex;
   flex-direction: column;
   flex: 1;
@@ -40,29 +45,26 @@
 }
 
 .track-table-header {
+  box-sizing: border-box;
   display: grid;
   column-gap: var(--col-gap);
   align-items: center;
-  flex-shrink: 0;
-  position: relative;
-  z-index: 2;
   height: 36px;
-  margin: 0 -8px;
   padding: 0 8px;
+  background: var(--bg-elevated);
   border-bottom: 1px solid var(--border-subtle);
-  background: rgba(17, 17, 24, 0.55);
-  backdrop-filter: saturate(180%) blur(20px);
-  -webkit-backdrop-filter: saturate(180%) blur(20px);
   overflow: visible;
+  flex-shrink: 0;
+  scrollbar-gutter: stable;
 }
 
 .track-rows {
+  box-sizing: border-box;
   flex: 1;
-  margin-right: -8px;
-  padding: 8px 8px 8px 0;
   min-height: 0;
   overflow-y: auto;
   overflow-x: hidden;
+  scrollbar-gutter: stable;
 }
 
 .header-cell {
@@ -77,14 +79,23 @@
 }
 
 .header-cell.col-index {
-  padding-left: 12px;
-  box-sizing: border-box;
+  padding-left: 0;
+  justify-content: center;
 }
 
-.header-cell.col-duration {
+.header-cell.col-index .sort-btn {
+  width: 26px;
+  aspect-ratio: 1;
+  padding: 0;
+  justify-content: center;
+}
+
+.header-cell.col-duration .sort-btn {
+  width: 26px;
+  aspect-ratio: 1;
+  padding: 0;
+  margin-left: auto;
   justify-content: flex-end;
-  padding-right: 22px;
-  box-sizing: border-box;
 }
 
 .sort-btn {
@@ -92,15 +103,13 @@
   align-items: center;
   gap: 4px;
   min-width: 0;
-  padding: 4px 6px;
   border: none;
   border-radius: var(--radius-mini);
   background: transparent;
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 500;
   font-family: var(--font-family);
   letter-spacing: 0.04em;
-  text-transform: uppercase;
   color: var(--text-muted);
   cursor: pointer;
   transition: color var(--transition-fast), background var(--transition-fast);
@@ -108,7 +117,6 @@
 
 .sort-btn:hover {
   color: var(--text-secondary);
-  background: rgba(255, 255, 255, 0.05);
 }
 
 .sort-btn.sorted {
@@ -159,6 +167,8 @@
 }
 
 .track-row {
+  box-sizing: border-box;
+  padding: 0;
   display: grid;
   column-gap: var(--col-gap);
   align-items: center;
@@ -209,7 +219,6 @@
   justify-content: center;
   position: relative;
   height: 24px;
-  padding-left: 12px;
   box-sizing: border-box;
 }
 
@@ -217,6 +226,7 @@
   font-size: 13px;
   color: var(--text-muted);
   font-weight: 400;
+  text-align: right;
   font-variant-numeric: tabular-nums;
   transition: opacity var(--transition-fast);
 }
@@ -342,7 +352,6 @@
   font-size: 13px;
   color: var(--text-muted);
   font-variant-numeric: tabular-nums;
-  padding-right: 18px;
   box-sizing: border-box;
 }
 
@@ -418,7 +427,6 @@
 .like-btn:hover {
   opacity: 1;
   color: #e25555;
-  background: rgba(226, 85, 85, 0.1);
 }
 
 .like-btn.liked {

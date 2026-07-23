@@ -233,7 +233,7 @@
 {:else}
   <div class="app-layout">
     <ImportProgressBar />
-    <header class="app-header glass">
+    <header class="app-header">
       <SearchBar bind:searchQuery />
 
       {#if fullscreenOpen}

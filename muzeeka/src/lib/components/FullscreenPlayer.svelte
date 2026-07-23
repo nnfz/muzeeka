@@ -563,7 +563,6 @@
               <div class="fullscreen-title-wrapper" bind:this={titleRef} class:marquee-active={titleRef && titleRef.scrollWidth > titleRef.clientWidth}>
                 <h2 class="fullscreen-title">
                   {player.currentTrack ? trackDisplayTitle(player.currentTrack) : player.currentFileName ?? ''}
-                  {player.currentTrack ? trackDisplayTitle(player.currentTrack) : player.currentFileName ?? ''}
                 </h2>
               </div>
               {#if player.currentTrack}
