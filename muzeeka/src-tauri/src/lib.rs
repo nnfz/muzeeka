@@ -35,6 +35,7 @@ use drop_handler::{handle_window_event, DropState, ExportDragState};
 
 use player::Player;
 use remote_control::RemoteController;
+use remote_server::RemoteServer;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -253,7 +254,16 @@ pub fn run() {
             ));
             app.manage(remote_controller.clone());
             taskbar_handler::setup(app.handle(), remote_controller.clone());
-            remote_server::start(remote_controller);
+
+            let (remote_enabled, remote_port) =
+                if let Ok(app_settings) = settings::load_settings(&app.handle()) {
+                    (app_settings.remote_enabled, app_settings.remote_port)
+                } else {
+                    (true, remote_server::DEFAULT_REMOTE_PORT)
+                };
+            let remote_http =
+                RemoteServer::new(remote_controller, remote_enabled, remote_port);
+            app.manage(remote_http);
 
             Ok(())
         })
@@ -275,6 +285,7 @@ pub fn run() {
             commands::load_addon,
             commands::settings_load,
             commands::settings_save,
+            commands::remote_status,
             commands::input_is_ctrl_held,
             commands::library_scan,
             commands::library_scan_paths,
@@ -287,6 +298,7 @@ pub fn run() {
             commands::lyrics_clear,
             commands::lyrics_refetch,
             commands::playlists_load,
+            commands::playlists_list_meta,
             commands::playlists_save,
             commands::playlist_cache_cover,
             commands::playlist_cache_cover_url,

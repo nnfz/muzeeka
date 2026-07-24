@@ -23,22 +23,6 @@
   accent-color: var(--accent);
 }
 
-.eq-badge {
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: var(--text-secondary);
-  background: rgba(255, 255, 255, 0.06);
-  padding: 4px 8px;
-  border-radius: var(--radius-sm);
-}
-
-.eq-badge--active {
-  color: var(--accent);
-  background: var(--accent-soft);
-}
-
 .eq-reset {
   margin-left: auto;
   padding: 6px 12px;
@@ -59,7 +43,6 @@
   display: flex;
   align-items: center;
   gap: 6px;
-  margin-left: 8px;
 }
 
 .eq-presets-label {
@@ -122,9 +105,9 @@
   overflow-y: auto;
   padding: 4px;
   border-radius: var(--radius-sm);
-  background: var(--bg-glass);
-  backdrop-filter: blur(16px) saturate(1.2);
-  -webkit-backdrop-filter: blur(16px) saturate(1.2);
+  background: var(--bg-glass-hover-transp);
+  backdrop-filter: blur(16px) saturate(130%);
+  -webkit-backdrop-filter: blur(16px) saturate(130%);
   border: 1px solid var(--border-subtle);
   box-shadow: var(--shadow-md);
   animation: fade-in 0.1s ease;
@@ -265,10 +248,11 @@
   display: flex;
   align-items: flex-end;
   gap: 6px;
+  justify-content: space-between;
   height: 220px;
   padding: 12px 8px;
   border-radius: var(--radius-md);
-  background: rgba(0, 0, 0, 0.25);
+  background: var(--bg-elevated);
   border: 1px solid var(--border-subtle);
   overflow-x: auto;
 }
@@ -278,7 +262,6 @@
   flex-direction: column;
   align-items: center;
   gap: 6px;
-  min-width: 36px;
   height: 100%;
 }
 
@@ -289,37 +272,67 @@
   border-right: 1px solid var(--border-subtle);
 }
 
+/* Seekbar-style vertical faders: muted track + solid accent fill + white thumb */
 .eq-slider {
   flex: 1;
   width: 4px;
   margin: 0;
   appearance: none;
-  background: rgba(255, 255, 255, 0.08);
+  -webkit-appearance: none;
   border-radius: var(--radius-full);
   cursor: pointer;
   writing-mode: vertical-lr;
   direction: rtl;
-}
-
-.eq-slider::-webkit-slider-thumb {
-  appearance: none;
-  width: 14px;
-  height: 14px;
-  border-radius: 50%;
-  background: #fff;
-  box-shadow: 0 0 8px var(--accent-glow), 0 2px 4px rgba(0, 0, 0, 0.4);
-  border: 2px solid var(--accent);
-}
-
-.eq-slider::-webkit-slider-runnable-track {
-  width: 4px;
-  border-radius: var(--radius-full);
+  /* Hard cut fill (not a soft gradient), same idea as .slider-fill */
   background: linear-gradient(
     to top,
     var(--accent) 0%,
-    rgba(255, 255, 255, 0.12) 50%,
-    var(--accent) 100%
+    var(--accent) var(--fill, 50%),
+    rgba(255, 255, 255, 0.08) var(--fill, 50%),
+    rgba(255, 255, 255, 0.08) 100%
   );
+}
+
+
+.eq-slider::-webkit-slider-runnable-track {
+  width: 100%;
+  height: 100%;
+  border-radius: var(--radius-full);
+  background: transparent;
+}
+
+.eq-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 12px;
+  height: 12px;
+  margin-left: -4px;
+  border-radius: 50%;
+  background: #fff;
+  border: none;
+  box-shadow: 0 0 8px var(--accent-glow), 0 2px 4px rgba(0, 0, 0, 0.3);
+  transition: transform var(--transition-fast), box-shadow var(--transition-fast);
+}
+
+.eq-slider:hover::-webkit-slider-thumb,
+.eq-slider:active::-webkit-slider-thumb {
+  transform: scale(1.15);
+}
+
+.eq-slider::-moz-range-track {
+  width: 4px;
+  border-radius: var(--radius-full);
+  background: transparent;
+  border: none;
+}
+
+.eq-slider::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #fff;
+  border: none;
+  box-shadow: 0 0 8px var(--accent-glow), 0 2px 4px rgba(0, 0, 0, 0.3);
 }
 
 .eq-gain {

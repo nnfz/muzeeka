@@ -6,6 +6,16 @@ const DEFAULT_ACCENT = {
   border: 'rgba(139, 92, 246, 0.25)',
 };
 
+const ACCENT_STORAGE_KEY = 'muzeeka:accent';
+
+export type AccentPalette = {
+  accent: string;
+  hover: string;
+  glow: string;
+  soft: string;
+  border: string;
+};
+
 let applyToken = 0;
 let lastSrc: string | null = null;
 
@@ -94,26 +104,62 @@ function darken(r: number, g: number, b: number, amount: number): [number, numbe
   ];
 }
 
+function writeAccentVars(palette: AccentPalette) {
+  const root = document.documentElement;
+  root.style.setProperty('--accent', palette.accent);
+  root.style.setProperty('--accent-hover', palette.hover);
+  root.style.setProperty('--accent-glow', palette.glow);
+  root.style.setProperty('--accent-soft', palette.soft);
+  root.style.setProperty('--border-accent', palette.border);
+}
+
+/** Apply accent CSS vars (used by secondary windows + main). */
+export function applyAccentPalette(palette: AccentPalette, opts?: { persist?: boolean }) {
+  writeAccentVars(palette);
+  if (opts?.persist === false) return;
+  try {
+    localStorage.setItem(ACCENT_STORAGE_KEY, JSON.stringify(palette));
+  } catch {
+    // ignore quota / private mode
+  }
+  // Broadcast to other webviews (settings window).
+  void import('@tauri-apps/api/event')
+    .then(({ emit }) => emit('muzeeka:accent', palette))
+    .catch(() => {});
+}
+
+/** Restore last accent from storage (settings / download windows). */
+export function hydrateAccentFromStorage(): boolean {
+  try {
+    const raw = localStorage.getItem(ACCENT_STORAGE_KEY);
+    if (!raw) return false;
+    const parsed = JSON.parse(raw) as Partial<AccentPalette>;
+    if (!parsed?.accent || !parsed.hover || !parsed.glow || !parsed.soft || !parsed.border) {
+      return false;
+    }
+    writeAccentVars(parsed as AccentPalette);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function applyRgb(r: number, g: number, b: number) {
   const [tr, tg, tb] = tuneForAccent(r, g, b);
   const [hr, hg, hb] = darken(tr, tg, tb, 0.12);
-  const root = document.documentElement;
-  root.style.setProperty('--accent', toHex(tr, tg, tb));
-  root.style.setProperty('--accent-hover', toHex(hr, hg, hb));
-  root.style.setProperty('--accent-glow', `rgba(${tr}, ${tg}, ${tb}, 0.35)`);
-  root.style.setProperty('--accent-soft', `rgba(${tr}, ${tg}, ${tb}, 0.12)`);
-  root.style.setProperty('--border-accent', `rgba(${tr}, ${tg}, ${tb}, 0.25)`);
+  applyAccentPalette({
+    accent: toHex(tr, tg, tb),
+    hover: toHex(hr, hg, hb),
+    glow: `rgba(${tr}, ${tg}, ${tb}, 0.35)`,
+    soft: `rgba(${tr}, ${tg}, ${tb}, 0.12)`,
+    border: `rgba(${tr}, ${tg}, ${tb}, 0.25)`,
+  });
 }
 
 export function resetCoverAccent() {
   applyToken += 1;
   lastSrc = null;
-  const root = document.documentElement;
-  root.style.setProperty('--accent', DEFAULT_ACCENT.accent);
-  root.style.setProperty('--accent-hover', DEFAULT_ACCENT.hover);
-  root.style.setProperty('--accent-glow', DEFAULT_ACCENT.glow);
-  root.style.setProperty('--accent-soft', DEFAULT_ACCENT.soft);
-  root.style.setProperty('--border-accent', DEFAULT_ACCENT.border);
+  applyAccentPalette({ ...DEFAULT_ACCENT });
 }
 
 function loadImage(src: string): Promise<HTMLImageElement> {

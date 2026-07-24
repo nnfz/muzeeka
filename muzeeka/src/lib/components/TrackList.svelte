@@ -402,6 +402,22 @@
     return items.sort((a, b) => compareTracks(a, b, sortColumn!) * dir);
   });
 
+  // Keep next/prev + gapless in sync with the table's visible (sorted) order.
+  $effect(() => {
+    const playlistId = player.activePlaylistId;
+    if (!playlistId) {
+      player.setViewPlayOrder(null, null);
+      return;
+    }
+    if (!sortColumn) {
+      // Viewing this playlist unsorted — restore natural order if it is playing.
+      player.setViewPlayOrder(playlistId, null);
+      return;
+    }
+    const paths = displayedTracks.map((item) => item.track.path);
+    player.setViewPlayOrder(playlistId, paths);
+  });
+
   const HEADER_HEIGHT = 36;
 
   let visibleRange = $derived.by(() => {

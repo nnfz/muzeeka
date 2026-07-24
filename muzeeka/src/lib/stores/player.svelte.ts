@@ -113,6 +113,19 @@ let lastGaplessQueuePaths: string[] = [];
 let lastPauseRequestAt = 0;
 let applyingExternalSync = false;
 let listenersSetup = false;
+/**
+ * Table sort / display order for the playlist currently shown in the track list.
+ * Used to seed playback order when that same playlist is playing.
+ * (Plain lets: only read synchronously in adopt/setView, not inside $derived.)
+ */
+let viewOrderPlaylistId: string | null = null;
+let viewOrderPaths: string[] | null = null;
+/**
+ * Active next/prev (and gapless) order for the playing playlist, when overridden by table sort.
+ * Must be $state so `playingTracks` $derived re-runs when sort order changes.
+ */
+let playOrderPlaylistId = $state<string | null>(null);
+let playOrderPaths = $state<string[] | null>(null);
 
 const PAUSE_FADE_GUARD_MS = 350;
 
@@ -269,11 +282,51 @@ let playingPlaylist = $derived(
   playingPlaylistId ? (playlistById.get(playingPlaylistId) ?? null) : null
 );
 
-let playingTracks = $derived.by(() => {
-  if (!playingPlaylistId) return [];
+function samePathOrder(a: string[] | null, b: string[] | null): boolean {
+  if (a === b) return true;
+  if (!a || !b || a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
+/** Reorder `tracks` to follow `orderPaths`; unknown paths are dropped, new tracks append. */
+function applyPathOrder(tracks: MusicFile[], orderPaths: string[]): MusicFile[] {
+  if (orderPaths.length === 0 || tracks.length === 0) return tracks;
+  const byPath = new Map(tracks.map((track) => [track.path, track]));
+  const ordered: MusicFile[] = [];
+  const seen = new Set<string>();
+  for (const path of orderPaths) {
+    const track = byPath.get(path);
+    if (!track || seen.has(path)) continue;
+    ordered.push(track);
+    seen.add(path);
+  }
+  if (ordered.length === tracks.length) return ordered;
+  for (const track of tracks) {
+    if (!seen.has(track.path)) ordered.push(track);
+  }
+  return ordered;
+}
+
+let playingTracksBase = $derived.by(() => {
+  if (!playingPlaylistId) return [] as MusicFile[];
   if (playingPlaylistId === VIRTUAL_ALL_ID) return allTracks;
   if (playingPlaylistId === VIRTUAL_LIKED_ID) return likedTracks;
   return playlistById.get(playingPlaylistId)?.tracks ?? [];
+});
+
+let playingTracks = $derived.by(() => {
+  const base = playingTracksBase;
+  if (
+    playOrderPaths &&
+    playOrderPlaylistId &&
+    playOrderPlaylistId === playingPlaylistId
+  ) {
+    return applyPathOrder(base, playOrderPaths);
+  }
+  return base;
 });
 
 // Search across ALL playlists so metadata survives playlist switches
@@ -492,6 +545,54 @@ function syncTrackIndex() {
   syncShufflePosition();
 }
 
+/**
+ * Override next/prev/gapless order for a playlist (table sort).
+ * Pass `paths: null` to restore the playlist's natural order.
+ * Returns true when the active play order actually changed.
+ */
+function setPlaybackOrder(playlistId: string | null, paths: string[] | null): boolean {
+  const nextId = playlistId && paths && paths.length > 0 ? playlistId : null;
+  const nextPaths = nextId ? [...paths!] : null;
+  if (playOrderPlaylistId === nextId && samePathOrder(playOrderPaths, nextPaths)) {
+    return false;
+  }
+  playOrderPlaylistId = nextId;
+  playOrderPaths = nextPaths;
+  syncTrackIndex();
+  if (shuffleEnabled) {
+    rebuildShuffleOrder(currentTrackIndex >= 0);
+    syncShufflePosition();
+  }
+  return true;
+}
+
+/**
+ * Report the track list's current display order (after table sort).
+ * When that playlist is the one playing, next/prev and gapless follow it.
+ */
+function setViewPlayOrder(playlistId: string | null, paths: string[] | null) {
+  viewOrderPlaylistId = playlistId;
+  viewOrderPaths = paths && paths.length > 0 ? [...paths] : null;
+
+  // Only rewrite the live play queue when the user is looking at the playing list.
+  // Switching to another playlist must not clobber the order of what's already playing.
+  if (playlistId != null && playlistId === playingPlaylistId) {
+    const changed = setPlaybackOrder(playlistId, viewOrderPaths);
+    if (changed && currentFile && (isPlaying || isPaused)) {
+      void prepareGaplessNext(currentFile);
+    }
+  }
+}
+
+/** After `playingPlaylistId` is set for a play request, adopt the table order if it matches. */
+function adoptViewOrderForPlayingPlaylist() {
+  if (viewOrderPlaylistId && viewOrderPlaylistId === playingPlaylistId && viewOrderPaths?.length) {
+    setPlaybackOrder(playingPlaylistId, viewOrderPaths);
+  } else if (playOrderPlaylistId !== playingPlaylistId) {
+    setPlaybackOrder(null, null);
+  }
+}
+
 /** True when `toPath` is the immediate next track after `fromPath` in the active play order. */
 function isNaturalQueueAdvance(fromPath: string, toPath: string): boolean {
   if (!fromPath || !toPath || fromPath === toPath || !hasPlayingTracks) return false;
@@ -695,14 +796,41 @@ function scheduleSave() {
   }, 250);
 }
 
+/** Push pending playlists/volume to disk immediately (window close / hide). */
+function flushSave() {
+  if (!persistReady || applyingExternalSync) return;
+  if (saveTimer) {
+    clearTimeout(saveTimer);
+    saveTimer = null;
+  }
+  void invoke('playlists_save', { data: buildSaveData() }).catch((e) => {
+    console.error('Failed to flush playlists save:', e);
+  });
+}
+
+/** Clamp and apply volume to the native player (safe before/after BASS init). */
+async function applyVolumeToPlayer(vol: number = volume) {
+  const clamped = Math.max(0, Math.min(1, vol));
+  volume = clamped;
+  try {
+    await invoke('player_set_volume', { volume: clamped });
+  } catch (e) {
+    // Player may not be ready yet during very early startup; init() will re-apply.
+    console.error('Failed to apply volume:', e);
+  }
+}
+
 async function loadPlaylists() {
   try {
     const data = await invoke<PlaylistsData>('playlists_load');
     playlists = (data.playlists ?? []).map(repairPlaylistTracks);
     activePlaylistId = data.active_playlist_id ?? playlists[0]?.id ?? null;
-    if (typeof data.volume === 'number') {
-      volume = data.volume;
+    if (typeof data.volume === 'number' && Number.isFinite(data.volume)) {
+      volume = Math.max(0, Math.min(1, data.volume));
     }
+    // Settings bootstrap can call player init in parallel and stamp the default
+    // 0.8 into BASS before this load finishes — always re-push restored volume.
+    await applyVolumeToPlayer(volume);
     if (Array.isArray(data.liked_paths)) {
       likedPaths = data.liked_paths.filter((p: any) => typeof p === 'string' && p);
     }
@@ -1297,15 +1425,22 @@ async function addDroppedPaths(paths: string[], playlistId?: string | null) {
 // --- Player Actions ---
 
 async function init() {
-  if (isInitialized) return;
+  // Already initialized: still re-apply volume. Settings-store bootstrap can finish
+  // init before loadPlaylists restores the saved level; a bare early return left BASS
+  // stuck at the default 0.8 while the UI showed the real value (or vice versa).
+  if (isInitialized) {
+    await applyVolumeToPlayer(volume);
+    return;
+  }
   if (initPromise) {
     await initPromise;
+    await applyVolumeToPlayer(volume);
     return;
   }
 
   initPromise = (async () => {
     await invoke('player_init');
-    await invoke('player_set_volume', { volume });
+    await applyVolumeToPlayer(volume);
 
     // Restore persisted playback rate from settings (so rate survives app restart)
     try {
@@ -1532,18 +1667,24 @@ async function play(filePath: string) {
         }
       })
       .catch(() => {});
-    // Prefer the currently viewed playlist (incl. virtual All/Liked) so that next/prev
-    // operate over the collected list when playing from All or Liked views.
-    let playlistId = activePlaylistId;
-    if (!playlistId || (playlistId !== VIRTUAL_ALL_ID && playlistId !== VIRTUAL_LIKED_ID)) {
+    // Prefer the playlist the user is currently viewing when the track is in that list
+    // (real playlists, All, Liked). That keeps next/prev aligned with table sort.
+    // Fall back to the track's home playlist only when playing from search / elsewhere.
+    let playlistId: string | null = null;
+    if (activePlaylistId && tracks.some((t) => t.path === filePath)) {
+      playlistId = activePlaylistId;
+    } else {
       playlistId = findPlaylistForTrack(filePath);
     }
     if (playlistId) {
       playingPlaylistId = playlistId;
     }
 
-    // Build gapless queue from the active play order (incl. shuffle). playingPlaylistId is
-    // already set above so derived playingTracks matches what next/prev and the UI use.
+    // Prefer the table's sorted order when playing from the list the user is viewing.
+    adoptViewOrderForPlayingPlaylist();
+
+    // Build gapless queue from the active play order (incl. shuffle / table sort).
+    // playingPlaylistId is already set above so derived playingTracks matches next/prev.
     // Remember the exact paths we send — track-changed guards must match backend order,
     // otherwise sub-second tracks finish inside the manual-play window and the UI never advances.
     const queueToSend = buildGaplessQueue(filePath);
@@ -1648,9 +1789,7 @@ async function seek(pos: number) {
 
 function setVolume(vol: number) {
   volume = Math.max(0, Math.min(1, vol));
-  void invoke('player_set_volume', { volume }).catch((e) => {
-    console.error('Failed to set volume:', e);
-  });
+  void applyVolumeToPlayer(volume);
   scheduleSave();
 }
 
@@ -1996,6 +2135,12 @@ export function createPlayerStore() {
   void setupTaskbar();
   void bootstrap();
 
+  if (typeof window !== 'undefined') {
+    // Debounced playlists_save (250ms) can miss the last volume change on quit.
+    window.addEventListener('pagehide', flushSave);
+    window.addEventListener('beforeunload', flushSave);
+  }
+
   return {
     // State (getters)
     get isPlaying() { return isPlaying; },
@@ -2067,6 +2212,7 @@ export function createPlayerStore() {
     setPlaybackRate,
     toggleLike,
     isLiked,
+    setViewPlayOrder,
     init,
     ensureInit,
   };

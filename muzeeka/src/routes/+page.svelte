@@ -39,7 +39,11 @@
     ensurePlayerReady = () => player!.ensureInit();
   }
 
-  const settings = createSettingsStore(ensurePlayerReady);
+  // Secondary windows only read settings for UI — do not re-push EQ/rate/pitch
+  // into the live player (that was freezing the app on Settings open).
+  const settings = createSettingsStore(ensurePlayerReady, {
+    applyToPlayer: !isSecondaryWindow,
+  });
   setSettingsStore(settings);
   let searchQuery = $state('');
   let fullscreenOpen = $state(false);

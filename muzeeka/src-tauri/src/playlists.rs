@@ -35,6 +35,13 @@ pub struct SavedPlaylist {
     pub cover_path: Option<String>,
 }
 
+/// Minimal playlist info for pickers (settings download target, etc.).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlaylistMeta {
+    pub id: String,
+    pub name: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PlaylistsData {
     pub playlists: Vec<SavedPlaylist>,
@@ -43,6 +50,8 @@ pub struct PlaylistsData {
     pub playing_playlist_id: Option<String>,
     #[serde(default)]
     pub current_file: Option<String>,
+    /// Last UI volume (0.0–1.0). Optional for older files; missing ≠ 0.
+    #[serde(default)]
     pub volume: Option<f32>,
     #[serde(default)]
     pub liked_paths: Vec<String>,

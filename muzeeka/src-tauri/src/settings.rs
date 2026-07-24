@@ -45,6 +45,12 @@ pub struct AppSettings {
     /// Show the current track in Discord Rich Presence.
     #[serde(default = "default_discord_rpc_enabled")]
     pub discord_rpc_enabled: bool,
+    /// Local phone/browser remote control HTTP server.
+    #[serde(default = "default_remote_enabled")]
+    pub remote_enabled: bool,
+    /// Port for the remote control server (default 8765).
+    #[serde(default = "default_remote_port")]
+    pub remote_port: u16,
     /// Last main window position and size.
     #[serde(default)]
     pub window_state: Option<WindowState>,
@@ -60,6 +66,8 @@ impl Default for AppSettings {
             download_folder: None,
             download_playlist_id: None,
             discord_rpc_enabled: default_discord_rpc_enabled(),
+            remote_enabled: default_remote_enabled(),
+            remote_port: default_remote_port(),
             window_state: None,
         }
     }
@@ -75,6 +83,14 @@ fn default_pitch_enabled() -> bool {
 
 fn default_discord_rpc_enabled() -> bool {
     true
+}
+
+fn default_remote_enabled() -> bool {
+    true
+}
+
+fn default_remote_port() -> u16 {
+    crate::remote_server::DEFAULT_REMOTE_PORT
 }
 
 fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {

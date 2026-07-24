@@ -379,7 +379,7 @@
   height: 32px;
   flex-shrink: 0;
   border-radius: var(--radius-sm);
-  color: var(--text-primary);
+  color: var(--text-primary-md);
   background: transparent;
   transition:
     color 200ms var(--fs-ease-soft),
@@ -389,7 +389,6 @@
 .lyrics-toggle-btn:hover {
   color: var(--text-primary);
   background: transparent;
-  transform: scale(1.12);
 }
 
 .lyrics-toggle-btn.active {
@@ -427,7 +426,7 @@
   justify-self: end;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 4px;
   min-width: 0;
   max-width: 240px;
 }
@@ -441,7 +440,7 @@
 }
 
 .fullscreen-volume :global(.volume-pct) {
-  color: #fff;
+  color: var(--text-primary);
   text-shadow: 0 1px 4px rgba(0, 0, 0, 0.65);
 }
 
@@ -452,7 +451,7 @@
 /* Volume mute: no hover plate, slight grow */
 .fullscreen-volume :global(.volume-btn) {
   background: transparent;
-  color: var(--text-primary);
+  color: var(--text-primary-md);
   transition:
     color 200ms var(--fs-ease-soft),
     transform 200ms var(--fs-ease);
@@ -460,7 +459,7 @@
 
 .fullscreen-volume :global(.volume-btn:hover) {
   background: transparent;
-  transform: scale(1.12);
+  color: var(--text-primary);
 }
 
 .fullscreen-volume :global(.volume-btn:active) {

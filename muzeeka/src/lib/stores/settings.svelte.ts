@@ -21,6 +21,8 @@ export interface AppSettings {
   download_folder?: string | null;
   download_playlist_id?: string | null;
   discord_rpc_enabled?: boolean;
+  remote_enabled?: boolean;
+  remote_port?: number;
 }
 
 export interface EQPreset {
@@ -29,12 +31,23 @@ export interface EQPreset {
   bands_db: number[];
 }
 
+export interface RemoteStatus {
+  enabled: boolean;
+  running: boolean;
+  port: number;
+  local_ip: string | null;
+  local_ips: string[];
+  urls: string[];
+  last_error: string | null;
+}
 
 const DEFAULT_EQUALIZER: EqualizerSettings = {
   enabled: false,
   preamp_db: 0,
   bands_db: Array(BAND_COUNT).fill(0),
 };
+
+const DEFAULT_REMOTE_PORT = 8765;
 
 let equalizer = $state<EqualizerSettings>({ ...DEFAULT_EQUALIZER, bands_db: [...DEFAULT_EQUALIZER.bands_db] });
 let customPresets = $state<EQPreset[]>([]);
@@ -43,6 +56,8 @@ let pitchEnabled = $state(true);
 let downloadFolder = $state<string | null>(null);
 let downloadPlaylistId = $state<string | null>(null);
 let discordRpcEnabled = $state(true);
+let remoteEnabled = $state(true);
+let remotePort = $state(DEFAULT_REMOTE_PORT);
 let defaultDownloadFolder = $state<string | null>(null);
 let isReady = $state(false);
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -56,6 +71,12 @@ function clampEqualizer(settings: EqualizerSettings): EqualizerSettings {
     preamp_db: Math.max(-15, Math.min(15, settings.preamp_db)),
     bands_db: settings.bands_db.map((g) => Math.max(-20, Math.min(20, g))),
   };
+}
+
+function clampRemotePort(port: number): number {
+  const n = Math.round(Number(port));
+  if (!Number.isFinite(n) || n < 1024 || n > 65535) return DEFAULT_REMOTE_PORT;
+  return n;
 }
 
 function scheduleSave() {
@@ -75,6 +96,8 @@ function scheduleSave() {
       download_folder: downloadFolder,
       download_playlist_id: downloadPlaylistId,
       discord_rpc_enabled: discordRpcEnabled,
+      remote_enabled: remoteEnabled,
+      remote_port: clampRemotePort(remotePort),
     };
     invoke('settings_save', { data: payload }).catch((e) => {
       console.error('Failed to save settings:', e);
@@ -148,7 +171,13 @@ async function applyPitchEnabled(enabled: boolean) {
   scheduleSave();
 }
 
-export function createSettingsStore(ensurePlayerReady: () => Promise<void>) {
+export function createSettingsStore(
+  ensurePlayerReady: () => Promise<void>,
+  opts?: { applyToPlayer?: boolean },
+) {
+  /** Main window applies EQ/rate/pitch on boot. Secondary windows only display state. */
+  const applyToPlayer = opts?.applyToPlayer !== false;
+
   async function bootstrap() {
     try {
       const data = await invoke<AppSettings>('settings_load');
@@ -187,17 +216,25 @@ export function createSettingsStore(ensurePlayerReady: () => Promise<void>) {
         downloadPlaylistId = null;
       }
       discordRpcEnabled = data.discord_rpc_enabled !== false;
+      remoteEnabled = data.remote_enabled !== false;
+      remotePort =
+        typeof data.remote_port === 'number' ? clampRemotePort(data.remote_port) : DEFAULT_REMOTE_PORT;
       try {
         defaultDownloadFolder = await invoke<string>('ytdlp_default_download_dir');
       } catch {
         defaultDownloadFolder = null;
       }
-      await ensurePlayerReady();
-      await invoke('player_set_equalizer', { settings: equalizer });
-      if (playbackRate !== 1.0) {
-        await invoke('player_set_playback_rate', { rate: playbackRate }).catch(() => {});
+      // Never re-apply DSP from the settings/download webview on open: that races the
+      // main player, can rebuild pitch topology mid-playback, and freezes the UI via
+      // run_on_main_thread while BASS is busy.
+      if (applyToPlayer) {
+        await ensurePlayerReady();
+        await invoke('player_set_equalizer', { settings: equalizer });
+        if (playbackRate !== 1.0) {
+          await invoke('player_set_playback_rate', { rate: playbackRate }).catch(() => {});
+        }
+        await invoke('player_set_pitch_enabled', { enabled: pitchEnabled }).catch(() => {});
       }
-      await invoke('player_set_pitch_enabled', { enabled: pitchEnabled }).catch(() => {});
     } catch (e) {
       console.error('Failed to load settings:', e);
     } finally {
@@ -229,6 +266,12 @@ export function createSettingsStore(ensurePlayerReady: () => Promise<void>) {
     get discordRpcEnabled() {
       return discordRpcEnabled;
     },
+    get remoteEnabled() {
+      return remoteEnabled;
+    },
+    get remotePort() {
+      return remotePort;
+    },
     get effectiveDownloadFolder() {
       return downloadFolder ?? defaultDownloadFolder ?? '';
     },
@@ -243,6 +286,22 @@ export function createSettingsStore(ensurePlayerReady: () => Promise<void>) {
     setDiscordRpcEnabled(enabled: boolean) {
       discordRpcEnabled = enabled;
       scheduleSave();
+    },
+    setRemoteEnabled(enabled: boolean) {
+      remoteEnabled = enabled;
+      scheduleSave();
+    },
+    setRemotePort(port: number) {
+      remotePort = clampRemotePort(port);
+      scheduleSave();
+    },
+    async fetchRemoteStatus(): Promise<RemoteStatus | null> {
+      try {
+        return await invoke<RemoteStatus>('remote_status');
+      } catch (e) {
+        console.error('Failed to fetch remote status:', e);
+        return null;
+      }
     },
     async setEqualizerEnabled(enabled: boolean) {
       await applyEqualizer({ ...equalizer, enabled });

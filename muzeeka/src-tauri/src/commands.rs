@@ -9,6 +9,7 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::discord_rpc::DiscordPresence;
 use crate::remote_control::RemoteController;
+use crate::remote_server::{RemoteServer, RemoteStatus};
 
 use crate::equalizer::EqualizerSettings;
 use crate::library;
@@ -56,7 +57,7 @@ fn parse_gapless_queue(queue: Option<Vec<NextTrackInput>>) -> Vec<GaplessTrack> 
         .filter_map(parse_gapless_track)
         .collect()
 }
-use crate::playlists::{self, PlaylistsData};
+use crate::playlists::{self, PlaylistMeta, PlaylistsData};
 use crate::settings::{self, AppSettings};
 use crate::ytdlp::{self, YtdlpDownloadResult, YtdlpProbeResult};
 
@@ -215,10 +216,27 @@ pub fn settings_load(app: AppHandle) -> Result<AppSettings, String> {
 pub fn settings_save(
     app: AppHandle,
     discord: State<'_, DiscordPresence>,
-    data: AppSettings,
+    remote: State<'_, Arc<RemoteServer>>,
+    mut data: AppSettings,
 ) -> Result<(), String> {
     discord.configure(data.discord_rpc_enabled);
-    settings::save_settings(&app, &data)
+    // Frontend settings payloads never include window geometry. Preserve whatever
+    // the main window last wrote so a Discord/EQ save cannot wipe position/size.
+    if data.window_state.is_none() {
+        if let Ok(existing) = settings::load_settings(&app) {
+            data.window_state = existing.window_state;
+        }
+    }
+    data.remote_port = crate::remote_server::sanitize_port(data.remote_port);
+    settings::save_settings(&app, &data)?;
+    let _ = remote.apply(data.remote_enabled, data.remote_port);
+    Ok(())
+}
+
+/// Live remote control server status (IP, port, running, errors).
+#[tauri::command]
+pub fn remote_status(remote: State<'_, Arc<RemoteServer>>) -> RemoteStatus {
+    remote.status()
 }
 
 // ── Input helpers ─────────────────────────────────────────────────────────────
@@ -441,15 +459,40 @@ pub async fn lyrics_refetch(
 
 // ── Playlist persistence ──────────────────────────────────────────────────────
 
-/// Load saved playlists from disk.
+/// Load saved playlists from disk (full data + missing-track prune).
+/// Runs off the async runtime so path checks cannot freeze the UI thread.
 #[tauri::command]
-pub fn playlists_load(app: AppHandle) -> Result<PlaylistsData, String> {
-    playlists::load_playlists(&app)
+pub async fn playlists_load(app: AppHandle) -> Result<PlaylistsData, String> {
+    tauri::async_runtime::spawn_blocking(move || playlists::load_playlists(&app))
+        .await
+        .map_err(|e| format!("Playlists load task failed: {e}"))?
+}
+
+/// Lightweight playlist list for UI pickers (id + name only, no prune / no tracks).
+/// Safe to call from secondary windows on open — will not walk the filesystem.
+#[tauri::command]
+pub fn playlists_list_meta(app: AppHandle) -> Result<Vec<PlaylistMeta>, String> {
+    let data = playlists::load_playlists_fast(&app)?;
+    Ok(data
+        .playlists
+        .into_iter()
+        .map(|p| PlaylistMeta {
+            id: p.id,
+            name: p.name,
+        })
+        .collect())
 }
 
 /// Save playlists to disk.
 #[tauri::command]
-pub fn playlists_save(app: AppHandle, data: PlaylistsData) -> Result<(), String> {
+pub fn playlists_save(app: AppHandle, mut data: PlaylistsData) -> Result<(), String> {
+    // Never wipe a known volume with null/omitted — a racy save during startup
+    // used to reset the level back to the frontend default on next launch.
+    if data.volume.is_none() {
+        if let Ok(existing) = playlists::load_playlists_fast(&app) {
+            data.volume = existing.volume;
+        }
+    }
     playlists::save_playlists(&app, &data)
 }
 

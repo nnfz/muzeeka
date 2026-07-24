@@ -47,8 +47,9 @@
 
 .np-cover-hit {
   flex-shrink: 0;
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius-mini);
   cursor: pointer;
+  overflow: hidden;
   transition: transform var(--transition-fast), opacity var(--transition-fast);
 }
 

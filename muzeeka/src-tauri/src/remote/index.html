@@ -4,20 +4,22 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
   <meta name="apple-mobile-web-app-capable" content="yes">
-  <meta name="theme-color" content="#0a0a0f">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="theme-color" content="#0f0f0f">
   <title>Muzeeka Remote</title>
   <style>
     :root {
-      --bg: #0a0a0f;
-      --surface: #14141f;
-      --surface2: #1c1c2a;
-      --border: rgba(255,255,255,0.08);
-      --text: #f2f2f7;
-      --muted: #8e8e9a;
-      --accent: #7c5cff;
-      --accent2: #a78bfa;
-      --danger: #ff5c7a;
+      --bg: #0f0f0f;
+      --surface: #1a1a1a;
+      --surface2: #262626;
+      --border: rgba(255, 255, 255, 0.08);
+      --text: #ffffff;
+      --muted: #888888;
+      --accent: #b3b3b3;
+      --accent2: #ffffff;
+      --danger: #555555; 
       --radius: 16px;
+      --safe-top: env(safe-area-inset-top, 0px);
       --safe-bottom: env(safe-area-inset-bottom, 0px);
     }
 
@@ -34,19 +36,68 @@
     }
 
     .app {
-      min-height: 100dvh;
       display: flex;
       flex-direction: column;
-      max-width: 480px;
+      max-width: 100%;
       margin: 0 auto;
+    }
+
+    .player-section {
+      min-height: 100dvh; 
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      padding-top: calc(70px + var(--safe-top)); 
       padding-bottom: calc(16px + var(--safe-bottom));
+      flex-shrink: 0;
     }
 
     .header {
-      padding: 16px 20px 8px;
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100%;
+      z-index: 100;
+      background: rgba(15, 15, 15, 0.5); 
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+      padding: calc(16px + var(--safe-top)) 20px 16px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0); 
+      transition: padding 0.3s cubic-bezier(0.4, 0, 0.2, 1), 
+                  background 0.3s ease, border-color 0.3s ease;
+    }
+
+    .header.scrolled {
+      padding: calc(8px + var(--safe-top)) 20px 8px;
+      background: rgba(15, 15, 15, 0.85);
+      border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    }
+
+    .header-inner {
+      position: relative;
+      width: 100%;
+      height: 32px;
+    }
+
+    .header-default, .header-scrolled-content {
+      position: absolute;
+      inset: 0;
       display: flex;
       align-items: center;
       justify-content: space-between;
+      transition: opacity 0.3s ease, transform 0.3s ease, visibility 0.3s;
+    }
+
+    .header-default {
+      opacity: 1;
+      transform: translateY(0);
+      visibility: visible;
+    }
+
+    .header.scrolled .header-default {
+      opacity: 0;
+      transform: translateY(-10px);
+      visibility: hidden;
     }
 
     .logo {
@@ -60,31 +111,114 @@
       width: 8px;
       height: 8px;
       border-radius: 50%;
-      background: #3dd68c;
-      box-shadow: 0 0 8px #3dd68c88;
+      background: #aaaaaa;
+      box-shadow: 0 0 8px rgba(170, 170, 170, 0.6);
     }
 
-    .now-playing {
-      padding: 8px 20px 16px;
-      text-align: center;
+    .header-scrolled-content {
+      opacity: 0;
+      transform: translateY(10px);
+      visibility: hidden;
     }
 
-    .now-playing-meta {
+    .header.scrolled .header-scrolled-content {
+      opacity: 1;
+      transform: translateY(0);
+      visibility: visible;
+    }
+
+    .header-meta {
+      flex: 1;
       min-width: 0;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      gap: 2px;
+      padding-right: 12px;
     }
 
-    .player-section {
+    .header-title {
+      font-size: 14px;
+      font-weight: 700;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      line-height: 1.1;
+    }
+
+    .header-artist {
+      font-size: 11px;
+      color: var(--muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      line-height: 1.1;
+    }
+
+    .header-controls {
+      display: flex;
+      align-items: center;
+      gap: 12px;
       flex-shrink: 0;
     }
 
+    .header-time {
+      font-size: 12px;
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+    }
+
+    .btn-header {
+      width: 32px;
+      height: 32px;
+      font-size: 14px;
+      background: var(--surface2);
+      color: var(--text);
+      border: none;
+      border-radius: 50%;
+      display: grid;
+      place-items: center;
+      cursor: pointer;
+    }
+
+    /* Icons are inlined as data: URIs in JS (same SVG as static/icons) */
+    .icon {
+      display: block;
+      width: 20px;
+      height: 20px;
+      flex-shrink: 0;
+      object-fit: contain;
+      pointer-events: none;
+      /* White monochrome regardless of SVG fill/currentColor */
+      filter: brightness(0) invert(1);
+    }
+
+    .btn-header .icon { width: 14px; height: 14px; }
+    .btn-sm .icon { width: 20px; height: 20px; }
+    .btn-md .icon { width: 24px; height: 24px; }
+    .btn-lg .icon { width: 30px; height: 30px; }
+    .vol-icon { width: 22px; height: 22px; opacity: 0.7; }
+
+    .now-playing {
+      flex: 1;
+      padding: 8px 20px 16px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .cover-wrap, .now-playing-meta {
+      width: min(80vw, 340px);
+    }
+
     .cover-wrap {
-      width: min(56vw, 220px);
       aspect-ratio: 1;
       margin: 0 auto 16px;
-      border-radius: 20px;
+      border-radius: 10px;
       overflow: hidden;
       background: var(--surface2);
-      box-shadow: 0 20px 60px rgba(0,0,0,0.5), 0 0 0 1px var(--border);
+      box-shadow: 0 20px 60px rgba(0,0,0,0.7), 0 0 0 1px var(--border);
       position: relative;
     }
 
@@ -102,32 +236,36 @@
       place-items: center;
       font-size: 64px;
       color: var(--muted);
-      background: linear-gradient(135deg, #1a1a28, #12121c);
+      background: linear-gradient(135deg, #222, #111);
+    }
+
+    .now-playing-meta {
+      text-align: left;
     }
 
     .track-title {
-      font-size: 22px;
+      font-size: 24px;
       font-weight: 700;
       line-height: 1.2;
       margin-bottom: 6px;
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
-      padding: 0 8px;
+      padding: 0;
     }
 
     .track-artist {
-      font-size: 15px;
+      font-size: 16px;
       color: var(--muted);
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
-      padding: 0 8px;
+      padding: 0;
     }
 
     .progress {
       padding: 0 20px;
-      margin-top: 16px;
+      margin-top: auto;
     }
 
     .progress-bar {
@@ -141,7 +279,7 @@
 
     .progress-fill {
       height: 100%;
-      background: linear-gradient(90deg, var(--accent), var(--accent2));
+      background: linear-gradient(90deg, #888, #fff);
       border-radius: 2px;
       width: 0%;
       transition: width 0.1s linear;
@@ -186,11 +324,12 @@
       width: 68px;
       height: 68px;
       font-size: 28px;
-      background: var(--accent);
-      box-shadow: 0 8px 24px rgba(124,92,255,0.4);
+      background: var(--surface2);
+      color: var(--accent2);
+      box-shadow: 0 8px 24px rgba(0,0,0,0.4);
     }
 
-    .btn.active { color: var(--accent2); }
+    .btn.active { color: var(--accent2); background: rgba(255,255,255,0.15); }
 
     .extra-controls {
       display: flex;
@@ -208,24 +347,23 @@
 
     .volume-row input[type=range] {
       flex: 1;
-      accent-color: var(--accent);
+      accent-color: var(--accent2);
       height: 4px;
     }
 
     .playlists-panel {
       flex: 1;
-      background: var(--surface);
+      background: var(--bg);
       border-top: 1px solid var(--border);
-      border-radius: 20px 20px 0 0;
       display: flex;
       flex-direction: column;
-      min-height: 280px;
+      min-height: 50vh;
     }
 
     .panel-tabs {
       display: flex;
       gap: 4px;
-      padding: 12px 12px 0;
+      padding: 16px 16px 0;
       overflow-x: auto;
       scrollbar-width: none;
     }
@@ -251,7 +389,7 @@
     }
 
     .playlist-name {
-      padding: 8px 20px 4px;
+      padding: 16px 20px 4px;
       font-size: 13px;
       color: var(--muted);
       font-weight: 600;
@@ -261,7 +399,7 @@
 
     .track-list {
       flex: 1;
-      padding: 4px 8px 16px;
+      padding: 4px 12px 16px;
     }
 
     .track-item {
@@ -275,7 +413,7 @@
     }
 
     .track-item:active { background: var(--surface2); }
-    .track-item.playing { background: rgba(124,92,255,0.15); }
+    .track-item.playing { background: rgba(255, 255, 255, 0.1); }
 
     .track-thumb {
       width: 44px;
@@ -328,16 +466,15 @@
       display: none;
       margin: 0 20px 8px;
       padding: 10px 14px;
-      background: rgba(255,92,122,0.15);
-      border: 1px solid rgba(255,92,122,0.3);
+      background: rgba(255, 255, 255, 0.1);
+      border: 1px solid rgba(255, 255, 255, 0.2);
       border-radius: 10px;
       font-size: 13px;
-      color: #ff8fa3;
+      color: #ddd;
     }
 
     .error-banner.show { display: block; }
 
-    /* Mini overlay for OBS / narrow browser source (height < 200px) */
     .mini-time {
       display: none;
       flex-shrink: 0;
@@ -352,96 +489,82 @@
 
     .mini-time-sep { opacity: 0.55; }
 
-    @media (max-height: 199px) {
-      html, body {
-        overflow: hidden;
-        height: 100%;
-      }
-
-      body {
-        background: transparent;
-      }
-
+    @media (min-width: 768px) {
       .app {
-        min-height: 100vh;
-        height: 100vh;
-        max-width: none;
-        margin: 0;
-        padding: 0;
-        background:
-          linear-gradient(180deg, rgba(10, 10, 18, 0.88) 0%, rgba(6, 6, 12, 0.94) 100%),
-          var(--bg);
+        flex-direction: row;
+        height: 100dvh;
+        overflow: hidden;
       }
 
-      .header,
-      .progress,
-      .controls,
-      .volume-row,
-      .playlists-panel,
-      .error-banner {
-        display: none !important;
+      .header {
+        width: 50%;
+        max-width: 500px;
       }
 
       .player-section {
+        width: 50%;
+        max-width: 500px;
+        min-height: 100dvh;
+        border-right: 1px solid var(--border);
+        padding-bottom: 30px;
+      }
+
+      .playlists-panel {
         flex: 1;
-        display: flex;
-        flex-direction: column;
-        min-height: 0;
+        height: 100dvh;
+        border-top: none;
+        overflow-y: auto;
       }
-
-      .now-playing {
-        flex: 1;
-        display: flex;
-        align-items: center;
-        gap: 10px;
-        padding: 6px 10px;
-        text-align: left;
-        min-height: 0;
-        cursor: pointer;
-      }
-
-      .cover-wrap {
-        width: auto;
-        height: min(72px, calc(100vh - 12px));
-        margin: 0;
-        flex-shrink: 0;
-        border-radius: 8px;
-        box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45);
-      }
-
-      .now-playing-meta {
-        flex: 1;
-        min-width: 0;
-        display: flex;
-        flex-direction: column;
-        gap: 2px;
-      }
-
-      .track-title {
-        font-size: clamp(11px, 3.2vw, 14px);
-        font-weight: 600;
-        margin-bottom: 0;
-        text-shadow: 0 1px 4px rgba(0, 0, 0, 0.85);
-      }
-
-      .track-artist {
-        font-size: clamp(10px, 2.8vw, 12px);
-        text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
-      }
-
-      .mini-time {
-        display: flex;
+      
+      .cover-wrap, .now-playing-meta {
+        width: min(35vw, 340px);
       }
     }
 
+    @media (max-height: 199px) {
+      html, body { overflow: hidden; height: 100%; }
+      body { background: transparent; }
+      .app {
+        min-height: 100vh; height: 100vh; max-width: none; margin: 0; padding: 0;
+        background: linear-gradient(180deg, rgba(20, 20, 20, 0.88) 0%, rgba(10, 10, 10, 0.94) 100%), var(--bg);
+      }
+      .header, .progress, .controls, .volume-row, .playlists-panel, .error-banner { display: none !important; }
+      .player-section { flex: 1; display: flex; flex-direction: column; min-height: 0; border: none; padding-top: 0; }
+      .now-playing { flex: 1; display: flex; flex-direction: row; align-items: center; gap: 10px; padding: 6px 10px; min-height: 0; cursor: pointer; }
+      .cover-wrap { width: auto; height: min(72px, calc(100vh - 12px)); margin: 0; flex-shrink: 0; border-radius: 8px; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45); }
+      .now-playing-meta { width: auto; flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+      .track-title { font-size: clamp(11px, 3.2vw, 14px); font-weight: 600; margin-bottom: 0; text-shadow: 0 1px 4px rgba(0, 0, 0, 0.85); }
+      .track-artist { font-size: clamp(10px, 2.8vw, 12px); text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8); }
+      .mini-time { display: flex; }
+    }
   </style>
 </head>
 <body>
   <div class="app">
     <div class="player-section">
-      <div class="header">
-        <div class="logo">MUZEEKA REMOTE</div>
-        <div class="status-dot" id="statusDot"></div>
+
+      <div class="header" id="topHeader">
+        <div class="header-inner">
+          
+          <div class="header-default">
+            <div class="logo">MUZEEKA REMOTE</div>
+            <div class="status-dot" id="statusDot"></div>
+          </div>
+          
+          <div class="header-scrolled-content">
+            <div class="header-meta">
+              <div class="header-title" id="headerTitle">Ничего не играет</div>
+              <div class="header-artist" id="headerArtist">—</div>
+            </div>
+            <div class="header-controls">
+              <span class="header-time" id="headerTime">0:00</span>
+              <button class="btn-header" id="btnHeaderPlay" title="Play/Pause" aria-label="Play/Pause">
+                <img class="icon" id="iconHeaderPlay" data-icon="play" src="" alt="" aria-hidden="true">
+              </button>
+            </div>
+          </div>
+          
+        </div>
       </div>
 
       <div class="error-banner" id="errorBanner"></div>
@@ -473,15 +596,25 @@
       </div>
 
       <div class="controls">
-        <button class="btn btn-sm" id="btnShuffle" title="Shuffle">🔀</button>
-        <button class="btn btn-md" id="btnPrev" title="Previous">⏮</button>
-        <button class="btn btn-lg" id="btnPlay" title="Play/Pause">▶</button>
-        <button class="btn btn-md" id="btnNext" title="Next">⏭</button>
-        <button class="btn btn-sm" id="btnRepeat" title="Repeat">🔁</button>
+        <button class="btn btn-sm" id="btnShuffle" title="Shuffle" aria-label="Shuffle">
+          <img class="icon" id="iconShuffle" data-icon="noshuffle" src="" alt="" aria-hidden="true">
+        </button>
+        <button class="btn btn-md" id="btnPrev" title="Previous" aria-label="Previous">
+          <img class="icon" data-icon="playbackward" src="" alt="" aria-hidden="true">
+        </button>
+        <button class="btn btn-lg" id="btnPlay" title="Play/Pause" aria-label="Play/Pause">
+          <img class="icon" id="iconPlay" data-icon="play" src="" alt="" aria-hidden="true">
+        </button>
+        <button class="btn btn-md" id="btnNext" title="Next" aria-label="Next">
+          <img class="icon" data-icon="playforward" src="" alt="" aria-hidden="true">
+        </button>
+        <button class="btn btn-sm" id="btnRepeat" title="Repeat" aria-label="Repeat">
+          <img class="icon" id="iconRepeat" data-icon="norepeat" src="" alt="" aria-hidden="true">
+        </button>
       </div>
 
       <div class="volume-row">
-        <span style="font-size:16px">🔊</span>
+        <img class="icon vol-icon" id="iconVolume" data-icon="volmed" src="" alt="" aria-hidden="true">
         <input type="range" id="volumeSlider" min="0" max="100" value="80">
       </div>
     </div>
@@ -493,11 +626,50 @@
     </div>
   </div>
 
-  <!-- Near-silent audio keeps lock-screen / Control Center controls alive (duration-matched per track). -->
   <audio id="silentKeeper" playsinline webkit-playsinline preload="auto" style="display:none"></audio>
 
   <script>
     const $ = (id) => document.getElementById(id);
+
+
+    // SVG icons inlined from static/icons (no network / no disk paths on phone)
+    const ICONS_SVG = {
+      "play": "<svg width=\"49\" height=\"48\" viewBox=\"0 0 49 48\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\"> <path d=\"M12.7286 41.25C12.141 41.2489 11.5638 41.098 11.0538 40.8122C9.90535 40.1747 9.19141 38.9372 9.19141 37.5937V10.4062C9.19141 9.05905 9.90535 7.82529 11.0538 7.18779C11.5759 6.89383 12.1691 6.74266 12.7713 6.75008C13.3735 6.7575 13.9626 6.92324 14.4771 7.22998L38.1971 21.1387C38.6915 21.4424 39.099 21.864 39.3815 22.3642C39.6639 22.8643 39.8121 23.4265 39.8121 23.9981C39.8121 24.5697 39.6639 25.1319 39.3815 25.632C39.099 26.1322 38.6915 26.5538 38.1971 26.8575L14.4733 40.77C13.9468 41.0818 13.3438 41.2477 12.7286 41.25Z\" fill=\"#FEFEFE\"/> </svg>",
+      "pause": "<svg width=\"49\" height=\"49\" viewBox=\"0 0 49 49\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\"> <path d=\"M19.9062 41.3438H15.3125C14.9064 41.3438 14.5169 41.1824 14.2297 40.8953C13.9426 40.6081 13.7812 40.2186 13.7812 39.8125V9.1875C13.7812 8.78139 13.9426 8.39191 14.2297 8.10474C14.5169 7.81758 14.9064 7.65625 15.3125 7.65625H19.9062C20.3124 7.65625 20.7018 7.81758 20.989 8.10474C21.2762 8.39191 21.4375 8.78139 21.4375 9.1875V39.8125C21.4375 40.2186 21.2762 40.6081 20.989 40.8953C20.7018 41.1824 20.3124 41.3438 19.9062 41.3438ZM33.6875 41.3438H29.0938C28.6876 41.3438 28.2982 41.1824 28.011 40.8953C27.7238 40.6081 27.5625 40.2186 27.5625 39.8125V9.1875C27.5625 8.78139 27.7238 8.39191 28.011 8.10474C28.2982 7.81758 28.6876 7.65625 29.0938 7.65625H33.6875C34.0936 7.65625 34.4831 7.81758 34.7703 8.10474C35.0574 8.39191 35.2188 8.78139 35.2188 9.1875V39.8125C35.2188 40.2186 35.0574 40.6081 34.7703 40.8953C34.4831 41.1824 34.0936 41.3438 33.6875 41.3438Z\" fill=\"#FEFEFE\"/> </svg>",
+      "playbackward": "<svg stroke=\"#000000\" fill=\"#FEFEFE\" stroke-width=\"0px\" viewBox=\"0 0 24 24\" height=\"200\" width=\"200\" xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\"><path d=\"M20.341 4.247l-8 7a1 1 0 0 0 0 1.506l8 7c.647 .565 1.659 .106 1.659 -.753v-14c0 -.86 -1.012 -1.318 -1.659 -.753z\" stroke=\"#000000\" stroke-width=\"0px\"></path><path d=\"M9.341 4.247l-8 7a1 1 0 0 0 0 1.506l8 7c.647 .565 1.659 .106 1.659 -.753v-14c0 -.86 -1.012 -1.318 -1.659 -.753z\" stroke=\"#000000\" stroke-width=\"0px\"></path></svg>",
+      "playforward": "<svg stroke=\"#000000\" fill=\"#FEFEFE\" stroke-width=\"0px\" viewBox=\"0 0 24 24\" height=\"200\" width=\"200\" xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\"><path d=\"M2 5v14c0 .86 1.012 1.318 1.659 .753l8 -7a1 1 0 0 0 0 -1.506l-8 -7c-.647 -.565 -1.659 -.106 -1.659 .753z\" stroke=\"#000000\" stroke-width=\"0px\"></path><path d=\"M13 5v14c0 .86 1.012 1.318 1.659 .753l8 -7a1 1 0 0 0 0 -1.506l-8 -7c-.647 -.565 -1.659 -.106 -1.659 .753z\" stroke=\"#000000\" stroke-width=\"0px\"></path></svg>",
+      "shuffle": "<svg width=\"49\" height=\"49\" viewBox=\"0 0 49 49\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\"> <path d=\"M37.1986 28.0111C37.7966 27.4131 38.7659 27.4131 39.3639 28.0111L43.9576 32.6049C44.5556 33.2029 44.5556 34.1722 43.9576 34.7701L39.3639 39.3639C38.7659 39.9619 37.7966 39.9619 37.1986 39.3639C36.6006 38.7659 36.6006 37.7966 37.1986 37.1986L40.7097 33.6875L37.1986 30.1764C36.6006 29.5784 36.6006 28.6091 37.1986 28.0111ZM23.226 23.6506C23.695 22.947 24.6457 22.7569 25.3494 23.226C26.053 23.695 26.2431 24.6457 25.774 25.3494L21.922 31.1274C21.083 32.3858 19.9457 33.4185 18.6123 34.1321C17.279 34.8455 15.7899 35.2187 14.2777 35.2188H6.125C5.27931 35.2188 4.59375 34.5332 4.59375 33.6875C4.59375 32.8418 5.27931 32.1563 6.125 32.1563H14.2777C15.286 32.1562 16.2798 31.9082 17.1687 31.4325C18.0576 30.9568 18.8146 30.2675 19.3739 29.4287L23.226 23.6506ZM37.1986 9.63611C37.7966 9.03812 38.7659 9.03812 39.3639 9.63611L43.9576 14.2299C44.5556 14.8279 44.5556 15.7972 43.9576 16.3951L39.3639 20.9889C38.7659 21.5869 37.7966 21.5869 37.1986 20.9889C36.6006 20.3909 36.6006 19.4216 37.1986 18.8236L40.7097 15.3125L37.1986 11.8014C36.6006 11.2034 36.6006 10.2341 37.1986 9.63611Z\" fill=\"#FEFEFE\"/> <path d=\"M14.2777 13.7812C15.7899 13.7813 17.279 14.1545 18.6123 14.8679C19.9457 15.5815 21.083 16.6142 21.922 17.8726L29.6261 29.4287L29.8454 29.7358C30.3773 30.4359 31.0534 31.0162 31.8313 31.4325C32.7202 31.9082 33.714 32.1562 34.7223 32.1562H39.8125C40.6582 32.1562 41.3438 32.8418 41.3438 33.6875C41.3438 34.5332 40.6582 35.2188 39.8125 35.2188H34.7223C33.2101 35.2187 31.721 34.8455 30.3877 34.1321C29.2213 33.5079 28.2047 32.6399 27.407 31.59L27.078 31.1274L19.3739 19.5713C18.8146 18.7325 18.0576 18.0432 17.1687 17.5675C16.2798 17.0918 15.286 16.8438 14.2777 16.8438H6.125C5.27931 16.8438 4.59375 16.1582 4.59375 15.3125C4.59375 14.4668 5.27931 13.7812 6.125 13.7812H14.2777ZM39.8125 13.7812C40.6582 13.7812 41.3438 14.4668 41.3438 15.3125C41.3438 16.1582 40.6582 16.8438 39.8125 16.8438H34.7223C33.714 16.8438 32.7202 17.0918 31.8313 17.5675C31.0534 17.9838 30.3773 18.5641 29.8454 19.2642L29.6261 19.5713L28.8365 20.7556C28.3675 21.4592 27.4168 21.6492 26.7131 21.1803C26.0096 20.7113 25.8195 19.7605 26.2885 19.0569L27.078 17.8726L27.407 17.41C28.2048 16.3601 29.2213 15.4921 30.3877 14.8679C31.721 14.1545 33.2101 13.7813 34.7223 13.7812H39.8125Z\" fill=\"#FEFEFE\"/> </svg>",
+      "noshuffle": "<svg width=\"49\" height=\"49\" viewBox=\"0 0 49 49\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\"> <path d=\"M37.1985 28.0111C37.7965 27.4131 38.7658 27.4131 39.3638 28.0111L43.9575 32.6049C44.5555 33.2029 44.5555 34.1722 43.9575 34.7701L39.3638 39.3639C38.7658 39.9619 37.7965 39.9619 37.1985 39.3639C36.6005 38.7659 36.6005 37.7966 37.1985 37.1986L40.7096 33.6875L37.1985 30.1764C36.6005 29.5784 36.6005 28.6091 37.1985 28.0111ZM37.1985 9.63611C37.7965 9.03812 38.7658 9.03812 39.3638 9.63611L43.9575 14.2299C44.5555 14.8279 44.5555 15.7972 43.9575 16.3951L39.3638 20.9889C38.7658 21.5869 37.7965 21.5869 37.1985 20.9889C36.6005 20.3909 36.6005 19.4216 37.1985 18.8236L40.7096 15.3125L37.1985 11.8014C36.6005 11.2034 36.6005 10.2341 37.1985 9.63611Z\" fill=\"#FEFEFE\"/> <rect x=\"5\" y=\"14\" width=\"36\" height=\"3\" rx=\"1.5\" fill=\"#FEFEFE\"/> <rect x=\"5\" y=\"32\" width=\"36\" height=\"3\" rx=\"1.5\" fill=\"#FEFEFE\"/> </svg>",
+      "repeat": "<svg width=\"49\" height=\"49\" viewBox=\"0 0 49 49\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\"> <path d=\"M29.5422 10.4017C30.1402 9.80375 31.1095 9.80375 31.7075 10.4017L36.3013 14.9955C36.8993 15.5935 36.8993 16.5628 36.3013 17.1608L31.7075 21.7545C31.1095 22.3525 30.1402 22.3525 29.5422 21.7545C28.9443 21.1565 28.9443 20.1872 29.5422 19.5892L33.0534 16.0781L29.5422 12.567C28.9443 11.969 28.9443 10.9997 29.5422 10.4017Z\" fill=\"#FEFEFE\"/> <path d=\"M17.2924 27.2455C17.8903 26.6475 18.8597 26.6475 19.4576 27.2455C20.0556 27.8435 20.0556 28.8128 19.4576 29.4108L15.9465 32.9219L19.4576 36.433C20.0556 37.031 20.0556 38.0003 19.4576 38.5983C18.8597 39.1963 17.8903 39.1963 17.2924 38.5983L12.6986 34.0045C12.1006 33.4065 12.1006 32.4372 12.6986 31.8392L17.2924 27.2455ZM4.59375 25.2656V23.7304L4.60571 23.2758C4.72433 21.0081 5.67814 18.8578 7.29138 17.2445C9.01194 15.5239 11.344 14.5541 13.7773 14.5469H33.6875C34.5332 14.5469 35.2188 15.2324 35.2188 16.0781C35.2188 16.9238 34.5332 17.6094 33.6875 17.6094H13.7852L13.1811 17.6413C11.7793 17.784 10.4617 18.4048 9.45667 19.4098C8.30833 20.5581 7.66125 22.1144 7.65625 23.7384V25.2656C7.65625 26.1113 6.97069 26.7969 6.125 26.7969C5.27931 26.7969 4.59375 26.1113 4.59375 25.2656Z\" fill=\"#FEFEFE\"/> <path d=\"M41.3438 23.7344C41.3438 22.8887 42.0293 22.2031 42.875 22.2031C43.7207 22.2031 44.4063 22.8887 44.4063 23.7344V25.2696C44.399 27.7028 43.4292 30.0349 41.7086 31.7555C39.9881 33.4761 37.656 34.4459 35.2227 34.4531H15.3125C14.4668 34.4531 13.7812 33.7676 13.7812 32.9219C13.7812 32.0762 14.4668 31.3906 15.3125 31.3906H35.2148C36.8387 31.3856 38.395 30.7385 39.5433 29.5902C40.6907 28.4428 41.3377 26.8881 41.3438 25.2656V23.7344Z\" fill=\"#FEFEFE\"/> <circle cx=\"43\" cy=\"16\" r=\"3\" fill=\"#FEFEFE\"/> </svg>",
+      "norepeat": "<svg width=\"49\" height=\"49\" viewBox=\"0 0 49 49\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\"> <path d=\"M37.4485 10.4485C38.0465 9.8505 39.0158 9.8505 39.6138 10.4485L44.2075 15.0422C44.8055 15.6402 44.8055 16.6095 44.2075 17.2075L39.6138 21.8013C39.0158 22.3993 38.0465 22.3993 37.4485 21.8013C36.8505 21.2033 36.8505 20.234 37.4485 19.636L40.9596 16.1249L37.4485 12.6138C36.8505 12.0158 36.8505 11.0465 37.4485 10.4485Z\" fill=\"#FEFEFE\"/> <path d=\"M10.2922 27.2922C10.8902 26.6943 11.8595 26.6943 12.4575 27.2922C13.0555 27.8902 13.0555 28.8595 12.4575 29.4575L8.94642 32.9686L12.4575 36.4797C13.0555 37.0777 13.0555 38.047 12.4575 38.645C11.8595 39.243 10.8902 39.243 10.2922 38.645L5.69849 34.0513C5.1005 33.4533 5.1005 32.484 5.69849 31.886L10.2922 27.2922Z\" fill=\"#FEFEFE\"/> <rect x=\"5\" y=\"14.5468\" width=\"37\" height=\"3\" rx=\"1.5\" fill=\"#FEFEFE\"/> <rect x=\"6\" y=\"31.5468\" width=\"39\" height=\"3\" rx=\"1.5\" fill=\"#FEFEFE\"/> </svg>",
+      "repeatplaylist": "<svg width=\"49\" height=\"49\" viewBox=\"0 0 49 49\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\"> <path d=\"M29.5422 10.4017C30.1402 9.80375 31.1095 9.80375 31.7075 10.4017L36.3013 14.9955C36.8993 15.5935 36.8993 16.5628 36.3013 17.1608L31.7075 21.7545C31.1095 22.3525 30.1402 22.3525 29.5422 21.7545C28.9443 21.1565 28.9443 20.1872 29.5422 19.5892L33.0534 16.0781L29.5422 12.567C28.9443 11.969 28.9443 10.9997 29.5422 10.4017Z\" fill=\"#FEFEFE\"/> <path d=\"M17.2924 27.2455C17.8903 26.6475 18.8597 26.6475 19.4576 27.2455C20.0556 27.8435 20.0556 28.8128 19.4576 29.4108L15.9465 32.9219L19.4576 36.433C20.0556 37.031 20.0556 38.0003 19.4576 38.5983C18.8597 39.1963 17.8903 39.1963 17.2924 38.5983L12.6986 34.0045C12.1006 33.4065 12.1006 32.4372 12.6986 31.8392L17.2924 27.2455ZM4.59375 25.2656V23.7304L4.60571 23.2758C4.72433 21.0081 5.67814 18.8578 7.29138 17.2445C9.01194 15.5239 11.344 14.5541 13.7773 14.5469H33.6875C34.5332 14.5469 35.2188 15.2324 35.2188 16.0781C35.2188 16.9238 34.5332 17.6094 33.6875 17.6094H13.7852L13.1811 17.6413C11.7793 17.784 10.4617 18.4048 9.45667 19.4098C8.30833 20.5581 7.66125 22.1144 7.65625 23.7384V25.2656C7.65625 26.1113 6.97069 26.7969 6.125 26.7969C5.27931 26.7969 4.59375 26.1113 4.59375 25.2656Z\" fill=\"#FEFEFE\"/> <path d=\"M41.3438 23.7344C41.3438 22.8887 42.0293 22.2031 42.875 22.2031C43.7207 22.2031 44.4063 22.8887 44.4063 23.7344V25.2696C44.399 27.7028 43.4292 30.0349 41.7086 31.7555C39.9881 33.4761 37.656 34.4459 35.2227 34.4531H15.3125C14.4668 34.4531 13.7812 33.7676 13.7812 32.9219C13.7812 32.0762 14.4668 31.3906 15.3125 31.3906H35.2148C36.8387 31.3856 38.395 30.7385 39.5433 29.5902C40.6907 28.4428 41.3377 26.8881 41.3438 25.2656V23.7344Z\" fill=\"#FEFEFE\"/> </svg>",
+      "mute": "<svg width=\"45\" height=\"38\" viewBox=\"0 0 45 38\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\"> <path d=\"M25.457 5.26953L18.8516 11.875H11.2812C10.8088 11.875 10.3558 12.0627 10.0217 12.3967C9.68767 12.7308 9.5 13.1838 9.5 13.6562V24.3437C9.5 24.8162 9.68767 25.2692 10.0217 25.6033C10.3558 25.9373 10.8088 26.125 11.2812 26.125H18.856L25.457 32.7305C26.5703 33.8437 28.5 33.0622 28.5 31.4687V6.53125C28.5 4.93777 26.5703 4.15625 25.457 5.26953Z\" fill=\"#EFEFEF\"/> <rect x=\"35.1094\" y=\"13\" width=\"14\" height=\"3\" rx=\"1.5\" transform=\"rotate(45 35.1094 13)\" fill=\"#FEFEFE\"/> <rect x=\"45.0088\" y=\"15.1213\" width=\"14\" height=\"3\" rx=\"1.5\" transform=\"rotate(135 45.0088 15.1213)\" fill=\"#FEFEFE\"/> </svg>",
+      "volmin": "<svg width=\"38\" height=\"38\" viewBox=\"0 0 38 38\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\"> <path d=\"M25.457 5.26953L18.8516 11.875H11.2812C10.8088 11.875 10.3558 12.0627 10.0217 12.3967C9.68767 12.7308 9.5 13.1838 9.5 13.6562V24.3437C9.5 24.8162 9.68767 25.2692 10.0217 25.6033C10.3558 25.9373 10.8088 26.125 11.2812 26.125H18.856L25.457 32.7305C26.5703 33.8437 28.5 33.0622 28.5 31.4687V6.53125C28.5 4.93777 26.5703 4.15625 25.457 5.26953Z\" fill=\"#EFEFEF\"/> </svg>",
+      "volmed": "<svg width=\"42\" height=\"38\" viewBox=\"0 0 42 38\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\"> <path d=\"M25.457 5.26953L18.8516 11.875H11.2812C10.8088 11.875 10.3558 12.0627 10.0217 12.3967C9.68767 12.7308 9.5 13.1838 9.5 13.6562V24.3437C9.5 24.8162 9.68767 25.2692 10.0217 25.6033C10.3558 25.9373 10.8088 26.125 11.2812 26.125H18.856L25.457 32.7305C26.5703 33.8437 28.5 33.0622 28.5 31.4687V6.53125C28.5 4.93777 26.5703 4.15625 25.457 5.26953Z\" fill=\"#EFEFEF\"/> <path d=\"M35 24C37.7614 24 40 21.7614 40 19C40 16.2386 37.7614 14 35 14\" stroke=\"#EFEFEF\" stroke-width=\"2.5\" stroke-miterlimit=\"3.99393\" stroke-linecap=\"round\"/> </svg>",
+      "volmax": "<svg width=\"48\" height=\"38\" viewBox=\"0 0 48 38\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\"> <path d=\"M25.457 5.26953L18.8516 11.875H11.2812C10.8088 11.875 10.3558 12.0627 10.0217 12.3967C9.68767 12.7308 9.5 13.1838 9.5 13.6562V24.3437C9.5 24.8162 9.68767 25.2692 10.0217 25.6033C10.3558 25.9373 10.8088 26.125 11.2812 26.125H18.856L25.457 32.7305C26.5703 33.8437 28.5 33.0622 28.5 31.4687V6.53125C28.5 4.93777 26.5703 4.15625 25.457 5.26953Z\" fill=\"#EFEFEF\"/> <path d=\"M35 24C37.7614 24 40 21.7614 40 19C40 16.2386 37.7614 14 35 14\" stroke=\"#EFEFEF\" stroke-width=\"2.5\" stroke-miterlimit=\"3.99393\" stroke-linecap=\"round\"/> <path d=\"M34.5459 31.0909C41.2235 31.0909 46.6368 25.6777 46.6368 19C46.6368 12.3224 41.2235 6.90912 34.5459 6.90912\" stroke=\"#EFEFEF\" stroke-width=\"2.5\" stroke-miterlimit=\"3.99393\" stroke-linecap=\"round\"/> </svg>"
+    };
+
+    function iconSrc(name) {
+      const svg = ICONS_SVG[name];
+      if (!svg) return '';
+      return 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
+    }
+
+    function setIcon(el, name) {
+      if (!el) return;
+      const src = iconSrc(name);
+      if (src && el.getAttribute('src') !== src) el.setAttribute('src', src);
+    }
+
+    function setVolumeIcon(vol) {
+      const v = Number(vol) || 0;
+      const name = v <= 0 ? 'mute' : v > 0.66 ? 'volmax' : v > 0.33 ? 'volmed' : 'volmin';
+      setIcon($('iconVolume'), name);
+    }
+
+    document.querySelectorAll('[data-icon]').forEach((el) => {
+      setIcon(el, el.dataset.icon);
+    });
 
     const LS_PLAYLIST_KEY = 'muzeeka-remote-active-playlist';
     const IS_IOS = /iPhone|iPad|iPod/i.test(navigator.userAgent)
@@ -526,6 +698,19 @@
       const s = Math.floor(sec % 60);
       return `${m}:${s.toString().padStart(2, '0')}`;
     }
+
+    window.addEventListener('scroll', () => {
+      const header = $('topHeader');
+      const playerSection = document.querySelector('.player-section');
+      
+      const threshold = playerSection ? (playerSection.offsetHeight - 80) : 150;
+
+      if (window.scrollY > threshold) {
+        header.classList.add('scrolled');
+      } else {
+        header.classList.remove('scrolled');
+      }
+    });
 
     async function api(path, opts = {}) {
       const res = await fetch(path, {
@@ -646,7 +831,6 @@
       if (!force && now - lastMediaPositionSync < 800) return;
       lastMediaPositionSync = now;
 
-      // Clamp to keeper duration so we don't exceed the audio length
       const target = Math.min(pos, keeper.duration - 0.1);
       if (target >= 0 && Math.abs(keeper.currentTime - target) > 0.3) {
         try {
@@ -665,7 +849,6 @@
       const paused = !!state?.isPaused;
       const dur = state?.duration ?? 0;
 
-      // Regenerate silent audio when track duration changes significantly
       if (dur > 0 && Math.abs(dur - silentBlobDuration) > 1) {
         const newUrl = createSilentBlobUrl(dur);
         if (keeper.src !== newUrl) {
@@ -681,21 +864,15 @@
       if (hasTrack && playing) {
         syncKeeperClock(true);
         if (keeper.paused) {
-          try {
-            await keeper.play();
-          } catch (_) {}
+          try { await keeper.play(); } catch (_) {}
         }
         startKeeperSync();
       } else if (hasTrack && paused) {
         syncKeeperClock(true);
-        if (!keeper.paused) {
-          keeper.pause();
-        }
+        if (!keeper.paused) keeper.pause();
         stopKeeperSync();
       } else {
-        if (!keeper.paused) {
-          keeper.pause();
-        }
+        if (!keeper.paused) keeper.pause();
         stopKeeperSync();
       }
     }
@@ -742,14 +919,7 @@
           });
           document.title = 'Muzeeka Remote';
         }
-      } catch (_) {
-        try {
-          navigator.mediaSession.metadata = new MediaMetadata({
-            title: track?.title || 'Muzeeka',
-            artist: track?.artist || 'Unknown Artist',
-          });
-        } catch (_) {}
-      }
+      } catch (_) {}
     }
 
     function updateMediaSession() {
@@ -760,21 +930,14 @@
       const paused = !!state?.isPaused;
 
       setMediaMetadata(track);
-
-      // iOS Safari resets action handlers when metadata is updated — re-bind them.
       if (IS_IOS) bindMediaHandlers();
 
       try {
-        navigator.mediaSession.playbackState = playing
-          ? 'playing'
-          : paused
-            ? 'paused'
-            : 'none';
+        navigator.mediaSession.playbackState = playing ? 'playing' : paused ? 'paused' : 'none';
       } catch (_) {}
 
       if (!mediaSessionEnabled) return;
 
-      // iOS reads time from the <audio> element — setPositionState fights it and causes flicker.
       if (!IS_IOS && 'setPositionState' in navigator.mediaSession) {
         const dur = state?.duration ?? 0;
         const pos = state?.position ?? 0;
@@ -795,18 +958,14 @@
     }
 
     function createSilentBlobUrl(durationSec = 0.5) {
-      // Always regenerate when duration changes so iOS gets correct track length
       if (silentBlobUrl && Math.abs(silentBlobDuration - durationSec) < 1) {
         return silentBlobUrl;
       }
-
-      // Revoke old blob to avoid memory leaks
       if (silentBlobUrl) {
         URL.revokeObjectURL(silentBlobUrl);
         silentBlobUrl = null;
       }
 
-      // Use low sample rate to keep the blob small even for long tracks
       const sampleRate = 1000;
       const channels = 1;
       const bits = 16;
@@ -844,7 +1003,6 @@
     function prepareSilentKeeper() {
       const keeper = $('silentKeeper');
       if (!keeper) return;
-      // Initial short silent audio; will be replaced with track-duration one
       const dur = state?.duration ?? 0.5;
       keeper.src = createSilentBlobUrl(dur > 0 ? dur : 0.5);
       keeper.loop = false;
@@ -852,7 +1010,6 @@
       keeper.muted = false;
       keeper.preload = 'auto';
 
-      // When the keeper ends, restart if we're still playing (prevents iOS killing the session)
       keeper.addEventListener('ended', () => {
         if (state?.isPlaying && mediaSessionEnabled) {
           syncKeeperClock(true);
@@ -863,18 +1020,14 @@
 
     async function tryEnableSystemMedia() {
       if (mediaSessionEnabled) return true;
-
       setupMediaSession();
       if (!mediaSessionReady) return false;
-
       const keeper = $('silentKeeper');
       if (!keeper) return false;
 
       try {
         prepareSilentKeeper();
-        if (keeper.paused) {
-          await keeper.play();
-        }
+        if (keeper.paused) await keeper.play();
         mediaSessionEnabled = true;
         await requestWakeLock();
         updateMediaSession();
@@ -889,7 +1042,6 @@
         if (mediaSessionEnabled) return;
         void tryEnableSystemMedia();
       };
-
       ['pointerdown', 'touchstart', 'keydown'].forEach((eventName) => {
         document.addEventListener(eventName, unlock, { capture: true, passive: true });
       });
@@ -897,8 +1049,12 @@
 
     function renderNowPlaying() {
       const track = state?.track;
+      
       $('trackTitle').textContent = track?.title || 'Ничего не играет';
       $('trackArtist').textContent = track?.artist || '—';
+      
+      $('headerTitle').textContent = track?.title || 'Ничего не играет';
+      $('headerArtist').textContent = track?.artist || '—';
 
       const img = $('coverImg');
       const ph = $('coverPlaceholder');
@@ -915,21 +1071,32 @@
       const pos = state?.position || 0;
       const pct = dur > 0 ? (pos / dur) * 100 : 0;
       $('progressFill').style.width = `${pct}%`;
-      $('timeCurrent').textContent = fmt(pos);
+      
+      const posFormatted = fmt(pos);
+      $('timeCurrent').textContent = posFormatted;
       $('timeTotal').textContent = fmt(dur);
-      $('miniTimeCurrent').textContent = fmt(pos);
+      $('miniTimeCurrent').textContent = posFormatted;
       $('miniTimeTotal').textContent = fmt(dur);
+      $('headerTime').textContent = posFormatted;
 
       const playing = state?.isPlaying;
-      $('btnPlay').textContent = playing ? '⏸' : '▶';
+      setIcon($('iconPlay'), playing ? 'pause' : 'play');
+      setIcon($('iconHeaderPlay'), playing ? 'pause' : 'play');
 
-      $('btnShuffle').classList.toggle('active', !!state?.shuffleEnabled);
+      const shuffleOn = !!state?.shuffleEnabled;
+      setIcon($('iconShuffle'), shuffleOn ? 'shuffle' : 'noshuffle');
+      $('btnShuffle').classList.toggle('active', shuffleOn);
+
       const repeat = state?.repeatMode || 'off';
+      setIcon(
+        $('iconRepeat'),
+        repeat === 'one' ? 'repeat' : repeat === 'all' ? 'repeatplaylist' : 'norepeat'
+      );
       $('btnRepeat').classList.toggle('active', repeat !== 'off');
-      $('btnRepeat').textContent = repeat === 'one' ? '🔂' : '🔁';
 
       if (!volumeDragging && state?.volume != null) {
         $('volumeSlider').value = Math.round(state.volume * 100);
+        setVolumeIcon(state.volume);
       }
 
       highlightPlayingTrack();
@@ -1009,7 +1176,7 @@
       try {
         const next = await api('/api/state');
         state = next;
-        $('statusDot').style.background = '#3dd68c';
+        $('statusDot').style.background = '#aaaaaa';
         renderNowPlaying();
         if (
           !userPickedPlaylist &&
@@ -1022,7 +1189,7 @@
           renderTabs();
         }
       } catch (e) {
-        $('statusDot').style.background = '#ff5c7a';
+        $('statusDot').style.background = '#555555';
       }
     }
 
@@ -1089,6 +1256,7 @@
     });
 
     $('btnPlay').addEventListener('click', () => action('/api/toggle', null, { optimistic: true }));
+    $('btnHeaderPlay').addEventListener('click', () => action('/api/toggle', null, { optimistic: true }));
     $('btnPause')?.addEventListener('click', () => action('/api/pause', null, { optimistic: true }));
     $('btnPrev').addEventListener('click', () => action('/api/prev'));
     $('btnNext').addEventListener('click', () => action('/api/next'));
@@ -1099,6 +1267,7 @@
       volumeDragging = true;
       const vol = e.target.value / 100;
       if (state) state.volume = vol;
+      setVolumeIcon(vol);
       if (volumeSendTimer) clearTimeout(volumeSendTimer);
       volumeSendTimer = setTimeout(() => {
         api('/api/volume', { method: 'POST', body: JSON.stringify({ volume: vol }) })

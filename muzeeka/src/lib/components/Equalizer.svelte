@@ -1,5 +1,4 @@
 <script lang="ts">
-  import { invoke } from '@tauri-apps/api/core';
   import { onDestroy } from 'svelte';
   import {
     BAND_COUNT,
@@ -9,52 +8,97 @@
 
   const settings = getSettingsStore();
 
-  let dspAttached = $state(false);
-  let processCount = $state(0);
-  let statusTimer: ReturnType<typeof setInterval> | null = null;
-
-  async function refreshEqStatus() {
-    try {
-      const status = await invoke<{
-        dsp_attached: boolean;
-        process_count: number;
-      }>('player_get_equalizer_status');
-      dspAttached = status.dsp_attached;
-      processCount = status.process_count;
-    } catch {
-      dspAttached = false;
-      processCount = 0;
-    }
-  }
-
-  statusTimer = setInterval(() => {
-    void refreshEqStatus();
-  }, 1000);
-  void refreshEqStatus();
-
-  onDestroy(() => {
-    if (statusTimer) clearInterval(statusTimer);
-  });
+  /** Visual fader values (animated on preset/reset; instant on drag). */
+  let displayPreamp = $state(settings.equalizer.preamp_db);
+  let displayBands = $state<number[]>(
+    Array.from({ length: BAND_COUNT }, (_, i) => settings.equalizer.bands_db[i] ?? 0),
+  );
+  /** False until user drags / preset / reset — so bootstrap can fill display values. */
+  let userTouched = $state(false);
+  let animRaf = 0;
 
   function formatFreq(freq: number): string {
     if (freq >= 1000) return `${freq / 1000}k`;
     return String(freq);
   }
 
+  /** 0–100 fill for seekbar-style track (min → max). */
+  function fillPct(value: number, min: number, max: number): number {
+    if (max <= min) return 0;
+    return Math.max(0, Math.min(100, ((value - min) / (max - min)) * 100));
+  }
+
+  function cancelAnim() {
+    if (animRaf) {
+      cancelAnimationFrame(animRaf);
+      animRaf = 0;
+    }
+  }
+
+  function easeOutCubic(t: number): number {
+    return 1 - Math.pow(1 - t, 3);
+  }
+
+  function animateDisplay(targetPreamp: number, targetBands: number[], duration = 320) {
+    cancelAnim();
+    const fromPreamp = displayPreamp;
+    const fromBands = [...displayBands];
+    const toBands = Array.from({ length: BAND_COUNT }, (_, i) => targetBands[i] ?? 0);
+    const start = performance.now();
+
+    const tick = (now: number) => {
+      const t = Math.min(1, (now - start) / duration);
+      const e = easeOutCubic(t);
+      displayPreamp = fromPreamp + (targetPreamp - fromPreamp) * e;
+      displayBands = fromBands.map((b, i) => b + (toBands[i] - b) * e);
+      if (t < 1) {
+        animRaf = requestAnimationFrame(tick);
+      } else {
+        animRaf = 0;
+        displayPreamp = targetPreamp;
+        displayBands = [...toBands];
+      }
+    };
+    animRaf = requestAnimationFrame(tick);
+  }
+
+  // Follow store until the user interacts (covers async settings_load).
+  $effect(() => {
+    const eq = settings.equalizer;
+    if (userTouched || animRaf) return;
+    displayPreamp = eq.preamp_db;
+    displayBands = Array.from({ length: BAND_COUNT }, (_, i) => eq.bands_db[i] ?? 0);
+  });
+
   function handleBandInput(index: number, e: Event) {
+    userTouched = true;
+    cancelAnim();
     const value = Number((e.target as HTMLInputElement).value);
+    displayBands = displayBands.map((g, i) => (i === index ? value : g));
     void settings.setBandGain(index, value);
   }
 
   function handlePreampInput(e: Event) {
+    userTouched = true;
+    cancelAnim();
     const value = Number((e.target as HTMLInputElement).value);
+    displayPreamp = value;
     void settings.setPreamp(value);
   }
 
-  function handlePresetChange(name: string) {
-    if (name) {
-      void settings.applyPreset(name);
-    }
+  function applyPresetAndClose(name: string) {
+    const p = settings.customPresets.find((x) => x.name === name);
+    if (!p) return;
+    userTouched = true;
+    closeDropdown();
+    void settings.applyPreset(name);
+    animateDisplay(p.preamp_db, p.bands_db);
+  }
+
+  function handleReset() {
+    userTouched = true;
+    void settings.resetEqualizer();
+    animateDisplay(0, Array(BAND_COUNT).fill(0));
   }
 
   // Custom dropdown state
@@ -95,7 +139,6 @@
     e?.stopPropagation();
     saveMode = true;
     newPresetName = '';
-    // focus input after render
     setTimeout(() => {
       const input = document.querySelector('.preset-save-input') as HTMLInputElement | null;
       input?.focus();
@@ -108,7 +151,6 @@
     const name = newPresetName.trim();
     if (!name) return;
     await settings.savePreset(name);
-    // After saving, close and the label will update if it matches
     closeDropdown();
   }
 
@@ -126,12 +168,6 @@
     }
   }
 
-  function applyPresetAndClose(name: string) {
-    handlePresetChange(name);
-    closeDropdown();
-  }
-
-  // Close dropdown on outside click / escape
   function handleGlobalClick(e: MouseEvent) {
     if (!dropdownOpen) return;
     const target = e.target as HTMLElement;
@@ -145,6 +181,8 @@
       closeDropdown();
     }
   }
+
+  onDestroy(() => cancelAnim());
 </script>
 
 <svelte:window onclick={handleGlobalClick} onkeydown={handleGlobalKey} />
@@ -159,10 +197,6 @@
       />
       <span>Enable EQ</span>
     </label>
-
-    <span class="eq-badge" class:eq-badge--active={dspAttached}>
-      {dspAttached ? 'DSP active' : 'DSP inactive'} · {processCount} buffers
-    </span>
 
     <div class="eq-presets">
       <span class="eq-presets-label">Preset:</span>
@@ -241,7 +275,7 @@
       </div>
     </div>
 
-    <button type="button" class="eq-reset" onclick={() => settings.resetEqualizer()}>
+    <button type="button" class="eq-reset" onclick={handleReset}>
       Reset
     </button>
   </div>
@@ -254,16 +288,17 @@
         min="-15"
         max="15"
         step="0.1"
-        value={settings.equalizer.preamp_db}
+        value={displayPreamp}
+        style={`--fill: ${fillPct(displayPreamp, -15, 15)}%`}
         oninput={handlePreampInput}
         aria-label="Preamp"
       />
-      <span class="eq-gain">{settings.equalizer.preamp_db > 0 ? '+' : ''}{settings.equalizer.preamp_db.toFixed(1)}</span>
+      <span class="eq-gain">{displayPreamp > 0 ? '+' : ''}{displayPreamp.toFixed(1)}</span>
       <span class="eq-freq">Preamp</span>
     </div>
 
     {#each Array(BAND_COUNT) as _, i (i)}
-      {@const gain = settings.equalizer.bands_db[i] ?? 0}
+      {@const gain = displayBands[i] ?? 0}
       <div class="eq-band">
         <input
           type="range"
@@ -272,6 +307,7 @@
           max="20"
           step="0.1"
           value={gain}
+          style={`--fill: ${fillPct(gain, -20, 20)}%`}
           oninput={(e) => handleBandInput(i, e)}
           aria-label={`${BAND_FREQUENCIES[i]} Hz`}
         />

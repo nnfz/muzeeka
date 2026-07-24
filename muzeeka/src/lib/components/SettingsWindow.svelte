@@ -4,8 +4,13 @@
   import WindowControls from './WindowControls.svelte';
   import SettingsSidebar from './SettingsSidebar.svelte';
   import Equalizer from './Equalizer.svelte';
-  import { getSettingsStore } from '$lib/stores/settings.svelte';
-  type Section = 'general' | 'audio' | 'about';
+  import { getSettingsStore, type RemoteStatus } from '$lib/stores/settings.svelte';
+  import {
+    applyAccentPalette,
+    hydrateAccentFromStorage,
+    type AccentPalette,
+  } from '$lib/coverAccent';
+  type Section = 'general' | 'downloads' | 'remote' | 'audio' | 'about';
   import { getVersion, getName } from '@tauri-apps/api/app';
   import { invoke } from '@tauri-apps/api/core';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
@@ -32,6 +37,14 @@
   let coverRebuildMsg = $state<string | null>(null);
   let coverRebuildError = $state<string | null>(null);
 
+  let remoteStatus = $state<RemoteStatus | null>(null);
+  let portDraft = $state(String(settings.remotePort));
+
+  /** Visual playback rate (animated on presets; instant on drag). */
+  let displayRate = $state(settings.playbackRate);
+  let rateUserTouched = $state(false);
+  let rateAnimRaf = 0;
+
   interface CoverRebuildStats {
     cleared_files: number;
     track_covers: number;
@@ -42,10 +55,12 @@
 
   // Prevent white flash when the window becomes visible
   if (typeof document !== 'undefined') {
-    document.documentElement.style.setProperty('background-color', '#0a0a0f', 'important');
+    document.documentElement.style.setProperty('background-color', '#0a0a0a', 'important');
     if (document.body) {
-      document.body.style.setProperty('background-color', '#0a0a0f', 'important');
+      document.body.style.setProperty('background-color', '#0a0a0a', 'important');
     }
+    // Match main window cover accent (shared localStorage origin).
+    hydrateAccentFromStorage();
   }
 
   async function refreshVkAuth() {
@@ -58,8 +73,19 @@
     }
   }
 
+  async function refreshRemoteStatus() {
+    remoteStatus = await settings.fetchRemoteStatus();
+    if (remoteStatus) {
+      portDraft = String(remoteStatus.port);
+    }
+  }
+
   onMount(() => {
-    let unlisten: UnlistenFn | null = null;
+    let unlistenVk: UnlistenFn | null = null;
+    let unlistenAccent: UnlistenFn | null = null;
+    let remotePoll: ReturnType<typeof setInterval> | null = null;
+
+    hydrateAccentFromStorage();
 
     void (async () => {
       try {
@@ -70,26 +96,46 @@
       }
 
       try {
-        const data = await invoke<{ playlists: { id: string; name: string }[] }>('playlists_load');
-        playlists = (data.playlists ?? []).map((p) => ({ id: p.id, name: p.name }));
+        // Meta-only list: no full library, no per-track Path::exists prune.
+        // Full playlists_load was freezing the app on open for large / network libs.
+        playlists = await invoke<{ id: string; name: string }[]>('playlists_list_meta');
       } catch {
         playlists = [];
       }
 
       await refreshVkAuth();
+      await refreshRemoteStatus();
+      portDraft = String(settings.remotePort);
 
       try {
-        unlisten = await listen<VkAuthStatus>('vk:auth-changed', (event) => {
+        unlistenVk = await listen<VkAuthStatus>('vk:auth-changed', (event) => {
           vkAuth = event.payload;
           vkAuthError = null;
         });
       } catch {
         // non-fatal
       }
+
+      try {
+        unlistenAccent = await listen<AccentPalette>('muzeeka:accent', (event) => {
+          applyAccentPalette(event.payload, { persist: false });
+        });
+      } catch {
+        // non-fatal
+      }
+
+      remotePoll = setInterval(() => {
+        if (activeSection === 'remote') {
+          void refreshRemoteStatus();
+        }
+      }, 2000);
     })();
 
     return () => {
-      unlisten?.();
+      unlistenVk?.();
+      unlistenAccent?.();
+      if (remotePoll) clearInterval(remotePoll);
+      cancelRateAnim();
     };
   });
 
@@ -163,10 +209,86 @@
       coverRebuildBusy = false;
     }
   }
+
+  function onRemoteEnabledChange(checked: boolean) {
+    settings.setRemoteEnabled(checked);
+    // Refresh after save debounce + server restart
+    setTimeout(() => void refreshRemoteStatus(), 450);
+  }
+
+  function commitRemotePort() {
+    const parsed = parseInt(portDraft, 10);
+    if (!Number.isFinite(parsed)) {
+      portDraft = String(settings.remotePort);
+      return;
+    }
+    settings.setRemotePort(parsed);
+    portDraft = String(settings.remotePort);
+    setTimeout(() => void refreshRemoteStatus(), 450);
+  }
+
+  function remoteStatusBadge(status: RemoteStatus | null): { text: string; kind: 'ok' | 'warn' | 'muted' } {
+    if (!status) return { text: '…', kind: 'muted' };
+    if (!status.enabled) return { text: 'Off', kind: 'muted' };
+    if (status.running) return { text: 'Running', kind: 'ok' };
+    if (status.last_error) return { text: 'Error', kind: 'warn' };
+    return { text: 'Starting…', kind: 'warn' };
+  }
+
+  let remoteBadge = $derived(remoteStatusBadge(remoteStatus));
+
+  function rateFillPct(rate: number): number {
+    return Math.max(0, Math.min(100, ((rate - 0.25) / (2 - 0.25)) * 100));
+  }
+
+  function cancelRateAnim() {
+    if (rateAnimRaf) {
+      cancelAnimationFrame(rateAnimRaf);
+      rateAnimRaf = 0;
+    }
+  }
+
+  function animateRate(target: number, duration = 280) {
+    cancelRateAnim();
+    const from = displayRate;
+    const start = performance.now();
+    const tick = (now: number) => {
+      const t = Math.min(1, (now - start) / duration);
+      const e = 1 - Math.pow(1 - t, 3);
+      displayRate = from + (target - from) * e;
+      if (t < 1) {
+        rateAnimRaf = requestAnimationFrame(tick);
+      } else {
+        rateAnimRaf = 0;
+        displayRate = target;
+      }
+    };
+    rateAnimRaf = requestAnimationFrame(tick);
+  }
+
+  $effect(() => {
+    const r = settings.playbackRate;
+    if (rateUserTouched || rateAnimRaf) return;
+    displayRate = r;
+  });
+
+  function onRateInput(e: Event) {
+    rateUserTouched = true;
+    cancelRateAnim();
+    const v = parseFloat((e.target as HTMLInputElement).value);
+    displayRate = v;
+    void settings.setPlaybackRate(v);
+  }
+
+  function onRatePreset(r: number) {
+    rateUserTouched = true;
+    void settings.setPlaybackRate(r, { immediate: true });
+    animateRate(r);
+  }
 </script>
 
-<div class="settings-window" style="background-color: #0a0a0f;">
-  <header class="app-header glass">
+<div class="settings-window">
+  <header class="app-header">
     <div class="settings-win-title" data-tauri-drag-region>Settings</div>
     <div class="app-header-spacer" data-tauri-drag-region></div>
     <WindowControls showMinimize={false} showMaximize={false} />
@@ -179,8 +301,60 @@
       {#if activeSection === 'general'}
         <div class="settings-section">
           <h2 class="section-title">General</h2>
+          <p class="section-desc">App behavior and integrations.</p>
+
+          <div class="settings-card">
+            <div class="card-row">
+              <div>
+                <div class="card-label">Discord Rich Presence</div>
+                <div class="card-value">Show the current track in Discord</div>
+              </div>
+              <label class="settings-toggle">
+                <input
+                  type="checkbox"
+                  checked={settings.discordRpcEnabled}
+                  onchange={(e) =>
+                    settings.setDiscordRpcEnabled((e.target as HTMLInputElement).checked)}
+                />
+                <span>Enabled</span>
+              </label>
+            </div>
+            <div class="card-row card-row-stack">
+              <div>
+                <div class="card-label">Cover art cache</div>
+                <div class="card-value">
+                  Rebuild as WebP and dedupe identical album art
+                </div>
+                {#if coverRebuildMsg}
+                  <div class="card-value card-value-ok">{coverRebuildMsg}</div>
+                {/if}
+                {#if coverRebuildError}
+                  <div class="card-value card-value-error">{coverRebuildError}</div>
+                {/if}
+              </div>
+              <div class="card-actions">
+                <button
+                  type="button"
+                  class="action-btn"
+                  disabled={coverRebuildBusy}
+                  onclick={() => void rebuildCovers()}
+                >
+                  {coverRebuildBusy ? 'Rebuilding…' : 'Rebuild covers'}
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div class="settings-info">
+            Keyboard shortcuts and mouse controls are available in the main window.
+            Use Alt + scroll to adjust volume.
+          </div>
+        </div>
+      {:else if activeSection === 'downloads'}
+        <div class="settings-section">
+          <h2 class="section-title">Downloads</h2>
           <p class="section-desc">
-            Application behavior and preferences. Most settings are saved automatically.
+            Where downloaded tracks are saved and which playlist receives them.
           </p>
 
           <div class="settings-card">
@@ -221,71 +395,11 @@
                 {/each}
               </select>
             </div>
-            <div class="card-row">
-              <div>
-                <div class="card-label">Playlists &amp; library</div>
-                <div class="card-value">Stored locally in app data</div>
-              </div>
-              <div class="card-badge">Auto-saved</div>
-            </div>
-            <div class="card-row">
-              <div>
-                <div class="card-label">Volume level</div>
-                <div class="card-value">Persisted across restarts</div>
-              </div>
-              <div class="card-badge">Auto-saved</div>
-            </div>
-            <div class="card-row">
-              <div>
-                <div class="card-label">Playback speed / rate</div>
-                <div class="card-value">Persisted in Audio settings</div>
-              </div>
-              <div class="card-badge">Auto-saved</div>
-            </div>
-            <div class="card-row">
-              <div>
-                <div class="card-label">Discord Rich Presence</div>
-                <div class="card-value">Show the current track in Discord</div>
-              </div>
-              <label class="discord-toggle">
-                <input
-                  type="checkbox"
-                  checked={settings.discordRpcEnabled}
-                  onchange={(e) =>
-                    settings.setDiscordRpcEnabled((e.target as HTMLInputElement).checked)}
-                />
-                <span>Enabled</span>
-              </label>
-            </div>
-            <div class="card-row card-row-stack">
-              <div>
-                <div class="card-label">Cover art cache</div>
-                <div class="card-value">
-                  Rebuild as WebP, dedupe identical album art (one file per unique image)
-                </div>
-                {#if coverRebuildMsg}
-                  <div class="card-value card-value-ok">{coverRebuildMsg}</div>
-                {/if}
-                {#if coverRebuildError}
-                  <div class="card-value card-value-error">{coverRebuildError}</div>
-                {/if}
-              </div>
-              <div class="card-actions">
-                <button
-                  type="button"
-                  class="action-btn"
-                  disabled={coverRebuildBusy}
-                  onclick={() => void rebuildCovers()}
-                >
-                  {coverRebuildBusy ? 'Rebuilding…' : 'Rebuild covers'}
-                </button>
-              </div>
-            </div>
           </div>
 
           <h2 class="section-title section-title-spaced">VK Music</h2>
           <p class="section-desc">
-            Log in to download tracks and playlists from vk.com / vk.ru. Session is stored only on this device.
+            Log in to download tracks and playlists from vk.com / vk.ru. Session stays on this device.
           </p>
 
           <div class="settings-card">
@@ -323,23 +437,105 @@
               </div>
             </div>
           </div>
+        </div>
+      {:else if activeSection === 'remote'}
+        <div class="settings-section">
+          <h2 class="section-title">Remote control</h2>
+          <p class="section-desc">
+            Control playback from a phone or browser on the same network.
+          </p>
 
-          <div class="settings-info">
-            Keyboard shortcuts and mouse controls are available in the main window.
-            Use Alt + scroll to adjust volume.
+          <div class="settings-card">
+            <div class="card-row">
+              <div>
+                <div class="card-label">Remote server</div>
+                <div class="card-value">HTTP control panel on your local network</div>
+              </div>
+              <div class="card-actions">
+                <div class="card-badge {remoteBadge.kind}">{remoteBadge.text}</div>
+                <label class="settings-toggle">
+                  <input
+                    type="checkbox"
+                    checked={settings.remoteEnabled}
+                    onchange={(e) =>
+                      onRemoteEnabledChange((e.target as HTMLInputElement).checked)}
+                  />
+                  <span>Enabled</span>
+                </label>
+              </div>
+            </div>
+
+            <div class="card-row card-row-stack">
+              <div>
+                <div class="card-label">Computer IP</div>
+                <div class="card-value card-value-mono">
+                  {remoteStatus?.local_ip ?? '—'}
+                </div>
+                {#if remoteStatus?.local_ips?.length}
+                  <div class="card-value">
+                    Also:
+                    {#each remoteStatus.local_ips as ip, i (ip)}
+                      <span class="card-value-mono">{ip}</span>{i < remoteStatus.local_ips.length - 1 ? ', ' : ''}
+                    {/each}
+                  </div>
+                {/if}
+              </div>
+            </div>
+
+            <div class="card-row">
+              <div>
+                <div class="card-label">Port</div>
+                <div class="card-value">1024–65535 (default 8765)</div>
+              </div>
+              <input
+                class="port-input"
+                type="number"
+                min="1024"
+                max="65535"
+                step="1"
+                disabled={!settings.remoteEnabled}
+                bind:value={portDraft}
+                onchange={commitRemotePort}
+                onkeydown={(e) => {
+                  if (e.key === 'Enter') {
+                    (e.target as HTMLInputElement).blur();
+                    commitRemotePort();
+                  }
+                }}
+              />
+            </div>
+
+            {#if settings.remoteEnabled && remoteStatus?.urls?.length}
+              <div class="card-row card-row-stack">
+                <div>
+                  <div class="card-label">Open on phone</div>
+                  <div class="card-value">Same Wi‑Fi as this PC</div>
+                  {#each remoteStatus.urls as url (url)}
+                    <a class="remote-url" href={url} target="_blank" rel="noreferrer">{url}</a>
+                  {/each}
+                </div>
+              </div>
+            {/if}
+
+            {#if remoteStatus?.last_error}
+              <div class="card-row">
+                <div class="card-value card-value-error">{remoteStatus.last_error}</div>
+              </div>
+            {/if}
           </div>
 
+          <div class="settings-info">
+            Open the URL on your phone. If it doesn’t load, check firewall rules for the chosen port.
+          </div>
         </div>
       {:else if activeSection === 'audio'}
         <div class="settings-section">
           <h2 class="section-title">Audio</h2>
-          <p class="section-desc">
-            15-band 1/3-octave graphic EQ with 32-bit floating-point DSP processing.
-          </p>
+          <p class="section-desc">15-band graphic equalizer and playback speed.</p>
           <Equalizer />
 
           <!-- Playback Rate -->
-          <div class="settings-card rate-card">
+          <div class="rate-card">
             <div class="card-header">
               <div>
                 <div class="card-label">Playback speed</div>
@@ -352,18 +548,20 @@
                 </div>
               </div>
               <div class="rate-display">
-                <span class="rate-value-big">{settings.playbackRate.toFixed(2)}×</span>
+                <span class="rate-value-big">{displayRate.toFixed(2)}×</span>
               </div>
             </div>
 
             <div class="rate-slider-row">
               <input
                 type="range"
+                class="rate-slider"
                 min="0.25"
                 max="2"
                 step="0.01"
-                value={settings.playbackRate}
-                oninput={(e) => settings.setPlaybackRate(parseFloat((e.target as HTMLInputElement).value))}
+                value={displayRate}
+                style={`--fill: ${rateFillPct(displayRate)}%`}
+                oninput={onRateInput}
               />
               <div class="rate-bounds">
                 <span>0.25×</span>
@@ -377,7 +575,7 @@
                   type="button"
                   class="preset-btn"
                   class:active={Math.abs(settings.playbackRate - r) < 0.01}
-                  onclick={() => void settings.setPlaybackRate(r, { immediate: true })}
+                  onclick={() => onRatePreset(r)}
                 >
                   {r.toFixed(r === 1 ? 1 : 2)}×
                 </button>
@@ -439,60 +637,4 @@
 
 <style>
   @import './SettingsWindow.css';
-
-  .section-title-spaced {
-    margin-top: 22px;
-  }
-
-  .card-value-error {
-    color: #f07178;
-    margin-top: 4px;
-  }
-
-  .card-value-ok {
-    color: #7fd99a;
-    margin-top: 4px;
-  }
-
-  .action-btn-primary {
-    background: var(--accent-soft);
-    color: var(--accent);
-    border-color: transparent;
-  }
-
-  .action-btn-primary:disabled {
-    opacity: 0.6;
-  }
-
-  .card-row-stack {
-    flex-wrap: wrap;
-    align-items: flex-start;
-  }
-
-  .card-value-path {
-    word-break: break-all;
-    max-width: 42ch;
-  }
-
-  .card-actions {
-    display: flex;
-    gap: 6px;
-    flex-shrink: 0;
-  }
-
-  .playlist-select {
-    min-width: 180px;
-    height: 32px;
-    padding: 0 10px;
-    font-size: 12px;
-    color: var(--text-primary);
-    background: var(--bg-elevated);
-    border: 1px solid var(--border-subtle);
-    border-radius: var(--radius-sm);
-    outline: none;
-  }
-
-  .playlist-select:focus {
-    border-color: var(--border-accent);
-  }
 </style>
