@@ -78,6 +78,7 @@
   transform: translateY(-50%);
   color: var(--text-muted);
   padding: 4px;
+  line-height: 0;
   border-radius: var(--radius-sm);
   transition: color var(--transition-fast);
 }

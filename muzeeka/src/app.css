@@ -45,7 +45,9 @@
   --bg-surface: #111111;
   --bg-elevated: #1a1a1a;
   --bg-glass: rgba(18, 18, 18);
+  --bg-glass-transp: rgba(18, 18, 18, 0.6);
   --bg-glass-hover: rgba(26, 26, 26);
+  --bg-glass-hover-transp: rgba(26, 26, 26, 0.6);
 
 
   /* Accent palette (overridden from cover via coverAccent.ts) */

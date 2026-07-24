@@ -61,7 +61,9 @@
             onclick={() => playTrack(track.path)}
             title={`${trackDisplayTitle(track)} — ${trackDisplayArtist(track)} (${item.playlistName})`}
           >
-            <TrackCover track={track} />
+            <div class="search-dropdown-track-cover">
+              <TrackCover track={track} />
+            </div>
             <span class="search-dropdown-info">
               <span class="search-dropdown-primary">{trackDisplayTitle(track)}</span>
               <span class="search-dropdown-secondary">

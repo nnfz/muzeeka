@@ -33,11 +33,11 @@
   height: 32px;
   padding: 0 12px;
   border-bottom: 1px solid var(--border-subtle);
-  background: rgba(17, 17, 24, 0.7);
+  background: var(--bg-surface);
 }
 
 .search-dropdown-title {
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 600;
   color: var(--text-primary);
   white-space: nowrap;
@@ -54,7 +54,7 @@
 }
 
 .search-dropdown-hint {
-  font-size: 10px;
+  font-size: 12px;
   color: var(--text-muted);
   white-space: nowrap;
   flex-shrink: 0;
@@ -91,6 +91,11 @@
   display: flex;
   flex-direction: column;
   gap: 1px;
+}
+
+.search-dropdown-track-cover {
+  border-radius: var(--radius-mini);
+  overflow: hidden;
 }
 
 .search-dropdown-primary {

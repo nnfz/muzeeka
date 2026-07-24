@@ -1,12 +1,13 @@
 .context-menu {
   position: fixed;
   z-index: 300;
-  width: 176px;
+  width: auto;
   padding: 4px;
   border-radius: var(--radius-sm);
-  background: rgba(43, 43, 61, 0.96);
-  backdrop-filter: blur(16px);
-  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-glass-hover-transp);
+  backdrop-filter: saturate(130%) blur(20px);
+  -webkit-backdrop-filter: saturate(130%) blur(20px);
   animation: fade-in 0.12s ease;
 }
 

@@ -282,6 +282,7 @@
   opacity: 0.7;
   border-radius: 8px;
   cursor: pointer;
+  pointer-events: auto;
   transition: all var(--transition-fast);
 }
 
@@ -327,18 +328,20 @@
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 16px;
+  gap: 24px;
   opacity: 1;
   transform: translate3d(0, 0, 0);
   filter: none;
-  transition: opacity 200ms var(--fs-ease-soft);
+  transition: opacity 200ms var(--fs-ease-soft) 
+    , transform 400ms var(--fs-ease-soft)
+    , filter 200ms var(--fs-ease-soft);
   animation: none;
 }
 
 .fullscreen-bottom-chrome-inner.chrome-hidden {
   opacity: 0;
-  transform: none;
-  filter: none;
+  transform: translate3d(0, 8px, 0);
+  filter: blur(4px);
   pointer-events: none;
 }
 
@@ -364,7 +367,7 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 14px;
+  gap: 20px;
 }
 
 /* Match MediaSlider .volume-btn */
@@ -410,8 +413,8 @@
 }
 
 .fs-icon-sm {
-  width: 18px;
-  height: 18px;
+  width: 20px;
+  height: 20px;
 }
 
 .fs-icon-play {
@@ -460,6 +463,10 @@
   transform: scale(1.12);
 }
 
+.fullscreen-volume :global(.volume-btn:active) {
+  transform: scale(0.94);
+}
+
 .fs-control-btn {
   display: flex;
   align-items: center;
@@ -467,7 +474,7 @@
   width: 46px;
   height: 46px;
   border-radius: var(--radius-sm);
-  color: var(--text-primary);
+  color: var(--text-primary-md);
   background: transparent;
   transition:
     color 200ms var(--fs-ease-soft),
@@ -477,11 +484,10 @@
 .fs-control-btn:hover:not(:disabled) {
   color: var(--text-primary);
   background: transparent;
-  transform: scale(1.12);
 }
 
 .fs-control-btn:active:not(:disabled) {
-  transform: scale(0.94);
+  transform: scale(0.9);
 }
 
 .fs-control-btn:disabled {
@@ -508,18 +514,17 @@
 .fs-control-btn.play-btn {
   aspect-ratio: 1;
   background: transparent;
-  color: var(--text-primary);
+  color: var(--text-primary-md);
   border-radius: var(--radius-sm);
 }
 
 .fs-control-btn.play-btn:hover:not(:disabled) {
   background: transparent;
   color: var(--text-primary);
-  transform: scale(1.12);
 }
 
 .fs-control-btn.play-btn:active:not(:disabled) {
-  transform: scale(0.94);
+  transform: scale(0.8);
 }
 
 .fullscreen-progress {

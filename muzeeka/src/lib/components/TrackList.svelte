@@ -1274,7 +1274,7 @@
                 {/if}
               </button>
 
-              {#if i < visibleColumns.length - 1 && column !== "index"}
+              {#if i < visibleColumns.length - 1 && column !== "index" && column !== "album"}
                 {@const rightColumn = visibleColumns[i + 1]}
                 <button
                   type="button"
