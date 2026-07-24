@@ -1,8 +1,8 @@
 [package]
 name = "muzeeka"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
+description = "Music player"
+authors = ["nnfz"]
 edition = "2021"
 default-run = "muzeeka"
 
