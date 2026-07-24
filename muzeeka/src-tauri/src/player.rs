@@ -4,6 +4,7 @@
 // playback state, and emits Tauri events for position updates.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex as StdMutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -43,7 +44,12 @@ const SEEK_DIP_LEVEL: f32 = 0.0;
 
 // Gapless: switch at the real segment boundary (tight tolerance avoids early cuts).
 const GAPLESS_END_EPSILON_SECS: f64 = 0.008;
+/// How often BASS is polled for gapless / end detection (always).
 const POLL_INTERVAL_MS: u64 = 50;
+/// UI position events while the main window is focused (smooth seekbar).
+const UI_EMIT_HOT_MS: u64 = 50;
+/// UI position events while unfocused — keeps WebView/GPU quiet during games.
+const UI_EMIT_COLD_MS: u64 = 500;
 /// Re-push Discord RPC timestamps while playing so progress stays in sync.
 const RPC_POSITION_SYNC_MS: u64 = 5000;
 /// After a manual play/seek, a new stream can briefly look "ended". Ignore end
@@ -178,6 +184,8 @@ pub struct Player {
     app: Arc<RwLock<Option<AppHandle>>>,
     bass_thread: Arc<RwLock<Option<thread::ThreadId>>>,
     discord: Arc<RwLock<Option<DiscordPresence>>>,
+    /// True while the main window is focused — drives UI event rate (games-friendly when false).
+    ui_hot: Arc<AtomicBool>,
 }
 
 impl Player {
@@ -215,7 +223,17 @@ impl Player {
             app: Arc::new(RwLock::new(None)),
             bass_thread: Arc::new(RwLock::new(None)),
             discord: Arc::new(RwLock::new(None)),
+            ui_hot: Arc::new(AtomicBool::new(true)),
         }
+    }
+
+    /// Focused main window → hot UI updates; unfocused (game in foreground) → cold.
+    pub fn set_ui_hot(&self, hot: bool) {
+        self.ui_hot.store(hot, Ordering::Relaxed);
+    }
+
+    pub fn ui_is_hot(&self) -> bool {
+        self.ui_hot.load(Ordering::Relaxed)
     }
 
     fn cancel_pending_pause(inner: &mut PlayerInner) {
@@ -1914,6 +1932,9 @@ impl Player {
     /// Poll playback on the main thread and emit position / track-ended events.
     ///
     /// BASS must only be called from the thread that invoked `BASS_Init`.
+    /// Uses one long-lived worker (not a new OS thread every tick). While the
+    /// main window is unfocused, UI position events are throttled so games are
+    /// not fighting a 20 Hz WebView update loop; gapless still polls at 50 ms.
     pub fn start_position_emitter(&self, app: AppHandle) {
         let player = self.clone();
         let was_playing = Arc::new(StdMutex::new(false));
@@ -1924,119 +1945,242 @@ impl Player {
                 .checked_sub(Duration::from_millis(RPC_POSITION_SYNC_MS))
                 .unwrap_or_else(Instant::now),
         ));
-        Self::schedule_position_poll(
-            app,
-            player,
-            was_playing,
-            last_rpc_state,
-            last_rpc_sync,
-            POLL_INTERVAL_MS,
-        );
+        let last_ui_emit = Arc::new(StdMutex::new(
+            Instant::now()
+                .checked_sub(Duration::from_millis(UI_EMIT_COLD_MS))
+                .unwrap_or_else(Instant::now),
+        ));
+
+        let _ = thread::Builder::new()
+            .name("muzeeka-position-poll".into())
+            .spawn(move || {
+                loop {
+                    thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
+                    let app_emit = app.clone();
+                    let player_for_main = player.clone();
+                    let was_for_main = was_playing.clone();
+                    let rpc_for_main = last_rpc_state.clone();
+                    let rpc_sync_for_main = last_rpc_sync.clone();
+                    let ui_emit_for_main = last_ui_emit.clone();
+                    let (done_tx, done_rx) = mpsc::sync_channel::<()>(1);
+
+                    let _ = app.run_on_main_thread(move || {
+                        Self::position_poll_tick(
+                            &app_emit,
+                            &player_for_main,
+                            &was_for_main,
+                            &rpc_for_main,
+                            &rpc_sync_for_main,
+                            &ui_emit_for_main,
+                        );
+                        let _ = done_tx.send(());
+                    });
+                    // Bound wait so a stuck main thread cannot freeze the worker forever.
+                    let _ = done_rx.recv_timeout(Duration::from_secs(2));
+                }
+            });
     }
 
-    fn schedule_position_poll(
-        app: AppHandle,
-        player: Player,
-        was_playing: Arc<StdMutex<bool>>,
-        last_rpc_state: Arc<StdMutex<Option<PlaybackState>>>,
-        last_rpc_sync: Arc<StdMutex<Instant>>,
-        poll_ms: u64,
+    fn should_emit_ui_position(
+        player: &Player,
+        last_ui_emit: &StdMutex<Instant>,
+        force: bool,
+    ) -> bool {
+        if force {
+            if let Ok(mut last) = last_ui_emit.lock() {
+                *last = Instant::now();
+            }
+            return true;
+        }
+        let interval_ms = if player.ui_is_hot() {
+            UI_EMIT_HOT_MS
+        } else {
+            UI_EMIT_COLD_MS
+        };
+        let Ok(mut last) = last_ui_emit.lock() else {
+            return true;
+        };
+        if last.elapsed() >= Duration::from_millis(interval_ms) {
+            *last = Instant::now();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn position_poll_tick(
+        app_emit: &AppHandle,
+        player_for_main: &Player,
+        was_for_main: &StdMutex<bool>,
+        rpc_for_main: &StdMutex<Option<PlaybackState>>,
+        rpc_sync_for_main: &StdMutex<Instant>,
+        last_ui_emit: &StdMutex<Instant>,
     ) {
-        let app_for_sleep = app.clone();
-        let player_for_main = player.clone();
-        let was_for_main = was_playing.clone();
-        let rpc_for_main = last_rpc_state.clone();
-        let rpc_sync_for_main = last_rpc_sync.clone();
-        let app_for_next = app.clone();
-        let player_for_next = player.clone();
-        let was_for_next = was_playing;
-        let rpc_for_next = last_rpc_state;
-        let rpc_sync_for_next = last_rpc_sync;
+        let poll_result = player_for_main.run_on_bass_thread(|inner| {
+            if inner.current_source == 0 || inner.mixer_handle == 0 || inner.bass.is_none() {
+                return Ok(None);
+            }
+            let bass = inner.bass.as_ref().unwrap();
+            let mixer_active = bass.channel_is_active(inner.mixer_handle);
+            let src_active = if inner.current_source != 0 {
+                bass.channel_is_active(inner.current_source)
+            } else {
+                bass::BASS_ACTIVE_STOPPED
+            };
+            let pos_bytes =
+                bass.mixer_channel_get_position(inner.current_source, bass::BASS_POS_BYTE);
+            let absolute = bass.channel_bytes2seconds(inner.current_source, pos_bytes);
 
-        thread::spawn(move || {
-            thread::sleep(Duration::from_millis(poll_ms));
-            let app_emit = app_for_sleep.clone();
-            let _ = app_for_sleep.run_on_main_thread(move || {
-                let poll_result = player_for_main.run_on_bass_thread(|inner| {
-                    if inner.current_source == 0 || inner.mixer_handle == 0 || inner.bass.is_none() {
-                        return Ok((None, POLL_INTERVAL_MS));
-                    }
-                    let bass = inner.bass.as_ref().unwrap();
-                    let mixer_active = bass.channel_is_active(inner.mixer_handle);
-                    let src_active = if inner.current_source != 0 {
-                        bass.channel_is_active(inner.current_source)
-                    } else {
-                        bass::BASS_ACTIVE_STOPPED
+            let playing = mixer_active == bass::BASS_ACTIVE_PLAYING;
+            let ending = playing && Self::track_ending(inner, bass, absolute);
+            // Source ended (or no source) means the track is done, even if mixer is still "playing" silence (NONSTOP)
+            let stream_done =
+                src_active == bass::BASS_ACTIVE_STOPPED || mixer_active == bass::BASS_ACTIVE_STOPPED;
+
+            let now = Self::now_millis();
+            // Pitch/rate topology rebuild and seeks can briefly look "ended".
+            // Never advance or tear down during the suppress window.
+            if now < inner.suppress_gapless_until {
+                return Ok(None);
+            }
+
+            if Self::has_next_in_gapless_queue(inner) && (ending || stream_done) {
+                // Guard against spurious early advance after manual click in que
+                // (new track can briefly appear done). Short tracks cap the guard
+                // by their own duration so <1s files still auto-advance.
+                if Self::past_spurious_end_guard(inner, bass) {
+                    return Self::try_advance_gapless(inner).map(Some).map_err(|error| {
+                        eprintln!("Gapless advance failed: {error}");
+                        error
+                    });
+                }
+            }
+
+            if (ending || stream_done)
+                && !Self::has_next_in_gapless_queue(inner)
+                && Self::past_spurious_end_guard(inner, bass)
+            {
+                // End of playlist: ensure source is gone (AUTOFREE usually handles it).
+                // Wait for the duration-aware guard so short last tracks still emit
+                // track-ended promptly (duration is known while the source lives).
+                // Do not stop the mixer — keep it running (silent) so next playback starts without device hiccup.
+                if inner.current_source != 0 {
+                    let _ = bass.mixer_channel_remove(inner.current_source);
+                    Self::free_playback_channel(
+                        bass,
+                        inner.current_source,
+                        inner.current_decode,
+                    );
+                    inner.current_source = 0;
+                    inner.current_decode = 0;
+                }
+            }
+
+            Ok(None)
+        });
+
+        let advanced_path = match poll_result {
+            Ok(result) => result,
+            Err(error) => {
+                eprintln!("Gapless poll failed: {error}");
+                None
+            }
+        };
+
+        if let Some(path) = advanced_path {
+            let mut was = was_for_main.lock().unwrap_or_else(|e| e.into_inner());
+            *was = true;
+            let snapshot = player_for_main.get_state();
+            let _ = app_emit.emit(
+                "player:track-changed",
+                TrackChangedPayload { path: path.clone() },
+            );
+            let _ = app_emit.emit(
+                "player:position",
+                PositionPayload {
+                    position: snapshot.position,
+                    duration: snapshot.duration,
+                    state: snapshot.state,
+                },
+            );
+            let _ = Self::should_emit_ui_position(player_for_main, last_ui_emit, true);
+            player_for_main.sync_discord_presence();
+            if let Ok(mut rpc_state) = rpc_for_main.lock() {
+                *rpc_state = Some(snapshot.state);
+            }
+            if let Ok(mut last_sync) = rpc_sync_for_main.lock() {
+                *last_sync = Instant::now();
+            }
+            return;
+        }
+
+        let snapshot = player_for_main.get_state();
+
+        let mut was = was_for_main.lock().unwrap_or_else(|e| e.into_inner());
+        match snapshot.state {
+            PlaybackState::Playing => {
+                *was = true;
+                if Self::should_emit_ui_position(player_for_main, last_ui_emit, false) {
+                    let payload = PositionPayload {
+                        position: snapshot.position,
+                        duration: snapshot.duration,
+                        state: snapshot.state,
                     };
-                    let pos_bytes =
-                        bass.mixer_channel_get_position(inner.current_source, bass::BASS_POS_BYTE);
-                    let absolute =
-                        bass.channel_bytes2seconds(inner.current_source, pos_bytes);
-
-                    let playing = mixer_active == bass::BASS_ACTIVE_PLAYING;
-                    let ending = playing && Self::track_ending(inner, bass, absolute);
-                    // Source ended (or no source) means the track is done, even if mixer is still "playing" silence (NONSTOP)
-                    let stream_done = src_active == bass::BASS_ACTIVE_STOPPED || mixer_active == bass::BASS_ACTIVE_STOPPED;
-
-                    let now = Self::now_millis();
-                    // Pitch/rate topology rebuild and seeks can briefly look "ended".
-                    // Never advance or tear down during the suppress window.
-                    if now < inner.suppress_gapless_until {
-                        return Ok((None, POLL_INTERVAL_MS));
-                    }
-
-                    if Self::has_next_in_gapless_queue(inner) && (ending || stream_done) {
-                        // Guard against spurious early advance after manual click in que
-                        // (new track can briefly appear done). Short tracks cap the guard
-                        // by their own duration so <1s files still auto-advance.
+                    let _ = app_emit.emit("player:position", &payload);
+                }
+                // Note: do not emit player:state on every poll tick.
+                // The position event already carries the state, and the
+                // frontend position listener applies it (with pause guard).
+                // Frequent player:state was causing extra clobbering of isPlaying.
+            }
+            PlaybackState::Paused => {
+                // Emit on transition into pause, while focused (seek while paused),
+                // or on the cold interval — never spam 20 Hz while paused in background.
+                let entered_pause = *was;
+                *was = false;
+                if Self::should_emit_ui_position(player_for_main, last_ui_emit, entered_pause) {
+                    let payload = PositionPayload {
+                        position: snapshot.position,
+                        duration: snapshot.duration,
+                        state: snapshot.state,
+                    };
+                    let _ = app_emit.emit("player:position", &payload);
+                }
+            }
+            PlaybackState::Stopped if *was => {
+                let recovered = player_for_main
+                    .run_on_bass_thread(|inner| {
+                        if !Self::has_next_in_gapless_queue(inner) {
+                            return Ok(None);
+                        }
+                        let now = Self::now_millis();
+                        // Same guards as the playing-path advance: pitch/rate
+                        // topology rebuilds can briefly look "stopped".
+                        if now < inner.suppress_gapless_until {
+                            return Ok(None);
+                        }
+                        let bass = match inner.bass.as_ref() {
+                            Some(b) => b,
+                            None => return Ok(None),
+                        };
                         if Self::past_spurious_end_guard(inner, bass) {
-                            return Self::try_advance_gapless(inner)
-                                .map(|path| (Some(path), POLL_INTERVAL_MS))
-                                .map_err(|error| {
-                                    eprintln!("Gapless advance failed: {error}");
-                                    error
-                                });
+                            Self::try_advance_gapless(inner).map(Some).map_err(|error| {
+                                eprintln!("Gapless recovery failed: {error}");
+                                error
+                            })
+                        } else {
+                            Ok(None)
                         }
-                    }
+                    })
+                    .ok()
+                    .flatten();
 
-                    if (ending || stream_done)
-                        && !Self::has_next_in_gapless_queue(inner)
-                        && Self::past_spurious_end_guard(inner, bass)
-                    {
-                        // End of playlist: ensure source is gone (AUTOFREE usually handles it).
-                        // Wait for the duration-aware guard so short last tracks still emit
-                        // track-ended promptly (duration is known while the source lives).
-                        // Do not stop the mixer — keep it running (silent) so next playback starts without device hiccup.
-                        if inner.current_source != 0 {
-                            let _ = bass.mixer_channel_remove(inner.current_source);
-                            Self::free_playback_channel(
-                                bass,
-                                inner.current_source,
-                                inner.current_decode,
-                            );
-                            inner.current_source = 0;
-                            inner.current_decode = 0;
-                        }
-                    }
-
-                    Ok((None, POLL_INTERVAL_MS))
-                });
-
-                let (advanced_path, next_poll_ms) = match poll_result {
-                    Ok(result) => result,
-                    Err(error) => {
-                        eprintln!("Gapless poll failed: {error}");
-                        (None, POLL_INTERVAL_MS)
-                    }
-                };
-
-                if let Some(path) = advanced_path {
-                    let mut was = was_for_main.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(path) = recovered {
                     *was = true;
                     let snapshot = player_for_main.get_state();
                     let _ = app_emit.emit(
                         "player:track-changed",
-                        TrackChangedPayload { path: path.clone() },
+                        TrackChangedPayload { path },
                     );
                     let _ = app_emit.emit(
                         "player:position",
@@ -2046,6 +2190,7 @@ impl Player {
                             state: snapshot.state,
                         },
                     );
+                    let _ = Self::should_emit_ui_position(player_for_main, last_ui_emit, true);
                     player_for_main.sync_discord_presence();
                     if let Ok(mut rpc_state) = rpc_for_main.lock() {
                         *rpc_state = Some(snapshot.state);
@@ -2053,198 +2198,84 @@ impl Player {
                     if let Ok(mut last_sync) = rpc_sync_for_main.lock() {
                         *last_sync = Instant::now();
                     }
-                    Self::schedule_position_poll(
-                        app_for_next,
-                        player_for_next,
-                        was_for_next,
-                        rpc_for_next,
-                        rpc_sync_for_next,
-                        POLL_INTERVAL_MS,
-                    );
                     return;
                 }
 
-                let snapshot = player_for_main.get_state();
-
-                let mut was = was_for_main.lock().unwrap_or_else(|e| e.into_inner());
-                match snapshot.state {
-                    PlaybackState::Playing => {
-                        *was = true;
-                        let payload = PositionPayload {
-                            position: snapshot.position,
-                            duration: snapshot.duration,
-                            state: snapshot.state,
-                        };
-                        let _ = app_emit.emit("player:position", &payload);
-                        // Note: do not emit player:state on every poll tick.
-                        // The position event already carries the state, and the
-                        // frontend position listener applies it (with pause guard).
-                        // Frequent player:state was causing extra clobbering of isPlaying.
-                    }
-                    PlaybackState::Paused => {
-                        *was = false;
-                        let payload = PositionPayload {
-                            position: snapshot.position,
-                            duration: snapshot.duration,
-                            state: snapshot.state,
-                        };
-                        let _ = app_emit.emit("player:position", &payload);
-                    }
-                    PlaybackState::Stopped if *was => {
-                        let recovered = player_for_main
-                            .run_on_bass_thread(|inner| {
-                                if !Self::has_next_in_gapless_queue(inner) {
-                                    return Ok(None);
-                                }
-                                let now = Self::now_millis();
-                                // Same guards as the playing-path advance: pitch/rate
-                                // topology rebuilds can briefly look "stopped".
-                                if now < inner.suppress_gapless_until {
-                                    return Ok(None);
-                                }
-                                let bass = match inner.bass.as_ref() {
-                                    Some(b) => b,
-                                    None => return Ok(None),
-                                };
-                                if Self::past_spurious_end_guard(inner, bass) {
-                                    Self::try_advance_gapless(inner).map(Some).map_err(|error| {
-                                        eprintln!("Gapless recovery failed: {error}");
-                                        error
-                                    })
-                                } else {
-                                    Ok(None)
-                                }
-                            })
-                            .ok()
-                            .flatten();
-
-                        if let Some(path) = recovered {
-                            *was = true;
-                            let snapshot = player_for_main.get_state();
-                            let _ = app_emit.emit(
-                                "player:track-changed",
-                                TrackChangedPayload { path },
-                            );
-                            let _ = app_emit.emit(
-                                "player:position",
-                                PositionPayload {
-                                    position: snapshot.position,
-                                    duration: snapshot.duration,
-                                    state: snapshot.state,
-                                },
-                            );
-                            player_for_main.sync_discord_presence();
-                            if let Ok(mut rpc_state) = rpc_for_main.lock() {
-                                *rpc_state = Some(snapshot.state);
+                // End-of-queue (or gapless failed): emit track-ended only after the
+                // anti-spurious window, so sub-second tracks aren't torn down too early
+                // and frontend can still advance once the guard elapses.
+                let ended_path = player_for_main
+                    .run_on_bass_thread(|inner| {
+                        let now = Self::now_millis();
+                        if now < inner.suppress_gapless_until {
+                            return Ok(None::<String>);
+                        }
+                        if let Some(bass) = inner.bass.as_ref() {
+                            if !Self::past_spurious_end_guard(inner, bass) {
+                                return Ok(None);
                             }
-                            if let Ok(mut last_sync) = rpc_sync_for_main.lock() {
-                                *last_sync = Instant::now();
-                            }
-                            Self::schedule_position_poll(
-                                app_for_next,
-                                player_for_next,
-                                was_for_next,
-                                rpc_for_next,
-                                rpc_sync_for_next,
-                                POLL_INTERVAL_MS,
-                            );
-                            return;
-                        }
-
-                        // End-of-queue (or gapless failed): emit track-ended only after the
-                        // anti-spurious window, so sub-second tracks aren't torn down too early
-                        // and frontend can still advance once the guard elapses.
-                        let ended_path = player_for_main
-                            .run_on_bass_thread(|inner| {
-                                let now = Self::now_millis();
-                                if now < inner.suppress_gapless_until {
-                                    return Ok(None::<String>);
-                                }
-                                if let Some(bass) = inner.bass.as_ref() {
-                                    if !Self::past_spurious_end_guard(inner, bass) {
-                                        return Ok(None);
-                                    }
-                                } else if now.saturating_sub(inner.current_track_start_time)
-                                    <= SPURIOUS_END_GUARD_MS
-                                {
-                                    return Ok(None);
-                                }
-                                Ok(inner.current_file.clone())
-                            })
-                            .ok()
-                            .flatten();
-
-                        let Some(ended_path) = ended_path else {
-                            // Guard still active — keep *was so we retry on the next poll.
-                            Self::schedule_position_poll(
-                                app_for_next,
-                                player_for_next,
-                                was_for_next,
-                                rpc_for_next,
-                                rpc_sync_for_next,
-                                POLL_INTERVAL_MS,
-                            );
-                            return;
-                        };
-
-                        player_for_main.release_ended_stream();
-                        *was = false;
-                        let _ = app_emit.emit(
-                            "player:track-ended",
-                            serde_json::json!({ "path": ended_path }),
-                        );
-                        player_for_main.sync_discord_presence();
-                        if let Ok(mut rpc_state) = rpc_for_main.lock() {
-                            *rpc_state = Some(PlaybackState::Stopped);
-                        }
-                        if let Ok(mut last_sync) = rpc_sync_for_main.lock() {
-                            *last_sync = Instant::now();
-                        }
-                    }
-                    _ => {
-                        if snapshot.state != PlaybackState::Paused {
-                            *was = false;
-                        }
-                    }
-                }
-
-                if let Ok(mut rpc_state) = rpc_for_main.lock() {
-                    if *rpc_state != Some(snapshot.state) {
-                        if snapshot.state == PlaybackState::Paused
-                            || snapshot.state == PlaybackState::Stopped
-                            || *rpc_state == Some(PlaybackState::Paused)
+                        } else if now.saturating_sub(inner.current_track_start_time)
+                            <= SPURIOUS_END_GUARD_MS
                         {
-                            player_for_main.sync_discord_presence();
-                            if let Ok(mut last_sync) = rpc_sync_for_main.lock() {
-                                *last_sync = Instant::now();
-                            }
+                            return Ok(None);
                         }
-                        *rpc_state = Some(snapshot.state);
-                    } else if snapshot.state == PlaybackState::Playing {
-                        // While playing, re-push timestamps every few seconds so Discord
-                        // progress does not drift (rate changes, clock skew, long tracks).
-                        let due = rpc_sync_for_main
-                            .lock()
-                            .map(|last| last.elapsed() >= Duration::from_millis(RPC_POSITION_SYNC_MS))
-                            .unwrap_or(false);
-                        if due {
-                            player_for_main.sync_discord_presence();
-                            if let Ok(mut last_sync) = rpc_sync_for_main.lock() {
-                                *last_sync = Instant::now();
-                            }
-                        }
+                        Ok(inner.current_file.clone())
+                    })
+                    .ok()
+                    .flatten();
+
+                let Some(ended_path) = ended_path else {
+                    // Guard still active — keep *was so we retry on the next poll.
+                    return;
+                };
+
+                player_for_main.release_ended_stream();
+                *was = false;
+                let _ = app_emit.emit(
+                    "player:track-ended",
+                    serde_json::json!({ "path": ended_path }),
+                );
+                player_for_main.sync_discord_presence();
+                if let Ok(mut rpc_state) = rpc_for_main.lock() {
+                    *rpc_state = Some(PlaybackState::Stopped);
+                }
+                if let Ok(mut last_sync) = rpc_sync_for_main.lock() {
+                    *last_sync = Instant::now();
+                }
+            }
+            _ => {
+                if snapshot.state != PlaybackState::Paused {
+                    *was = false;
+                }
+            }
+        }
+
+        if let Ok(mut rpc_state) = rpc_for_main.lock() {
+            if *rpc_state != Some(snapshot.state) {
+                if snapshot.state == PlaybackState::Paused
+                    || snapshot.state == PlaybackState::Stopped
+                    || *rpc_state == Some(PlaybackState::Paused)
+                {
+                    player_for_main.sync_discord_presence();
+                    if let Ok(mut last_sync) = rpc_sync_for_main.lock() {
+                        *last_sync = Instant::now();
                     }
                 }
-
-                Self::schedule_position_poll(
-                    app_for_next,
-                    player_for_next,
-                    was_for_next,
-                    rpc_for_next,
-                    rpc_sync_for_next,
-                    next_poll_ms,
-                );
-            });
-        });
+                *rpc_state = Some(snapshot.state);
+            } else if snapshot.state == PlaybackState::Playing {
+                // While playing, re-push timestamps every few seconds so Discord
+                // progress does not drift (rate changes, clock skew, long tracks).
+                let due = rpc_sync_for_main
+                    .lock()
+                    .map(|last| last.elapsed() >= Duration::from_millis(RPC_POSITION_SYNC_MS))
+                    .unwrap_or(false);
+                if due {
+                    player_for_main.sync_discord_presence();
+                    if let Ok(mut last_sync) = rpc_sync_for_main.lock() {
+                        *last_sync = Instant::now();
+                    }
+                }
+            }
+        }
     }
 }

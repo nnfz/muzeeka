@@ -2025,6 +2025,9 @@ function setupListeners() {
     syncWindowTitle();
   });
 
+  // Backend already throttles when unfocused; this is a second guard so a
+  // hidden/minimized WebView does not thrash Svelte reactivity during games.
+  let lastHiddenPositionApply = 0;
   listen<{ position: number; duration: number; state?: string }>('player:position', (event) => {
     const newPos = event.payload.position;
     duration = event.payload.duration;
@@ -2041,6 +2044,14 @@ function setupListeners() {
 
     if (Date.now() >= seekGuardUntil) {
       seekGuardUntil = 0;
+    }
+
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+      const now = Date.now();
+      if (now - lastHiddenPositionApply < 500) {
+        return;
+      }
+      lastHiddenPositionApply = now;
     }
 
     position = newPos;

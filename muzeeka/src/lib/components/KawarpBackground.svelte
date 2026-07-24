@@ -367,10 +367,14 @@
   $effect(() => {
     let disposed = false;
     let unlistenFocus: (() => void) | undefined;
+    let unlistenAppActive: (() => void) | undefined;
+    let recheckTimer: ReturnType<typeof setInterval> | null = null;
     let osFocused = true;
 
     const sync = () => {
       if (disposed) return;
+      // Both page visibility and real OS focus — exclusive-fullscreen games
+      // sometimes leave visibility=visible while the window is deactivated.
       windowActive = document.visibilityState === 'visible' && osFocused;
     };
 
@@ -380,11 +384,13 @@
     void (async () => {
       try {
         const { getCurrentWindow } = await import('@tauri-apps/api/window');
+        const { listen } = await import('@tauri-apps/api/event');
         if (disposed) return;
         const win = getCurrentWindow();
         osFocused = await win.isFocused();
         if (disposed) return;
         sync();
+
         const unlisten = await win.onFocusChanged(({ payload: focused }) => {
           osFocused = focused;
           sync();
@@ -394,6 +400,29 @@
           return;
         }
         unlistenFocus = unlisten;
+
+        // Rust WindowEvent::Focused — more reliable under exclusive fullscreen games.
+        const unlistenRust = await listen<boolean>('app:window-active', (event) => {
+          osFocused = event.payload;
+          sync();
+        });
+        if (disposed) {
+          unlistenRust();
+          return;
+        }
+        unlistenAppActive = unlistenRust;
+
+        // Safety net: if focus events were missed, re-query while we might be animating.
+        recheckTimer = setInterval(() => {
+          if (disposed) return;
+          void win.isFocused().then((focused) => {
+            if (disposed) return;
+            if (osFocused !== focused) {
+              osFocused = focused;
+              sync();
+            }
+          });
+        }, 2000);
       } catch {
         if (disposed) return;
         // Browser / non-Tauri: fall back to window focus events.
@@ -419,6 +448,8 @@
       disposed = true;
       document.removeEventListener('visibilitychange', sync);
       unlistenFocus?.();
+      unlistenAppActive?.();
+      if (recheckTimer) clearInterval(recheckTimer);
     };
   });
 

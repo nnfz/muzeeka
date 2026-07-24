@@ -40,7 +40,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::path::BaseDirectory;
-use tauri::{LogicalPosition, LogicalSize, Manager, WindowEvent};
+use tauri::{Emitter, LogicalPosition, LogicalSize, Manager, WindowEvent};
 
 fn bass_dir_is_valid(dir: &Path) -> bool {
     dir.join("bass.dll").is_file()
@@ -148,6 +148,7 @@ fn resolve_bass_dir(app: Option<&tauri::AppHandle>) -> PathBuf {
 pub fn run() {
     let player = Player::new();
     let player_for_close = player.clone();
+    let player_for_focus = player.clone();
     let discord_presence = DiscordPresence::new();
     let discord_for_close = discord_presence.clone();
     let last_window_state_save = Arc::new(Mutex::new(Instant::now() - Duration::from_secs(10)));
@@ -177,6 +178,13 @@ pub fn run() {
                             }
                         }
                     }
+                    // Reliable path for exclusive-fullscreen games (JS focus can miss).
+                    // Throttle WebView position spam + drop process priority for Dota/etc.
+                    WindowEvent::Focused(focused) => {
+                        player_for_focus.set_ui_hot(*focused);
+                        process_util::set_background_mode(!focused);
+                        let _ = window.app_handle().emit("app:window-active", *focused);
+                    }
                     _ => {}
                 }
             }
@@ -194,6 +202,7 @@ pub fn run() {
                     // Without this, sound could continue after the app exits.
                     discord_for_close.shutdown();
                     let _ = player_for_close.shutdown();
+                    process_util::set_background_mode(false);
                 }
             }
         })

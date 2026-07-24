@@ -27,6 +27,7 @@
   flex-direction: column;
   gap: 2px;
   overflow-y: auto;
+  padding-left: 4px;
 }
 
 .nav-item {

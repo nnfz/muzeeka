@@ -288,7 +288,7 @@
 </script>
 
 <div class="settings-window">
-  <header class="app-header">
+  <header class="app-header settings-header">
     <div class="settings-win-title" data-tauri-drag-region>Settings</div>
     <div class="app-header-spacer" data-tauri-drag-region></div>
     <WindowControls showMinimize={false} showMaximize={false} />
