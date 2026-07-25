@@ -31,6 +31,7 @@
     role="menu"
     tabindex="-1"
     onclick={(e) => e.stopPropagation()}
+    onkeydown={(e) => e.stopPropagation()}
     oncontextmenu={(e) => e.stopPropagation()}
   >
     {#each items as item (item.id)}

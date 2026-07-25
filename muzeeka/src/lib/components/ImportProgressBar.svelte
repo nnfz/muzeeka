@@ -30,6 +30,11 @@
     border-radius: 0 1px 1px 0;
   }
 
+  @keyframes import-pulse {
+    0% { transform: translateX(-100%); }
+    100% { transform: translateX(400%); }
+  }
+
   .import-progress-fill.indeterminate {
     animation: import-pulse 1.5s ease-in-out infinite;
     width: 30% !important;

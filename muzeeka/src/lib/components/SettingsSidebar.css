@@ -9,18 +9,6 @@
   border-radius: var(--radius-sm);
 }
 
-.sidebar-header {
-  padding: 8px 12px 8px;
-  flex-shrink: 0;
-}
-
-.section-label {
-  font-size: 14px;
-  font-weight: 500;
-  letter-spacing: 0.08em;
-  color: var(--text-secondary);
-}
-
 .settings-nav {
   flex: 1;
   display: flex;

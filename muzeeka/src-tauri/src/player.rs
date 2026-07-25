@@ -644,8 +644,22 @@ impl Player {
         let track_path = track_path.to_string();
         let audio_path = audio_path.map(str::to_string);
         self.run_on_bass_thread(move |inner| {
-            Self::set_gapless_queue(inner, queue);
-            Self::sync_gapless_index(inner, &track_path);
+            // Install the queue/index only — do NOT preload the next track yet.
+            // Preloading before the current segment is open is wrong for single-image CUE:
+            // the next entry is the same audio file seeked to track 2's offset, and
+            // play_inner's can_use_preloaded (audio path match) would activate that
+            // source for track 1. With cue_start=0 activate_preloaded used to skip
+            // re-seek, so the first track immediately looked "ended" and gapless
+            // advanced to track 2. play_inner refreshes the preload after open.
+            inner.gapless_queue = queue;
+            inner.gapless_queue_index = 0;
+            if let Some(index) = inner
+                .gapless_queue
+                .iter()
+                .position(|track| track.track_path == track_path)
+            {
+                inner.gapless_queue_index = index;
+            }
             Self::play_inner(inner, &track_path, audio_path.as_deref(), cue_start, cue_end)?;
             inner.user_paused = false;
             // Record start time for this track (used to guard against early advance after manual que click)
@@ -655,12 +669,6 @@ impl Player {
                 .unwrap_or(0);
             Ok(())
         })
-    }
-
-    fn set_gapless_queue(inner: &mut PlayerInner, queue: Vec<GaplessTrack>) {
-        inner.gapless_queue = queue;
-        inner.gapless_queue_index = 0;
-        Self::refresh_pending_next(inner);
     }
 
     fn sync_gapless_index(inner: &mut PlayerInner, track_path: &str) {
@@ -985,11 +993,14 @@ impl Player {
         Self::add_source_to_mixer(inner, preloaded)?;
 
         if let Some(bass) = inner.bass.as_ref() {
+            // Always re-position for this track's segment (including cue_start=0).
+            // Preload is built for the *next* gapless entry; on a single-image CUE that
+            // is the same file already seeked to a later INDEX. Skipping seek when
+            // start==0 left playback at track 2's offset while metadata said track 1,
+            // so gapless immediately advanced past the first track.
             let start = playback.cue_start.unwrap_or(0.0);
-            if start > 0.0 {
-                let byte = bass.channel_seconds2bytes(preloaded, start);
-                let _ = bass.mixer_channel_set_position(preloaded, byte, bass::BASS_POS_BYTE);
-            }
+            let byte = bass.channel_seconds2bytes(preloaded, start.max(0.0));
+            let _ = bass.mixer_channel_set_position(preloaded, byte, bass::BASS_POS_BYTE);
             let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_VOL, inner.volume);
             let _ = bass.channel_play(inner.mixer_handle, true);
             let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_BUFFER, 0.0);
@@ -1330,6 +1341,8 @@ impl Player {
     }
 
     /// Seek the mixer-facing channel so content is at `abs_secs` on the file timeline.
+    /// Includes `0.0` — CUE track 1 often starts at INDEX 01 00:00:00, and skipping
+    /// that seek left a later preloaded segment position in place.
     fn seek_content_absolute(
         bass: &BassLibrary,
         mixer_channel: u32,
@@ -1337,7 +1350,7 @@ impl Player {
         in_mixer: bool,
         abs_secs: f64,
     ) {
-        if mixer_channel == 0 || abs_secs <= 0.0 {
+        if mixer_channel == 0 || abs_secs < 0.0 {
             return;
         }
         let decode = Self::decode_handle_for_channel(bass, mixer_channel, tracked_decode);

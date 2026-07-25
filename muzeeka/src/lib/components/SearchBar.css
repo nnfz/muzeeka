@@ -1,3 +1,8 @@
+/* Keyboard highlight for filter/playlist suggestions */
+.search-dropdown-row.selected {
+  background: rgba(124, 92, 255, 0.12);
+}
+
 .search-area {
   position: relative;
   width: 220px;

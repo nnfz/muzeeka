@@ -253,12 +253,16 @@
 }
 
 .fullscreen-title {
+  display: inline-block;
   font-size: 26px;
   font-weight: 700;
   line-height: 1.25;
   color: var(--text-primary);
   text-align: left;
   letter-spacing: -0.01em;
+  white-space: nowrap;
+  width: max-content;
+  max-width: none;
 }
 
 .fullscreen-artist {
@@ -685,12 +689,6 @@
   overflow: hidden;
 }
 
-.fullscreen-title-wrapper.marquee-active .fullscreen-title-inner {
+.fullscreen-title-wrapper.marquee-active .fullscreen-title {
   animation: fs-marquee-scroll 8s cubic-bezier(0.25, 0.1, 0.25, 1) infinite;
-}
-
-.fullscreen-title-inner {
-  display: inline-block;
-  white-space: nowrap;
-  width: max-content;
 }

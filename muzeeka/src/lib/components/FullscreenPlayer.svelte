@@ -123,7 +123,7 @@
   /** Reactive: drives class so chrome cannot hide under the cursor. */
   let pointerOverChrome = $state(false);
   let chromeEl = $state<HTMLDivElement | null>(null);
-  let titleRef: HTMLDivElement | null = null;
+  let titleRef = $state<HTMLDivElement | null>(null);
   let hideTimer: ReturnType<typeof setTimeout> | null = null;
   let pointerX = 0;
   let pointerY = 0;

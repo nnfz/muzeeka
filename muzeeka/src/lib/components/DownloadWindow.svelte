@@ -120,8 +120,8 @@
 
 <div class="download-window" style="background-color: #0a0a0f;">
   <header class="app-header glass download-header">
-    <div class="download-win-title" data-tauri-drag-region ondblclick={blockMaximize}>Download</div>
-    <div class="app-header-spacer" data-tauri-drag-region ondblclick={blockMaximize}></div>
+    <div class="download-win-title" data-tauri-drag-region role="presentation" ondblclick={blockMaximize}>Download</div>
+    <div class="app-header-spacer" data-tauri-drag-region role="presentation" ondblclick={blockMaximize}></div>
     <WindowControls showMinimize={false} showMaximize={false} />
   </header>
 
