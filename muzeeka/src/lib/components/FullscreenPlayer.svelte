@@ -100,8 +100,18 @@
   let lyricsUnmountTimer: ReturnType<typeof setTimeout> | null = null;
   /** Match .fullscreen-lyrics-slot leave transition (hide) */
   const LYRICS_EXIT_MS = 280;
-  /** After open settle — transitions + Kawarp allowed. */
+  /** After open settle — transitions + Kawarp / lyrics layout allowed. */
   let enterDone = $state(false);
+  /**
+   * Open surface animation:
+   * - `from`: mounted oversized + blurred + faded (no CSS transition yet)
+   * - `active`: animating to scale 1 / sharp / opaque
+   * - `done`: settled (same as enterDone for lyrics timing)
+   */
+  /** Component only mounts while open — start on the oversized first frame. */
+  let enterPhase = $state<'idle' | 'from' | 'active' | 'done'>('from');
+  /** Full open zoom/blur duration — keep in sync with FullscreenPlayer.css. */
+  const FS_ENTER_MS = 480;
   /**
    * Drives cover left + lyrics visible. Set one frame AFTER enterDone so the browser
    * paints the centered state with transitions enabled, then animates to lyrics layout.
@@ -269,6 +279,7 @@
       lyricsVisible = true;
       lyricsMounted = true;
       enterDone = false;
+      enterPhase = 'idle';
       lyricsLayoutActive = false;
       clearArt();
       bgCoverSrc = null;
@@ -283,13 +294,27 @@
     enterDone = false;
     lyricsLayoutActive = false;
 
-    const enterTimer = setTimeout(() => {
-      enterDone = true;
-    }, 200);
+    // Paint first frame oversized/blurred without transition, then animate in.
+    enterPhase = 'from';
+    let raf1 = 0;
+    let raf2 = 0;
+    let enterTimer: ReturnType<typeof setTimeout> | null = null;
+
+    raf1 = requestAnimationFrame(() => {
+      raf2 = requestAnimationFrame(() => {
+        enterPhase = 'active';
+        enterTimer = setTimeout(() => {
+          enterPhase = 'done';
+          enterDone = true;
+        }, FS_ENTER_MS);
+      });
+    });
 
     return () => {
       clearHideTimer();
-      clearTimeout(enterTimer);
+      cancelAnimationFrame(raf1);
+      cancelAnimationFrame(raf2);
+      if (enterTimer) clearTimeout(enterTimer);
     };
   });
 
@@ -517,6 +542,8 @@
   <div
     class="fullscreen-player"
     class:enter-done={enterDone}
+    class:fs-enter-from={enterPhase === 'from'}
+    class:fs-enter-active={enterPhase === 'active' || enterPhase === 'done'}
     role="dialog"
     aria-modal="true"
     aria-label="Now playing"

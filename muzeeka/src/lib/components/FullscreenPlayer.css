@@ -3,6 +3,8 @@
   --fs-ease-soft: cubic-bezier(0.33, 1, 0.68, 1);
   --fs-move: 620ms;
   --fs-fade: 320ms;
+  /* Open: zoom out from oversized + deblur — keep in sync with FS_ENTER_MS in .svelte */
+  --fs-enter: 480ms;
   /* Marquee scroll distance (relative to title width) */
   --fs-marquee-scroll: -70%;
   /* Cover column; lyrics start further right */
@@ -15,8 +17,35 @@
   display: flex;
   flex-direction: column;
   pointer-events: none;
-  /* Shell itself is always solid — animating it faded the cover and stuttered */
+  transform-origin: center center;
+  will-change: transform, opacity, filter;
+  /* Default settled look; enter classes override the first frames */
   opacity: 1;
+  transform: scale3d(1, 1, 1);
+  filter: blur(0) saturate(1);
+}
+
+/*
+ * Open choreography:
+ * 1) fs-enter-from — first paint: large, blurred, transparent (no transition)
+ * 2) fs-enter-active — tween to 100% scale, sharp, opaque
+ * Main UI shrinks/blurs in parallel via html.fullscreen-active (app.css).
+ */
+.fullscreen-player.fs-enter-from {
+  opacity: 0;
+  transform: scale3d(1.16, 1.16, 1);
+  filter: blur(28px) saturate(1.15);
+  transition: none;
+}
+
+.fullscreen-player.fs-enter-active {
+  opacity: 1;
+  transform: scale3d(1, 1, 1);
+  filter: blur(0) saturate(1);
+  transition:
+    opacity var(--fs-enter) var(--fs-ease-soft),
+    transform var(--fs-enter) var(--fs-ease),
+    filter calc(var(--fs-enter) * 0.92) var(--fs-ease-soft);
 }
 
 .fullscreen-player > :not(.fullscreen-bottom-chrome) {
@@ -648,6 +677,9 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .fullscreen-player,
+  .fullscreen-player.fs-enter-from,
+  .fullscreen-player.fs-enter-active,
   .fullscreen-backdrop,
   .fullscreen-side,
   .fullscreen-side-scale,
@@ -655,7 +687,15 @@
   .fullscreen-bottom-chrome-inner,
   .fullscreen-art {
     animation: none !important;
-    transition-duration: 0.01ms !important;
+    transition: none !important;
+  }
+
+  .fullscreen-player,
+  .fullscreen-player.fs-enter-from,
+  .fullscreen-player.fs-enter-active {
+    opacity: 1;
+    transform: none;
+    filter: none;
   }
 
   .fullscreen-backdrop {

@@ -66,8 +66,9 @@
   font-family: var(--font-family);
   outline: none;
   font-weight: 300;
+  transition: all var(--transition-normal);
 }
-
+  
 .search-input::placeholder {
   color: var(--text-muted);
 }

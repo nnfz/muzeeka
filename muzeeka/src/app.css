@@ -152,6 +152,29 @@ body.track-table-resizing {
   background: rgba(38, 38, 38);
 }
 
+/*
+ * Fullscreen open: main chrome shrinks + blurs under the overlay.
+ * Only animate .app-body (not .app-layout) so position:fixed fullscreen
+ * (mounted under TransportBar) is not trapped by a transformed ancestor.
+ */
+.app-body {
+  transform-origin: center center;
+  transition:
+    transform 480ms cubic-bezier(0.16, 1, 0.3, 1),
+    filter 435ms cubic-bezier(0.33, 1, 0.68, 1),
+    opacity 390ms cubic-bezier(0.33, 1, 0.68, 1);
+}
+
+html.fullscreen-active .app-body {
+  transform: scale(0.9);
+  filter: blur(16px) saturate(0.75) brightness(0.72);
+  opacity: 0.55;
+  pointer-events: none;
+  /* Avoid scrolling / hit-testing the scaled list under the overlay */
+  overflow: hidden;
+  will-change: transform, filter, opacity;
+}
+
 /* Fullscreen: layer header + transport controls above overlay without moving layout */
 html.fullscreen-active .app-header {
   position: relative;
@@ -179,10 +202,46 @@ html.fullscreen-active .header-btn:hover {
   backdrop-filter: saturate(130%);
 }
 
-
 html.fullscreen-active .transport-bar {
+  /* Keep in layout for the fullscreen portal; hide chrome only */
   visibility: hidden;
   pointer-events: none;
+  opacity: 0;
+  transform: scale(0.94) translateY(12px);
+  filter: blur(10px);
+  transition:
+    opacity 315ms cubic-bezier(0.33, 1, 0.68, 1),
+    transform 390ms cubic-bezier(0.16, 1, 0.3, 1),
+    filter 315ms cubic-bezier(0.33, 1, 0.68, 1),
+    visibility 0ms linear 315ms;
+}
+
+/* Idle transport is ready to animate when fullscreen toggles */
+.transport-bar {
+  transform-origin: center bottom;
+  transition:
+    opacity 315ms cubic-bezier(0.33, 1, 0.68, 1),
+    transform 390ms cubic-bezier(0.16, 1, 0.3, 1),
+    filter 315ms cubic-bezier(0.33, 1, 0.68, 1),
+    visibility 0ms linear 0ms;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .app-body,
+  .transport-bar {
+    transition: none !important;
+  }
+
+  html.fullscreen-active .app-body {
+    transform: none;
+    filter: none;
+    opacity: 1;
+  }
+
+  html.fullscreen-active .transport-bar {
+    transform: none;
+    filter: none;
+  }
 }
 
 /* --- Glassmorphism utility --- */
