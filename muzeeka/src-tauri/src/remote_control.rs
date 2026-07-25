@@ -12,8 +12,10 @@ use crate::discord_rpc::DiscordPresence;
 use crate::library::MusicFile;
 use crate::metadata;
 use crate::player::{GaplessTrack, Player, PlayerStateSnapshot, PositionPayload, TrackChangedPayload};
-use crate::taskbar_handler;
 use crate::playlists::{self, PlaylistsData};
+use crate::settings::{self, ShuffleMode};
+use crate::taskbar_handler;
+use std::collections::HashSet;
 
 pub const VIRTUAL_ALL_ID: &str = "__all__";
 pub const VIRTUAL_LIKED_ID: &str = "__liked__";
@@ -126,6 +128,9 @@ pub struct RemoteController {
     app: AppHandle,
     shuffle_order: Mutex<Vec<usize>>,
     shuffle_position: Mutex<usize>,
+    /// Smart shuffle: paths already heard in the current playlist cycle.
+    smart_played: Mutex<HashSet<String>>,
+    smart_playlist_id: Mutex<Option<String>>,
     playlists_cache: Mutex<Option<PlaylistsCache>>,
 }
 
@@ -137,8 +142,33 @@ impl RemoteController {
             app,
             shuffle_order: Mutex::new(Vec::new()),
             shuffle_position: Mutex::new(0),
+            smart_played: Mutex::new(HashSet::new()),
+            smart_playlist_id: Mutex::new(None),
             playlists_cache: Mutex::new(None),
         }
+    }
+
+    fn shuffle_mode(&self) -> ShuffleMode {
+        settings::load_settings(&self.app)
+            .map(|s| s.shuffle_mode)
+            .unwrap_or_default()
+    }
+
+    fn ensure_smart_scope(&self, playing_id: Option<&str>) {
+        let mut key = self.smart_playlist_id.lock();
+        let id = playing_id.map(str::to_string);
+        if *key != id {
+            *key = id;
+            self.smart_played.lock().clear();
+        }
+    }
+
+    fn mark_smart_played(&self, path: &str, playing_id: Option<&str>) {
+        if self.shuffle_mode() != ShuffleMode::Smart {
+            return;
+        }
+        self.ensure_smart_scope(playing_id);
+        self.smart_played.lock().insert(path.to_string());
     }
 
     fn playing_id_from_data(data: &PlaylistsData) -> Option<String> {
@@ -462,9 +492,8 @@ impl RemoteController {
         RepeatMode::from_str(data.repeat_mode.as_deref())
     }
 
-    fn shuffle_indices(count: usize) -> Vec<usize> {
-        let mut indices: Vec<usize> = (0..count).collect();
-        for i in (1..count).rev() {
+    fn shuffle_vec(mut indices: Vec<usize>) -> Vec<usize> {
+        for i in (1..indices.len()).rev() {
             let j = (rand_simple() as usize) % (i + 1);
             indices.swap(i, j);
         }
@@ -480,7 +509,33 @@ impl RemoteController {
             return;
         }
 
-        let mut indices = Self::shuffle_indices(tracks.len());
+        let mode = self.shuffle_mode();
+        let pool: Vec<usize> = if mode == ShuffleMode::Smart {
+            self.ensure_smart_scope(playing_id.as_deref());
+            // Drop history entries that left the playlist.
+            {
+                let live: HashSet<&str> = tracks.iter().map(|t| t.path.as_str()).collect();
+                let mut played = self.smart_played.lock();
+                played.retain(|p| live.contains(p.as_str()));
+            }
+            let played = self.smart_played.lock();
+            let mut unplayed: Vec<usize> = tracks
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| !played.contains(&t.path))
+                .map(|(i, _)| i)
+                .collect();
+            drop(played);
+            if unplayed.is_empty() {
+                self.smart_played.lock().clear();
+                unplayed = (0..tracks.len()).collect();
+            }
+            unplayed
+        } else {
+            (0..tracks.len()).collect()
+        };
+
+        let mut indices = Self::shuffle_vec(pool);
         if keep_current {
             let current = self.player.get_state().current_file;
             if let Some(path) = current {
@@ -490,6 +545,8 @@ impl RemoteController {
                             indices.remove(at);
                             indices.insert(0, current_idx);
                         }
+                    } else {
+                        indices.insert(0, current_idx);
                     }
                 }
             }
@@ -520,11 +577,56 @@ impl RemoteController {
         let playing_id = Self::playing_id_from_data(data);
         let tracks = Self::playing_tracks(data, playing_id.as_deref());
         let order = self.shuffle_order.lock();
-        if order.len() != tracks.len() || order.iter().any(|&i| i >= tracks.len()) {
+        let invalid = order.is_empty() || order.iter().any(|&i| i >= tracks.len());
+        let need_full_len =
+            self.shuffle_mode() == ShuffleMode::Normal && order.len() != tracks.len();
+        if invalid || need_full_len {
             drop(order);
             self.rebuild_shuffle_order(data, true);
             self.sync_shuffle_position(data);
         }
+    }
+
+    fn advance_shuffle_position(&self, data: &PlaylistsData) -> bool {
+        self.ensure_shuffle_order(data);
+        let order_len = self.shuffle_order.lock().len();
+        if order_len == 0 {
+            return false;
+        }
+
+        let pos = *self.shuffle_position.lock();
+        if pos < order_len.saturating_sub(1) {
+            *self.shuffle_position.lock() = pos + 1;
+            return true;
+        }
+
+        if Self::repeat_mode(data) != RepeatMode::All {
+            return false;
+        }
+
+        if self.shuffle_mode() == ShuffleMode::Smart {
+            self.smart_played.lock().clear();
+            *self.smart_playlist_id.lock() = Self::playing_id_from_data(data);
+        }
+
+        let finished = self.player.get_state().current_file;
+        self.rebuild_shuffle_order(data, false);
+        let mut order = self.shuffle_order.lock();
+        if let Some(ref path) = finished {
+            let playing_id = Self::playing_id_from_data(data);
+            let tracks = Self::playing_tracks(data, playing_id.as_deref());
+            if order.len() > 1 {
+                if let Some(&first_idx) = order.first() {
+                    if tracks.get(first_idx).is_some_and(|t| &t.path == path) {
+                        let first = order.remove(0);
+                        order.push(first);
+                    }
+                }
+            }
+        }
+        drop(order);
+        *self.shuffle_position.lock() = 0;
+        !self.shuffle_order.lock().is_empty()
     }
 
     fn ordered_tracks_from(&self, data: &PlaylistsData, file_path: &str) -> Vec<MusicFile> {
@@ -595,6 +697,8 @@ impl RemoteController {
         if let Some(id) = playing_id.clone() {
             data.playing_playlist_id = Some(id);
         }
+
+        self.mark_smart_played(file_path, playing_id.as_deref());
 
         let repeat = Self::repeat_mode(&data);
         let queue = if repeat == RepeatMode::One {
@@ -796,17 +900,11 @@ impl RemoteController {
         let repeat = Self::repeat_mode(&data);
 
         if data.shuffle_enabled {
-            self.ensure_shuffle_order(&data);
-            let mut pos = *self.shuffle_position.lock();
-            let order = self.shuffle_order.lock();
-            if pos < order.len().saturating_sub(1) {
-                pos += 1;
-            } else if repeat == RepeatMode::All {
-                pos = 0;
-            } else {
+            if !self.advance_shuffle_position(&data) {
                 return Ok(());
             }
-            *self.shuffle_position.lock() = pos;
+            let pos = *self.shuffle_position.lock();
+            let order = self.shuffle_order.lock();
             if let Some(&idx) = order.get(pos) {
                 if let Some(track) = tracks.get(idx) {
                     return self.play_track(&track.path, playing_id.as_deref());

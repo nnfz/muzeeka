@@ -230,6 +230,8 @@ pub fn settings_save(
     data.remote_port = crate::remote_server::sanitize_port(data.remote_port);
     settings::save_settings(&app, &data)?;
     let _ = remote.apply(data.remote_enabled, data.remote_port);
+    // Let the main player window pick up shuffle mode / other prefs without reload.
+    let _ = app.emit("settings:updated", &data);
     Ok(())
 }
 

@@ -321,6 +321,38 @@
             </div>
             <div class="card-row card-row-stack">
               <div>
+                <div class="card-label">Shuffle mode</div>
+                <div class="card-value">
+                  {#if settings.shuffleMode === 'smart'}
+                    Smart: remembers tracks already played in this playlist and won’t
+                    repeat them until every track has had a turn
+                  {:else}
+                    Normal: classic random order; tracks may come up again sooner when
+                    the order reshuffles
+                  {/if}
+                </div>
+              </div>
+              <div class="mode-switch" role="group" aria-label="Shuffle mode">
+                <button
+                  type="button"
+                  class="mode-btn"
+                  class:active={settings.shuffleMode === 'smart'}
+                  onclick={() => settings.setShuffleMode('smart')}
+                >
+                  Smart
+                </button>
+                <button
+                  type="button"
+                  class="mode-btn"
+                  class:active={settings.shuffleMode === 'normal'}
+                  onclick={() => settings.setShuffleMode('normal')}
+                >
+                  Normal
+                </button>
+              </div>
+            </div>
+            <div class="card-row card-row-stack">
+              <div>
                 <div class="card-label">Cover art cache</div>
                 <div class="card-value">
                   Rebuild as WebP and dedupe identical album art

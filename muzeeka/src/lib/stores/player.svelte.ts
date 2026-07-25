@@ -5,6 +5,11 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { setImportProgress, resetImportProgress } from '$lib/stores/importProgress.svelte';
+import {
+  applyShuffleModeFromSettings,
+  readShuffleMode,
+  type ShuffleMode,
+} from '$lib/stores/settings.svelte';
 
 // Yield to the browser event loop so the UI stays responsive
 function yieldToUI() {
@@ -97,6 +102,14 @@ let currentTrackIndex = $state(-1);
 let shuffleEnabled = $state(false);
 let shuffleOrder = $state<number[]>([]);
 let shufflePosition = $state(0);
+/** Mirrors settings.shuffle_mode (default smart). */
+let shuffleMode = $state<ShuffleMode>('smart');
+/**
+ * Smart shuffle: paths already heard in the current playing playlist cycle.
+ * Cleared when the playlist changes or every track has been played once.
+ */
+let smartPlayedPaths = new Set<string>();
+let smartPlayedPlaylistId: string | null = null;
 let repeatMode = $state<RepeatMode>('off');
 let playbackRate = $state(1.0);
 let likedPaths = $state<string[]>([]);
@@ -664,13 +677,66 @@ function rememberGaplessQueue(queue: { filePath?: string }[] | string[]) {
     .filter((path): path is string => typeof path === 'string' && path.length > 0);
 }
 
-function shuffleIndices(count: number): number[] {
-  const indices = Array.from({ length: count }, (_, i) => i);
-  for (let i = indices.length - 1; i > 0; i--) {
+function shuffleArray<T>(items: T[]): T[] {
+  const arr = [...items];
+  for (let i = arr.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
-    [indices[i], indices[j]] = [indices[j], indices[i]];
+    [arr[i], arr[j]] = [arr[j], arr[i]];
   }
-  return indices;
+  return arr;
+}
+
+function shuffleIndices(count: number): number[] {
+  return shuffleArray(Array.from({ length: count }, (_, i) => i));
+}
+
+function smartPlaylistKey(): string | null {
+  return playingPlaylistId ?? activePlaylistId ?? null;
+}
+
+function ensureSmartPlaylistScope() {
+  const key = smartPlaylistKey();
+  if (smartPlayedPlaylistId !== key) {
+    smartPlayedPlaylistId = key;
+    smartPlayedPaths = new Set();
+  }
+}
+
+function pruneSmartHistory() {
+  if (playingTracks.length === 0) {
+    smartPlayedPaths = new Set();
+    return;
+  }
+  const live = new Set(playingTracks.map((t) => t.path));
+  const next = new Set<string>();
+  for (const path of smartPlayedPaths) {
+    if (live.has(path)) next.add(path);
+  }
+  smartPlayedPaths = next;
+}
+
+/** Remember a track as already heard (smart shuffle only). */
+function markSmartPlayed(path: string | null | undefined) {
+  if (shuffleMode !== 'smart' || !path) return;
+  ensureSmartPlaylistScope();
+  smartPlayedPaths.add(path);
+}
+
+function applyShuffleMode(mode: ShuffleMode) {
+  const next = mode === 'normal' ? 'normal' : 'smart';
+  if (shuffleMode === next) return;
+  shuffleMode = next;
+  if (next === 'normal') {
+    smartPlayedPaths = new Set();
+    smartPlayedPlaylistId = null;
+  }
+  if (shuffleEnabled) {
+    rebuildShuffleOrder(currentTrackIndex >= 0);
+    syncShufflePosition();
+    if (currentFile && (isPlaying || isPaused)) {
+      void prepareGaplessNext(currentFile);
+    }
+  }
 }
 
 function rebuildShuffleOrder(keepCurrent = true) {
@@ -680,11 +746,40 @@ function rebuildShuffleOrder(keepCurrent = true) {
     return;
   }
 
-  const indices = shuffleIndices(playingTracks.length);
+  let pool: number[];
+
+  if (shuffleMode === 'smart') {
+    ensureSmartPlaylistScope();
+    pruneSmartHistory();
+
+    const unplayed: number[] = [];
+    for (let i = 0; i < playingTracks.length; i++) {
+      if (!smartPlayedPaths.has(playingTracks[i].path)) {
+        unplayed.push(i);
+      }
+    }
+
+    if (unplayed.length === 0) {
+      // Full cycle complete — start a fresh random pass over the whole playlist.
+      smartPlayedPaths = new Set();
+      pool = Array.from({ length: playingTracks.length }, (_, i) => i);
+    } else {
+      pool = unplayed;
+    }
+  } else {
+    pool = Array.from({ length: playingTracks.length }, (_, i) => i);
+  }
+
+  const indices = shuffleArray(pool);
+
   if (keepCurrent && currentTrackIndex >= 0) {
     const at = indices.indexOf(currentTrackIndex);
     if (at > 0) {
       indices.splice(at, 1);
+      indices.unshift(currentTrackIndex);
+    } else if (at < 0) {
+      // Current track already counted as played (smart) — keep it at the head so
+      // next/prev still work while it is finishing.
       indices.unshift(currentTrackIndex);
     }
   }
@@ -701,13 +796,78 @@ function syncShufflePosition() {
 
 function ensureShuffleOrder() {
   if (!shuffleEnabled) return;
-  if (
-    shuffleOrder.length !== playingTracks.length ||
-    shuffleOrder.some((index) => index < 0 || index >= playingTracks.length)
-  ) {
+
+  const invalid =
+    shuffleOrder.length === 0 ||
+    shuffleOrder.some((index) => index < 0 || index >= playingTracks.length);
+
+  if (shuffleMode === 'smart') {
+    if (invalid) {
+      rebuildShuffleOrder(currentTrackIndex >= 0);
+      syncShufflePosition();
+      return;
+    }
+    // If new unplayed tracks appeared (import) that aren't in the order, rebuild
+    // so they get a turn before the cycle ends.
+    ensureSmartPlaylistScope();
+    pruneSmartHistory();
+    const orderSet = new Set(shuffleOrder);
+    let missingUnplayed = false;
+    for (let i = 0; i < playingTracks.length; i++) {
+      if (!smartPlayedPaths.has(playingTracks[i].path) && !orderSet.has(i)) {
+        // Current track may already be played in history while still in order.
+        if (i !== currentTrackIndex) {
+          missingUnplayed = true;
+          break;
+        }
+      }
+    }
+    if (missingUnplayed) {
+      rebuildShuffleOrder(currentTrackIndex >= 0);
+      syncShufflePosition();
+    }
+    return;
+  }
+
+  if (invalid || shuffleOrder.length !== playingTracks.length) {
     rebuildShuffleOrder(currentTrackIndex >= 0);
     syncShufflePosition();
   }
+}
+
+/** Advance shuffle cursor; reshuffle / start a new smart cycle at the end when allowed. */
+function advanceShufflePosition(): boolean {
+  ensureShuffleOrder();
+  if (shuffleOrder.length === 0) return false;
+
+  if (shufflePosition < shuffleOrder.length - 1) {
+    shufflePosition += 1;
+    return true;
+  }
+
+  if (repeatMode !== 'all') {
+    return false;
+  }
+
+  if (shuffleMode === 'smart') {
+    // Finished the remaining unplayed set — clear history for a new full cycle.
+    smartPlayedPaths = new Set();
+    smartPlayedPlaylistId = smartPlaylistKey();
+  }
+
+  const finishedPath = currentFile;
+  rebuildShuffleOrder(false);
+  // Avoid immediately replaying the track we just finished when possible.
+  if (
+    finishedPath &&
+    shuffleOrder.length > 1 &&
+    playingTracks[shuffleOrder[0]]?.path === finishedPath
+  ) {
+    const first = shuffleOrder.shift()!;
+    shuffleOrder.push(first);
+  }
+  shufflePosition = 0;
+  return shuffleOrder.length > 0;
 }
 
 const DOWNLOADS_PLAYLIST_NAME = 'Downloads';
@@ -820,8 +980,18 @@ async function applyVolumeToPlayer(vol: number = volume) {
   }
 }
 
+async function loadShuffleModeFromSettings() {
+  try {
+    const data = await invoke<{ shuffle_mode?: ShuffleMode }>('settings_load');
+    shuffleMode = applyShuffleModeFromSettings(data.shuffle_mode);
+  } catch {
+    shuffleMode = readShuffleMode();
+  }
+}
+
 async function loadPlaylists() {
   try {
+    await loadShuffleModeFromSettings();
     const data = await invoke<PlaylistsData>('playlists_load');
     playlists = (data.playlists ?? []).map(repairPlaylistTracks);
     activePlaylistId = data.active_playlist_id ?? playlists[0]?.id ?? null;
@@ -1640,6 +1810,8 @@ async function play(filePath: string) {
     lastPauseRequestAt = 0;
     isPlaying = true;
     isPaused = false;
+    // Smart shuffle: count this track as heard once playback is requested.
+    markSmartPlayed(filePath);
 
     // DON'T call player_stop before player_play!
     // The backend's play_inner handles transitions properly:
@@ -1832,14 +2004,7 @@ function togglePlayPause() {
 
 async function nextTrack() {
   if (shuffleEnabled) {
-    ensureShuffleOrder();
-    if (shufflePosition < shuffleOrder.length - 1) {
-      shufflePosition += 1;
-    } else if (repeatMode === 'all') {
-      shufflePosition = 0;
-    } else {
-      return;
-    }
+    if (!advanceShufflePosition()) return;
     const idx = shuffleOrder[shufflePosition];
     if (idx >= 0 && idx < playingTracks.length) {
       await play(playingTracks[idx].path);
@@ -1887,6 +2052,8 @@ async function prevTrack() {
 function toggleShuffle() {
   shuffleEnabled = !shuffleEnabled;
   if (shuffleEnabled) {
+    // Keep smart history when re-enabling so the cycle continues.
+    shuffleMode = readShuffleMode();
     rebuildShuffleOrder(currentTrackIndex >= 0);
     syncShufflePosition();
   } else {
@@ -1967,6 +2134,11 @@ function setupListeners() {
   if (listenersSetup) return;
   listenersSetup = true;
 
+  listen<{ shuffle_mode?: ShuffleMode }>('settings:updated', (event) => {
+    const mode = applyShuffleModeFromSettings(event.payload?.shuffle_mode);
+    applyShuffleMode(mode);
+  });
+
   listen<StoreSyncPayload>('player:store-sync', (event) => {
     const prevPlayingId = playingPlaylistId;
     const prevFile = currentFile;
@@ -1996,6 +2168,7 @@ function setupListeners() {
 
     currentFile = path;
     lastPlayedFile = path;
+    markSmartPlayed(path);
     const track = trackByPath.get(path);
     currentFileName = track
       ? trackDisplayTitle(track)
@@ -2016,6 +2189,11 @@ function setupListeners() {
       playingPlaylistId = playlistId;
     }
     syncTrackIndex();
+    // Keep shuffle cursor aligned after gapless auto-advance.
+    if (shuffleEnabled) {
+      ensureShuffleOrder();
+      syncShufflePosition();
+    }
     isPlaying = true;
     isPaused = false;
     lastPauseRequestAt = 0;
@@ -2120,13 +2298,11 @@ function setupListeners() {
     }
 
     if (shuffleEnabled) {
-      ensureShuffleOrder();
-      if (shufflePosition < shuffleOrder.length - 1) {
-        shufflePosition += 1;
-        void play(playingTracks[shuffleOrder[shufflePosition]].path);
-      } else if (repeatMode === 'all') {
-        shufflePosition = 0;
-        void play(playingTracks[shuffleOrder[0]].path);
+      if (advanceShufflePosition()) {
+        const idx = shuffleOrder[shufflePosition];
+        if (idx >= 0 && idx < playingTracks.length) {
+          void play(playingTracks[idx].path);
+        }
       }
       return;
     }

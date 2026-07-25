@@ -13,6 +13,9 @@ export interface EqualizerSettings {
   bands_db: number[];
 }
 
+/** Classic random vs no-repeat until every track in the playlist has played. */
+export type ShuffleMode = 'normal' | 'smart';
+
 export interface AppSettings {
   equalizer: EqualizerSettings;
   playback_rate?: number;
@@ -23,6 +26,7 @@ export interface AppSettings {
   discord_rpc_enabled?: boolean;
   remote_enabled?: boolean;
   remote_port?: number;
+  shuffle_mode?: ShuffleMode;
 }
 
 export interface EQPreset {
@@ -58,6 +62,8 @@ let downloadPlaylistId = $state<string | null>(null);
 let discordRpcEnabled = $state(true);
 let remoteEnabled = $state(true);
 let remotePort = $state(DEFAULT_REMOTE_PORT);
+/** Default smart: avoid replaying tracks until the playlist cycle is complete. */
+let shuffleMode = $state<ShuffleMode>('smart');
 let defaultDownloadFolder = $state<string | null>(null);
 let isReady = $state(false);
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -79,6 +85,10 @@ function clampRemotePort(port: number): number {
   return n;
 }
 
+function parseShuffleMode(value: unknown): ShuffleMode {
+  return value === 'normal' ? 'normal' : 'smart';
+}
+
 function scheduleSave() {
   if (!isReady) return;
   if (saveTimer) clearTimeout(saveTimer);
@@ -98,6 +108,7 @@ function scheduleSave() {
       discord_rpc_enabled: discordRpcEnabled,
       remote_enabled: remoteEnabled,
       remote_port: clampRemotePort(remotePort),
+      shuffle_mode: shuffleMode,
     };
     invoke('settings_save', { data: payload }).catch((e) => {
       console.error('Failed to save settings:', e);
@@ -219,6 +230,7 @@ export function createSettingsStore(
       remoteEnabled = data.remote_enabled !== false;
       remotePort =
         typeof data.remote_port === 'number' ? clampRemotePort(data.remote_port) : DEFAULT_REMOTE_PORT;
+      shuffleMode = parseShuffleMode(data.shuffle_mode);
       try {
         defaultDownloadFolder = await invoke<string>('ytdlp_default_download_dir');
       } catch {
@@ -272,6 +284,9 @@ export function createSettingsStore(
     get remotePort() {
       return remotePort;
     },
+    get shuffleMode() {
+      return shuffleMode;
+    },
     get effectiveDownloadFolder() {
       return downloadFolder ?? defaultDownloadFolder ?? '';
     },
@@ -293,6 +308,10 @@ export function createSettingsStore(
     },
     setRemotePort(port: number) {
       remotePort = clampRemotePort(port);
+      scheduleSave();
+    },
+    setShuffleMode(mode: ShuffleMode) {
+      shuffleMode = parseShuffleMode(mode);
       scheduleSave();
     },
     async fetchRemoteStatus(): Promise<RemoteStatus | null> {
@@ -374,4 +393,14 @@ export function readDownloadSettings(): {
     downloadFolder,
     downloadPlaylistId,
   };
+}
+
+/** Current shuffle algorithm (safe outside Svelte context). */
+export function readShuffleMode(): ShuffleMode {
+  return shuffleMode;
+}
+
+export function applyShuffleModeFromSettings(mode: unknown): ShuffleMode {
+  shuffleMode = parseShuffleMode(mode);
+  return shuffleMode;
 }

@@ -24,6 +24,17 @@ pub struct WindowState {
     pub maximized: bool,
 }
 
+/// How shuffle picks the next track.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ShuffleMode {
+    /// Classic random order of the full playlist (can reshuffle freely).
+    Normal,
+    /// Avoid tracks already heard in this playlist until every track has played once.
+    #[default]
+    Smart,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     #[serde(default)]
@@ -51,6 +62,9 @@ pub struct AppSettings {
     /// Port for the remote control server (default 8765).
     #[serde(default = "default_remote_port")]
     pub remote_port: u16,
+    /// Shuffle algorithm: normal random vs smart no-repeat-until-exhausted.
+    #[serde(default)]
+    pub shuffle_mode: ShuffleMode,
     /// Last main window position and size.
     #[serde(default)]
     pub window_state: Option<WindowState>,
@@ -68,6 +82,7 @@ impl Default for AppSettings {
             discord_rpc_enabled: default_discord_rpc_enabled(),
             remote_enabled: default_remote_enabled(),
             remote_port: default_remote_port(),
+            shuffle_mode: ShuffleMode::default(),
             window_state: None,
         }
     }
