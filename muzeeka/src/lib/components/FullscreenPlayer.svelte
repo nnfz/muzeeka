@@ -133,7 +133,6 @@
   /** Reactive: drives class so chrome cannot hide under the cursor. */
   let pointerOverChrome = $state(false);
   let chromeEl = $state<HTMLDivElement | null>(null);
-  let titleRef = $state<HTMLDivElement | null>(null);
   let hideTimer: ReturnType<typeof setTimeout> | null = null;
   let pointerX = 0;
   let pointerY = 0;
@@ -526,11 +525,6 @@
     };
   });
 
-  $effect(() => {
-    const el = titleRef;
-    if (!el) return;
-    void player.currentFile;
-  });
 </script>
 
 <svelte:window
@@ -587,11 +581,9 @@
 
           <div class="fullscreen-meta">
             <div class="fullscreen-meta-text">
-              <div class="fullscreen-title-wrapper" bind:this={titleRef} class:marquee-active={titleRef && titleRef.scrollWidth > titleRef.clientWidth}>
-                <h2 class="fullscreen-title">
-                  {player.currentTrack ? trackDisplayTitle(player.currentTrack) : player.currentFileName ?? ''}
-                </h2>
-              </div>
+              <h2 class="fullscreen-title">
+                {player.currentTrack ? trackDisplayTitle(player.currentTrack) : player.currentFileName ?? ''}
+              </h2>
               {#if player.currentTrack}
                 <p class="fullscreen-artist">{trackDisplayArtist(player.currentTrack)}</p>
               {/if}

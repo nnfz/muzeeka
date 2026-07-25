@@ -5,8 +5,6 @@
   --fs-fade: 320ms;
   /* Open: zoom out from oversized + deblur — keep in sync with FS_ENTER_MS in .svelte */
   --fs-enter: 480ms;
-  /* Marquee scroll distance (relative to title width) */
-  --fs-marquee-scroll: -70%;
   /* Cover column; lyrics start further right */
   --fs-side-w: clamp(280px, min(36vw, 48vh), 480px);
   --fs-lyrics-inset: max(44vw, calc(28px + var(--fs-side-w) + clamp(48px, 5vw, 96px)));
@@ -282,7 +280,9 @@
 }
 
 .fullscreen-title {
-  display: inline-block;
+  display: block;
+  width: 100%;
+  min-width: 0;
   font-size: 26px;
   font-weight: 700;
   line-height: 1.25;
@@ -290,8 +290,8 @@
   text-align: left;
   letter-spacing: -0.01em;
   white-space: nowrap;
-  width: max-content;
-  max-width: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .fullscreen-artist {
@@ -322,7 +322,6 @@
 .like-btn-fullscreen:hover {
   opacity: 1;
   color: #e25555;
-  background: rgba(226, 85, 85, 0.12);
 }
 
 .like-btn-fullscreen.liked {
@@ -332,7 +331,6 @@
 
 .like-btn-fullscreen.liked:hover {
   color: #c93f3f;
-  background: rgba(226, 85, 85, 0.18);
 }
 
 .fullscreen-bottom-chrome {
@@ -703,32 +701,3 @@
   }
 }
 
-@keyframes fs-marquee-scroll {
-  0% {
-    transform: translateX(0);
-  }
-  12.5% {
-    transform: translateX(0);
-  }
-  37.5% {
-    transform: translateX(var(--fs-marquee-scroll));
-  }
-  62.5% {
-    transform: translateX(var(--fs-marquee-scroll));
-  }
-  87.5% {
-    transform: translateX(0);
-  }
-  100% {
-    transform: translateX(0);
-  }
-}
-
-.fullscreen-title-wrapper {
-  width: 100%;
-  overflow: hidden;
-}
-
-.fullscreen-title-wrapper.marquee-active .fullscreen-title {
-  animation: fs-marquee-scroll 8s cubic-bezier(0.25, 0.1, 0.25, 1) infinite;
-}
