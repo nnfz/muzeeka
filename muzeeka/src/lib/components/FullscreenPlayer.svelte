@@ -10,11 +10,18 @@
     getPlayerStore,
     trackDisplayArtist,
     trackDisplayTitle,
+    type MusicFile,
   } from '$lib/stores/player.svelte';
   import { invoke } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
-  import { fetchLyrics } from '$lib/lyrics/fetchLyrics';
   import type { LyricsResult } from '$lib/lyrics/types';
+  import {
+    invalidateLyricsCache,
+    loadLyricsForPath,
+    peekLyricsCache,
+    prefetchLyricsForPath,
+    setLyricsCache,
+  } from '$lib/lyrics/lyricsCache';
   import FullscreenLyrics from './FullscreenLyrics.svelte';
   import KawarpBackground from './KawarpBackground.svelte';
   import MediaSlider from './MediaSlider.svelte';
@@ -100,6 +107,8 @@
   let lyricsUnmountTimer: ReturnType<typeof setTimeout> | null = null;
   /** Match .fullscreen-lyrics-slot leave transition (hide) */
   const LYRICS_EXIT_MS = 280;
+  /** Cover/lyrics column travel — match FullscreenPlayer.css transitions. */
+  const LAYOUT_CLOSE_MS = 400;
   /** After open settle — transitions + Kawarp / lyrics layout allowed. */
   let enterDone = $state(false);
   /**
@@ -113,14 +122,107 @@
   /** Full open zoom/blur duration — keep in sync with FullscreenPlayer.css. */
   const FS_ENTER_MS = 480;
   /**
-   * Drives cover left + lyrics visible. Set one frame AFTER enterDone so the browser
-   * paints the centered state with transitions enabled, then animates to lyrics layout.
-   * Same-frame enterDone+show skipped CSS transitions entirely (looked like "nothing changes").
+   * Cover left + lyrics column.
+   * On track change: always close fully, then open again if the next track has lyrics.
    */
   let lyricsLayoutActive = $state(false);
   let hasLyrics = $derived((lyricsState?.lines.length ?? 0) > 0);
-  let showLyricsPanel = $derived(lyricsLayoutActive);
+  let showLyricsPanel = $derived(lyricsLayoutActive && lyricsVisible);
   const CHROME_HIDE_DELAY = 1800;
+  const LYRICS_PREFETCH_COUNT = 2;
+  /** Bumps on every track switch so stale close/open timers cannot reopen wrong layout. */
+  let lyricsSwitchGen = 0;
+  let lyricsReopenTimer: ReturnType<typeof setTimeout> | null = null;
+  /** When layout was closed for a track switch (0 = no pending close wait). */
+  let layoutClosedAt = 0;
+
+  function lyricsParamsForTrack(
+    track: MusicFile | null | undefined,
+    durationFallback?: number | null,
+  ) {
+    if (!track) return null;
+    return {
+      title: trackDisplayTitle(track),
+      artist: trackDisplayArtist(track),
+      album: track.album,
+      durationSecs:
+        track.duration_secs
+        ?? (durationFallback != null && durationFallback > 0 ? durationFallback : null),
+    };
+  }
+
+  function clearLyricsReopenTimer() {
+    if (lyricsReopenTimer) {
+      clearTimeout(lyricsReopenTimer);
+      lyricsReopenTimer = null;
+    }
+  }
+
+  /** After layout has closed, open again if this generation still has lyrics. */
+  function scheduleLyricsLayoutOpen(gen: number, delayMs: number) {
+    clearLyricsReopenTimer();
+    const openNow = () => {
+      if (gen !== lyricsSwitchGen) return;
+      if (!untrack(() => open) || !untrack(() => enterDone) || !untrack(() => lyricsVisible)) {
+        return;
+      }
+      if (!untrack(() => hasLyrics)) return;
+      // Two rAFs so the browser paints the closed state before opening (CSS transition runs).
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          if (gen !== lyricsSwitchGen) return;
+          if (!untrack(() => hasLyrics) || !untrack(() => lyricsVisible) || !untrack(() => enterDone)) {
+            return;
+          }
+          lyricsLayoutActive = true;
+          layoutClosedAt = 0;
+        });
+      });
+    };
+    if (delayMs <= 0) {
+      openNow();
+      return;
+    }
+    lyricsReopenTimer = setTimeout(() => {
+      lyricsReopenTimer = null;
+      openNow();
+    }, delayMs);
+  }
+
+  function applyLyricsForFile(file: string, result: LyricsResult | null, gen: number) {
+    setLyricsCache(file, result);
+    if (gen !== lyricsSwitchGen) return;
+    if (untrack(() => player.currentFile) !== file) return;
+
+    lyricsState = result;
+    lyricsSettledForFile = file;
+
+    const nextHas = (result?.lines.length ?? 0) > 0;
+    if (!nextHas) {
+      lyricsLayoutActive = false;
+      clearLyricsReopenTimer();
+      return;
+    }
+
+    // Finish the close animation, then open cleanly (no half-state thrash).
+    const closedAt = layoutClosedAt;
+    const delay = closedAt > 0
+      ? Math.max(0, LAYOUT_CLOSE_MS - (Date.now() - closedAt))
+      : 0;
+    scheduleLyricsLayoutOpen(gen, delay);
+  }
+
+  function prefetchUpcomingLyrics() {
+    if (!open) return;
+    const current = untrack(() => player.currentFile);
+    if (!current) return;
+    const upcoming = player.getUpcomingTracks(current, LYRICS_PREFETCH_COUNT);
+    for (const track of upcoming) {
+      const params = lyricsParamsForTrack(track);
+      if (!params) continue;
+      prefetchLyricsForPath(track.path, params);
+    }
+  }
 
   function clearLyricsUnmountTimer() {
     if (lyricsUnmountTimer) {
@@ -272,6 +374,7 @@
     if (!open) {
       clearHideTimer();
       clearLyricsUnmountTimer();
+      clearLyricsReopenTimer();
       chromeVisible = true;
       pointerOverChrome = false;
       sawPointerMove = false;
@@ -280,6 +383,7 @@
       enterDone = false;
       enterPhase = 'idle';
       lyricsLayoutActive = false;
+      layoutClosedAt = 0;
       clearArt();
       bgCoverSrc = null;
       resolvedFullCoverPath = null;
@@ -292,6 +396,7 @@
     scheduleChromeHide();
     enterDone = false;
     lyricsLayoutActive = false;
+    layoutClosedAt = 0;
 
     // Paint first frame oversized/blurred without transition, then animate in.
     enterPhase = 'from';
@@ -317,12 +422,12 @@
     };
   });
 
-  // Two rAFs after we can show lyrics: paint "centered + transitions on", then flip layout.
+  // First open / user re-enabled lyrics: open layout when we already have lines.
   $effect(() => {
-    if (!open || !enterDone || !hasLyrics || !lyricsVisible) {
-      lyricsLayoutActive = false;
-      return;
-    }
+    if (!open || !enterDone || !lyricsVisible) return;
+    if (!hasLyrics || lyricsLayoutActive) return;
+    // Track-switch path schedules its own reopen; only handle cold open here.
+    if (layoutClosedAt > 0) return;
 
     let cancelled = false;
     let raf1 = 0;
@@ -332,7 +437,6 @@
         if (!cancelled) lyricsLayoutActive = true;
       });
     });
-
     return () => {
       cancelled = true;
       cancelAnimationFrame(raf1);
@@ -340,7 +444,7 @@
     };
   });
 
-  // File change: lyrics reset + resolve/shrink full cover on disk.
+  // Track change: close layout fully, then load lyrics and reopen if present.
   $effect(() => {
     const file = player.currentFile;
 
@@ -356,9 +460,14 @@
     );
     resolvedFullCoverPath = knownFull;
 
+    // Always animate closed on switch, then open again when ready.
+    const gen = ++lyricsSwitchGen;
+    const wasOpen = untrack(() => lyricsLayoutActive);
+    clearLyricsReopenTimer();
+    lyricsLayoutActive = false;
     lyricsState = null;
     lyricsSettledForFile = null;
-    lyricsLayoutActive = false;
+    layoutClosedAt = wasOpen ? Date.now() : 0;
 
     let cancelled = false;
 
@@ -433,12 +542,17 @@
     };
   });
 
-  // After manual TTML import / clear — drop settled flag so lyrics re-fetch from cache.
+  // After manual TTML import / clear — invalidate memory cache + re-fetch.
   $effect(() => {
     const unlisteners: Array<() => void> = [];
     const onLyricsCacheChanged = (payload: string | undefined) => {
       const changedPath = payload?.trim() || '';
       const current = untrack(() => player.currentFile);
+      if (changedPath) {
+        invalidateLyricsCache(changedPath);
+      } else {
+        invalidateLyricsCache();
+      }
       if (!changedPath || !current || changedPath === current) {
         lyricsSettledForFile = null;
         lyricsState = null;
@@ -458,63 +572,51 @@
     };
   });
 
-  // Silent background fetch — panel appears only when lines exist.
-  // Depend ONLY on open + file. Reading track/duration/settled reactively was
-  // re-running this effect mid-flight, cancelling the request, and leaving no lyrics.
+  // Fetch lyrics for current track; reopen layout after close completes when lines exist.
   $effect(() => {
     const file = player.currentFile;
     const isOpen = open;
-    // Re-run when settled flag is cleared after import.
+    // Track generation so this fetch is tied to the latest switch.
+    const gen = lyricsSwitchGen;
     void lyricsSettledForFile;
 
     if (!isOpen || !file) {
-      lyricsState = null;
-      lyricsSettledForFile = null;
+      if (!isOpen) {
+        lyricsState = null;
+        lyricsSettledForFile = null;
+      }
       return;
     }
 
     if (untrack(() => lyricsSettledForFile === file)) {
+      prefetchUpcomingLyrics();
       return;
     }
 
     let alive = true;
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
-    const finish = (result: LyricsResult | null) => {
-      if (!alive) return;
-      if (untrack(() => player.currentFile) !== file) return;
-      lyricsState = result;
-      lyricsSettledForFile = file;
-    };
-
     const run = () => {
       if (!alive) return;
 
-      const params = untrack(() => {
-        const track = player.currentTrack;
-        if (!track) return null;
-        return {
-          title: trackDisplayTitle(track),
-          artist: trackDisplayArtist(track),
-          album: track.album,
-          durationSecs:
-            track.duration_secs
-            ?? (player.duration > 0 ? player.duration : null),
-        };
-      });
+      const cached = peekLyricsCache(file);
+      if (cached !== undefined) {
+        applyLyricsForFile(file, cached, gen);
+        prefetchUpcomingLyrics();
+        return;
+      }
 
-      // Track metadata not in the map yet — retry without cancelling a parent fetch.
+      const params = untrack(() => lyricsParamsForTrack(player.currentTrack, player.duration));
       if (!params) {
         retryTimer = setTimeout(run, 80);
         return;
       }
 
-      void fetchLyrics(params)
-        .then((result) => finish(result))
-        .catch((error: unknown) => {
-          console.warn('[lyrics] fetch failed', error);
-          finish(null);
-        });
+      void loadLyricsForPath(file, params).then((result) => {
+        if (!alive) return;
+        applyLyricsForFile(file, result, gen);
+        prefetchUpcomingLyrics();
+      });
     };
 
     run();
@@ -523,6 +625,16 @@
       alive = false;
       if (retryTimer) clearTimeout(retryTimer);
     };
+  });
+
+  // Warm next tracks while open.
+  $effect(() => {
+    if (!open) return;
+    void player.currentFile;
+    void player.playingTracks;
+    void player.shuffleEnabled;
+    void player.repeatMode;
+    prefetchUpcomingLyrics();
   });
 
 </script>
@@ -554,7 +666,10 @@
       <div class="fullscreen-backdrop-shade"></div>
     </div>
 
-    <div class="fullscreen-layout" class:lyrics-hidden={!showLyricsPanel}>
+    <div
+      class="fullscreen-layout"
+      class:lyrics-hidden={!showLyricsPanel}
+    >
       <aside class="fullscreen-side">
         <div class="fullscreen-side-scale" class:is-paused={player.isPaused}>
           <div class="fullscreen-art-wrap">
@@ -606,10 +721,7 @@
       </aside>
 
       <div class="fullscreen-lyrics-slot" aria-hidden={!showLyricsPanel}>
-        <!--
-          Mount while hidden so open can fade/slide in.
-          Keep mounted during hide so opacity + fly-right can finish.
-        -->
+        <!-- Keep mounted while layout open so hide CSS can finish. -->
         {#if hasLyrics && lyricsMounted}
           <FullscreenLyrics
             lines={lyricsState?.lines ?? []}

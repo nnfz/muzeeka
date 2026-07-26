@@ -5,6 +5,7 @@
 </script>
 
 <div class="import-progress-bar" role="progressbar" aria-valuenow={progress.current} aria-valuemax={progress.total} aria-label="Importing...">
+  <!-- <div class="import-progress-fill" style="width: 70%"></div> -->
   {#if progress.total > 0}
     <div class="import-progress-fill" style="width: {(progress.current / progress.total) * 100}%"></div>
   {:else if progress.active}
@@ -14,7 +15,7 @@
 
 <style>
   .import-progress-bar {
-    position: sticky;
+    position: absolute;
     top: 0;
     left: 0;
     right: 0;

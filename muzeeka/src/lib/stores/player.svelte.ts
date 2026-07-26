@@ -1729,6 +1729,24 @@ function orderedTracksFrom(filePath: string): MusicFile[] {
   return playingTracks.slice(index, index + MAX_GAPLESS_FOLLOWING);
 }
 
+/** Upcoming play-order tracks after `filePath` (shuffle-aware), for lyrics/cover prefetch. */
+function getUpcomingTracks(filePath: string | null, limit = 2): MusicFile[] {
+  if (!filePath || limit <= 0) return [];
+  const ordered = orderedTracksFrom(filePath);
+  if (ordered.length <= 1) {
+    // End of list with repeat-all: warm the start of the next cycle.
+    if (repeatMode === 'all' && hasPlayingTracks) {
+      if (shuffleEnabled) {
+        ensureShuffleOrder();
+        return shuffleOrder.slice(0, limit).map((i) => playingTracks[i]).filter(Boolean);
+      }
+      return playingTracks.slice(0, limit);
+    }
+    return [];
+  }
+  return ordered.slice(1, 1 + limit);
+}
+
 function buildGaplessQueue(filePath: string) {
   if (repeatMode === 'one') {
     const track = playingTracks.find((t) => t.path === filePath) ?? trackByPath.get(filePath);
@@ -2400,6 +2418,7 @@ export function createPlayerStore() {
     toggleLike,
     isLiked,
     setViewPlayOrder,
+    getUpcomingTracks,
     init,
     ensureInit,
   };
