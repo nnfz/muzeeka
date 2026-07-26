@@ -130,6 +130,10 @@ struct PlayerInner {
     preloaded_decode: u32,
     cue_start: Option<f64>,
     cue_end: Option<f64>,
+    /// After a CUE seek, some BASS/mixer paths report 0-based position (relative to
+    /// the seek point) instead of absolute file time. INDEX end checks must then
+    /// add `cue_start`. Detected right after each segment open/seek.
+    cue_pos_relative: bool,
     eq_context: &'static EqDspContext,
     /// Handles returned by BASS_PluginLoad — keep plugins registered.
     _plugin_handles: Vec<u32>,
@@ -207,6 +211,7 @@ impl Player {
                 preloaded_decode: 0,
                 cue_start: None,
                 cue_end: None,
+                cue_pos_relative: false,
                 eq_context: Box::leak(Box::new(EqDspContext::new())),
                 _plugin_handles: Vec::new(),
                 gapless_queue: Vec::new(),
@@ -279,6 +284,7 @@ impl Player {
                 inner.current_audio_path = None;
                 inner.cue_start = None;
                 inner.cue_end = None;
+                inner.cue_pos_relative = false;
             }
         } else {
             Self::teardown_current(inner);
@@ -755,6 +761,7 @@ impl Player {
         inner.current_audio_path = None;
         inner.cue_start = None;
         inner.cue_end = None;
+        inner.cue_pos_relative = false;
         inner.current_decode = 0;
     }
 
@@ -767,6 +774,37 @@ impl Player {
         inner.current_audio_path = Some(playback.audio_path.clone());
         inner.cue_start = playback.cue_start;
         inner.cue_end = playback.cue_end;
+    }
+
+    /// Map a raw BASS position read onto the absolute file timeline (CUE INDEX space).
+    fn content_timeline_secs(inner: &PlayerInner, reported_secs: f64) -> f64 {
+        if inner.cue_pos_relative {
+            reported_secs.max(0.0) + inner.cue_start.unwrap_or(0.0)
+        } else {
+            reported_secs.max(0.0)
+        }
+    }
+
+    /// After open/seek to a CUE segment, detect whether BASS reports absolute file
+    /// time or 0-based time from the seek point (common with mixer+decode).
+    fn detect_cue_position_mode(inner: &mut PlayerInner) {
+        let start = inner.cue_start.unwrap_or(0.0);
+        if start <= 0.05 || inner.current_source == 0 {
+            inner.cue_pos_relative = false;
+            return;
+        }
+        let Some(bass) = inner.bass.as_ref() else {
+            inner.cue_pos_relative = false;
+            return;
+        };
+        let reported = Self::content_absolute_secs(
+            bass,
+            inner.current_source,
+            inner.current_decode,
+            true,
+        );
+        // Seek target was `start`; if we read ~0, channel is segment-relative.
+        inner.cue_pos_relative = reported + 0.5 < start;
     }
 
     /// Seek an already-open source (CUE) to segment without reopening.
@@ -790,6 +828,7 @@ impl Player {
             let _ = bass.channel_play(inner.mixer_handle, false);
         }
         Self::apply_segment_metadata(inner, track_path, playback);
+        Self::detect_cue_position_mode(inner);
         Ok(())
     }
 
@@ -904,6 +943,7 @@ impl Player {
         inner.current_decode = tracked_decode;
         inner.applied_playback_rate = rate;
         Self::apply_segment_metadata(inner, track_path, playback);
+        Self::detect_cue_position_mode(inner);
 
         // Ensure EQ on mixer
         let eq_enabled = inner.eq_context.get_settings().enabled;
@@ -1013,6 +1053,7 @@ impl Player {
         inner.preloaded_decode = 0;
 
         Self::apply_segment_metadata(inner, track_path, playback);
+        Self::detect_cue_position_mode(inner);
         Ok(())
     }
 
@@ -1037,7 +1078,9 @@ impl Player {
 
         if same_file {
             // Continuous audio image (CUE): never seek on auto-advance — only update bounds.
+            // Timeline stays absolute on the open stream.
             Self::apply_segment_metadata(inner, &next.track_path, &playback);
+            inner.cue_pos_relative = false;
         } else {
             Self::activate_preloaded(inner, &next.track_path, &playback)?;
         }
@@ -1090,10 +1133,14 @@ impl Player {
     }
 
 
-    fn cue_relative_position(inner: &PlayerInner, absolute_secs: f64) -> f64 {
+    fn cue_relative_position(inner: &PlayerInner, reported_secs: f64) -> f64 {
+        if inner.cue_pos_relative {
+            // Channel already counts from segment start.
+            return reported_secs.max(0.0);
+        }
         match inner.cue_start {
-            Some(start) => (absolute_secs - start).max(0.0),
-            None => absolute_secs,
+            Some(start) => (reported_secs - start).max(0.0),
+            None => reported_secs.max(0.0),
         }
     }
 
@@ -1106,6 +1153,7 @@ impl Player {
     }
 
     fn absolute_seek_position(inner: &PlayerInner, relative_secs: f64) -> f64 {
+        // mixer_channel_set_position always wants the real file timeline.
         let start = inner.cue_start.unwrap_or(0.0);
         let mut absolute = start + relative_secs.max(0.0);
         if let (Some(start), Some(end)) = (inner.cue_start, inner.cue_end) {
@@ -1493,15 +1541,22 @@ impl Player {
         if let Some(end) = inner.cue_end {
             return end;
         }
-        Self::stream_duration_secs(bass, handle)
+        // Prefer decode length (content timeline) when tempo-wrapped.
+        let decode = Self::decode_handle_for_channel(bass, handle, inner.current_decode);
+        Self::stream_duration_secs(bass, decode)
     }
 
-    fn track_ending(inner: &PlayerInner, bass: &BassLibrary, absolute_secs: f64) -> bool {
+    /// `reported_secs` is the raw BASS read (may be absolute or segment-relative).
+    fn track_ending(inner: &PlayerInner, bass: &BassLibrary, reported_secs: f64) -> bool {
         if inner.current_source == 0 {
             return false;
         }
         let end = Self::track_end_position(inner, bass, inner.current_source);
-        absolute_secs + GAPLESS_END_EPSILON_SECS >= end
+        if !end.is_finite() || end < 0.0 {
+            return false;
+        }
+        let timeline = Self::content_timeline_secs(inner, reported_secs);
+        timeline + GAPLESS_END_EPSILON_SECS >= end
     }
 
     /// Segment length in ms (CUE bounds or full stream). 0 if unknown.
@@ -1647,6 +1702,7 @@ impl Player {
             inner.current_audio_path = None;
             inner.cue_start = None;
             inner.cue_end = None;
+            inner.cue_pos_relative = false;
             inner.gapless_queue.clear();
             inner.gapless_queue_index = 0;
             inner.pending_next = None;
@@ -1666,30 +1722,39 @@ impl Player {
             if inner.current_source == 0 || inner.mixer_handle == 0 {
                 return Err("Nothing is playing".into());
             }
-            let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
             let target = inner.volume;
             let was_paused = inner.user_paused;
-
-            // Instant seek: hard jump + flush. No long animation.
-            // Dip only for the flush moment to avoid click, then immediate restore.
-            let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_VOL, SEEK_DIP_LEVEL);
-
             let absolute_secs = Self::absolute_seek_position(inner, position_secs);
-            let byte = bass.channel_seconds2bytes(inner.current_source, absolute_secs);
-            let _ = bass.mixer_channel_set_position(inner.current_source, byte, bass::BASS_POS_BYTE);
+            let source = inner.current_source;
+            let mixer = inner.mixer_handle;
 
-            // Flush mixer buffer so the new position is heard immediately.
-            // channel_play restarts the mixer — re-pause if we were paused.
-            let _ = bass.channel_play(inner.mixer_handle, true);
-            let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_BUFFER, 0.2);
+            {
+                let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
+                // Instant seek: hard jump + flush. No long animation.
+                // Dip only for the flush moment to avoid click, then immediate restore.
+                let _ = bass.channel_set_attribute(mixer, bass::BASS_ATTRIB_VOL, SEEK_DIP_LEVEL);
 
+                let byte = bass.channel_seconds2bytes(source, absolute_secs);
+                let _ = bass.mixer_channel_set_position(source, byte, bass::BASS_POS_BYTE);
+
+                // Flush mixer buffer so the new position is heard immediately.
+                // channel_play restarts the mixer — re-pause if we were paused.
+                let _ = bass.channel_play(mixer, true);
+                let _ = bass.channel_set_attribute(mixer, bass::BASS_ATTRIB_BUFFER, 0.2);
+
+                if was_paused {
+                    let _ = bass.channel_pause(mixer);
+                    // Match post-pause-fade state: silent until resume.
+                    let _ = bass.channel_set_attribute(mixer, bass::BASS_ATTRIB_VOL, 0.0);
+                } else {
+                    let _ = bass.channel_set_attribute(mixer, bass::BASS_ATTRIB_VOL, target);
+                }
+            }
+
+            // Re-probe absolute vs segment-relative reporting after the seek.
+            Self::detect_cue_position_mode(inner);
             if was_paused {
-                let _ = bass.channel_pause(inner.mixer_handle);
-                // Match post-pause-fade state: silent until resume.
-                let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_VOL, 0.0);
                 inner.user_paused = true;
-            } else {
-                let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_VOL, target);
             }
 
             Ok(())
@@ -1852,13 +1917,18 @@ impl Player {
         // Mixer with NONSTOP keeps PLAYING (silence) after last source ends.
         // Report Stopped based on the *source* being gone or ended.
         let source_ended = src_active == PlaybackState::Stopped || inner.current_source == 0;
+        let decode = Self::decode_handle_for_channel(bass, inner.current_source, inner.current_decode);
+        let reported = Self::content_absolute_secs(
+            bass,
+            inner.current_source,
+            inner.current_decode,
+            true,
+        );
+        let absolute_duration = Self::stream_duration_secs(bass, decode);
+        let position = Self::cue_relative_position(inner, reported);
+        let duration = Self::cue_segment_duration(inner, absolute_duration);
+
         if source_ended || mixer_active == PlaybackState::Stopped {
-            let pos_bytes = bass.mixer_channel_get_position(inner.current_source, bass::BASS_POS_BYTE);
-            let len_bytes = bass.channel_get_length(inner.current_source, bass::BASS_POS_BYTE);
-            let absolute_position = bass.channel_bytes2seconds(inner.current_source, pos_bytes);
-            let absolute_duration = bass.channel_bytes2seconds(inner.current_source, len_bytes);
-            let position = Self::cue_relative_position(inner, absolute_position);
-            let duration = Self::cue_segment_duration(inner, absolute_duration);
             let file_name = inner.current_file.as_ref().map(|f| {
                 std::path::Path::new(f)
                     .file_name()
@@ -1880,13 +1950,6 @@ impl Player {
 
         let active_raw = mixer_active_raw;
         let active: PlaybackState = active_raw.into();
-
-        let pos_bytes = bass.mixer_channel_get_position(inner.current_source, bass::BASS_POS_BYTE);
-        let len_bytes = bass.channel_get_length(inner.current_source, bass::BASS_POS_BYTE);
-        let absolute_position = bass.channel_bytes2seconds(inner.current_source, pos_bytes);
-        let absolute_duration = bass.channel_bytes2seconds(inner.current_source, len_bytes);
-        let position = Self::cue_relative_position(inner, absolute_position);
-        let duration = Self::cue_segment_duration(inner, absolute_duration);
 
         let file_name = inner.current_file.as_ref().map(|f| {
             std::path::Path::new(f)
@@ -2040,12 +2103,17 @@ impl Player {
             } else {
                 bass::BASS_ACTIVE_STOPPED
             };
-            let pos_bytes =
-                bass.mixer_channel_get_position(inner.current_source, bass::BASS_POS_BYTE);
-            let absolute = bass.channel_bytes2seconds(inner.current_source, pos_bytes);
+            // Content timeline (decode handle) — required for correct CUE INDEX end detection
+            // with tempo wrappers and for absolute-vs-relative seek reporting.
+            let reported = Self::content_absolute_secs(
+                bass,
+                inner.current_source,
+                inner.current_decode,
+                true,
+            );
 
             let playing = mixer_active == bass::BASS_ACTIVE_PLAYING;
-            let ending = playing && Self::track_ending(inner, bass, absolute);
+            let ending = playing && Self::track_ending(inner, bass, reported);
             // Source ended (or no source) means the track is done, even if mixer is still "playing" silence (NONSTOP)
             let stream_done =
                 src_active == bass::BASS_ACTIVE_STOPPED || mixer_active == bass::BASS_ACTIVE_STOPPED;

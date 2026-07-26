@@ -9,20 +9,45 @@ use tauri::{AppHandle, Manager};
 use crate::cue;
 use crate::library::MusicFile;
 
-fn repair_playlist_tracks(tracks: &mut Vec<MusicFile>) {
+/// Returns true if any track path/metadata was upgraded (e.g. multi-file #cue: → plain m4a).
+fn repair_playlist_tracks(tracks: &mut Vec<MusicFile>) -> bool {
     let mut repaired = Vec::with_capacity(tracks.len());
+    let mut changed = false;
 
     for mut track in tracks.drain(..) {
         if cue::is_cue_sheet_path(&track.path) {
-            repaired.extend(cue::expand_cue_file(std::path::Path::new(&track.path)));
+            let expanded = cue::expand_cue_file(std::path::Path::new(&track.path));
+            if expanded.is_empty() {
+                // Keep original so user can see something went wrong.
+                repaired.push(track);
+            } else {
+                changed = true;
+                repaired.extend(expanded);
+            }
             continue;
         }
 
-        cue::repair_track(&mut track);
+        if cue::repair_track(&mut track) {
+            changed = true;
+        }
         repaired.push(track);
     }
 
+    // Dedupe plain paths after multi-file #cue: → m4a rewrites.
+    let mut seen = std::collections::HashSet::new();
+    repaired.retain(|t| {
+        let key = t.path.to_lowercase();
+        if seen.contains(&key) {
+            changed = true;
+            false
+        } else {
+            seen.insert(key);
+            true
+        }
+    });
+
     *tracks = repaired;
+    changed
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,16 +101,25 @@ pub fn playlists_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir.join("playlists.json"))
 }
 
-fn prune_missing_tracks(data: &mut PlaylistsData) {
+/// Returns true if playlist contents changed (repairs / missing prune).
+fn prune_missing_tracks(data: &mut PlaylistsData) -> bool {
+    let mut changed = false;
     for playlist in &mut data.playlists {
-        repair_playlist_tracks(&mut playlist.tracks);
+        if repair_playlist_tracks(&mut playlist.tracks) {
+            changed = true;
+        }
+        let before = playlist.tracks.len();
         playlist.tracks.retain(cue::track_file_exists);
+        if playlist.tracks.len() != before {
+            changed = true;
+        }
     }
+    changed
 }
 
-fn parse_playlists_file(path: &PathBuf, prune: bool) -> Result<PlaylistsData, String> {
+fn parse_playlists_file(path: &PathBuf, prune: bool) -> Result<(PlaylistsData, bool), String> {
     if !path.exists() {
-        return Ok(PlaylistsData::default());
+        return Ok((PlaylistsData::default(), false));
     }
 
     let raw = fs::read_to_string(path)
@@ -94,8 +128,9 @@ fn parse_playlists_file(path: &PathBuf, prune: bool) -> Result<PlaylistsData, St
     let mut data: PlaylistsData = serde_json::from_str(&raw)
         .map_err(|e| format!("Failed to parse playlists file: {}", e))?;
 
+    let mut changed = false;
     if prune {
-        prune_missing_tracks(&mut data);
+        changed = prune_missing_tracks(&mut data);
     }
 
     if let Some(active_id) = &data.active_playlist_id {
@@ -104,19 +139,27 @@ fn parse_playlists_file(path: &PathBuf, prune: bool) -> Result<PlaylistsData, St
             && !data.playlists.iter().any(|p| p.id == *active_id)
         {
             data.active_playlist_id = data.playlists.first().map(|p| p.id.clone());
+            changed = true;
         }
     }
 
-    Ok(data)
+    Ok((data, changed))
 }
 
 pub fn load_playlists(app: &AppHandle) -> Result<PlaylistsData, String> {
-    parse_playlists_file(&playlists_path(app)?, true)
+    let path = playlists_path(app)?;
+    let (data, changed) = parse_playlists_file(&path, true)?;
+    // Persist multi-file CUE upgrades (m4a#cue:N → plain m4a) so durations stick.
+    if changed {
+        let _ = save_playlists(app, &data);
+    }
+    Ok(data)
 }
 
 /// Hot-path load for remote/polling — skips per-track filesystem checks.
 pub fn load_playlists_fast(app: &AppHandle) -> Result<PlaylistsData, String> {
-    parse_playlists_file(&playlists_path(app)?, false)
+    let (data, _) = parse_playlists_file(&playlists_path(app)?, false)?;
+    Ok(data)
 }
 
 fn write_file_atomic(path: &PathBuf, contents: &[u8]) -> Result<(), String> {
