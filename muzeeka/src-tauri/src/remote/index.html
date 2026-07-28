@@ -1175,21 +1175,68 @@
     async function refreshState() {
       try {
         const next = await api('/api/state');
-        state = next;
-        $('statusDot').style.background = '#aaaaaa';
-        renderNowPlaying();
-        if (
-          !userPickedPlaylist &&
-          next?.activePlaylistId &&
-          next.activePlaylistId !== activePlaylistId
-        ) {
-          activePlaylistId = next.activePlaylistId;
-          localStorage.setItem(LS_PLAYLIST_KEY, activePlaylistId);
-          await loadPlaylist(activePlaylistId);
-          renderTabs();
-        }
+        applyState(next);
       } catch (e) {
         $('statusDot').style.background = '#555555';
+      }
+    }
+
+    function applyState(next) {
+      if (!next || typeof next !== 'object') return;
+      state = next;
+      $('statusDot').style.background = '#aaaaaa';
+      renderNowPlaying();
+      if (
+        !userPickedPlaylist &&
+        next?.activePlaylistId &&
+        next.activePlaylistId !== activePlaylistId
+      ) {
+        activePlaylistId = next.activePlaylistId;
+        localStorage.setItem(LS_PLAYLIST_KEY, activePlaylistId);
+        void loadPlaylist(activePlaylistId).then(() => renderTabs());
+      }
+      updateMediaSession();
+    }
+
+    let stateStream = null;
+    let stateStreamRetryTimer = null;
+
+    function connectStateStream() {
+      if (stateStream) {
+        try { stateStream.close(); } catch (_) {}
+        stateStream = null;
+      }
+      if (stateStreamRetryTimer) {
+        clearTimeout(stateStreamRetryTimer);
+        stateStreamRetryTimer = null;
+      }
+      if (typeof EventSource === 'undefined') {
+        // Fallback for very old browsers: keep polling.
+        if (!window.__muzeekaPoll) {
+          window.__muzeekaPoll = setInterval(refreshState, 500);
+        }
+        return;
+      }
+      try {
+        const es = new EventSource('/api/stream?interval=250');
+        stateStream = es;
+        es.addEventListener('state', (ev) => {
+          try {
+            applyState(JSON.parse(ev.data));
+          } catch (_) {}
+        });
+        es.onerror = () => {
+          $('statusDot').style.background = '#555555';
+          // EventSource reconnects while CONNECTING; only re-open if fully closed.
+          if (es.readyState === EventSource.CLOSED) {
+            stateStream = null;
+            stateStreamRetryTimer = setTimeout(connectStateStream, 1500);
+          }
+        };
+      } catch (_) {
+        if (!window.__muzeekaPoll) {
+          window.__muzeekaPoll = setInterval(refreshState, 500);
+        }
       }
     }
 
@@ -1293,7 +1340,7 @@
     $('progressBar').addEventListener('touchend', () => { seekDragging = false; });
 
     init();
-    setInterval(refreshState, 500);
+    connectStateStream();
   </script>
 </body>
 </html>

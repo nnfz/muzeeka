@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 
 use crate::discord_rpc::DiscordPresence;
@@ -41,7 +41,13 @@ pub(crate) struct NextTrackInput {
 
 fn parse_gapless_track(input: NextTrackInput) -> Option<GaplessTrack> {
     let track_path = input.file_path.filter(|value| !value.is_empty())?;
-    let audio_path = input.audio_path.filter(|value| !value.is_empty())?;
+    let audio_path = input
+        .audio_path
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            // Virtual CUE paths always encode the real audio file before `#cue:`.
+            crate::cue::parse_virtual_cue_path(&track_path).map(|(audio, _)| audio)
+        })?;
     Some(GaplessTrack {
         track_path,
         audio_path,
@@ -57,7 +63,7 @@ fn parse_gapless_queue(queue: Option<Vec<NextTrackInput>>) -> Vec<GaplessTrack> 
         .filter_map(parse_gapless_track)
         .collect()
 }
-use crate::playlists::{self, PlaylistMeta, PlaylistsData};
+use crate::playlists::{LibraryDatabase, LibraryState, PlaylistMeta, PlaylistsData};
 use crate::settings::{self, AppSettings};
 use crate::ytdlp::{self, YtdlpDownloadResult, YtdlpProbeResult};
 
@@ -97,9 +103,10 @@ pub fn player_play(
 #[tauri::command]
 pub fn player_prepare_next(
     player: State<'_, Player>,
+    current_file: Option<String>,
     queue: Option<Vec<NextTrackInput>>,
 ) -> Result<(), String> {
-    player.prepare_next(parse_gapless_queue(queue))
+    player.prepare_next(current_file.as_deref(), parse_gapless_queue(queue))
 }
 
 /// Pause the current playback.
@@ -251,20 +258,87 @@ pub fn input_is_ctrl_held() -> bool {
 
 // ── Library commands ──────────────────────────────────────────────────────────
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LibraryScanProgress {
+    current: usize,
+    total: usize,
+    label: String,
+}
+
+fn scan_progress_label(path: &std::path::Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("Scanning music...")
+        .to_string()
+}
+
 /// Scan a directory recursively for music files.
 #[tauri::command]
-pub async fn library_scan(directory: String) -> Result<Vec<library::MusicFile>, String> {
-    tauri::async_runtime::spawn_blocking(move || library::scan_directory(&directory))
-        .await
-        .map_err(|e| format!("Scan task failed: {e}"))?
+pub async fn library_scan(
+    app: AppHandle,
+    directory: String,
+) -> Result<Vec<library::MusicFile>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let last_emitted = std::sync::Mutex::new(0usize);
+        library::scan_directory_with_progress(&directory, &|current, total, path| {
+            let step = (total / 200).max(1);
+            if current > 0 && current < total && current % step != 0 {
+                return;
+            }
+            let Ok(mut last) = last_emitted.lock() else {
+                return;
+            };
+            if current > 0 && current < *last {
+                return;
+            }
+            *last = current;
+            let _ = app.emit(
+                "library:scan-progress",
+                LibraryScanProgress {
+                    current,
+                    total,
+                    label: scan_progress_label(path),
+                },
+            );
+        })
+    })
+    .await
+    .map_err(|e| format!("Scan task failed: {e}"))?
 }
 
 /// Scan dropped file and folder paths for music files.
 #[tauri::command]
-pub async fn library_scan_paths(paths: Vec<String>) -> Result<Vec<library::MusicFile>, String> {
-    tauri::async_runtime::spawn_blocking(move || library::scan_paths(&paths))
-        .await
-        .map_err(|e| format!("Scan task failed: {e}"))?
+pub async fn library_scan_paths(
+    app: AppHandle,
+    paths: Vec<String>,
+) -> Result<Vec<library::MusicFile>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let last_emitted = std::sync::Mutex::new(0usize);
+        library::scan_paths_with_progress(&paths, &|current, total, path| {
+            let step = (total / 200).max(1);
+            if current > 0 && current < total && current % step != 0 {
+                return;
+            }
+            let Ok(mut last) = last_emitted.lock() else {
+                return;
+            };
+            if current > 0 && current < *last {
+                return;
+            }
+            *last = current;
+            let _ = app.emit(
+                "library:scan-progress",
+                LibraryScanProgress {
+                    current,
+                    total,
+                    label: scan_progress_label(path),
+                },
+            );
+        })
+    })
+    .await
+    .map_err(|e| format!("Scan task failed: {e}"))?
 }
 
 /// Read or refresh metadata for known file paths.
@@ -273,6 +347,23 @@ pub async fn library_fetch_metadata(paths: Vec<String>) -> Result<Vec<library::M
     tauri::async_runtime::spawn_blocking(move || library::fetch_metadata(&paths))
         .await
         .map_err(|e| format!("Metadata task failed: {e}"))?
+}
+
+/// Resolve the small cover used by virtualized lists and the transport bar.
+#[tauri::command]
+pub async fn library_resolve_cover(path: String) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        use std::path::Path;
+        if crate::cue::is_cue_track_path(&path) {
+            if let Some((audio, _)) = crate::cue::parse_virtual_cue_path(&path) {
+                return crate::metadata::resolve_list_cover(Path::new(&audio));
+            }
+            return None;
+        }
+        crate::metadata::resolve_list_cover(Path::new(&path))
+    })
+    .await
+    .map_err(|e| format!("Cover resolve task failed: {e}"))
 }
 
 /// Resolve a full-resolution cover path for a track (creates cache if needed).
@@ -303,18 +394,16 @@ pub fn library_cover_data_url(path: String) -> Result<Option<String>, String> {
 #[tauri::command]
 pub async fn library_rebuild_covers(
     app: AppHandle,
+    database: State<'_, LibraryDatabase>,
 ) -> Result<crate::metadata::CoverRebuildStats, String> {
+    let database = database.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let mut data = playlists::load_playlists(&app)?;
-
-        let mut track_paths: Vec<String> = Vec::new();
-        for pl in &data.playlists {
-            for t in &pl.tracks {
-                track_paths.push(t.path.clone());
-            }
-        }
-        track_paths.extend(data.all_paths.iter().cloned());
-        track_paths.extend(data.liked_paths.iter().cloned());
+        let mut data = database.load()?;
+        let track_paths: Vec<String> = data
+            .library_tracks
+            .iter()
+            .map(|track| track.path.clone())
+            .collect();
 
         let playlist_covers: Vec<(String, Option<String>)> = data
             .playlists
@@ -326,21 +415,17 @@ pub async fn library_rebuild_covers(
             crate::metadata::rebuild_cover_cache(&track_paths, &playlist_covers)?;
 
         // Refresh track cover paths from regenerated cache (clear stale paths too).
-        for pl in &mut data.playlists {
-            for track in &mut pl.tracks {
-                let (thumb, full) = crate::metadata::fresh_cover_paths_for_track(&track.path);
-                track.cover_path = thumb;
-                track.cover_path_full = full;
-            }
+        for track in &mut data.library_tracks {
+            let (thumb, full) = crate::metadata::fresh_cover_paths_for_track(&track.path);
+            track.cover_path = thumb;
+            track.cover_path_full = full;
         }
+        database.upsert_tracks(&data.library_tracks)?;
 
         for (id, path) in cover_updates {
-            if let Some(pl) = data.playlists.iter_mut().find(|p| p.id == id) {
-                pl.cover_path = path;
-            }
+            database.set_playlist_cover(&id, path.as_deref())?;
         }
 
-        playlists::save_playlists(&app, &data)?;
         let _ = app.emit("covers:rebuilt", &stats);
         Ok(stats)
     })
@@ -464,8 +549,9 @@ pub async fn lyrics_refetch(
 /// Load saved playlists from disk (full data + missing-track prune).
 /// Runs off the async runtime so path checks cannot freeze the UI thread.
 #[tauri::command]
-pub async fn playlists_load(app: AppHandle) -> Result<PlaylistsData, String> {
-    tauri::async_runtime::spawn_blocking(move || playlists::load_playlists(&app))
+pub async fn playlists_load(database: State<'_, LibraryDatabase>) -> Result<PlaylistsData, String> {
+    let database = database.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || database.load())
         .await
         .map_err(|e| format!("Playlists load task failed: {e}"))?
 }
@@ -473,29 +559,139 @@ pub async fn playlists_load(app: AppHandle) -> Result<PlaylistsData, String> {
 /// Lightweight playlist list for UI pickers (id + name only, no prune / no tracks).
 /// Safe to call from secondary windows on open — will not walk the filesystem.
 #[tauri::command]
-pub fn playlists_list_meta(app: AppHandle) -> Result<Vec<PlaylistMeta>, String> {
-    let data = playlists::load_playlists_fast(&app)?;
-    Ok(data
-        .playlists
-        .into_iter()
-        .map(|p| PlaylistMeta {
-            id: p.id,
-            name: p.name,
-        })
-        .collect())
+pub fn playlists_list_meta(
+    database: State<'_, LibraryDatabase>,
+) -> Result<Vec<PlaylistMeta>, String> {
+    database.list_meta()
 }
 
 /// Save playlists to disk.
 #[tauri::command]
-pub fn playlists_save(app: AppHandle, mut data: PlaylistsData) -> Result<(), String> {
-    // Never wipe a known volume with null/omitted — a racy save during startup
-    // used to reset the level back to the frontend default on next launch.
-    if data.volume.is_none() {
-        if let Ok(existing) = playlists::load_playlists_fast(&app) {
-            data.volume = existing.volume;
-        }
-    }
-    playlists::save_playlists(&app, &data)
+pub fn library_state_save(
+    database: State<'_, LibraryDatabase>,
+    state: LibraryState,
+) -> Result<(), String> {
+    database.save_state(&state)
+}
+
+#[tauri::command]
+pub fn playlist_create(
+    database: State<'_, LibraryDatabase>,
+    id: String,
+    name: String,
+) -> Result<(), String> {
+    database.create_playlist(&id, &name)
+}
+
+#[tauri::command]
+pub fn playlist_delete(database: State<'_, LibraryDatabase>, id: String) -> Result<(), String> {
+    database.delete_playlist(&id)
+}
+
+#[tauri::command]
+pub fn playlist_rename(
+    database: State<'_, LibraryDatabase>,
+    id: String,
+    name: String,
+) -> Result<(), String> {
+    database.rename_playlist(&id, &name)
+}
+
+#[tauri::command]
+pub fn playlist_set_cover_path(
+    database: State<'_, LibraryDatabase>,
+    id: String,
+    cover_path: Option<String>,
+) -> Result<(), String> {
+    database.set_playlist_cover(&id, cover_path.as_deref())
+}
+
+#[tauri::command]
+pub async fn library_tracks_upsert(
+    database: State<'_, LibraryDatabase>,
+    tracks: Vec<library::MusicFile>,
+) -> Result<(), String> {
+    let database = database.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || database.upsert_tracks(&tracks))
+        .await
+        .map_err(|error| format!("Track upsert task failed: {error}"))?
+}
+
+#[tauri::command]
+pub async fn playlist_add_tracks(
+    database: State<'_, LibraryDatabase>,
+    playlist_id: String,
+    tracks: Vec<library::MusicFile>,
+) -> Result<(), String> {
+    let database = database.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        database.add_tracks_to_playlist(&playlist_id, &tracks)
+    })
+    .await
+    .map_err(|error| format!("Playlist import task failed: {error}"))?
+}
+
+#[tauri::command]
+pub fn playlist_remove_tracks(
+    database: State<'_, LibraryDatabase>,
+    playlist_id: String,
+    paths: Vec<String>,
+) -> Result<(), String> {
+    database.remove_tracks_from_playlist(&playlist_id, &paths)
+}
+
+#[tauri::command]
+pub fn playlist_reorder(
+    database: State<'_, LibraryDatabase>,
+    playlist_id: String,
+    paths: Vec<String>,
+) -> Result<(), String> {
+    database.reorder_playlist(&playlist_id, &paths)
+}
+
+#[tauri::command]
+pub fn library_reorder(
+    database: State<'_, LibraryDatabase>,
+    paths: Vec<String>,
+) -> Result<(), String> {
+    database.reorder_library(&paths)
+}
+
+#[tauri::command]
+pub fn library_clear_all(
+    app: AppHandle,
+    player: State<'_, Player>,
+    database: State<'_, LibraryDatabase>,
+) -> Result<(), String> {
+    let _ = player.stop();
+    database.clear_all()?;
+    let _ = app.emit("library:cleared", ());
+    Ok(())
+}
+
+#[tauri::command]
+pub fn library_remove_tracks(
+    database: State<'_, LibraryDatabase>,
+    paths: Vec<String>,
+) -> Result<(), String> {
+    database.remove_library_tracks(&paths)
+}
+
+#[tauri::command]
+pub fn library_set_liked(
+    database: State<'_, LibraryDatabase>,
+    path: String,
+    liked: bool,
+) -> Result<(), String> {
+    database.set_liked(&path, liked)
+}
+
+#[tauri::command]
+pub fn library_reorder_liked(
+    database: State<'_, LibraryDatabase>,
+    paths: Vec<String>,
+) -> Result<(), String> {
+    database.reorder_liked(&paths)
 }
 
 /// Cache a user-selected image as a playlist cover.

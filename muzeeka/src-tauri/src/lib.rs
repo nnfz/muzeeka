@@ -207,6 +207,10 @@ pub fn run() {
             }
         })
         .setup(move |app| {
+            let library_database = playlists::LibraryDatabase::open(app.handle())
+                .map_err(std::io::Error::other)?;
+            app.manage(library_database.clone());
+
             if let Ok(app_data) = app.path().app_data_dir() {
                 metadata::init_cover_cache(app_data.clone());
                 lyrics::init_lyrics_cache(app_data.clone());
@@ -260,6 +264,7 @@ pub fn run() {
                 player.clone(),
                 discord_presence.clone(),
                 app.handle().clone(),
+                library_database,
             ));
             app.manage(remote_controller.clone());
             taskbar_handler::setup(app.handle(), remote_controller.clone());
@@ -299,6 +304,7 @@ pub fn run() {
             commands::library_scan,
             commands::library_scan_paths,
             commands::library_fetch_metadata,
+            commands::library_resolve_cover,
             commands::library_resolve_full_cover,
             commands::library_cover_data_url,
             commands::library_rebuild_covers,
@@ -308,7 +314,20 @@ pub fn run() {
             commands::lyrics_refetch,
             commands::playlists_load,
             commands::playlists_list_meta,
-            commands::playlists_save,
+            commands::library_state_save,
+            commands::playlist_create,
+            commands::playlist_delete,
+            commands::playlist_rename,
+            commands::playlist_set_cover_path,
+            commands::library_tracks_upsert,
+            commands::playlist_add_tracks,
+            commands::playlist_remove_tracks,
+            commands::playlist_reorder,
+            commands::library_reorder,
+            commands::library_remove_tracks,
+            commands::library_clear_all,
+            commands::library_set_liked,
+            commands::library_reorder_liked,
             commands::playlist_cache_cover,
             commands::playlist_cache_cover_url,
             commands::playlist_remove_cover,

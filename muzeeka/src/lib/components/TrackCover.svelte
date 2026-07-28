@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { getCoverSrc } from '$lib/coverCache';
+  import { getCoverSrc, resolveTrackCoverPath } from '$lib/coverCache';
   import { COVER_PLACEHOLDER_SRC } from '$lib/coverPlaceholder';
   import type { MusicFile } from '$lib/stores/player.svelte';
 
@@ -11,10 +11,29 @@
 
   let failedSrc = $state<string | null>(null);
   let placeholderFailed = $state(false);
+  let resolvedCoverPath = $state<string | null>(null);
 
   let src = $derived.by(() => {
-    const next = getCoverSrc(track?.cover_path);
+    const next = getCoverSrc(track?.cover_path ?? resolvedCoverPath);
     return next && next !== failedSrc ? next : null;
+  });
+
+  $effect(() => {
+    const path = track?.path?.trim() ?? '';
+    const knownCover = track?.cover_path?.trim();
+    resolvedCoverPath = null;
+    if (!path || knownCover) return;
+
+    let cancelled = false;
+    void resolveTrackCoverPath(path).then((coverPath) => {
+      if (!cancelled && track?.path?.trim() === path) {
+        resolvedCoverPath = coverPath;
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
   });
 
   function handleImageError() {

@@ -2,6 +2,7 @@
 
 use cue_rw::{CUEFile, CUETrack, CUETimeStamp};
 use num_rational::Rational32;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -150,35 +151,6 @@ fn expanded_track_for_audio(audio_path: &str, track_no: u32) -> Option<MusicFile
         .nth(track_no.saturating_sub(1) as usize)
 }
 
-fn apply_expanded_cue_track(track: &mut MusicFile, expanded: MusicFile) {
-    track.audio_path = expanded.audio_path.or_else(|| track.audio_path.clone());
-    // Prefer freshly expanded INDEX bounds / duration over stale playlist values.
-    if expanded.cue_start_secs.is_some() {
-        track.cue_start_secs = expanded.cue_start_secs;
-    }
-    if expanded.cue_end_secs.is_some() {
-        track.cue_end_secs = expanded.cue_end_secs;
-    }
-    if expanded.duration_secs.is_some() {
-        track.duration_secs = expanded.duration_secs;
-    }
-    if track.title.is_none() {
-        track.title = expanded.title;
-    }
-    if track.artist.is_none() {
-        track.artist = expanded.artist;
-    }
-    if track.album.is_none() {
-        track.album = expanded.album;
-    }
-    if track.cover_path.is_none() {
-        track.cover_path = expanded.cover_path;
-    }
-    if track.cover_path_full.is_none() {
-        track.cover_path_full = expanded.cover_path_full;
-    }
-}
-
 /// Fill missing CUE metadata on a playlist track loaded from disk.
 /// Always refreshes INDEX bounds / duration from the companion sheet when possible
 /// so multi-file lengths match the CUE (not the full container file).
@@ -295,13 +267,6 @@ pub fn resolve_playback(
     }
 
     Err(format!("Can't open audio file: {track_path}"))
-}
-
-pub fn track_file_exists(track: &MusicFile) -> bool {
-    if let Some(audio) = &track.audio_path {
-        return Path::new(audio).exists();
-    }
-    Path::new(&track.path).exists()
 }
 
 fn non_empty(value: &str) -> Option<String> {
@@ -632,7 +597,7 @@ fn end_secs_for_track(
     tracks: &[(usize, &CUETrack)],
     index: usize,
     file_id: usize,
-    audio_path: &Path,
+    audio_duration: Option<f64>,
 ) -> Option<f64> {
     if let Some((_, next_track)) = tracks.get(index + 1) {
         if tracks[index + 1].0 == file_id {
@@ -640,8 +605,7 @@ fn end_secs_for_track(
         }
     }
 
-    metadata::read_metadata(audio_path, "")
-        .duration_secs
+    audio_duration
 }
 
 /// Parse `INDEX 00 mm:ss:ff` / `INDEX 01 mm:ss:ff` → seconds.
@@ -695,6 +659,16 @@ fn extract_multifile_index00_ends(content: &str) -> Vec<Option<f64>> {
 ///   `cue_start`/`cue_end` from INDEX so duration/gapless match the sheet (INDEX 00),
 ///   not the full container length of the m4a/ALAC file.
 pub fn expand_cue_file(cue_path: &Path) -> Vec<MusicFile> {
+    expand_cue_file_impl(cue_path, true)
+}
+
+/// Import variant: preserve all CUE identity/timing while deferring expensive
+/// embedded-cover extraction until a track becomes visible.
+pub fn expand_cue_file_fast(cue_path: &Path) -> Vec<MusicFile> {
+    expand_cue_file_impl(cue_path, false)
+}
+
+fn expand_cue_file_impl(cue_path: &Path, resolve_covers: bool) -> Vec<MusicFile> {
     let raw = match read_cue_text(cue_path) {
         Some(t) => t,
         None => return Vec::new(),
@@ -728,6 +702,7 @@ pub fn expand_cue_file(cue_path: &Path) -> Vec<MusicFile> {
     }
 
     let mut result = Vec::with_capacity(track_refs.len());
+    let mut metadata_by_audio = HashMap::<String, metadata::TrackMetadata>::new();
 
     for (index, (file_id, track)) in track_refs.iter().enumerate() {
         let file_name = match cue.files.get(*file_id) {
@@ -753,7 +728,16 @@ pub fn expand_cue_file(cue_path: &Path) -> Vec<MusicFile> {
             .or_else(|| album_artist.clone());
 
         let audio_path_str = audio_path.to_string_lossy().to_string();
-        let audio_meta = metadata::read_metadata(&audio_path, file_name);
+        let audio_meta = metadata_by_audio
+            .entry(audio_path_str.clone())
+            .or_insert_with(|| {
+                if resolve_covers {
+                    metadata::read_metadata(&audio_path, file_name)
+                } else {
+                    metadata::read_metadata_fast(&audio_path, file_name)
+                }
+            })
+            .clone();
         let ext = audio_path
             .extension()
             .and_then(|value| value.to_str())
@@ -777,7 +761,12 @@ pub fn expand_cue_file(cue_path: &Path) -> Vec<MusicFile> {
                     .flatten()
                     .filter(|e| *e > start + 0.05)
                     .or_else(|| {
-                        end_secs_for_track(&track_refs, index, *file_id, &audio_path)
+                        end_secs_for_track(
+                            &track_refs,
+                            index,
+                            *file_id,
+                            audio_meta.duration_secs,
+                        )
                     })
                     .or(audio_meta.duration_secs);
                 let dur = cue_end.map(|e| (e - start).max(0.0));
@@ -790,7 +779,12 @@ pub fn expand_cue_file(cue_path: &Path) -> Vec<MusicFile> {
                     dur,
                 )
             } else {
-                let end_secs = end_secs_for_track(&track_refs, index, *file_id, &audio_path);
+                let end_secs = end_secs_for_track(
+                    &track_refs,
+                    index,
+                    *file_id,
+                    audio_meta.duration_secs,
+                );
                 let duration_secs = end_secs.map(|end| (end - start).max(0.0));
                 (
                     format!("{}{}{}", audio_path_str, CUE_PATH_MARKER, index + 1),

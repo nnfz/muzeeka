@@ -201,6 +201,18 @@
   border-color: transparent;
 }
 
+.action-btn-danger {
+  background: color-mix(in srgb, #e05555 12%, transparent);
+  color: #e05555;
+  border-color: transparent;
+}
+
+.action-btn-danger:hover:not(:disabled) {
+  background: color-mix(in srgb, #e05555 22%, transparent);
+  color: #ff7070;
+  border-color: transparent;
+}
+
 .playlist-select,
 .port-input {
   min-width: 160px;

@@ -185,6 +185,14 @@ pub struct DroppedTracksPayload {
     pub ctrl: bool,
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LibraryScanProgress {
+    current: usize,
+    total: usize,
+    label: String,
+}
+
 /// Hover state while dragging files over the window (physical pixel coords).
 #[derive(Clone, Serialize)]
 pub struct DragActivePayload {
@@ -214,10 +222,35 @@ fn effective_paths(drop_paths: &[PathBuf], fallback: &[PathBuf]) -> Vec<String> 
         .collect()
 }
 
-fn emit_drop_result(window: &Window, position: [f64; 2], paths: Vec<String>) {
+fn emit_drop_result(window: &Window, position: [f64; 2], paths: Vec<String>, ctrl: bool) {
     let source_paths = paths.clone();
-    let ctrl = is_ctrl_held();
-    let payload = match library::scan_paths(&paths) {
+    let last_emitted = std::sync::Mutex::new(0usize);
+    let payload = match library::scan_paths_with_progress(&paths, &|current, total, path| {
+        let step = (total / 200).max(1);
+        if current > 0 && current < total && current % step != 0 {
+            return;
+        }
+        let Ok(mut last) = last_emitted.lock() else {
+            return;
+        };
+        if current > 0 && current < *last {
+            return;
+        }
+        *last = current;
+        let label = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("Scanning music...")
+            .to_string();
+        let _ = window.emit(
+            "library:scan-progress",
+            LibraryScanProgress {
+                current,
+                total,
+                label,
+            },
+        );
+    }) {
         Ok(files) if files.is_empty() => DroppedTracksPayload {
             files,
             position,
@@ -242,6 +275,7 @@ fn emit_drop_result(window: &Window, position: [f64; 2], paths: Vec<String>) {
     };
 
     let _ = window.emit("muzeeka:dropped-tracks", &payload);
+    let _ = window.emit("library:scan-finished", ());
 }
 
 fn emit_drag_active(window: &Window, active: bool, position: Option<[f64; 2]>) {
@@ -304,7 +338,12 @@ fn handle_drag_drop(window: &Window, state: &DropState, drag: &DragDropEvent) {
                 return;
             }
 
-            emit_drop_result(window, [position.x, position.y], import_paths);
+            let scan_window = window.clone();
+            let scan_position = [position.x, position.y];
+            let ctrl = is_ctrl_held();
+            tauri::async_runtime::spawn_blocking(move || {
+                emit_drop_result(&scan_window, scan_position, import_paths, ctrl);
+            });
         }
         DragDropEvent::Leave => {
             state.last_paths.lock().clear();

@@ -3,6 +3,37 @@ import { convertFileSrc, invoke } from '@tauri-apps/api/core';
 const srcCache = new Map<string, string>();
 const warmed = new Set<string>();
 const inflight = new Map<string, Promise<string | null>>();
+const trackCoverPaths = new Map<string, string | null>();
+const trackCoverInflight = new Map<string, Promise<string | null>>();
+const trackCoverWaiters: Array<() => void> = [];
+let activeTrackCoverJobs = 0;
+const MAX_TRACK_COVER_JOBS = 2;
+
+function trackPathKey(path: string): string {
+  return path.trim().replace(/\//g, '\\').toLowerCase();
+}
+
+function coverSourcePath(path: string): string {
+  return path.replace(/#cue:\d+$/i, '');
+}
+
+function acquireTrackCoverSlot(): Promise<void> {
+  if (activeTrackCoverJobs < MAX_TRACK_COVER_JOBS) {
+    activeTrackCoverJobs += 1;
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    trackCoverWaiters.push(() => {
+      activeTrackCoverJobs += 1;
+      resolve();
+    });
+  });
+}
+
+function releaseTrackCoverSlot() {
+  activeTrackCoverJobs = Math.max(0, activeTrackCoverJobs - 1);
+  trackCoverWaiters.shift()?.();
+}
 
 function isCoverCachePath(path: string): boolean {
   return /[\\/]covers[\\/]/i.test(path) || /[\\/]playlist_covers[\\/]/i.test(path);
@@ -84,6 +115,38 @@ export async function resolveCoverSrc(
   }
 }
 
+/** Lazily extract a track cover only when its virtualized row is on screen. */
+export function resolveTrackCoverPath(trackPath: string): Promise<string | null> {
+  const path = coverSourcePath(trackPath.trim());
+  if (!path) return Promise.resolve(null);
+
+  const key = trackPathKey(path);
+  if (trackCoverPaths.has(key)) {
+    return Promise.resolve(trackCoverPaths.get(key) ?? null);
+  }
+
+  const pending = trackCoverInflight.get(key);
+  if (pending) return pending;
+
+  const task = (async () => {
+    await acquireTrackCoverSlot();
+    try {
+      const coverPath = await invoke<string | null>('library_resolve_cover', { path });
+      trackCoverPaths.set(key, coverPath);
+      return coverPath;
+    } catch {
+      trackCoverPaths.set(key, null);
+      return null;
+    } finally {
+      releaseTrackCoverSlot();
+      trackCoverInflight.delete(key);
+    }
+  })();
+
+  trackCoverInflight.set(key, task);
+  return task;
+}
+
 /** Decode into the browser image cache so the next <img src> paints immediately. */
 export function warmImageSrc(src: string | null | undefined): Promise<boolean> {
   const url = src?.trim();
@@ -138,4 +201,6 @@ export function clearCoverSrcCache() {
   srcCache.clear();
   warmed.clear();
   inflight.clear();
+  trackCoverPaths.clear();
+  trackCoverInflight.clear();
 }

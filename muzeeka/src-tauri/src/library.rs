@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use walkdir::WalkDir;
 
 use crate::cue;
@@ -159,7 +160,11 @@ fn apply_metadata(file: &mut MusicFile, meta: metadata::TrackMetadata) {
     file.cover_path_full = meta.cover_path_full;
 }
 
-fn music_file_from_path(path: &Path, read_tags: bool) -> Option<MusicFile> {
+fn music_file_from_path(
+    path: &Path,
+    read_tags: bool,
+    resolve_covers: bool,
+) -> Option<MusicFile> {
     if !is_regular_file(path) {
         return None;
     }
@@ -201,7 +206,12 @@ fn music_file_from_path(path: &Path, read_tags: bool) -> Option<MusicFile> {
     };
 
     if read_tags {
-        apply_metadata(&mut file, metadata::read_metadata(path, &filename));
+        let meta = if resolve_covers {
+            metadata::read_metadata(path, &filename)
+        } else {
+            metadata::read_metadata_fast(path, &filename)
+        };
+        apply_metadata(&mut file, meta);
     }
 
     Some(file)
@@ -246,6 +256,13 @@ fn collect_cue_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
         .cloned()
         .collect();
 
+    // A directory scan already includes every sibling .cue file in `paths`.
+    // Avoid reparsing all sheets once per audio file while looking for a
+    // multi-file companion; explicit single-file imports still use the lookup.
+    if !cue_paths.is_empty() {
+        return cue_paths;
+    }
+
     for path in paths {
         let Some(ext) = path.extension().and_then(|value| value.to_str()) else {
             continue;
@@ -263,22 +280,55 @@ fn collect_cue_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
     cue_paths
 }
 
-fn build_files_from_paths(paths: Vec<PathBuf>, read_tags: bool) -> Vec<MusicFile> {
-    let cue_paths = collect_cue_paths(&paths);
+type ScanProgressCallback<'a> = &'a (dyn Fn(usize, usize, &Path) + Sync);
+
+fn build_files_from_paths(
+    paths: Vec<PathBuf>,
+    read_tags: bool,
+    resolve_covers: bool,
+    skip_cue: bool,
+    progress: Option<ScanProgressCallback<'_>>,
+) -> Vec<MusicFile> {
+    let cue_paths = if skip_cue { vec![] } else { collect_cue_paths(&paths) };
     let covered = cue::covered_audio_paths(&cue_paths);
-    let mut files: Vec<MusicFile> = paths
-        .par_iter()
+    let audio_paths: Vec<&PathBuf> = paths
+        .iter()
         .filter(|path| {
             let Some(ext) = path.extension().and_then(|value| value.to_str()) else {
                 return false;
             };
             is_audio_extension(ext) && !is_covered_audio(path, &covered)
         })
-        .filter_map(|path| music_file_from_path(path, read_tags))
+        .collect();
+    let total = audio_paths.len() + cue_paths.len();
+    let completed = AtomicUsize::new(0);
+
+    if let Some(report) = progress {
+        report(0, total, Path::new(""));
+    }
+
+    let mut files: Vec<MusicFile> = audio_paths
+        .par_iter()
+        .filter_map(|path| {
+            let file = music_file_from_path(path, read_tags, resolve_covers);
+            if let Some(report) = progress {
+                let current = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                report(current, total, path);
+            }
+            file
+        })
         .collect();
 
     for cue_path in cue_paths {
-        files.extend(cue::expand_cue_file(&cue_path));
+        if resolve_covers {
+            files.extend(cue::expand_cue_file(&cue_path));
+        } else {
+            files.extend(cue::expand_cue_file_fast(&cue_path));
+        }
+        if let Some(report) = progress {
+            let current = completed.fetch_add(1, Ordering::Relaxed) + 1;
+            report(current, total, &cue_path);
+        }
     }
 
     for file in &mut files {
@@ -288,9 +338,14 @@ fn build_files_from_paths(paths: Vec<PathBuf>, read_tags: bool) -> Vec<MusicFile
     files
 }
 
-fn collect_from_directory(root: &Path, results: &mut Vec<MusicFile>, seen: &mut HashSet<String>) {
+fn collect_from_directory(
+    root: &Path,
+    results: &mut Vec<MusicFile>,
+    seen: &mut HashSet<String>,
+    progress: Option<ScanProgressCallback<'_>>,
+) {
     let paths = collect_paths_from_directory(root);
-    for file in build_files_from_paths(paths, true) {
+    for file in build_files_from_paths(paths, false, false, true, progress) {
         let key = path_key(&file.path);
         if seen.insert(key) {
             results.push(file);
@@ -299,7 +354,22 @@ fn collect_from_directory(root: &Path, results: &mut Vec<MusicFile>, seen: &mut 
 }
 
 /// Scan a directory recursively for music files.
+#[allow(dead_code)]
 pub fn scan_directory(dir: &str) -> Result<Vec<MusicFile>, String> {
+    scan_directory_impl(dir, None)
+}
+
+pub fn scan_directory_with_progress(
+    dir: &str,
+    progress: ScanProgressCallback<'_>,
+) -> Result<Vec<MusicFile>, String> {
+    scan_directory_impl(dir, Some(progress))
+}
+
+fn scan_directory_impl(
+    dir: &str,
+    progress: Option<ScanProgressCallback<'_>>,
+) -> Result<Vec<MusicFile>, String> {
     let root = resolve_dropped_path(dir).ok_or_else(|| format!("Directory does not exist: {}", dir))?;
 
     if !is_directory(&root) {
@@ -308,22 +378,37 @@ pub fn scan_directory(dir: &str) -> Result<Vec<MusicFile>, String> {
 
     let mut results = Vec::new();
     let mut seen = HashSet::new();
-    collect_from_directory(&root, &mut results, &mut seen);
+    collect_from_directory(&root, &mut results, &mut seen, progress);
     Ok(results)
 }
 
 /// Scan dropped paths — individual audio files and folders (recursive).
+#[allow(dead_code)]
 pub fn scan_paths(paths: &[String]) -> Result<Vec<MusicFile>, String> {
+    scan_paths_impl(paths, None)
+}
+
+pub fn scan_paths_with_progress(
+    paths: &[String],
+    progress: ScanProgressCallback<'_>,
+) -> Result<Vec<MusicFile>, String> {
+    scan_paths_impl(paths, Some(progress))
+}
+
+fn scan_paths_impl(
+    paths: &[String],
+    progress: Option<ScanProgressCallback<'_>>,
+) -> Result<Vec<MusicFile>, String> {
     let mut results = Vec::new();
     let mut seen = HashSet::new();
 
-    for path_str in paths {
+    for (input_index, path_str) in paths.iter().enumerate() {
         let Some(path) = resolve_dropped_path(path_str) else {
             continue;
         };
 
         if is_directory(&path) {
-            collect_from_directory(&path, &mut results, &mut seen);
+            collect_from_directory(&path, &mut results, &mut seen, progress);
             continue;
         }
 
@@ -332,11 +417,14 @@ pub fn scan_paths(paths: &[String]) -> Result<Vec<MusicFile>, String> {
             .and_then(|ext| ext.to_str())
             .is_some_and(is_cue_extension)
         {
-            for file in cue::expand_cue_file(&path) {
+            for file in cue::expand_cue_file_fast(&path) {
                 let key = path_key(&file.path);
                 if seen.insert(key) {
                     results.push(file);
                 }
+            }
+            if let Some(report) = progress {
+                report(input_index + 1, paths.len(), &path);
             }
             continue;
         }
@@ -346,20 +434,13 @@ pub fn scan_paths(paths: &[String]) -> Result<Vec<MusicFile>, String> {
             .and_then(|ext| ext.to_str())
             .is_some_and(is_audio_extension)
         {
-            if let Some(cue_path) = companion_cue_path(&path) {
-                for file in cue::expand_cue_file(&cue_path) {
-                    let key = path_key(&file.path);
-                    if seen.insert(key) {
-                        results.push(file);
-                    }
-                }
-                continue;
-            }
-
-            if let Some(file) = music_file_from_path(&path, true) {
+            if let Some(file) = music_file_from_path(&path, false, false) {
                 let key = path_key(&file.path);
                 if seen.insert(key) {
                     results.push(file);
+                }
+                if let Some(report) = progress {
+                    report(input_index + 1, paths.len(), &path);
                 }
                 continue;
             }
@@ -367,7 +448,7 @@ pub fn scan_paths(paths: &[String]) -> Result<Vec<MusicFile>, String> {
 
         // Fallback: some Windows folder drops may not report as directories via metadata.
         if fs::read_dir(&path).is_ok() {
-            collect_from_directory(&path, &mut results, &mut seen);
+            collect_from_directory(&path, &mut results, &mut seen, progress);
         }
     }
 
@@ -376,13 +457,77 @@ pub fn scan_paths(paths: &[String]) -> Result<Vec<MusicFile>, String> {
 
 /// Read or refresh metadata for existing file paths.
 pub fn fetch_metadata(paths: &[String]) -> Result<Vec<MusicFile>, String> {
+    let mut results: Vec<MusicFile> = Vec::new();
+
+    // CUE virtual tracks: re-expand from the companion sheet so duration /
+    // INDEX bounds stay correct (never overwrite with full-container length).
+    for path_str in paths {
+        if !cue::is_cue_track_path(path_str) {
+            continue;
+        }
+        let mut track = MusicFile {
+            path: path_str.clone(),
+            file_name: path_str
+                .rsplit(['\\', '/'])
+                .next()
+                .unwrap_or(path_str)
+                .to_string(),
+            extension: String::new(),
+            size: 0,
+            title: None,
+            artist: None,
+            album: None,
+            duration_secs: None,
+            year: None,
+            track_number: None,
+            genre: None,
+            cover_path: None,
+            cover_path_full: None,
+            audio_path: None,
+            cue_start_secs: None,
+            cue_end_secs: None,
+        };
+        if cue::repair_track(&mut track) {
+            // Fill covers from the audio file without clobbering CUE duration.
+            if let Some(audio) = track.audio_path.clone() {
+                let audio_path = Path::new(&audio);
+                if audio_path.is_file() {
+                    let meta = metadata::read_metadata(
+                        audio_path,
+                        audio_path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or(""),
+                    );
+                    if track.cover_path.is_none() {
+                        track.cover_path = meta.cover_path;
+                    }
+                    if track.cover_path_full.is_none() {
+                        track.cover_path_full = meta.cover_path_full;
+                    }
+                    if track.title.is_none() {
+                        track.title = meta.title;
+                    }
+                    if track.artist.is_none() {
+                        track.artist = meta.artist;
+                    }
+                    if track.album.is_none() {
+                        track.album = meta.album;
+                    }
+                }
+            }
+            results.push(track);
+        }
+    }
+
     let resolved: Vec<PathBuf> = paths
         .iter()
         .filter(|path_str| !cue::is_cue_track_path(path_str))
         .filter_map(|path_str| resolve_dropped_path(path_str))
         .collect();
 
-    Ok(dedupe_files(build_files_from_paths(resolved, true)))
+    results.extend(build_files_from_paths(resolved, true, true, true, None));
+    Ok(dedupe_files(results))
 }
 
 #[cfg(test)]
@@ -427,6 +572,36 @@ mod tests {
 
         let files = scan_paths(&[dir]).expect("scan trailing separator");
         assert_eq!(files.len(), 1);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn scan_directory_reports_progress_while_reading_files() {
+        let base = std::env::temp_dir().join(format!("muzeeka-progress-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).expect("create progress dir");
+        write_test_file(&base.join("one.mp3"), &[1]);
+        write_test_file(&base.join("two.flac"), &[2]);
+
+        let updates = std::sync::Mutex::new(Vec::new());
+        let files = scan_directory_with_progress(&base.to_string_lossy(), &|current, total, path| {
+            updates.lock().expect("lock progress").push((
+                current,
+                total,
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default()
+                    .to_string(),
+            ));
+        })
+        .expect("scan with progress");
+
+        let updates = updates.into_inner().expect("progress updates");
+        assert_eq!(files.len(), 2);
+        assert_eq!(updates.first().map(|item| (item.0, item.1)), Some((0, 2)));
+        assert_eq!(updates.iter().map(|item| item.0).max(), Some(2));
+        assert!(updates.iter().all(|item| item.1 == 2));
 
         let _ = fs::remove_dir_all(&base);
     }

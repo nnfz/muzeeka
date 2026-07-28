@@ -25,6 +25,10 @@
 
   const settings = getSettingsStore();
 
+  let clearAllBusy = $state(false);
+  let clearAllConfirm = $state(false);
+  let clearAllError = $state<string | null>(null);
+
   let activeSection = $state<Section>('general');
   let appVersion = $state('0.1.0');
   let appName = $state('muzeeka');
@@ -186,6 +190,25 @@
     if (status.user_name) return status.user_name;
     if (status.user_id) return `id${status.user_id}`;
     return 'Logged in';
+  }
+
+  async function clearAll() {
+    if (!clearAllConfirm) {
+      clearAllConfirm = true;
+      clearAllError = null;
+      setTimeout(() => { clearAllConfirm = false; }, 3000);
+      return;
+    }
+    clearAllBusy = true;
+    clearAllConfirm = false;
+    clearAllError = null;
+    try {
+      await invoke('library_clear_all');
+    } catch (e) {
+      clearAllError = typeof e === 'string' ? e : String(e);
+    } finally {
+      clearAllBusy = false;
+    }
   }
 
   async function rebuildCovers() {
@@ -372,6 +395,28 @@
                   onclick={() => void rebuildCovers()}
                 >
                   {coverRebuildBusy ? 'Rebuilding…' : 'Rebuild covers'}
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div class="settings-card">
+            <div class="card-row card-row-stack">
+              <div>
+                <div class="card-label">Library</div>
+                <div class="card-value">Remove all playlists and tracks from the library</div>
+                {#if clearAllError}
+                  <div class="card-value card-value-error">{clearAllError}</div>
+                {/if}
+              </div>
+              <div class="card-actions">
+                <button
+                  type="button"
+                  class="action-btn action-btn-danger"
+                  disabled={clearAllBusy}
+                  onclick={() => void clearAll()}
+                >
+                  {clearAllBusy ? 'Clearing…' : clearAllConfirm ? 'Are you sure?' : 'Delete all'}
                 </button>
               </div>
             </div>

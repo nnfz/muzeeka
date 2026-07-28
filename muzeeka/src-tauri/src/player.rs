@@ -41,11 +41,18 @@ const PLAYBACK_RATE_RAMP_MS: u32 = 1000;
 // For seek: we want it instant.
 // Very short hard mute only during the flush to hide any restart artifact.
 const SEEK_DIP_LEVEL: f32 = 0.0;
+const MIXER_BUFFER_SECS: f32 = 0.2;
 
-// Gapless: switch at the real segment boundary (tight tolerance avoids early cuts).
-const GAPLESS_END_EPSILON_SECS: f64 = 0.008;
+// Gapless: treat as ended this far before INDEX/file end so the next source is
+// already feeding the mixer while the last buffer of the current track plays out.
+// Keep tight — large values cut multi-file CUE tracks early and feel like "wrong skip".
+const GAPLESS_END_EPSILON_SECS: f64 = 0.025;
+/// Same-image CUE segments may continue without seeking only at the same boundary.
+const CUE_CONTIGUOUS_TOLERANCE_SECS: f64 = 0.075;
 /// How often BASS is polled for gapless / end detection (always).
 const POLL_INTERVAL_MS: u64 = 50;
+/// After a manual CUE seek / segment switch, ignore end/stop signals briefly.
+const MANUAL_SEGMENT_SUPPRESS_MS: u64 = 400;
 /// UI position events while the main window is focused (smooth seekbar).
 const UI_EMIT_HOT_MS: u64 = 50;
 /// UI position events while unfocused — keeps WebView/GPU quiet during games.
@@ -143,6 +150,8 @@ struct PlayerInner {
     pending_next: Option<GaplessTrack>,
     preloaded_source: u32,
     preloaded_audio_path: Option<String>,
+    /// Playlist/virtual path the preload was built for (match this on activate — not only audio path).
+    preloaded_track_path: Option<String>,
     /// Used to invalidate stale scheduled pause actions when user quickly plays new track.
     pause_generation: u64,
     /// Timestamp (millis since UNIX epoch) when current track play started (for manual plays).
@@ -219,6 +228,7 @@ impl Player {
                 pending_next: None,
                 preloaded_source: 0,
                 preloaded_audio_path: None,
+                preloaded_track_path: None,
                 pause_generation: 0,
                 current_track_start_time: 0,
                 user_paused: false,
@@ -258,18 +268,32 @@ impl Player {
         if let Some(bass) = inner.bass.as_ref() {
             if inner.mixer_handle != 0 {
                 let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_VOL, 0.0);
-                let _ = bass.channel_play(inner.mixer_handle, true);
-                let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_BUFFER, 0.0);
+                Self::restart_mixer_with_buffer(bass, inner.mixer_handle);
             }
         }
     }
 
-    fn begin_manual_track_switch(inner: &mut PlayerInner, playback: &PlaybackTarget) {
+    /// Flush queued samples without leaving playback buffering disabled globally.
+    fn restart_mixer_with_buffer(bass: &BassLibrary, mixer: u32) {
+        let _ = bass.channel_set_attribute(mixer, bass::BASS_ATTRIB_BUFFER, 0.0);
+        let _ = bass.channel_play(mixer, true);
+        let _ = bass.channel_set_attribute(
+            mixer,
+            bass::BASS_ATTRIB_BUFFER,
+            MIXER_BUFFER_SECS,
+        );
+    }
+
+    fn begin_manual_track_switch(
+        inner: &mut PlayerInner,
+        track_path: &str,
+        playback: &PlaybackTarget,
+    ) {
         if Self::can_gapless_reuse(inner, &playback.audio_path) {
             return;
         }
 
-        if Self::can_use_preloaded(inner, &playback.audio_path) {
+        if Self::can_use_preloaded(inner, track_path, &playback.audio_path) {
             if inner.current_source != 0 && inner.current_source != inner.preloaded_source {
                 if let Some(bass) = inner.bass.as_ref() {
                     let _ = bass.mixer_channel_remove(inner.current_source);
@@ -503,7 +527,11 @@ impl Player {
         // contribute to crackling/underruns over time).
         let flags = bass::BASS_MIXER_NONSTOP | bass::BASS_SAMPLE_FLOAT;
         let mixer = bass.mixer_stream_create(44100, 2, flags)?;
-        let _ = bass.channel_set_attribute(mixer, bass::BASS_ATTRIB_BUFFER, 0.2);
+        let _ = bass.channel_set_attribute(
+            mixer,
+            bass::BASS_ATTRIB_BUFFER,
+            MIXER_BUFFER_SECS,
+        );
         // Start the mixer (it will output silence until sources added, or play when first added).
         bass.channel_play(mixer, false)?;
         // Set initial volume on mixer
@@ -624,15 +652,26 @@ impl Player {
         Ok(())
     }
 
-    pub fn prepare_next(&self, queue: Vec<GaplessTrack>) -> Result<(), String> {
+    pub fn prepare_next(
+        &self,
+        expected_current: Option<&str>,
+        queue: Vec<GaplessTrack>,
+    ) -> Result<(), String> {
+        let expected_current = expected_current.map(str::to_string);
         self.run_on_bass_thread(move |inner| {
-            inner.gapless_queue = queue;
-            if let Some(current) = inner.current_file.clone() {
-                Self::sync_gapless_index(inner, &current);
-            } else {
-                inner.gapless_queue_index = 0;
-                Self::refresh_pending_next(inner);
+            // Queue refreshes are asynchronous. A refresh created for track N must
+            // never replace the queue after playback has already moved to N+1.
+            if !Self::queue_refresh_matches(
+                inner.current_file.as_deref(),
+                expected_current.as_deref(),
+                &queue,
+            ) {
+                return Ok(());
             }
+
+            inner.gapless_queue = queue;
+            inner.gapless_queue_index = 0;
+            Self::refresh_pending_next(inner);
             Ok(())
         })
     }
@@ -659,33 +698,19 @@ impl Player {
             // advanced to track 2. play_inner refreshes the preload after open.
             inner.gapless_queue = queue;
             inner.gapless_queue_index = 0;
-            if let Some(index) = inner
-                .gapless_queue
-                .iter()
-                .position(|track| track.track_path == track_path)
-            {
+            if let Some(index) = Self::find_gapless_queue_index(inner, &track_path) {
                 inner.gapless_queue_index = index;
             }
             Self::play_inner(inner, &track_path, audio_path.as_deref(), cue_start, cue_end)?;
             inner.user_paused = false;
             // Record start time for this track (used to guard against early advance after manual que click)
-            inner.current_track_start_time = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
+            inner.current_track_start_time = Self::now_millis();
+            // Manual play: don't treat residual BASS "ended" frames as gapless advance.
+            inner.suppress_gapless_until = inner
+                .current_track_start_time
+                .saturating_add(MANUAL_SEGMENT_SUPPRESS_MS);
             Ok(())
         })
-    }
-
-    fn sync_gapless_index(inner: &mut PlayerInner, track_path: &str) {
-        if let Some(index) = inner
-            .gapless_queue
-            .iter()
-            .position(|track| track.track_path == track_path)
-        {
-            inner.gapless_queue_index = index;
-            Self::refresh_pending_next(inner);
-        }
     }
 
     fn refresh_pending_next(inner: &mut PlayerInner) {
@@ -703,18 +728,83 @@ impl Player {
     }
 
     fn audio_path_key(path: &str) -> String {
+        let p = path.trim();
+        // Windows extended-length prefix breaks naive equality with normal paths.
+        let p = p
+            .strip_prefix(r"\\?\")
+            .or_else(|| p.strip_prefix("//?/"))
+            .unwrap_or(p);
         #[cfg(windows)]
         {
-            path.to_lowercase()
+            p.replace('/', "\\").to_lowercase()
         }
         #[cfg(not(windows))]
         {
-            path.to_string()
+            p.to_string()
         }
     }
 
     fn same_audio_path(a: &str, b: &str) -> bool {
         Self::audio_path_key(a) == Self::audio_path_key(b)
+    }
+
+    /// Virtual CUE paths (`file#cue:N`) and playlist paths — case/slash-normalized.
+    fn same_track_path(a: &str, b: &str) -> bool {
+        Self::same_audio_path(a, b)
+    }
+
+    fn cue_segments_are_contiguous(
+        current_end: Option<f64>,
+        next_start: Option<f64>,
+    ) -> bool {
+        let (Some(current_end), Some(next_start)) = (current_end, next_start) else {
+            return false;
+        };
+        current_end.is_finite()
+            && next_start.is_finite()
+            && (current_end - next_start).abs() <= CUE_CONTIGUOUS_TOLERANCE_SECS
+    }
+
+    fn queue_refresh_matches(
+        current: Option<&str>,
+        expected: Option<&str>,
+        queue: &[GaplessTrack],
+    ) -> bool {
+        let (Some(current), Some(expected), Some(first)) = (current, expected, queue.first()) else {
+            return false;
+        };
+        Self::same_track_path(current, expected)
+            && Self::same_track_path(&first.track_path, expected)
+    }
+
+    /// Locate the playing entry in the gapless queue.
+    ///
+    /// Never match by bare audio path alone when several CUE tracks share one image —
+    /// that always resolved to index 0 and made gapless "jump" to the wrong track.
+    fn find_gapless_queue_index(inner: &PlayerInner, track_path: &str) -> Option<usize> {
+        if let Some(index) = inner
+            .gapless_queue
+            .iter()
+            .position(|track| Self::same_track_path(&track.track_path, track_path))
+        {
+            return Some(index);
+        }
+
+        // Non-virtual path: allow a unique audio_path / track_path fallback.
+        if cue::is_cue_track_path(track_path) {
+            return None;
+        }
+
+        let mut matches = inner.gapless_queue.iter().enumerate().filter(|(_, track)| {
+            Self::same_track_path(&track.track_path, track_path)
+                || Self::same_audio_path(&track.audio_path, track_path)
+        });
+        let first = matches.next().map(|(i, _)| i)?;
+        if matches.next().is_some() {
+            None
+        } else {
+            Some(first)
+        }
     }
 
     fn can_gapless_reuse(inner: &PlayerInner, audio_path: &str) -> bool {
@@ -725,12 +815,44 @@ impl Player {
                 .is_some_and(|current| Self::same_audio_path(current, audio_path))
     }
 
-    fn can_use_preloaded(inner: &PlayerInner, audio_path: &str) -> bool {
-        inner.preloaded_source != 0
-            && inner
-                .preloaded_audio_path
-                .as_ref()
-                .is_some_and(|p| Self::same_audio_path(p, audio_path))
+    /// Preload is only valid for the exact playlist/virtual track it was built for.
+    /// Matching by audio path alone is wrong for single-image CUE albums (all tracks
+    /// share one file) — it activated track N's preload while playing track 1 and
+    /// immediately looked "ended".
+    fn can_use_preloaded(inner: &PlayerInner, track_path: &str, _audio_path: &str) -> bool {
+        if inner.preloaded_source == 0 {
+            return false;
+        }
+        if let Some(preloaded_track) = inner.preloaded_track_path.as_ref() {
+            return Self::same_track_path(preloaded_track, track_path);
+        }
+        // Legacy preload without track path: only safe for non-CUE unique files.
+        if cue::is_cue_track_path(track_path) {
+            return false;
+        }
+        inner
+            .preloaded_audio_path
+            .as_ref()
+            .is_some_and(|p| Self::same_audio_path(p, track_path) || Self::same_audio_path(p, _audio_path))
+    }
+
+    /// AAC/ALAC in MP4 often has encoder delay at the start (~40–50ms). Skipping it
+    /// on gapless *joins* removes a common hole between multi-file CUE tracks.
+    fn gapless_join_start_secs(audio_path: &str, cue_start: Option<f64>) -> f64 {
+        let start = cue_start.unwrap_or(0.0).max(0.0);
+        if start > 0.001 {
+            return start;
+        }
+        let ext = std::path::Path::new(audio_path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        if matches!(ext.as_str(), "m4a" | "mp4" | "aac" | "alac" | "m4b") {
+            // ~2112 samples @ 44.1 kHz — typical AAC priming.
+            return 0.048;
+        }
+        0.0
     }
 
     fn clear_preload(inner: &mut PlayerInner) {
@@ -746,6 +868,7 @@ impl Player {
             inner.preloaded_source = 0;
         }
         inner.preloaded_audio_path = None;
+        inner.preloaded_track_path = None;
         inner.preloaded_decode = 0;
     }
 
@@ -778,11 +901,17 @@ impl Player {
 
     /// Map a raw BASS position read onto the absolute file timeline (CUE INDEX space).
     fn content_timeline_secs(inner: &PlayerInner, reported_secs: f64) -> f64 {
+        let start = inner.cue_start.unwrap_or(0.0);
+        let reported = reported_secs.max(0.0);
+        // Prefer the flag when set; also recover if detection lagged after a seek.
         if inner.cue_pos_relative {
-            reported_secs.max(0.0) + inner.cue_start.unwrap_or(0.0)
-        } else {
-            reported_secs.max(0.0)
+            return reported + start;
         }
+        if start > 0.05 && reported + 0.35 < start {
+            // Looks segment-relative even if the flag is stale.
+            return reported + start;
+        }
+        reported
     }
 
     /// After open/seek to a CUE segment, detect whether BASS reports absolute file
@@ -797,6 +926,7 @@ impl Player {
             inner.cue_pos_relative = false;
             return;
         };
+        // Prefer decode-handle read (true content timeline).
         let reported = Self::content_absolute_secs(
             bass,
             inner.current_source,
@@ -804,7 +934,8 @@ impl Player {
             true,
         );
         // Seek target was `start`; if we read ~0, channel is segment-relative.
-        inner.cue_pos_relative = reported + 0.5 < start;
+        // Allow a bit of slack for encoder-delay skips (~50ms) and mix latency.
+        inner.cue_pos_relative = reported + 0.75 < start;
     }
 
     /// Seek an already-open source (CUE) to segment without reopening.
@@ -818,17 +949,26 @@ impl Player {
             // fallback
             return Self::open_stream(inner, track_path, playback);
         }
-        let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
-        let target = playback.cue_start.unwrap_or(0.0);
-        // Use mixer version if source is plugged
-        let byte_pos = bass.channel_seconds2bytes(source, target);
-        let _ = bass.mixer_channel_set_position(source, byte_pos, bass::BASS_POS_BYTE);
-        // Make sure mixer is running
-        if bass.channel_is_active(inner.mixer_handle) != bass::BASS_ACTIVE_PLAYING {
-            let _ = bass.channel_play(inner.mixer_handle, false);
+        let target = playback.cue_start.unwrap_or(0.0).max(0.0);
+        {
+            let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
+            // Content-timeline seek (handles tempo wrappers correctly).
+            Self::seek_content_absolute(
+                bass,
+                source,
+                inner.current_decode,
+                true,
+                target,
+            );
+            // Make sure mixer is running
+            if bass.channel_is_active(inner.mixer_handle) != bass::BASS_ACTIVE_PLAYING {
+                let _ = bass.channel_play(inner.mixer_handle, false);
+            }
         }
         Self::apply_segment_metadata(inner, track_path, playback);
         Self::detect_cue_position_mode(inner);
+        // Manual CUE seeks can briefly report the old absolute position → false end.
+        inner.suppress_gapless_until = Self::now_millis().saturating_add(MANUAL_SEGMENT_SUPPRESS_MS);
         Ok(())
     }
 
@@ -904,9 +1044,9 @@ impl Player {
         if inner.mixer_handle == 0 {
             return Err("Mixer not created".to_string());
         }
-        // NORAMPIN is key for gapless: no volume ramp on start of this source.
-        // No AUTOFREE: rate/pitch changes remove and re-add the channel; AUTOFREE would
-        // destroy the decode handle and trigger false gapless track advances.
+        // NORAMPIN: no volume ramp on start (needed for file-to-file joins).
+        // No AUTOFREE: rate/pitch rebuilds re-add the channel; AUTOFREE would free decode
+        // and false-trigger end detection.
         let add_flags = bass::BASS_MIXER_CHAN_NORAMPIN;
         bass.mixer_stream_add_channel(inner.mixer_handle, source, add_flags)?;
         Ok(())
@@ -934,9 +1074,8 @@ impl Player {
 
         if let Some(bass) = inner.bass.as_ref() {
             let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_VOL, volume);
-            // Manual track switch: always hard-restart to flush stale audio from pause/buffer.
-            let _ = bass.channel_play(inner.mixer_handle, true);
-            let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_BUFFER, 0.0);
+            // Manual track switch: hard-restart to flush stale audio from pause/buffer.
+            Self::restart_mixer_with_buffer(bass, inner.mixer_handle);
         }
 
         inner.current_source = mixer_channel;
@@ -968,26 +1107,26 @@ impl Player {
             .as_ref()
             .is_some_and(|current| Self::same_audio_path(current, &playback.audio_path))
         {
+            // Same-image CUE transitions reuse the active source. Do not leave a
+            // preload from an older queue around after drag-reordering.
+            Self::clear_preload(inner);
             return Ok(());
         }
 
-        if inner
-            .preloaded_audio_path
-            .as_ref()
-            .is_some_and(|path| Self::same_audio_path(path, &playback.audio_path))
-            && inner.preloaded_source != 0
-        {
+        if Self::can_use_preloaded(inner, &next.track_path, &playback.audio_path) {
             return Ok(());
         }
 
         Self::clear_preload(inner);
 
-        let source = Self::create_decode_source(inner, &playback.audio_path, playback.cue_start)?;
+        // For gapless joins into AAC/M4A, skip encoder delay so the first samples
+        // aren't silent padding (big contributor to multi-file CUE holes).
+        let join_start =
+            Self::gapless_join_start_secs(&playback.audio_path, playback.cue_start);
+        let source =
+            Self::create_decode_source(inner, &playback.audio_path, Some(join_start))?;
 
-        // Just create and position the next decode source.
-        // We add it to mixer only near the end of current track (in activate or advance).
-        // This keeps only 1 source active in mixer during long playback → more stable, less crackling.
-
+        // Decode+position only — not in the mixer until the cut.
         let rate = inner.playback_rate;
         let pitch_enabled = inner.pitch_enabled;
         let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
@@ -997,59 +1136,105 @@ impl Player {
         inner.preloaded_source = mixer_channel;
         inner.preloaded_decode = tracked_decode;
         inner.preloaded_audio_path = Some(playback.audio_path);
+        inner.preloaded_track_path = Some(next.track_path.clone());
         Ok(())
     }
 
+    /// Open next file and swap into the mixer without a full open_stream hard-restart.
+    /// Used when preload missed (first join) so WAV/CUE still gapless-ish.
+    fn open_next_seamless(
+        inner: &mut PlayerInner,
+        track_path: &str,
+        playback: &PlaybackTarget,
+    ) -> Result<(), String> {
+        let join_start =
+            Self::gapless_join_start_secs(&playback.audio_path, playback.cue_start);
+        let decode =
+            Self::create_decode_source(inner, &playback.audio_path, Some(join_start))?;
+        let rate = inner.playback_rate;
+        let pitch_enabled = inner.pitch_enabled;
+        let (mixer_channel, tracked_decode) = {
+            let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
+            Self::wrap_decode_for_rate(bass, decode, rate, pitch_enabled)?
+        };
+
+        let old_source = inner.current_source;
+        let old_decode = inner.current_decode;
+
+        Self::add_source_to_mixer(inner, mixer_channel)?;
+
+        if let Some(bass) = inner.bass.as_ref() {
+            if old_source != 0 && old_source != mixer_channel {
+                let _ = bass.mixer_channel_remove(old_source);
+                Self::free_playback_channel(bass, old_source, old_decode);
+            }
+            let _ = bass.channel_set_attribute(
+                inner.mixer_handle,
+                bass::BASS_ATTRIB_VOL,
+                inner.volume,
+            );
+            if bass.channel_is_active(inner.mixer_handle) != bass::BASS_ACTIVE_PLAYING {
+                let _ = bass.channel_play(inner.mixer_handle, false);
+            }
+        }
+
+        inner.current_source = mixer_channel;
+        inner.current_decode = tracked_decode;
+        inner.applied_playback_rate = rate;
+        Self::apply_segment_metadata(inner, track_path, playback);
+        Self::detect_cue_position_mode(inner);
+        Ok(())
+    }
+
+    /// Gapless file→file join: add preloaded next, drop current, never restart mixer.
     fn activate_preloaded(
         inner: &mut PlayerInner,
         track_path: &str,
         playback: &PlaybackTarget,
     ) -> Result<(), String> {
         let preloaded = inner.preloaded_source;
-        let matches = inner
-            .preloaded_audio_path
-            .as_ref()
-            .is_some_and(|path| Self::same_audio_path(path, &playback.audio_path));
+        let matches = Self::can_use_preloaded(inner, track_path, &playback.audio_path);
 
         if preloaded == 0 || !matches {
-            Self::teardown_current(inner);
-            return Self::open_stream(inner, track_path, playback);
+            // First join often has no warm preload — still avoid open_stream hard restart.
+            return Self::open_next_seamless(inner, track_path, playback);
         }
 
-        // Remove old source (if still there). Add the preloaded now.
-        // Since we add close to end (via poll), gap is tiny or none (inaudible).
-        // NORAMPIN for clean join.
-        if let Some(bass) = inner.bass.as_ref() {
-            if inner.current_source != 0 && inner.current_source != preloaded {
-                let _ = bass.mixer_channel_remove(inner.current_source);
-                Self::free_playback_channel(
-                    bass,
-                    inner.current_source,
-                    inner.current_decode,
-                );
-            }
+        let old_source = inner.current_source;
+        let old_decode = inner.current_decode;
+        let start =
+            Self::gapless_join_start_secs(&playback.audio_path, playback.cue_start);
+        let preloaded_decode = inner.preloaded_decode;
+
+        // Snap to segment start before plugging in (content timeline).
+        {
+            let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
+            Self::seek_content_absolute(bass, preloaded, preloaded_decode, false, start.max(0.0));
         }
 
+        // Order: add next (playing) → remove old. Mixer stays running (no play restart).
         Self::add_source_to_mixer(inner, preloaded)?;
 
         if let Some(bass) = inner.bass.as_ref() {
-            // Always re-position for this track's segment (including cue_start=0).
-            // Preload is built for the *next* gapless entry; on a single-image CUE that
-            // is the same file already seeked to a later INDEX. Skipping seek when
-            // start==0 left playback at track 2's offset while metadata said track 1,
-            // so gapless immediately advanced past the first track.
-            let start = playback.cue_start.unwrap_or(0.0);
-            let byte = bass.channel_seconds2bytes(preloaded, start.max(0.0));
-            let _ = bass.mixer_channel_set_position(preloaded, byte, bass::BASS_POS_BYTE);
-            let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_VOL, inner.volume);
-            let _ = bass.channel_play(inner.mixer_handle, true);
-            let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_BUFFER, 0.0);
+            if old_source != 0 && old_source != preloaded {
+                let _ = bass.mixer_channel_remove(old_source);
+                Self::free_playback_channel(bass, old_source, old_decode);
+            }
+            let _ = bass.channel_set_attribute(
+                inner.mixer_handle,
+                bass::BASS_ATTRIB_VOL,
+                inner.volume,
+            );
+            if bass.channel_is_active(inner.mixer_handle) != bass::BASS_ACTIVE_PLAYING {
+                let _ = bass.channel_play(inner.mixer_handle, false);
+            }
         }
 
         inner.preloaded_source = 0;
         inner.preloaded_audio_path = None;
+        inner.preloaded_track_path = None;
         inner.current_source = preloaded;
-        inner.current_decode = inner.preloaded_decode;
+        inner.current_decode = preloaded_decode;
         inner.preloaded_decode = 0;
 
         Self::apply_segment_metadata(inner, track_path, playback);
@@ -1076,11 +1261,29 @@ impl Player {
             .as_ref()
             .is_some_and(|current| Self::same_audio_path(current, &playback.audio_path));
 
-        if same_file {
-            // Continuous audio image (CUE): never seek on auto-advance — only update bounds.
-            // Timeline stays absolute on the open stream.
+        let continuous_segment = same_file
+            && Self::cue_segments_are_contiguous(inner.cue_end, playback.cue_start);
+
+        if continuous_segment {
+            // Physically adjacent segments in one image stay on the open timeline.
             Self::apply_segment_metadata(inner, &next.track_path, &playback);
             inner.cue_pos_relative = false;
+        } else if same_file {
+            // Reordered CUE queues can jump 3 -> 5 or 5 -> 4 inside one image.
+            // Mute and flush before seeking: the mixer can already contain ~0.5s
+            // of the physical neighbour at the old volume.
+            Self::flush_mixer_hard(inner);
+            Self::apply_segment(inner, &next.track_path, &playback)?;
+            if let Some(bass) = inner.bass.as_ref() {
+                // Flush any silence produced between the first reset and the seek.
+                Self::restart_mixer_with_buffer(bass, inner.mixer_handle);
+                let _ = bass.channel_set_attribute(
+                    inner.mixer_handle,
+                    bass::BASS_ATTRIB_VOL,
+                    inner.volume,
+                );
+            }
+            Self::detect_cue_position_mode(inner);
         } else {
             Self::activate_preloaded(inner, &next.track_path, &playback)?;
         }
@@ -1106,7 +1309,7 @@ impl Player {
         let playback = cue::resolve_playback(track_path, audio_path, cue_start, cue_end)
             .map_err(|error| format!("{error} (track: {track_path})"))?;
 
-        Self::begin_manual_track_switch(inner, &playback);
+        Self::begin_manual_track_switch(inner, track_path, &playback);
 
         if Self::can_gapless_reuse(inner, &playback.audio_path) {
             // CUE same-file: seek within the already-open stream (instant, no reopening).
@@ -1117,15 +1320,20 @@ impl Player {
             // the user wants the new segment to start immediately.
             if let Some(bass) = inner.bass.as_ref() {
                 let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_VOL, inner.volume);
-                let _ = bass.channel_play(inner.mixer_handle, true);
-                let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_BUFFER, 0.0);
+                Self::restart_mixer_with_buffer(bass, inner.mixer_handle);
             }
-        } else if Self::can_use_preloaded(inner, &playback.audio_path) {
+            // Re-detect after the hard flush — position can look 0-based for a frame.
+            Self::detect_cue_position_mode(inner);
+        } else if Self::can_use_preloaded(inner, track_path, &playback.audio_path) {
             // Fast path for manual next/prev when the track was preloaded for gapless.
             // This makes "hand switching" to the next track nearly instant.
             Self::activate_preloaded(inner, track_path, &playback)?;
+            inner.suppress_gapless_until =
+                Self::now_millis().saturating_add(MANUAL_SEGMENT_SUPPRESS_MS);
         } else {
             Self::open_stream(inner, track_path, &playback)?;
+            inner.suppress_gapless_until =
+                Self::now_millis().saturating_add(MANUAL_SEGMENT_SUPPRESS_MS);
         }
 
         Self::refresh_pending_next(inner);
@@ -1134,14 +1342,22 @@ impl Player {
 
 
     fn cue_relative_position(inner: &PlayerInner, reported_secs: f64) -> f64 {
-        if inner.cue_pos_relative {
+        let start = inner.cue_start.unwrap_or(0.0);
+        let reported = reported_secs.max(0.0);
+        let relative = if inner.cue_pos_relative || (start > 0.05 && reported + 0.35 < start) {
             // Channel already counts from segment start.
-            return reported_secs.max(0.0);
+            reported
+        } else {
+            (reported - start).max(0.0)
+        };
+        // Clamp to known CUE segment so the seekbar never shoots past 100%.
+        if let (Some(s), Some(e)) = (inner.cue_start, inner.cue_end) {
+            let seg = (e - s).max(0.0);
+            if seg > 0.0 {
+                return relative.min(seg);
+            }
         }
-        match inner.cue_start {
-            Some(start) => (reported_secs - start).max(0.0),
-            None => reported_secs.max(0.0),
-        }
+        relative
     }
 
     fn cue_segment_duration(inner: &PlayerInner, absolute_duration: f64) -> f64 {
@@ -1153,11 +1369,11 @@ impl Player {
     }
 
     fn absolute_seek_position(inner: &PlayerInner, relative_secs: f64) -> f64 {
-        // mixer_channel_set_position always wants the real file timeline.
+        // Always target the real file timeline on the decode handle.
         let start = inner.cue_start.unwrap_or(0.0);
         let mut absolute = start + relative_secs.max(0.0);
         if let (Some(start), Some(end)) = (inner.cue_start, inner.cue_end) {
-            absolute = absolute.clamp(start, end);
+            absolute = absolute.clamp(start, end.max(start));
         }
         absolute
     }
@@ -1367,7 +1583,9 @@ impl Player {
     /// Absolute content position (seconds on the original file timeline).
     ///
     /// FREQ and tempo channels use different byte timelines at rate ≠ 1; the
-    /// underlying decode handle always reports true content time.
+    /// underlying decode handle can run ahead while filling the mixer. Read the
+    /// mixer-facing channel position, then map its output timeline to content time.
+    /// Using the decode position directly makes one poll cross several CUE bounds.
     fn content_absolute_secs(
         bass: &BassLibrary,
         mixer_channel: u32,
@@ -1378,14 +1596,37 @@ impl Player {
             return 0.0;
         }
         let decode = Self::decode_handle_for_channel(bass, mixer_channel, tracked_decode);
-        let pos = if tracked_decode != 0 && tracked_decode != mixer_channel {
-            bass.channel_get_position(decode, bass::BASS_POS_BYTE)
-        } else if in_mixer {
+        let pos = if in_mixer {
             bass.mixer_channel_get_position(mixer_channel, bass::BASS_POS_BYTE)
         } else {
             bass.channel_get_position(mixer_channel, bass::BASS_POS_BYTE)
         };
-        bass.channel_bytes2seconds(decode, pos).max(0.0)
+        let output_secs = bass
+            .channel_bytes2seconds(mixer_channel, pos)
+            .max(0.0);
+        if decode == 0 || decode == mixer_channel {
+            return output_secs;
+        }
+
+        let output_duration = Self::stream_duration_secs(bass, mixer_channel);
+        let content_duration = Self::stream_duration_secs(bass, decode);
+        Self::map_output_position_to_content(output_secs, output_duration, content_duration)
+    }
+
+    fn map_output_position_to_content(
+        output_secs: f64,
+        output_duration: f64,
+        content_duration: f64,
+    ) -> f64 {
+        if output_duration.is_finite()
+            && content_duration.is_finite()
+            && output_duration > 0.001
+            && content_duration > 0.001
+        {
+            return (output_secs.max(0.0) / output_duration * content_duration)
+                .clamp(0.0, content_duration);
+        }
+        output_secs.max(0.0)
     }
 
     /// Seek the mixer-facing channel so content is at `abs_secs` on the file timeline.
@@ -1475,8 +1716,7 @@ impl Player {
             if was_paused {
                 let _ = bass.channel_pause(inner.mixer_handle);
             } else {
-                let _ = bass.channel_play(inner.mixer_handle, true);
-                let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_BUFFER, 0.0);
+                Self::restart_mixer_with_buffer(bass, inner.mixer_handle);
             }
         }
 
@@ -1555,8 +1795,58 @@ impl Player {
         if !end.is_finite() || end < 0.0 {
             return false;
         }
+        let start = inner.cue_start.unwrap_or(0.0);
+        // Degenerate / missing bounds must never auto-fire end (that causes
+        // immediate multi-track skip right after clicking a CUE entry).
+        if end <= start + 0.05 {
+            return false;
+        }
         let timeline = Self::content_timeline_secs(inner, reported_secs);
+        // Must have actually reached the segment — ignore stale high positions
+        // only when they still sit *before* this track's start (previous CUE).
+        if start > 0.05 && timeline + 0.5 < start {
+            return false;
+        }
         timeline + GAPLESS_END_EPSILON_SECS >= end
+    }
+
+    /// True when a STOPPED source is a real end-of-track, not a mid-switch glitch.
+    fn stream_done_is_real_end(
+        inner: &PlayerInner,
+        bass: &BassLibrary,
+        reported_secs: f64,
+        stream_done: bool,
+    ) -> bool {
+        if !stream_done {
+            return false;
+        }
+        if inner.user_paused {
+            return false;
+        }
+        // Source already torn down — poll recovery path; trust after spurious guard.
+        if inner.current_source == 0 {
+            return true;
+        }
+        let end = Self::track_end_position(inner, bass, inner.current_source);
+        if !end.is_finite() || end <= 0.0 {
+            // Unknown length — trust BASS only after the spurious guard.
+            return true;
+        }
+        let start = inner.cue_start.unwrap_or(0.0);
+        let timeline = Self::content_timeline_secs(inner, reported_secs);
+        // Near / past expected end on the content timeline.
+        if timeline + 1.25 >= end {
+            return start <= 0.05 || timeline + 0.25 >= start;
+        }
+        // Some codecs reset position to 0 the moment the decode ends. Fall back
+        // to wall-clock: only accept STOPPED if we've played most of the segment.
+        let segment = (end - start).max(0.0);
+        if segment <= 0.05 {
+            return false;
+        }
+        let age_ms = Self::now_millis().saturating_sub(inner.current_track_start_time);
+        let min_play_ms = ((segment * 0.82) * 1000.0).round() as u64;
+        age_ms >= min_play_ms.max(POLL_INTERVAL_MS)
     }
 
     /// Segment length in ms (CUE bounds or full stream). 0 if unknown.
@@ -1725,7 +2015,14 @@ impl Player {
             let target = inner.volume;
             let was_paused = inner.user_paused;
             let absolute_secs = Self::absolute_seek_position(inner, position_secs);
+            let segment_duration = match (inner.cue_start, inner.cue_end) {
+                (Some(start), Some(end)) => (end - start).max(0.0),
+                _ => 0.0,
+            };
+            let seeks_to_segment_end = segment_duration > 0.05
+                && position_secs + GAPLESS_END_EPSILON_SECS >= segment_duration;
             let source = inner.current_source;
+            let decode = inner.current_decode;
             let mixer = inner.mixer_handle;
 
             {
@@ -1734,13 +2031,12 @@ impl Player {
                 // Dip only for the flush moment to avoid click, then immediate restore.
                 let _ = bass.channel_set_attribute(mixer, bass::BASS_ATTRIB_VOL, SEEK_DIP_LEVEL);
 
-                let byte = bass.channel_seconds2bytes(source, absolute_secs);
-                let _ = bass.mixer_channel_set_position(source, byte, bass::BASS_POS_BYTE);
+                // Content timeline (decode) — correct for tempo wrappers and CUE segments.
+                Self::seek_content_absolute(bass, source, decode, true, absolute_secs);
 
                 // Flush mixer buffer so the new position is heard immediately.
                 // channel_play restarts the mixer — re-pause if we were paused.
-                let _ = bass.channel_play(mixer, true);
-                let _ = bass.channel_set_attribute(mixer, bass::BASS_ATTRIB_BUFFER, 0.2);
+                Self::restart_mixer_with_buffer(bass, mixer);
 
                 if was_paused {
                     let _ = bass.channel_pause(mixer);
@@ -1753,6 +2049,13 @@ impl Player {
 
             // Re-probe absolute vs segment-relative reporting after the seek.
             Self::detect_cue_position_mode(inner);
+            // Don't gapless-advance on a post-seek STOPPED glitch.
+            inner.suppress_gapless_until = if seeks_to_segment_end {
+                // Seeking to 100% is an intentional request to advance.
+                0
+            } else {
+                Self::now_millis().saturating_add(MANUAL_SEGMENT_SUPPRESS_MS)
+            };
             if was_paused {
                 inner.user_paused = true;
             }
@@ -2096,27 +2399,6 @@ impl Player {
             if inner.current_source == 0 || inner.mixer_handle == 0 || inner.bass.is_none() {
                 return Ok(None);
             }
-            let bass = inner.bass.as_ref().unwrap();
-            let mixer_active = bass.channel_is_active(inner.mixer_handle);
-            let src_active = if inner.current_source != 0 {
-                bass.channel_is_active(inner.current_source)
-            } else {
-                bass::BASS_ACTIVE_STOPPED
-            };
-            // Content timeline (decode handle) — required for correct CUE INDEX end detection
-            // with tempo wrappers and for absolute-vs-relative seek reporting.
-            let reported = Self::content_absolute_secs(
-                bass,
-                inner.current_source,
-                inner.current_decode,
-                true,
-            );
-
-            let playing = mixer_active == bass::BASS_ACTIVE_PLAYING;
-            let ending = playing && Self::track_ending(inner, bass, reported);
-            // Source ended (or no source) means the track is done, even if mixer is still "playing" silence (NONSTOP)
-            let stream_done =
-                src_active == bass::BASS_ACTIVE_STOPPED || mixer_active == bass::BASS_ACTIVE_STOPPED;
 
             let now = Self::now_millis();
             // Pitch/rate topology rebuild and seeks can briefly look "ended".
@@ -2125,11 +2407,41 @@ impl Player {
                 return Ok(None);
             }
 
-            if Self::has_next_in_gapless_queue(inner) && (ending || stream_done) {
+            let (ending, real_stream_done, past_guard) = {
+                let bass = inner.bass.as_ref().unwrap();
+                let mixer_active = bass.channel_is_active(inner.mixer_handle);
+                let src_active = if inner.current_source != 0 {
+                    bass.channel_is_active(inner.current_source)
+                } else {
+                    bass::BASS_ACTIVE_STOPPED
+                };
+                // Content timeline (decode handle) — required for correct CUE INDEX end detection
+                // with tempo wrappers and for absolute-vs-relative seek reporting.
+                let reported = Self::content_absolute_secs(
+                    bass,
+                    inner.current_source,
+                    inner.current_decode,
+                    true,
+                );
+
+                let playing = mixer_active == bass::BASS_ACTIVE_PLAYING
+                    && !inner.user_paused;
+                let ending = playing && Self::track_ending(inner, bass, reported);
+                // Source ended (or no source) means the track is done, even if mixer is still "playing" silence (NONSTOP)
+                let stream_done_raw = src_active == bass::BASS_ACTIVE_STOPPED
+                    || mixer_active == bass::BASS_ACTIVE_STOPPED;
+                // Ignore mid-track STOPPED glitches (very common right after CUE seeks).
+                let real_stream_done =
+                    Self::stream_done_is_real_end(inner, bass, reported, stream_done_raw);
+                let past_guard = Self::past_spurious_end_guard(inner, bass);
+                (ending, real_stream_done, past_guard)
+            };
+
+            if Self::has_next_in_gapless_queue(inner) && (ending || real_stream_done) {
                 // Guard against spurious early advance after manual click in que
                 // (new track can briefly appear done). Short tracks cap the guard
                 // by their own duration so <1s files still auto-advance.
-                if Self::past_spurious_end_guard(inner, bass) {
+                if past_guard {
                     return Self::try_advance_gapless(inner).map(Some).map_err(|error| {
                         eprintln!("Gapless advance failed: {error}");
                         error
@@ -2137,21 +2449,23 @@ impl Player {
                 }
             }
 
-            if (ending || stream_done)
+            if (ending || real_stream_done)
                 && !Self::has_next_in_gapless_queue(inner)
-                && Self::past_spurious_end_guard(inner, bass)
+                && past_guard
             {
                 // End of playlist: ensure source is gone (AUTOFREE usually handles it).
                 // Wait for the duration-aware guard so short last tracks still emit
                 // track-ended promptly (duration is known while the source lives).
                 // Do not stop the mixer — keep it running (silent) so next playback starts without device hiccup.
                 if inner.current_source != 0 {
-                    let _ = bass.mixer_channel_remove(inner.current_source);
-                    Self::free_playback_channel(
-                        bass,
-                        inner.current_source,
-                        inner.current_decode,
-                    );
+                    if let Some(bass) = inner.bass.as_ref() {
+                        let _ = bass.mixer_channel_remove(inner.current_source);
+                        Self::free_playback_channel(
+                            bass,
+                            inner.current_source,
+                            inner.current_decode,
+                        );
+                    }
                     inner.current_source = 0;
                     inner.current_decode = 0;
                 }
@@ -2358,5 +2672,81 @@ impl Player {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GaplessTrack, Player};
+
+    fn queue(first: &str) -> Vec<GaplessTrack> {
+        vec![GaplessTrack {
+            track_path: first.to_string(),
+            audio_path: first.split("#cue:").next().unwrap_or(first).to_string(),
+            cue_start: Some(0.0),
+            cue_end: Some(60.0),
+        }]
+    }
+
+    #[test]
+    fn stale_queue_refresh_cannot_replace_current_cue_track() {
+        let old = r"C:\music\album.flac#cue:3";
+        let current = r"C:\music\album.flac#cue:4";
+
+        assert!(!Player::queue_refresh_matches(
+            Some(current),
+            Some(old),
+            &queue(old),
+        ));
+        assert!(Player::queue_refresh_matches(
+            Some(current),
+            Some(current),
+            &queue(current),
+        ));
+    }
+
+    #[test]
+    fn queue_refresh_requires_current_track_as_first_entry() {
+        let current = r"C:\music\album.flac#cue:4";
+        let wrong_first = r"C:\music\album.flac#cue:5";
+
+        assert!(!Player::queue_refresh_matches(
+            Some(current),
+            Some(current),
+            &queue(wrong_first),
+        ));
+    }
+
+    #[test]
+    fn rendered_position_maps_to_content_timeline_without_decode_readahead() {
+        assert_eq!(
+            Player::map_output_position_to_content(30.0, 60.0, 120.0),
+            60.0
+        );
+        assert_eq!(
+            Player::map_output_position_to_content(61.0, 60.0, 120.0),
+            120.0
+        );
+    }
+
+    #[test]
+    fn only_physical_cue_neighbours_continue_without_seek() {
+        assert!(Player::cue_segments_are_contiguous(
+            Some(120.0),
+            Some(120.0),
+        ));
+        assert!(Player::cue_segments_are_contiguous(
+            Some(120.0),
+            Some(120.05),
+        ));
+        assert!(!Player::cue_segments_are_contiguous(
+            Some(120.0),
+            Some(180.0),
+        ));
+        assert!(!Player::cue_segments_are_contiguous(
+            Some(300.0),
+            Some(180.0),
+        ));
+        assert!(!Player::cue_segments_are_contiguous(None, Some(180.0)));
     }
 }

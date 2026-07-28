@@ -1,8 +1,6 @@
 // Remote playback controller — mirrors frontend queue logic for the HTTP API.
 
-use std::fs;
 use std::path::Path;
-use std::time::SystemTime;
 
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -12,7 +10,7 @@ use crate::discord_rpc::DiscordPresence;
 use crate::library::MusicFile;
 use crate::metadata;
 use crate::player::{GaplessTrack, Player, PlayerStateSnapshot, PositionPayload, TrackChangedPayload};
-use crate::playlists::{self, PlaylistsData};
+use crate::playlists::{LibraryDatabase, LibraryState, PlaylistsData};
 use crate::settings::{self, ShuffleMode};
 use crate::taskbar_handler;
 use std::collections::HashSet;
@@ -119,13 +117,14 @@ struct StoreSyncPayload {
 
 struct PlaylistsCache {
     data: PlaylistsData,
-    modified: Option<SystemTime>,
+    revision: u64,
 }
 
 pub struct RemoteController {
     player: Player,
     discord: DiscordPresence,
     app: AppHandle,
+    database: LibraryDatabase,
     shuffle_order: Mutex<Vec<usize>>,
     shuffle_position: Mutex<usize>,
     /// Smart shuffle: paths already heard in the current playlist cycle.
@@ -135,11 +134,17 @@ pub struct RemoteController {
 }
 
 impl RemoteController {
-    pub fn new(player: Player, discord: DiscordPresence, app: AppHandle) -> Self {
+    pub fn new(
+        player: Player,
+        discord: DiscordPresence,
+        app: AppHandle,
+        database: LibraryDatabase,
+    ) -> Self {
         Self {
             player,
             discord,
             app,
+            database,
             shuffle_order: Mutex::new(Vec::new()),
             shuffle_position: Mutex::new(0),
             smart_played: Mutex::new(HashSet::new()),
@@ -276,32 +281,36 @@ impl RemoteController {
     }
 
     fn load_data(&self) -> Result<PlaylistsData, String> {
-        let path = playlists::playlists_path(&self.app)?;
-        let modified = fs::metadata(&path).ok().and_then(|meta| meta.modified().ok());
-
-        if let Some(cached) = self.playlists_cache.lock().as_ref() {
-            if cached.modified == modified {
-                return Ok(cached.data.clone());
+        loop {
+            let revision = self.database.revision();
+            if let Some(cached) = self.playlists_cache.lock().as_ref() {
+                if cached.revision == revision {
+                    return Ok(cached.data.clone());
+                }
             }
-        }
 
-        let data = playlists::load_playlists_fast(&self.app)?;
-        *self.playlists_cache.lock() = Some(PlaylistsCache {
-            data: data.clone(),
-            modified,
-        });
-        Ok(data)
+            let data = self.database.load()?;
+            if self.database.revision() != revision {
+                continue;
+            }
+            *self.playlists_cache.lock() = Some(PlaylistsCache {
+                data: data.clone(),
+                revision,
+            });
+            return Ok(data);
+        }
     }
 
     fn save_data(&self, data: &PlaylistsData) -> Result<(), String> {
-        playlists::save_playlists(&self.app, data)?;
-        let modified = playlists::playlists_path(&self.app)
-            .ok()
-            .and_then(|path| fs::metadata(&path).ok().and_then(|meta| meta.modified().ok()));
-        *self.playlists_cache.lock() = Some(PlaylistsCache {
-            data: data.clone(),
-            modified,
-        });
+        self.database.save_state(&LibraryState {
+            active_playlist_id: data.active_playlist_id.clone(),
+            playing_playlist_id: data.playing_playlist_id.clone(),
+            current_file: data.current_file.clone(),
+            volume: data.volume,
+            shuffle_enabled: data.shuffle_enabled,
+            repeat_mode: data.repeat_mode.clone(),
+        })?;
+        *self.playlists_cache.lock() = None;
         Ok(())
     }
 
@@ -314,26 +323,17 @@ impl RemoteController {
     }
 
     fn track_map(data: &PlaylistsData) -> std::collections::HashMap<String, MusicFile> {
-        let mut map = std::collections::HashMap::new();
-        for playlist in &data.playlists {
-            for track in &playlist.tracks {
-                map.entry(track.path.clone()).or_insert_with(|| track.clone());
-            }
-        }
-        map
+        data.library_tracks
+            .iter()
+            .map(|track| (track.path.clone(), track.clone()))
+            .collect()
     }
 
     fn default_all_paths(data: &PlaylistsData) -> Vec<String> {
-        let mut seen = std::collections::HashSet::new();
-        let mut result = Vec::new();
-        for playlist in &data.playlists {
-            for track in &playlist.tracks {
-                if seen.insert(track.path.clone()) {
-                    result.push(track.path.clone());
-                }
-            }
-        }
-        result
+        data.library_tracks
+            .iter()
+            .map(|track| track.path.clone())
+            .collect()
     }
 
     fn all_tracks(data: &PlaylistsData) -> Vec<MusicFile> {
@@ -647,8 +647,9 @@ impl RemoteController {
             let Some(order_pos) = order_pos else {
                 return Vec::new();
             };
-            return order[order_pos..order_pos + MAX_GAPLESS_FOLLOWING]
+            return order[order_pos..]
                 .iter()
+                .take(MAX_GAPLESS_FOLLOWING)
                 .filter_map(|&index| tracks.get(index).cloned())
                 .collect();
         }
@@ -657,7 +658,11 @@ impl RemoteController {
         let Some(index) = index else {
             return Vec::new();
         };
-        tracks[index..index + MAX_GAPLESS_FOLLOWING].to_vec()
+        tracks[index..]
+            .iter()
+            .take(MAX_GAPLESS_FOLLOWING)
+            .cloned()
+            .collect()
     }
 
     fn build_gapless_queue(&self, data: &PlaylistsData, file_path: &str) -> Vec<GaplessTrack> {
@@ -730,7 +735,10 @@ impl RemoteController {
             if let Some(playlist) = data.playlists.iter().find(|p| p.id == *id) {
                 let idx = playlist.tracks.iter().position(|t| t.path == file_path);
                 let slice: Vec<&MusicFile> = if let Some(idx) = idx {
-                    playlist.tracks[idx..idx + MAX_GAPLESS_FOLLOWING].iter().collect()
+                    playlist.tracks[idx..]
+                        .iter()
+                        .take(MAX_GAPLESS_FOLLOWING)
+                        .collect()
                 } else if let Some(t) = track {
                     vec![t]
                 } else {
@@ -1024,7 +1032,7 @@ impl RemoteController {
 
         if let Some(path) = self.player.get_state().current_file {
             let queue = self.build_gapless_queue(&data, &path);
-            let _ = self.player.prepare_next(queue);
+            let _ = self.player.prepare_next(Some(&path), queue);
         }
 
         let mode = next.as_str().to_string();

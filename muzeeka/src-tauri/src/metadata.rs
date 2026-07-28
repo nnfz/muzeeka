@@ -3,9 +3,10 @@
 
 use image::imageops::FilterType;
 use image::{GenericImageView, ImageFormat};
-use lofty::config::WriteOptions;
+use lofty::config::{ParseOptions, WriteOptions};
 use lofty::file::{AudioFile, TaggedFile, TaggedFileExt};
 use lofty::picture::{MimeType, Picture, PictureType};
+use lofty::probe::Probe;
 use lofty::read_from_path;
 use lofty::tag::{Accessor, Tag, TagType};
 use serde::Serialize;
@@ -929,7 +930,7 @@ pub fn rebuild_cover_cache(
     Ok((stats, cover_updates))
 }
 
-/// Re-read cover paths for a track after cache rebuild (for playlists.json update).
+/// Re-read cover paths for a track after rebuilding the library cover cache.
 pub fn fresh_cover_paths_for_track(track_path: &str) -> (Option<String>, Option<String>) {
     let path = if crate::cue::is_cue_track_path(track_path) {
         if let Some((audio, _)) = crate::cue::parse_virtual_cue_path(track_path) {
@@ -1088,8 +1089,27 @@ fn resolve_cover_paths(path: &Path, tagged_file: Option<&TaggedFile>) -> CoverPa
     extract_nearby_cover(path)
 }
 
+/// Resolve the small list/transport cover, creating the cache only when the UI
+/// actually asks for this track.
+pub fn resolve_list_cover(path: &Path) -> Option<String> {
+    if let Some(paths) = existing_embedded_cover_cache(path) {
+        return paths.thumb.or(paths.full);
+    }
+
+    let tagged_file = read_from_path(path).ok();
+    let paths = match tagged_file.as_ref() {
+        Some(tagged_file) => resolve_cover_paths(path, Some(tagged_file)),
+        None => resolve_cover_paths(path, None),
+    };
+    paths.thumb.or(paths.full)
+}
+
 /// Resolve a full-resolution cover path for an audio file (creates cache if needed).
 pub fn resolve_full_cover(path: &Path) -> Option<String> {
+    if let Some(paths) = existing_embedded_cover_cache(path) {
+        return paths.full.or(paths.thumb);
+    }
+
     let tagged_file = read_from_path(path).ok();
     let paths = match tagged_file.as_ref() {
         Some(tagged_file) => resolve_cover_paths(path, Some(tagged_file)),
@@ -1122,9 +1142,27 @@ pub fn cover_data_url(path: &Path) -> Result<Option<String>, String> {
 
 /// Read tags and audio properties from a file. Falls back to the filename when tags are missing.
 pub fn read_metadata(path: &Path, file_name: &str) -> TrackMetadata {
+    read_metadata_impl(path, file_name, true)
+}
+
+/// Read only tags and audio properties. Cover extraction is deliberately skipped
+/// during imports; visible-player components resolve covers lazily on demand.
+pub fn read_metadata_fast(path: &Path, file_name: &str) -> TrackMetadata {
+    read_metadata_impl(path, file_name, false)
+}
+
+fn read_metadata_impl(path: &Path, file_name: &str, resolve_covers: bool) -> TrackMetadata {
     let mut meta = TrackMetadata::default();
 
-    let tagged_file = read_from_path(path);
+    let tagged_file = if resolve_covers {
+        read_from_path(path)
+    } else {
+        Probe::open(path).and_then(|probe| {
+            probe
+                .options(ParseOptions::new().read_cover_art(false))
+                .read()
+        })
+    };
 
     match &tagged_file {
         Ok(tagged_file) => {
@@ -1149,15 +1187,19 @@ pub fn read_metadata(path: &Path, file_name: &str) -> TrackMetadata {
                 meta.track_number = tag.track();
             }
 
-            let covers = resolve_cover_paths(path, Some(tagged_file));
-            meta.cover_path = covers.thumb;
-            meta.cover_path_full = covers.full;
+            if resolve_covers {
+                let covers = resolve_cover_paths(path, Some(tagged_file));
+                meta.cover_path = covers.thumb;
+                meta.cover_path_full = covers.full;
+            }
         }
         Err(_) => {
             meta.title = Some(strip_ytdlp_id_suffix(&filename_stem(path, file_name)));
-            let covers = resolve_cover_paths(path, None);
-            meta.cover_path = covers.thumb;
-            meta.cover_path_full = covers.full;
+            if resolve_covers {
+                let covers = resolve_cover_paths(path, None);
+                meta.cover_path = covers.thumb;
+                meta.cover_path_full = covers.full;
+            }
         }
     }
 

@@ -7,6 +7,8 @@ export function resolvePlaylistCoverTrack(playlist: Playlist): MusicFile | null 
     return {
       path: '',
       file_name: '',
+      extension: '',
+      size: 0,
       cover_path: custom,
     };
   }
@@ -17,7 +19,9 @@ export function resolvePlaylistCoverTrack(playlist: Playlist): MusicFile | null 
     }
   }
 
-  return null;
+  // Fast imports defer cover extraction; TrackCover resolves the first track
+  // lazily when this playlist row is actually visible.
+  return playlist.tracks[0] ?? null;
 }
 
 export function collectPlaylistCoverPaths(playlists: Playlist[]): string[] {

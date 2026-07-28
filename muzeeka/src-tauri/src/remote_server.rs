@@ -1,25 +1,35 @@
-// Local HTTP server for phone/browser remote control.
-// Can be enabled/disabled and rebound to a different port from settings.
+// Local HTTP server for phone/browser remote control + external app API.
+// REST for control, SSE/NDJSON stream for live state. Can be rebound from settings.
 
+use std::convert::Infallible;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
+    body::Body,
     extract::{Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
-    response::{Html, IntoResponse, Response},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        Html, IntoResponse, Response,
+    },
     routing::{get, post},
     Json, Router,
 };
+use futures_util::stream;
 use if_addrs::IfAddr;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
+use tower_http::cors::{Any, CorsLayer};
 
 use crate::remote_control::RemoteController;
 
 pub const DEFAULT_REMOTE_PORT: u16 = 8765;
+const DEFAULT_STREAM_INTERVAL_MS: u64 = 250;
+const MIN_STREAM_INTERVAL_MS: u64 = 50;
+const MAX_STREAM_INTERVAL_MS: u64 = 2000;
 const REMOTE_UI: &str = include_str!("remote/index.html");
 
 #[derive(Debug, Clone, Serialize)]
@@ -208,10 +218,19 @@ async fn run_server(
 ) -> Result<(), String> {
     let state = AppState { controller, port };
 
+    // LAN apps / other origins: allow browser and native clients to call the API.
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+
     let app = Router::new()
         .route("/", get(index))
+        .route("/api", get(api_info))
         .route("/api/info", get(api_info))
         .route("/api/state", get(api_state))
+        .route("/api/stream", get(api_stream))
+        .route("/api/events", get(api_stream))
         .route("/api/playlists", get(api_playlists))
         .route("/api/playlist", get(api_playlist))
         .route("/api/play", post(api_play))
@@ -226,6 +245,7 @@ async fn run_server(
         .route("/api/shuffle/toggle", post(api_toggle_shuffle))
         .route("/api/repeat/toggle", post(api_toggle_repeat))
         .route("/api/cover", get(api_cover))
+        .layer(cors)
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
@@ -239,7 +259,9 @@ async fn run_server(
         g.last_error = None;
     }
 
-    eprintln!("Remote control: http://localhost:{port} (LAN: http://<your-ip>:{port})");
+    eprintln!(
+        "Remote control: http://localhost:{port}  |  API stream: http://localhost:{port}/api/stream"
+    );
 
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
@@ -258,7 +280,7 @@ struct AppState {
 #[derive(Debug, Deserialize)]
 struct PlayBody {
     path: String,
-    #[serde(default)]
+    #[serde(default, alias = "playlistId")]
     playlist_id: Option<String>,
 }
 
@@ -282,10 +304,48 @@ struct CoverQuery {
     path: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct StreamQuery {
+    /// Snapshot interval in milliseconds (clamped 50..=2000). Default 250.
+    #[serde(default = "default_stream_interval_ms")]
+    interval: u64,
+    /// `sse` (default) or `ndjson` for a plain newline-delimited JSON body stream.
+    #[serde(default)]
+    format: Option<String>,
+}
+
+fn default_stream_interval_ms() -> u64 {
+    DEFAULT_STREAM_INTERVAL_MS
+}
+
+fn clamp_stream_interval_ms(ms: u64) -> u64 {
+    ms.clamp(MIN_STREAM_INTERVAL_MS, MAX_STREAM_INTERVAL_MS)
+}
+
+#[derive(Debug, Serialize)]
+struct EndpointDoc {
+    method: &'static str,
+    path: &'static str,
+    description: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct StreamDoc {
+    sse: &'static str,
+    ndjson: &'static str,
+    event: &'static str,
+    default_interval_ms: u64,
+    description: &'static str,
+}
+
 #[derive(Debug, Serialize)]
 struct InfoResponse {
+    name: &'static str,
+    version: &'static str,
     port: u16,
     urls: Vec<String>,
+    stream: StreamDoc,
+    endpoints: Vec<EndpointDoc>,
 }
 
 #[derive(Debug, Serialize)]
@@ -309,8 +369,109 @@ async fn index() -> Html<&'static str> {
 
 async fn api_info(State(state): State<AppState>) -> Json<InfoResponse> {
     Json(InfoResponse {
+        name: "muzeeka-remote",
+        version: env!("CARGO_PKG_VERSION"),
         port: state.port,
         urls: public_urls(state.port, &lan_ipv4_candidates()),
+        stream: StreamDoc {
+            sse: "/api/stream",
+            ndjson: "/api/stream?format=ndjson",
+            event: "state",
+            default_interval_ms: DEFAULT_STREAM_INTERVAL_MS,
+            description: "Long-lived stream of player state (position, track, volume, shuffle/repeat). Prefer SSE for browsers (EventSource); use NDJSON for simple scripts.",
+        },
+        endpoints: vec![
+            EndpointDoc {
+                method: "GET",
+                path: "/api/info",
+                description: "API discovery (this document)",
+            },
+            EndpointDoc {
+                method: "GET",
+                path: "/api/state",
+                description: "One-shot player state snapshot",
+            },
+            EndpointDoc {
+                method: "GET",
+                path: "/api/stream",
+                description: "Live state stream (SSE by default, ?format=ndjson, ?interval=250)",
+            },
+            EndpointDoc {
+                method: "GET",
+                path: "/api/events",
+                description: "Alias of /api/stream",
+            },
+            EndpointDoc {
+                method: "GET",
+                path: "/api/playlists",
+                description: "Playlist list",
+            },
+            EndpointDoc {
+                method: "GET",
+                path: "/api/playlist?id=...",
+                description: "Playlist tracks",
+            },
+            EndpointDoc {
+                method: "GET",
+                path: "/api/cover?path=...",
+                description: "Track cover image bytes",
+            },
+            EndpointDoc {
+                method: "POST",
+                path: "/api/play",
+                description: "Play track { path, playlistId? }",
+            },
+            EndpointDoc {
+                method: "POST",
+                path: "/api/toggle",
+                description: "Play/pause toggle",
+            },
+            EndpointDoc {
+                method: "POST",
+                path: "/api/pause",
+                description: "Pause",
+            },
+            EndpointDoc {
+                method: "POST",
+                path: "/api/resume",
+                description: "Resume",
+            },
+            EndpointDoc {
+                method: "POST",
+                path: "/api/next",
+                description: "Next track",
+            },
+            EndpointDoc {
+                method: "POST",
+                path: "/api/prev",
+                description: "Previous track",
+            },
+            EndpointDoc {
+                method: "POST",
+                path: "/api/seek",
+                description: "Seek { position } seconds",
+            },
+            EndpointDoc {
+                method: "POST",
+                path: "/api/volume",
+                description: "Volume { volume } 0.0–1.0",
+            },
+            EndpointDoc {
+                method: "POST",
+                path: "/api/playlist/select",
+                description: "Select playlist { id }",
+            },
+            EndpointDoc {
+                method: "POST",
+                path: "/api/shuffle/toggle",
+                description: "Toggle shuffle",
+            },
+            EndpointDoc {
+                method: "POST",
+                path: "/api/repeat/toggle",
+                description: "Cycle repeat mode",
+            },
+        ],
     })
 }
 
@@ -318,6 +479,129 @@ fn json_value<T: Serialize>(value: T) -> Result<Json<serde_json::Value>, AppErro
     serde_json::to_value(value)
         .map(Json)
         .map_err(|error| AppError(format!("Failed to serialize response: {error}")))
+}
+
+fn snapshot_state_json(controller: &RemoteController) -> Result<String, String> {
+    let state = controller.get_state()?;
+    serde_json::to_string(&state).map_err(|e| format!("Failed to serialize state: {e}"))
+}
+
+/// Live player-state feed for external apps.
+///
+/// - Default: **SSE** (`text/event-stream`), event name `state`, JSON payload.
+/// - `?format=ndjson`: continuous `application/x-ndjson` body (one JSON object per line).
+/// - `?interval=250`: snapshot interval in ms (50–2000).
+async fn api_stream(
+    State(state): State<AppState>,
+    Query(query): Query<StreamQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let interval_ms = clamp_stream_interval_ms(query.interval);
+    let want_ndjson = match query.format.as_deref() {
+        Some(f) if f.eq_ignore_ascii_case("ndjson") || f.eq_ignore_ascii_case("jsonl") => true,
+        Some(f) if f.eq_ignore_ascii_case("sse") || f.eq_ignore_ascii_case("event-stream") => false,
+        _ => headers
+            .get(header::ACCEPT)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|a| a.contains("ndjson") || a.contains("x-ndjson")),
+    };
+
+    if want_ndjson {
+        ndjson_stream_response(state.controller, interval_ms).into_response()
+    } else {
+        sse_stream_response(state.controller, interval_ms).into_response()
+    }
+}
+
+enum StreamPhase {
+    Active {
+        controller: Arc<RemoteController>,
+        first: bool,
+    },
+    Done,
+}
+
+fn sse_stream_response(
+    controller: Arc<RemoteController>,
+    interval_ms: u64,
+) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>> + Send + 'static> {
+    let stream = stream::unfold(
+        StreamPhase::Active {
+            controller,
+            first: true,
+        },
+        move |phase| async move {
+            let StreamPhase::Active { controller, first } = phase else {
+                return None;
+            };
+            if !first {
+                tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+            }
+            match snapshot_state_json(&controller) {
+                Ok(json) => {
+                    let event = Event::default().event("state").data(json);
+                    Some((
+                        Ok::<_, Infallible>(event),
+                        StreamPhase::Active {
+                            controller,
+                            first: false,
+                        },
+                    ))
+                }
+                Err(err) => {
+                    let event = Event::default().event("error").data(err);
+                    Some((Ok(event), StreamPhase::Done))
+                }
+            }
+        },
+    );
+
+    Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("ping"),
+    )
+}
+
+fn ndjson_stream_response(
+    controller: Arc<RemoteController>,
+    interval_ms: u64,
+) -> Response {
+    let stream = stream::unfold(
+        StreamPhase::Active {
+            controller,
+            first: true,
+        },
+        move |phase| async move {
+            let StreamPhase::Active { controller, first } = phase else {
+                return None;
+            };
+            if !first {
+                tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+            }
+            match snapshot_state_json(&controller) {
+                Ok(json) => {
+                    let line = format!("{json}\n");
+                    Some((
+                        Ok::<_, Infallible>(axum::body::Bytes::from(line)),
+                        StreamPhase::Active {
+                            controller,
+                            first: false,
+                        },
+                    ))
+                }
+                Err(_) => None,
+            }
+        },
+    );
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/x-ndjson; charset=utf-8")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header(header::CONNECTION, "keep-alive")
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 async fn api_state(State(state): State<AppState>) -> Result<Json<serde_json::Value>, AppError> {

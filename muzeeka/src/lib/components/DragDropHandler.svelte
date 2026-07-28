@@ -179,6 +179,7 @@
       return;
     }
     const show = active && !isExportDragActive() && !shouldSuppressDropOverlay(paths);
+    if (isDragging === show && externalDrop.active === show) return;
     isDragging = show;
     setExternalDropActive(show);
     if (!show) {
@@ -257,10 +258,12 @@
       }
 
       let added = 0;
-      if (paths && paths.length > 0) {
-        added = await player.addDroppedPaths(paths, target.id);
-      } else if (files && files.length > 0) {
+      // Native Rust drops already contain fully scanned files. Prefer them so
+      // dropping on the sidebar never scans the same directory a second time.
+      if (files && files.length > 0) {
         added = player.addScannedTracks(files, target.id);
+      } else if (paths && paths.length > 0) {
+        added = await player.addDroppedPaths(paths, target.id);
       }
 
       if (added > 0) {
@@ -273,14 +276,14 @@
       return;
     }
 
-    if (paths && paths.length > 0) {
-      const result = await player.createPlaylistsFromDroppedPaths(paths);
+    if (files && files.length > 0) {
+      const result = player.createPlaylistsFromScannedTracks(files, paths);
       toastForCreateResult(result);
       return;
     }
 
-    if (files && files.length > 0) {
-      const result = player.createPlaylistsFromScannedTracks(files, paths);
+    if (paths && paths.length > 0) {
+      const result = await player.createPlaylistsFromDroppedPaths(paths);
       toastForCreateResult(result);
       return;
     }
@@ -388,6 +391,11 @@
     const unlisteners: Array<() => void> = [];
     const webviewWindow = getCurrentWebviewWindow();
     let ctrlPollTimer: ReturnType<typeof setInterval> | null = null;
+    // Rust handles the native window drag and emits normalized coordinates. The
+    // WebView listener is only a fallback; processing both streams makes the
+    // hint jump when their coordinate systems disagree.
+    let rustDragSession = false;
+    let rustDragReleaseTimer: ReturnType<typeof setTimeout> | null = null;
 
     void getCurrentWindow()
       .scaleFactor()
@@ -438,6 +446,20 @@
     void webviewWindow.listen<DragActivePayload | boolean>('muzeeka:drag-active', (event) => {
       const payload = event.payload;
       const active = typeof payload === 'boolean' ? payload : !!payload?.active;
+      if (rustDragReleaseTimer) {
+        clearTimeout(rustDragReleaseTimer);
+        rustDragReleaseTimer = null;
+      }
+      if (active) {
+        rustDragSession = true;
+      } else {
+        // Keep ownership briefly through the matching WebView drop event. Rust
+        // may continue scanning in the background before dropped-tracks arrives.
+        rustDragReleaseTimer = setTimeout(() => {
+          rustDragSession = false;
+          rustDragReleaseTimer = null;
+        }, 750);
+      }
       const position =
         typeof payload === 'object' && payload && Array.isArray(payload.position)
           ? payload.position
@@ -465,6 +487,11 @@
     }).then((unlisten) => unlisteners.push(unlisten));
 
     void webviewWindow.listen<DroppedTracksPayload>('muzeeka:dropped-tracks', (event) => {
+      if (rustDragReleaseTimer) {
+        clearTimeout(rustDragReleaseTimer);
+        rustDragReleaseTimer = null;
+      }
+      rustDragSession = false;
       const { files, position, message, paths, ctrl } = event.payload;
       const sourcePaths = normalizePaths(paths);
       void finishDrop(
@@ -480,6 +507,7 @@
 
     // Fallback: native Tauri drag-drop API (in case Rust emit path fails)
     void webviewWindow.onDragDropEvent((event) => {
+      if (rustDragSession) return;
       const payload = event.payload;
 
       if (payload.type === 'enter') {
@@ -552,6 +580,7 @@
       window.removeEventListener('keyup', onKeyUp, true);
       window.removeEventListener('blur', onBlur);
       stopCtrlPoll();
+      if (rustDragReleaseTimer) clearTimeout(rustDragReleaseTimer);
       if (toastTimer) clearTimeout(toastTimer);
       resetExternalDrop();
     };

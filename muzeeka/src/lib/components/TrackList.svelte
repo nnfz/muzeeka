@@ -3,6 +3,7 @@
   import {
     getPlayerStore,
     isEditablePlaylist,
+    sameTrackPath,
     supportsPlaylistReorder,
     trackDisplayArtist,
     trackDisplayTitle,
@@ -27,6 +28,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { audioPathsForDrag, startFileDrag } from "$lib/fileDrag";
   import { exportAudioPathForTrack } from "$lib/trackPaths";
+  import { reorderItemsAtBoundary } from "$lib/trackOrder";
   import TrackCover from "./TrackCover.svelte";
 
   type ColumnId = "index" | "title" | "album" | "duration";
@@ -1070,20 +1072,16 @@
     playlistId: string,
   ) {
     const items = [...displayedTracks];
-    const movingSet = new Set(paths);
-    const moving = items.filter((item) => movingSet.has(item.track.path));
-    if (moving.length === 0) return;
-
-    const remaining = items.filter((item) => !movingSet.has(item.track.path));
-    const insertAt = Math.max(0, Math.min(insertIndex, remaining.length));
-    const newOrder = [
-      ...remaining.slice(0, insertAt),
-      ...moving,
-      ...remaining.slice(insertAt),
-    ];
+    const newOrder = reorderItemsAtBoundary(
+      items,
+      paths,
+      insertIndex,
+      (item) => item.track.path,
+    );
+    if (newOrder.every((item, index) => item === items[index])) return;
 
     if (playlistId === VIRTUAL_LIKED_ID || playlistId === VIRTUAL_ALL_ID) {
-      player.reorderTracksInView(playlistId, paths, insertAt);
+      player.reorderTracksInView(playlistId, paths, insertIndex);
     } else {
       player.setPlaylistTrackOrder(
         playlistId,
@@ -1317,7 +1315,7 @@
             {#each visibleTracks as item, localIndex (item.track.path)}
               {@const i = visibleRange.start + localIndex}
               {@const track = item.track}
-              {@const isActive = track.path === player.currentFile}
+              {@const isActive = sameTrackPath(track.path, player.currentFile)}
               {@const isSelected = selectedPaths.has(track.path)}
               {@const isDraggingRow =
                 (trackDrag?.active && trackDrag.paths.includes(track.path)) ||

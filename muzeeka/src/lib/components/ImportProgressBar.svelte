@@ -4,14 +4,25 @@
   const progress = getImportProgressStore();
 </script>
 
-<div class="import-progress-bar" role="progressbar" aria-valuenow={progress.current} aria-valuemax={progress.total} aria-label="Importing...">
-  <!-- <div class="import-progress-fill" style="width: 70%"></div> -->
-  {#if progress.total > 0}
-    <div class="import-progress-fill" style="width: {(progress.current / progress.total) * 100}%"></div>
-  {:else if progress.active}
-    <div class="import-progress-fill indeterminate"></div>
-  {/if}
-</div>
+{#if progress.active}
+  <div
+    class="import-progress-bar"
+    role="progressbar"
+    aria-valuenow={progress.total > 0 ? Math.min(progress.current, progress.total) : undefined}
+    aria-valuemin="0"
+    aria-valuemax={progress.total > 0 ? progress.total : undefined}
+    aria-label={progress.label || 'Importing music'}
+  >
+    {#if progress.total > 0}
+      <div
+        class="import-progress-fill"
+        style:width={`${Math.max(0, Math.min(100, (progress.current / progress.total) * 100))}%`}
+      ></div>
+    {:else}
+      <div class="import-progress-fill indeterminate"></div>
+    {/if}
+  </div>
+{/if}
 
 <style>
   .import-progress-bar {

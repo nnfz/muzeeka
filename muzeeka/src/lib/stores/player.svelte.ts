@@ -4,6 +4,7 @@ import { setupTaskbar } from '$lib/taskbar';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
+import { reorderItemsAtBoundary } from '$lib/trackOrder';
 import { setImportProgress, resetImportProgress } from '$lib/stores/importProgress.svelte';
 import {
   applyShuffleModeFromSettings,
@@ -14,6 +15,51 @@ import {
 // Yield to the browser event loop so the UI stays responsive
 function yieldToUI() {
   return new Promise<void>((resolve) => queueMicrotask(resolve));
+}
+
+/** Normalize track paths for equality (Windows case, slashes, `\\?\`, `#cue:N`). */
+function pathKey(path: string | null | undefined): string {
+  if (!path) return '';
+  let p = path.trim();
+  if (p.startsWith('\\\\?\\')) p = p.slice(4);
+  else if (p.startsWith('//?/')) p = p.slice(4);
+  p = p.replace(/\//g, '\\');
+  return p.toLowerCase();
+}
+
+export function sameTrackPath(a: string | null | undefined, b: string | null | undefined): boolean {
+  if (!a || !b) return false;
+  return pathKey(a) === pathKey(b);
+}
+
+function isCueVirtualPath(path: string | null | undefined): boolean {
+  return !!path && path.includes('#cue:');
+}
+
+/** Stable segment length for CUE rows (INDEX bounds beat full-file tags). */
+function cueSegmentDuration(track: MusicFile | null | undefined): number | null {
+  if (!track) return null;
+  const start = track.cue_start_secs;
+  const end = track.cue_end_secs;
+  if (typeof start === 'number' && typeof end === 'number' && end > start + 0.05) {
+    return end - start;
+  }
+  if (typeof track.duration_secs === 'number' && track.duration_secs > 0) {
+    return track.duration_secs;
+  }
+  return null;
+}
+
+function findTrackIndexByPath(tracks: MusicFile[], filePath: string | null | undefined): number {
+  if (!filePath) return -1;
+  const key = pathKey(filePath);
+  return tracks.findIndex((t) => pathKey(t.path) === key);
+}
+
+function findTrackByPath(tracks: MusicFile[], filePath: string | null | undefined): MusicFile | undefined {
+  if (!filePath) return undefined;
+  const key = pathKey(filePath);
+  return tracks.find((t) => pathKey(t.path) === key);
 }
 
 // --- Types ---
@@ -58,6 +104,7 @@ type RepeatMode = 'off' | 'all' | 'one';
 
 interface PlaylistsData {
   playlists: Playlist[];
+  library_tracks: MusicFile[];
   active_playlist_id: string | null;
   playing_playlist_id?: string | null;
   current_file: string | null;
@@ -66,6 +113,15 @@ interface PlaylistsData {
   all_paths?: string[];
   shuffle_enabled?: boolean;
   repeat_mode?: RepeatMode;
+}
+
+interface LibraryState {
+  active_playlist_id: string | null;
+  playing_playlist_id: string | null;
+  current_file: string | null;
+  volume: number | null;
+  shuffle_enabled: boolean;
+  repeat_mode: RepeatMode;
 }
 
 interface StoreSyncPayload {
@@ -96,6 +152,7 @@ let volume = $state(0.8);
 let currentFile = $state<string | null>(null);
 let currentFileName = $state<string | null>(null);
 let playlists = $state<Playlist[]>([]);
+let libraryTracks = $state<MusicFile[]>([]);
 let activePlaylistId = $state<string | null>(null);
 let playingPlaylistId = $state<string | null>(null);
 let currentTrackIndex = $state(-1);
@@ -117,7 +174,8 @@ let allPaths = $state<string[]>([]);
 let isInitialized = $state(false);
 let initPromise: Promise<void> | null = null;
 let persistReady = $state(false);
-let saveTimer: ReturnType<typeof setTimeout> | null = null;
+let stateSaveTimer: ReturnType<typeof setTimeout> | null = null;
+let persistenceChain: Promise<void> = Promise.resolve();
 let lastGaplessChangeAt = 0;
 let lastManualPlayAt = 0;
 let lastPlayedFile = '';
@@ -125,6 +183,16 @@ let lastPlayedFile = '';
 let lastGaplessQueuePaths: string[] = [];
 let lastPauseRequestAt = 0;
 let applyingExternalSync = false;
+/** Path of the track we transitioned FROM in the last track-changed event (gapless advance). */
+let lastTrackChangedFromPath = '';
+let lastTrackChangedAt = 0;
+/**
+ * Matches `playRequestId` once the backend has acknowledged the play command.
+ * Before confirmation, stale track-changed events from the old gapless queue
+ * are rejected unconditionally (the backend's 400ms suppress guarantees no
+ * legitimate advance can happen before the IPC round-trip completes).
+ */
+let queueConfirmedForPlay = 0;
 let listenersSetup = false;
 /**
  * Table sort / display order for the playlist currently shown in the track list.
@@ -186,39 +254,15 @@ function applyBackendPlaybackState(payload: {
 // --- Derived ---
 
 function buildTrackByPathMap(): Map<string, MusicFile> {
-  const trackByPath = new Map<string, MusicFile>();
-  for (const playlist of playlists) {
-    for (const track of playlist.tracks) {
-      if (!trackByPath.has(track.path)) {
-        trackByPath.set(track.path, track);
-      }
-    }
-  }
-  return trackByPath;
+  return new Map(libraryTracks.map((track) => [track.path, track]));
 }
 
 function defaultAllPaths(): string[] {
-  const seen = new Set<string>();
-  const result: string[] = [];
-  for (const playlist of playlists) {
-    for (const track of playlist.tracks) {
-      if (!seen.has(track.path)) {
-        seen.add(track.path);
-        result.push(track.path);
-      }
-    }
-  }
-  return result;
+  return libraryTracks.map((track) => track.path);
 }
 
 function reorderPathList(list: string[], paths: string[], insertIndex: number): string[] {
-  const movingSet = new Set(paths);
-  const moving = list.filter((path) => movingSet.has(path));
-  if (moving.length === 0) return list;
-
-  const remaining = list.filter((path) => !movingSet.has(path));
-  const insertAt = Math.max(0, Math.min(insertIndex, remaining.length));
-  return [...remaining.slice(0, insertAt), ...moving, ...remaining.slice(insertAt)];
+  return reorderItemsAtBoundary(list, paths, insertIndex, (path) => path);
 }
 
 let trackByPath = $derived(buildTrackByPathMap());
@@ -345,10 +389,14 @@ let playingTracks = $derived.by(() => {
 // Search across ALL playlists so metadata survives playlist switches
 let currentTrack = $derived.by(() => {
   if (!currentFile) return null;
-  return trackByPath.get(currentFile) ?? null;
+  return (
+    trackByPath.get(currentFile) ??
+    [...trackByPath.values()].find((t) => sameTrackPath(t.path, currentFile)) ??
+    null
+  );
 });
 
-let progress = $derived(duration > 0 ? position / duration : 0);
+let progress = $derived(duration > 0 ? Math.min(1, Math.max(0, position / duration)) : 0);
 let hasTrack = $derived(currentFile !== null);
 // hasCurrentTrack: track is remembered but player is fully stopped (e.g. after app restart)
 let hasCurrentTrack = $derived(currentFile !== null && !isPlaying && !isPaused);
@@ -455,52 +503,124 @@ function isStaleCoverPath(path: string | null | undefined): boolean {
 }
 
 function needsMetadata(track: MusicFile): boolean {
-  return track.duration_secs == null || !track.cover_path || isStaleCoverPath(track.cover_path);
+  // CUE rows with missing INDEX bounds / duration need a repair pass too.
+  if (isCueVirtualPath(track.path)) {
+    const missingBounds =
+      track.cue_start_secs == null ||
+      track.cue_end_secs == null ||
+      track.duration_secs == null ||
+      track.duration_secs <= 0;
+    return missingBounds || isStaleCoverPath(track.cover_path);
+  }
+  return track.duration_secs == null || isStaleCoverPath(track.cover_path);
 }
 
 
+
+function mergeTrackMetadata(track: MusicFile, incoming: MusicFile): MusicFile {
+  // Preserve CUE segment identity: never replace a virtual path with a plain file.
+  if (isCueVirtualPath(track.path) && !isCueVirtualPath(incoming.path)) {
+    return {
+      ...track,
+      title: track.title ?? incoming.title,
+      artist: track.artist ?? incoming.artist,
+      album: track.album ?? incoming.album,
+      cover_path: incoming.cover_path ?? track.cover_path,
+      cover_path_full: incoming.cover_path_full ?? track.cover_path_full,
+      duration_secs: cueSegmentDuration(track) ?? track.duration_secs,
+    };
+  }
+  if (isCueVirtualPath(track.path) || isCueVirtualPath(incoming.path)) {
+    const start = incoming.cue_start_secs ?? track.cue_start_secs;
+    const end = incoming.cue_end_secs ?? track.cue_end_secs;
+    let duration = incoming.duration_secs ?? track.duration_secs;
+    if (typeof start === 'number' && typeof end === 'number' && end > start + 0.05) {
+      duration = end - start;
+    }
+    return {
+      ...track,
+      ...incoming,
+      path: track.path,
+      audio_path: incoming.audio_path ?? track.audio_path,
+      cue_start_secs: start,
+      cue_end_secs: end,
+      duration_secs: duration,
+    };
+  }
+  return { ...track, ...incoming, path: track.path };
+}
 
 function mergeMetadataIntoPlaylists(enriched: MusicFile[]) {
   if (enriched.length === 0) return;
 
-  const byPath = new Map(enriched.map((track) => [track.path, track]));
+  const byPath = new Map(enriched.map((track) => [pathKey(track.path), track]));
+  libraryTracks = libraryTracks.map((track) => {
+    const incoming = byPath.get(pathKey(track.path));
+    return incoming ? mergeTrackMetadata(track, incoming) : track;
+  });
+  const canonical = new Map(libraryTracks.map((track) => [pathKey(track.path), track]));
   playlists = playlists.map((playlist) => ({
     ...playlist,
-    tracks: playlist.tracks.map((track) => byPath.get(track.path) ?? track),
+    tracks: playlist.tracks.map((track) => canonical.get(pathKey(track.path)) ?? track),
   }));
 
-  if (currentFile && byPath.has(currentFile)) {
+  if (currentFile && byPath.has(pathKey(currentFile))) {
     syncWindowTitle();
+  }
+  const updated = enriched
+    .map((track) => libraryTracks.find((item) => pathKey(item.path) === pathKey(track.path)))
+    .filter((track): track is MusicFile => !!track);
+  persistMutation('library_tracks_upsert', { tracks: updated });
+}
+
+let enrichRunning = false;
+let enrichQueued = false;
+
+async function enrichTrackMetadata() {
+  if (enrichRunning) {
+    enrichQueued = true;
+    return;
+  }
+  enrichRunning = true;
+  try {
+    await _doEnrichTrackMetadata();
+  } finally {
+    enrichRunning = false;
+    if (enrichQueued) {
+      enrichQueued = false;
+      void enrichTrackMetadata();
+    }
   }
 }
 
-async function enrichTrackMetadata() {
-  const paths = [
+async function _doEnrichTrackMetadata() {
+  const allNeedingMeta = [
     ...new Set(
-      playlists.flatMap((playlist) =>
-        playlist.tracks.filter(needsMetadata).map((track) => track.path)
-      )
+      [...libraryTracks, ...playlists.flatMap((p) => p.tracks)]
+        .filter(needsMetadata)
+        .map((t) => t.path)
     ),
   ];
 
-  // After collecting which paths need work, mark cache as validated so
-  // subsequent calls (e.g. after adding new tracks) don't re-scan everything.
   coverCacheValidated = true;
 
-  if (paths.length === 0) return;
+  if (allNeedingMeta.length === 0) return;
 
-  try {
-    const enriched = await invoke<MusicFile[]>('library_fetch_metadata', { paths });
-    mergeMetadataIntoPlaylists(enriched);
-    prefetchCoverPaths([
-      ...enriched.map((track) => track.cover_path_full),
-      ...enriched.map((track) => track.cover_path),
-    ]);
-    scheduleSave();
-  } catch (e) {
-    console.error('Failed to fetch track metadata:', e);
+  const CHUNK = 50;
+  for (let i = 0; i < allNeedingMeta.length; i += CHUNK) {
+    const paths = allNeedingMeta.slice(i, i + CHUNK);
+    try {
+      const enriched = await invoke<MusicFile[]>('library_fetch_metadata', { paths });
+      mergeMetadataIntoPlaylists(enriched);
+      prefetchCoverPaths([
+        ...enriched.map((t) => t.cover_path_full),
+        ...enriched.map((t) => t.cover_path),
+      ]);
+    } catch (e) {
+      console.error('Failed to fetch track metadata:', e);
+    }
+    await yieldToUI();
   }
-
 }
 
 /** Reload playlists + covers after Settings → Rebuild covers. */
@@ -508,32 +628,12 @@ async function refreshCoversAfterRebuild() {
   clearCoverSrcCache();
   coverCacheValidated = false;
   try {
+    await persistenceChain;
     const data = await invoke<PlaylistsData>('playlists_load');
-    const byId = new Map((data.playlists ?? []).map((p) => [p.id, p]));
-    playlists = playlists.map((local) => {
-      const remote = byId.get(local.id);
-      if (!remote) return local;
-      const remoteByPath = new Map(remote.tracks.map((t) => [t.path, t]));
-      return {
-        ...local,
-        cover_path: remote.cover_path ?? null,
-        tracks: local.tracks.map((t) => {
-          const r = remoteByPath.get(t.path);
-          if (!r) return { ...t, cover_path: null, cover_path_full: null };
-          return {
-            ...t,
-            cover_path: r.cover_path,
-            cover_path_full: r.cover_path_full,
-          };
-        }),
-      };
-    });
-    // Also pick up playlists that only exist on disk (shouldn't normally differ).
-    for (const remote of data.playlists ?? []) {
-      if (!playlists.some((p) => p.id === remote.id)) {
-        playlists = [...playlists, repairPlaylistTracks(remote)];
-      }
-    }
+    libraryTracks = data.library_tracks ?? [];
+    playlists = (data.playlists ?? []).map(repairPlaylistTracks);
+    allPaths = data.all_paths ?? libraryTracks.map((track) => track.path);
+    likedPaths = data.liked_paths ?? [];
     coverCacheValidated = false;
     await enrichTrackMetadata();
     prefetchCoverPaths([
@@ -547,15 +647,51 @@ async function refreshCoversAfterRebuild() {
 
 function findPlaylistForTrack(path: string): string | null {
   // Prefer the current playing playlist if the track exists in it (important for "que" clicks and gapless).
-  if (playingPlaylistId && playingTracks.some((t) => t.path === path)) {
+  if (playingPlaylistId && playingTracks.some((t) => sameTrackPath(t.path, path))) {
     return playingPlaylistId;
   }
-  return playlistIdByTrackPath.get(path) ?? null;
+  const direct = playlistIdByTrackPath.get(path);
+  if (direct) return direct;
+  // Case / `\\?\` mismatch between backend events and playlist JSON.
+  const key = pathKey(path);
+  for (const [p, id] of playlistIdByTrackPath) {
+    if (pathKey(p) === key) return id;
+  }
+  return null;
 }
 
 function syncTrackIndex() {
-  currentTrackIndex = playingTracks.findIndex((t) => t.path === currentFile);
+  currentTrackIndex = findTrackIndexByPath(playingTracks, currentFile);
   syncShufflePosition();
+}
+
+/** Reconcile UI indices and the backend queue after the playing collection changed. */
+function refreshPlayingQueueAfterMutation(playlistId: string) {
+  const affectsPlayingPlaylist =
+    playlistId === playingPlaylistId ||
+    (playingPlaylistId === VIRTUAL_ALL_ID && playlistId !== VIRTUAL_LIKED_ID);
+  if (!affectsPlayingPlaylist) return;
+
+  syncTrackIndex();
+  if (shuffleEnabled) {
+    rebuildShuffleOrder(currentTrackIndex >= 0);
+    syncShufflePosition();
+  }
+  if (currentFile && (isPlaying || isPaused)) {
+    void prepareGaplessNext(currentFile);
+  }
+}
+
+/** A drag reorder establishes a new natural order; old table-order snapshots are invalid. */
+function commitTrackOrderMutation(playlistId: string) {
+  if (viewOrderPlaylistId === playlistId) {
+    viewOrderPaths = null;
+  }
+  if (playOrderPlaylistId === playlistId) {
+    playOrderPlaylistId = null;
+    playOrderPaths = null;
+  }
+  refreshPlayingQueueAfterMutation(playlistId);
 }
 
 /**
@@ -608,26 +744,26 @@ function adoptViewOrderForPlayingPlaylist() {
 
 /** True when `toPath` is the immediate next track after `fromPath` in the active play order. */
 function isNaturalQueueAdvance(fromPath: string, toPath: string): boolean {
-  if (!fromPath || !toPath || fromPath === toPath || !hasPlayingTracks) return false;
+  if (!fromPath || !toPath || sameTrackPath(fromPath, toPath) || !hasPlayingTracks) return false;
 
   if (shuffleEnabled) {
     ensureShuffleOrder();
-    const fromIdx = playingTracks.findIndex((t) => t.path === fromPath);
+    const fromIdx = findTrackIndexByPath(playingTracks, fromPath);
     if (fromIdx < 0) return false;
     const orderPos = shuffleOrder.indexOf(fromIdx);
     if (orderPos < 0) return false;
     if (orderPos < shuffleOrder.length - 1) {
-      return playingTracks[shuffleOrder[orderPos + 1]]?.path === toPath;
+      return sameTrackPath(playingTracks[shuffleOrder[orderPos + 1]]?.path, toPath);
     }
-    return repeatMode === 'all' && playingTracks[shuffleOrder[0]]?.path === toPath;
+    return repeatMode === 'all' && sameTrackPath(playingTracks[shuffleOrder[0]]?.path, toPath);
   }
 
-  const idx = playingTracks.findIndex((t) => t.path === fromPath);
+  const idx = findTrackIndexByPath(playingTracks, fromPath);
   if (idx < 0) return false;
   if (idx < playingTracks.length - 1) {
-    return playingTracks[idx + 1]?.path === toPath;
+    return sameTrackPath(playingTracks[idx + 1]?.path, toPath);
   }
-  return repeatMode === 'all' && playingTracks[0]?.path === toPath;
+  return repeatMode === 'all' && sameTrackPath(playingTracks[0]?.path, toPath);
 }
 
 /**
@@ -637,11 +773,11 @@ function isNaturalQueueAdvance(fromPath: string, toPath: string): boolean {
  * finish inside the manual-play guard window).
  */
 function isSentQueueAdvance(fromPath: string, toPath: string): boolean {
-  if (!fromPath || !toPath || fromPath === toPath || lastGaplessQueuePaths.length < 2) {
+  if (!fromPath || !toPath || sameTrackPath(fromPath, toPath) || lastGaplessQueuePaths.length < 2) {
     return false;
   }
-  const fromIdx = lastGaplessQueuePaths.indexOf(fromPath);
-  const toIdx = lastGaplessQueuePaths.indexOf(toPath);
+  const fromIdx = lastGaplessQueuePaths.findIndex((p) => sameTrackPath(p, fromPath));
+  const toIdx = lastGaplessQueuePaths.findIndex((p) => sameTrackPath(p, toPath));
   // Any forward step in the queue we sent counts — intermediate track-changed
   // events can be missed when several sub-second tracks fire in one poll window.
   return fromIdx >= 0 && toIdx > fromIdx;
@@ -649,15 +785,15 @@ function isSentQueueAdvance(fromPath: string, toPath: string): boolean {
 
 /** Accept a track-changed event as a legitimate auto-advance (not a stale gapless poll). */
 function isLegitimateTrackAdvance(fromPath: string, toPath: string): boolean {
-  if (!fromPath || !toPath || fromPath === toPath) return false;
+  if (!fromPath || !toPath || sameTrackPath(fromPath, toPath)) return false;
   // Backend queue is authoritative for what gapless will actually play next.
   if (isSentQueueAdvance(fromPath, toPath)) return true;
   if (isNaturalQueueAdvance(fromPath, toPath)) return true;
   // Also accept advance from the UI's current file (may lag lastPlayedFile by one event).
-  if (currentFile && currentFile !== fromPath && isSentQueueAdvance(currentFile, toPath)) {
+  if (currentFile && !sameTrackPath(currentFile, fromPath) && isSentQueueAdvance(currentFile, toPath)) {
     return true;
   }
-  if (currentFile && currentFile !== fromPath && isNaturalQueueAdvance(currentFile, toPath)) {
+  if (currentFile && !sameTrackPath(currentFile, fromPath) && isNaturalQueueAdvance(currentFile, toPath)) {
     return true;
   }
   return false;
@@ -931,41 +1067,42 @@ function nextPlaylistName(): string {
   return name;
 }
 
-function buildSaveData(): PlaylistsData {
+function buildLibraryState(): LibraryState {
   return {
-    playlists,
     active_playlist_id: activePlaylistId,
     playing_playlist_id: playingPlaylistId,
     current_file: currentFile,
     volume,
-    liked_paths: likedPaths,
-    all_paths: allPaths,
     shuffle_enabled: shuffleEnabled,
     repeat_mode: repeatMode,
   };
 }
 
+function persistMutation(command: string, args: Record<string, unknown>) {
+  persistenceChain = persistenceChain
+    .then(() => invoke<void>(command, args))
+    .catch((error) => {
+      console.error(`Failed SQLite mutation ${command}:`, error);
+    });
+}
+
 function scheduleSave() {
   if (!persistReady || applyingExternalSync) return;
-  if (saveTimer) clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
-    saveTimer = null;
-    invoke('playlists_save', { data: buildSaveData() }).catch((e) => {
-      console.error('Failed to save playlists:', e);
-    });
+  if (stateSaveTimer) clearTimeout(stateSaveTimer);
+  stateSaveTimer = setTimeout(() => {
+    stateSaveTimer = null;
+    persistMutation('library_state_save', { state: buildLibraryState() });
   }, 250);
 }
 
 /** Push pending playlists/volume to disk immediately (window close / hide). */
 function flushSave() {
   if (!persistReady || applyingExternalSync) return;
-  if (saveTimer) {
-    clearTimeout(saveTimer);
-    saveTimer = null;
+  if (stateSaveTimer) {
+    clearTimeout(stateSaveTimer);
+    stateSaveTimer = null;
   }
-  void invoke('playlists_save', { data: buildSaveData() }).catch((e) => {
-    console.error('Failed to flush playlists save:', e);
-  });
+  persistMutation('library_state_save', { state: buildLibraryState() });
 }
 
 /** Clamp and apply volume to the native player (safe before/after BASS init). */
@@ -993,6 +1130,7 @@ async function loadPlaylists() {
   try {
     await loadShuffleModeFromSettings();
     const data = await invoke<PlaylistsData>('playlists_load');
+    libraryTracks = data.library_tracks ?? [];
     playlists = (data.playlists ?? []).map(repairPlaylistTracks);
     activePlaylistId = data.active_playlist_id ?? playlists[0]?.id ?? null;
     if (typeof data.volume === 'number' && Number.isFinite(data.volume)) {
@@ -1004,9 +1142,9 @@ async function loadPlaylists() {
     if (Array.isArray(data.liked_paths)) {
       likedPaths = data.liked_paths.filter((p: any) => typeof p === 'string' && p);
     }
-    if (Array.isArray(data.all_paths)) {
-      allPaths = data.all_paths.filter((p: any) => typeof p === 'string' && p);
-    }
+    allPaths = Array.isArray(data.all_paths)
+      ? data.all_paths.filter((p: any) => typeof p === 'string' && p)
+      : libraryTracks.map((track) => track.path);
     if (typeof data.shuffle_enabled === 'boolean') {
       shuffleEnabled = data.shuffle_enabled;
     }
@@ -1063,12 +1201,17 @@ function ensurePlaylist(name: string, options?: { select?: boolean }): string {
     tracks: [],
   };
   playlists = [...playlists, playlist];
+  persistMutation('playlist_create', { id: playlist.id, name: playlist.name });
   if (options?.select) {
     activePlaylistId = playlist.id;
   }
   syncTrackIndex();
   scheduleSave();
   return playlist.id;
+}
+
+async function clearAll() {
+  await invoke('library_clear_all');
 }
 
 function createPlaylist(name?: string): string {
@@ -1089,8 +1232,38 @@ function selectPlaylist(id: string) {
 }
 
 function deletePlaylist(id: string) {
+  const deleted = playlistById.get(id);
   const nextPlaylists = playlists.filter((p) => p.id !== id);
   playlists = nextPlaylists;
+  persistMutation('playlist_delete', { id });
+
+  if (deleted && deleted.tracks.length > 0) {
+    const remainingKeys = new Set(
+      nextPlaylists.flatMap((p) => p.tracks.map((t) => pathKey(t.path)))
+    );
+    const likedKeys = new Set(likedPaths.map(pathKey));
+    const orphanPaths = deleted.tracks
+      .map((t) => t.path)
+      .filter((p) => !remainingKeys.has(pathKey(p)) && !likedKeys.has(pathKey(p)));
+
+    if (orphanPaths.length > 0) {
+      const orphanKeys = new Set(orphanPaths.map(pathKey));
+      libraryTracks = libraryTracks.filter((t) => !orphanKeys.has(pathKey(t.path)));
+      allPaths = allPaths.filter((p) => !orphanKeys.has(pathKey(p)));
+      persistMutation('library_remove_tracks', { paths: orphanPaths });
+
+      if (currentFile && orphanKeys.has(pathKey(currentFile))) {
+        void stop();
+        currentFile = null;
+        currentFileName = null;
+        currentTrackIndex = -1;
+        playingPlaylistId = null;
+        shuffleOrder = [];
+        shufflePosition = 0;
+        syncWindowTitle();
+      }
+    }
+  }
 
   if (playingPlaylistId === id) {
     void stop();
@@ -1120,6 +1293,7 @@ function removeTrack(path: string, playlistId?: string | null) {
   playlists = playlists.map((p) =>
     p.id === targetId ? { ...p, tracks: p.tracks.filter((track) => track.path !== path) } : p
   );
+  persistMutation('playlist_remove_tracks', { playlistId: targetId, paths: [path] });
 
   if (currentFile === path) {
     void stop();
@@ -1132,12 +1306,8 @@ function removeTrack(path: string, playlistId?: string | null) {
     shuffleOrder = [];
     shufflePosition = 0;
     syncWindowTitle();
-  } else if (targetId === playingPlaylistId) {
-    syncTrackIndex();
-    if (shuffleEnabled) {
-      rebuildShuffleOrder(currentTrackIndex >= 0);
-      syncShufflePosition();
-    }
+  } else {
+    refreshPlayingQueueAfterMutation(targetId);
   }
 
   scheduleSave();
@@ -1154,8 +1324,8 @@ async function setPlaylistCover(id: string, sourcePath: string) {
     playlists = playlists.map((p) =>
       p.id === id ? { ...p, cover_path: coverPath } : p
     );
+    persistMutation('playlist_set_cover_path', { id, coverPath });
     prefetchCoverPaths([coverPath]);
-    scheduleSave();
   } catch (e) {
     console.error('Failed to set playlist cover:', e);
   }
@@ -1174,8 +1344,8 @@ async function setPlaylistCoverFromUrl(id: string, url: string) {
     playlists = playlists.map((p) =>
       p.id === id ? { ...p, cover_path: coverPath } : p
     );
+    persistMutation('playlist_set_cover_path', { id, coverPath });
     prefetchCoverPaths([coverPath]);
-    scheduleSave();
   } catch (e) {
     console.error('Failed to set playlist cover from URL:', e);
   }
@@ -1190,7 +1360,7 @@ async function clearPlaylistCover(id: string) {
   playlists = playlists.map((p) =>
     p.id === id ? { ...p, cover_path: null } : p
   );
-  scheduleSave();
+  persistMutation('playlist_set_cover_path', { id, coverPath: null });
 }
 
 function renamePlaylist(id: string, name: string) {
@@ -1199,7 +1369,7 @@ function renamePlaylist(id: string, name: string) {
   playlists = playlists.map((p) =>
     p.id === id ? { ...p, name: trimmed } : p
   );
-  scheduleSave();
+  persistMutation('playlist_rename', { id, name: trimmed });
 }
 
 export function isEditablePlaylist(id: string | null | undefined): boolean {
@@ -1217,26 +1387,24 @@ function setPlaylistTrackOrder(playlistId: string, tracks: MusicFile[]) {
     p.id === playlistId ? { ...p, tracks: [...tracks] } : p
   );
 
-  if (playlistId === playingPlaylistId) {
-    syncTrackIndex();
-    if (shuffleEnabled) {
-      rebuildShuffleOrder(currentTrackIndex >= 0);
-      syncShufflePosition();
-    }
-  }
-
-  scheduleSave();
+  commitTrackOrderMutation(playlistId);
+  persistMutation('playlist_reorder', {
+    playlistId,
+    paths: tracks.map((track) => track.path),
+  });
 }
 
 function reorderLikedPaths(paths: string[], insertIndex: number) {
   likedPaths = reorderPathList(likedPaths, paths, insertIndex);
-  scheduleSave();
+  commitTrackOrderMutation(VIRTUAL_LIKED_ID);
+  persistMutation('library_reorder_liked', { paths: likedPaths });
 }
 
 function reorderAllPaths(paths: string[], insertIndex: number) {
   const base = allPaths.length > 0 ? allPaths : defaultAllPaths();
   allPaths = reorderPathList(base, paths, insertIndex);
-  scheduleSave();
+  commitTrackOrderMutation(VIRTUAL_ALL_ID);
+  persistMutation('library_reorder', { paths: allPaths });
 }
 
 function reorderTracksInView(playlistId: string, paths: string[], insertIndex: number) {
@@ -1278,6 +1446,7 @@ function removeTracksFromPlaylist(paths: string[], playlistId: string) {
       ? { ...p, tracks: p.tracks.filter((track) => !pathSet.has(track.path)) }
       : p
   );
+  persistMutation('playlist_remove_tracks', { playlistId, paths });
 
   if (currentFile && pathSet.has(currentFile)) {
     void stop();
@@ -1290,12 +1459,8 @@ function removeTracksFromPlaylist(paths: string[], playlistId: string) {
     shuffleOrder = [];
     shufflePosition = 0;
     syncWindowTitle();
-  } else if (playlistId === playingPlaylistId) {
-    syncTrackIndex();
-    if (shuffleEnabled) {
-      rebuildShuffleOrder(currentTrackIndex >= 0);
-      syncShufflePosition();
-    }
+  } else {
+    refreshPlayingQueueAfterMutation(playlistId);
   }
 
   scheduleSave();
@@ -1320,17 +1485,25 @@ function moveTracksToPlaylist(
 
   if (sourcePlaylistId === VIRTUAL_LIKED_ID) {
     likedPaths = likedPaths.filter((path) => !pathSet.has(path));
-    scheduleSave();
-  } else if (sourcePlaylistId === VIRTUAL_ALL_ID) {
-    playlists = playlists.map((p) =>
-      p.id === targetPlaylistId
-        ? p
-        : { ...p, tracks: p.tracks.filter((track) => !pathSet.has(track.path)) }
-    );
-    if (allPaths.length > 0) {
-      allPaths = allPaths.filter((path) => !pathSet.has(path));
+    for (const path of paths) {
+      persistMutation('library_set_liked', { path, liked: false });
     }
-    scheduleSave();
+    refreshPlayingQueueAfterMutation(VIRTUAL_LIKED_ID);
+  } else if (sourcePlaylistId === VIRTUAL_ALL_ID) {
+    const affected = playlists.filter(
+      (playlist) =>
+        playlist.id !== targetPlaylistId &&
+        playlist.tracks.some((track) => pathSet.has(track.path)),
+    );
+    playlists = playlists.map((playlist) =>
+      playlist.id === targetPlaylistId
+        ? playlist
+        : { ...playlist, tracks: playlist.tracks.filter((track) => !pathSet.has(track.path)) }
+    );
+    for (const playlist of affected) {
+      persistMutation('playlist_remove_tracks', { playlistId: playlist.id, paths });
+    }
+    refreshPlayingQueueAfterMutation(VIRTUAL_ALL_ID);
   } else if (isEditablePlaylist(sourcePlaylistId)) {
     removeTracksFromPlaylist(paths, sourcePlaylistId);
   }
@@ -1340,18 +1513,53 @@ function moveTracksToPlaylist(
 
 function mergeTracksIntoPlaylist(playlistId: string, files: MusicFile[]): number {
   const existing = new Set(
-    playlistById.get(playlistId)?.tracks.map((t) => t.path) ?? []
+    (playlistById.get(playlistId)?.tracks ?? []).map((track) => pathKey(track.path))
   );
-  const newTracks = files.filter((f) => !existing.has(f.path));
+  const nextLibraryTracks = [...libraryTracks];
+  const libraryIndex = new Map(
+    nextLibraryTracks.map((track, index) => [pathKey(track.path), index])
+  );
+  const canonicalFiles: MusicFile[] = [];
+  const addedLibraryPaths: string[] = [];
+
+  // Build one index and update one array. The previous implementation searched
+  // and remapped the entire library for every imported file (O(n²)).
+  for (const file of files) {
+    const key = pathKey(file.path);
+    const existingIndex = libraryIndex.get(key);
+    if (existingIndex !== undefined) {
+      const merged = mergeTrackMetadata(nextLibraryTracks[existingIndex], file);
+      nextLibraryTracks[existingIndex] = merged;
+      canonicalFiles.push(merged);
+    } else {
+      libraryIndex.set(key, nextLibraryTracks.length);
+      nextLibraryTracks.push(file);
+      canonicalFiles.push(file);
+      addedLibraryPaths.push(file.path);
+    }
+  }
+
+  libraryTracks = nextLibraryTracks;
+  if (addedLibraryPaths.length > 0) {
+    allPaths = [...allPaths, ...addedLibraryPaths];
+  }
+
+  const appended = new Set<string>();
+  const newTracks = canonicalFiles.filter((track) => {
+    const key = pathKey(track.path);
+    if (existing.has(key) || appended.has(key)) return false;
+    appended.add(key);
+    return true;
+  });
+  persistMutation('playlist_add_tracks', { playlistId, tracks: canonicalFiles });
   if (newTracks.length === 0) return 0;
 
   playlists = playlists.map((p) =>
     p.id === playlistId ? { ...p, tracks: [...p.tracks, ...newTracks] } : p
   );
-  syncTrackIndex();
-  if (shuffleEnabled) rebuildShuffleOrder(currentTrackIndex >= 0);
+  refreshPlayingQueueAfterMutation(playlistId);
   prefetchCoverPaths(newTracks.map((track) => track.cover_path));
-  scheduleSave();
+  void enrichTrackMetadata();
   return newTracks.length;
 }
 
@@ -1366,6 +1574,7 @@ function addScannedTracks(files: MusicFile[], playlistId?: string | null): numbe
   }
 
   activePlaylistId = targetId;
+  scheduleSave();
   return mergeTracksIntoPlaylist(targetId, files);
 }
 
@@ -1446,7 +1655,6 @@ async function createPlaylistsFromDroppedPaths(
     }
 
     // Report progress and yield to UI every CHUNK_SIZE dirs
-    const progress = Math.floor(((i + 1) / Math.max(dirCount, 1)) * 100);
     setImportProgress({ active: true, current: i + 1, total: Math.max(dirCount, 1), label: pathBasename(path) });
     if ((i + 1) % CHUNK_SIZE === 0) {
       await yieldToUI();
@@ -1455,7 +1663,7 @@ async function createPlaylistsFromDroppedPaths(
 
   if (filePaths.length > 0) {
     try {
-      setImportProgress({ active: true, total: 1, label: 'Processing files...' });
+      setImportProgress({ active: true, current: 0, total: 0, label: 'Processing files...' });
       const files: MusicFile[] = await invoke('library_scan_paths', { paths: filePaths });
       if (files.length > 0) {
         const name = nextPlaylistName();
@@ -1475,11 +1683,6 @@ async function createPlaylistsFromDroppedPaths(
 
   if (lastId) {
     activePlaylistId = lastId;
-  }
-
-  // Batch metadata enrichment once at the end
-  if (trackCount > 0) {
-    await enrichTrackMetadata();
   }
 
   resetImportProgress();
@@ -1552,13 +1755,10 @@ async function addFolderToActivePlaylist(directory: string) {
   if (!activePlaylistId) return;
 
   try {
-    setImportProgress({ active: true, current: 0, total: 1, label: 'Scanning folder...' });
+    setImportProgress({ active: true, current: 0, total: 0, label: 'Scanning folder...' });
     await yieldToUI();
     const files: MusicFile[] = await invoke('library_scan', { directory });
-    const added = mergeTracksIntoPlaylist(activePlaylistId, files);
-    if (added > 0) {
-      await enrichTrackMetadata();
-    }
+    mergeTracksIntoPlaylist(activePlaylistId, files);
     resetImportProgress();
   } catch (e) {
     console.error('Failed to add folder to playlist:', e);
@@ -1571,17 +1771,12 @@ async function addDroppedPaths(paths: string[], playlistId?: string | null) {
   if (normalizedPaths.length === 0) return 0;
 
   try {
-    setImportProgress({ active: true, current: 0, total: 1, label: 'Scanning files...' });
+    setImportProgress({ active: true, current: 0, total: 0, label: 'Scanning files...' });
     await yieldToUI();
     const files: MusicFile[] = await invoke('library_scan_paths', { paths: normalizedPaths });
     setImportProgress({ active: true, current: 1, total: 1, label: 'Adding to playlist...' });
     await yieldToUI();
     const added = addScannedTracks(files, playlistId);
-
-    // Batch metadata enrichment once
-    if (added > 0) {
-      await enrichTrackMetadata();
-    }
 
     resetImportProgress();
     return added;
@@ -1666,9 +1861,21 @@ function repairCueTrack(track: MusicFile): MusicFile {
   if (markerPos <= 0) return track;
 
   const audioPath = track.path.slice(0, markerPos);
+  const start = track.cue_start_secs;
+  const end = track.cue_end_secs;
+  let duration = track.duration_secs;
+  // Prefer INDEX length over full-container tags (multi-file ALAC/m4a is often a few
+  // seconds longer than the CUE cut — that made the seekbar run past 100% / jump).
+  if (typeof start === 'number' && typeof end === 'number' && end > start + 0.05) {
+    const seg = end - start;
+    if (duration == null || duration <= 0 || duration > seg + 1.0) {
+      duration = seg;
+    }
+  }
   return {
     ...track,
     audio_path: track.audio_path ?? audioPath,
+    duration_secs: duration,
   };
 }
 
@@ -1694,11 +1901,22 @@ function audioPathForTrack(track: MusicFile, filePath: string): string {
 }
 
 function gaplessArgsForTrack(track: MusicFile, filePath: string) {
+  const repaired = repairCueTrack(track);
+  let cueStart = repaired.cue_start_secs ?? undefined;
+  let cueEnd = repaired.cue_end_secs ?? undefined;
+  // Multi-file CUE rows always start at 0; ensure the backend gets a real end bound
+  // even if the scanner only supplied duration_secs for the virtual row.
+  if (cueStart == null && isCueVirtualPath(filePath)) {
+    cueStart = 0;
+  }
+  if (cueEnd == null && typeof cueStart === 'number' && typeof repaired.duration_secs === 'number') {
+    cueEnd = cueStart + repaired.duration_secs;
+  }
   return {
     filePath,
-    audioPath: audioPathForTrack(track, filePath),
-    cueStart: track.cue_start_secs ?? undefined,
-    cueEnd: track.cue_end_secs ?? undefined,
+    audioPath: audioPathForTrack(repaired, filePath),
+    cueStart,
+    cueEnd,
   };
 }
 
@@ -1717,14 +1935,14 @@ function orderedTracksFrom(filePath: string): MusicFile[] {
 
   if (shuffleEnabled) {
     ensureShuffleOrder();
-    const trackIdx = playingTracks.findIndex((t) => t.path === filePath);
+    const trackIdx = findTrackIndexByPath(playingTracks, filePath);
     if (trackIdx < 0) return [];
     const orderPos = shuffleOrder.indexOf(trackIdx);
     if (orderPos < 0) return [];
     return shuffleOrder.slice(orderPos, orderPos + MAX_GAPLESS_FOLLOWING).map((index) => playingTracks[index]);
   }
 
-  const index = playingTracks.findIndex((t) => t.path === filePath);
+  const index = findTrackIndexByPath(playingTracks, filePath);
   if (index < 0) return [];
   return playingTracks.slice(index, index + MAX_GAPLESS_FOLLOWING);
 }
@@ -1749,9 +1967,12 @@ function getUpcomingTracks(filePath: string | null, limit = 2): MusicFile[] {
 
 function buildGaplessQueue(filePath: string) {
   if (repeatMode === 'one') {
-    const track = playingTracks.find((t) => t.path === filePath) ?? trackByPath.get(filePath);
+    const track =
+      findTrackByPath(playingTracks, filePath) ??
+      trackByPath.get(filePath) ??
+      [...trackByPath.values()].find((t) => sameTrackPath(t.path, filePath));
     if (track) {
-      return [gaplessArgsForTrack(track, filePath)];
+      return [gaplessArgsForTrack(track, track.path || filePath)];
     }
     return [gaplessArgsForTrack({ path: filePath } as MusicFile, filePath)];
   }
@@ -1760,21 +1981,31 @@ function buildGaplessQueue(filePath: string) {
   );
   if (ordered.length > 0) return ordered;
   // Fallback when the track is not yet in playingTracks (playlist switch race).
-  const track = trackByPath.get(filePath);
+  const track =
+    trackByPath.get(filePath) ??
+    [...trackByPath.values()].find((t) => sameTrackPath(t.path, filePath));
   return [gaplessArgsForTrack(track ?? ({ path: filePath } as MusicFile), filePath)];
 }
 
 async function prepareGaplessNext(filePath: string) {
+  const requestId = ++gaplessPrepareRequestId;
   const queue = buildGaplessQueue(filePath);
-  rememberGaplessQueue(queue);
   try {
-    await invoke('player_prepare_next', { queue });
+    await invoke('player_prepare_next', { currentFile: filePath, queue });
+    if (
+      requestId === gaplessPrepareRequestId &&
+      currentFile &&
+      sameTrackPath(currentFile, filePath)
+    ) {
+      rememberGaplessQueue(queue);
+    }
   } catch (e) {
     console.error('Failed to prepare gapless queue:', e);
   }
 }
 
 let playRequestId = 0;
+let gaplessPrepareRequestId = 0;
 
 type PlayUiSnapshot = {
   currentFile: string | null;
@@ -1784,7 +2015,7 @@ type PlayUiSnapshot = {
   position: number;
   duration: number;
   playingPlaylistId: string | null;
-  lastPlayedFile: string | null;
+  lastPlayedFile: string;
 };
 
 function snapshotPlayUi(): PlayUiSnapshot {
@@ -1817,6 +2048,9 @@ function restorePlayUi(snap: PlayUiSnapshot) {
 
 async function play(filePath: string) {
   const requestId = ++playRequestId;
+  // Invalidate queue refreshes started for the previous track. The backend also
+  // checks currentFile atomically, so a late IPC completion cannot replace this queue.
+  gaplessPrepareRequestId += 1;
   // Capture previous UI so a failed play can roll back (audio never switched).
   const previousUi = snapshotPlayUi();
   try {
@@ -1861,7 +2095,7 @@ async function play(filePath: string) {
     // (real playlists, All, Liked). That keeps next/prev aligned with table sort.
     // Fall back to the track's home playlist only when playing from search / elsewhere.
     let playlistId: string | null = null;
-    if (activePlaylistId && tracks.some((t) => t.path === filePath)) {
+    if (activePlaylistId && tracks.some((t) => sameTrackPath(t.path, filePath))) {
       playlistId = activePlaylistId;
     } else {
       playlistId = findPlaylistForTrack(filePath);
@@ -1875,10 +2109,12 @@ async function play(filePath: string) {
 
     // Build gapless queue from the active play order (incl. shuffle / table sort).
     // playingPlaylistId is already set above so derived playingTracks matches next/prev.
-    // Remember the exact paths we send — track-changed guards must match backend order,
-    // otherwise sub-second tracks finish inside the manual-play window and the UI never advances.
+    // Clear the remembered queue during the transition — we'll confirm it once the
+    // backend acknowledges the play command. This prevents stale track-changed events
+    // from the old queue being accepted via isSentQueueAdvance against the new queue
+    // (a path present in both old and new queue would incorrectly pass the check).
     const queueToSend = buildGaplessQueue(filePath);
-    rememberGaplessQueue(queueToSend);
+    lastGaplessQueuePaths = [];
 
     // Block stale position events BEFORE the invoke so they can't flash
     // the seekbar. This is critical for CUE tracks: when switching backward
@@ -1886,17 +2122,25 @@ async function play(filePath: string) {
     // position (e.g. 130s), but cue_start gets updated to 0 → relative
     // position = 130 → seekbar jumps to max for a frame before resetting.
     seekGuardPosition = 0;
-    seekGuardUntil = Date.now() + 600;
+    // CUE same-image seeks need a longer guard — BASS can report the previous
+    // absolute offset for several poll ticks after apply_segment.
+    seekGuardUntil = Date.now() + (isCueVirtualPath(filePath) ? 900 : 600);
     position = 0;
 
     // Update UI immediately — don't wait for IPC (file open + Discord sync can take 100ms+).
-    currentFile = filePath;
-    currentFileName = track
-      ? trackDisplayTitle(track)
+    const resolvedTrack =
+      track ??
+      findTrackByPath(playingTracks, filePath) ??
+      [...trackByPath.values()].find((t) => sameTrackPath(t.path, filePath));
+    currentFile = resolvedTrack?.path ?? filePath;
+    currentFileName = resolvedTrack
+      ? trackDisplayTitle(resolvedTrack)
       : filePath.split(/[\\/]/).pop()?.replace(/\.[^/.]+$/, '') ?? null;
-    const meta = track ?? trackByPath.get(filePath);
-    if (meta?.duration_secs != null) {
-      duration = meta.duration_secs;
+    const segDur = cueSegmentDuration(resolvedTrack);
+    if (segDur != null) {
+      duration = segDur;
+    } else if (resolvedTrack?.duration_secs != null) {
+      duration = resolvedTrack.duration_secs;
     }
     syncTrackIndex();
     lastGaplessChangeAt = Date.now();
@@ -1906,8 +2150,16 @@ async function play(filePath: string) {
     if (requestId !== playRequestId) return;
 
     void invoke('player_play', {
-      ...playOptionsForTrack(track, filePath),
+      ...playOptionsForTrack(resolvedTrack, currentFile ?? filePath),
       queue: queueToSend,
+    }).then(() => {
+      // Confirm queue only after backend accepted the play command.
+      // Before this callback, stale track-changed from the old gapless queue
+      // are rejected by the queueConfirmedForPlay guard.
+      if (requestId === playRequestId) {
+        rememberGaplessQueue(queueToSend);
+        queueConfirmedForPlay = requestId;
+      }
     }).catch((e) => {
       if (requestId !== playRequestId) return;
       const message = typeof e === 'string' ? e : String(e);
@@ -1964,10 +2216,14 @@ let seekGuardUntil = 0;
 let seekGuardPosition = 0;
 
 async function seek(pos: number) {
-  const clamped = Math.max(0, duration > 0 ? Math.min(pos, duration) : pos);
+  // Prefer CUE segment length so scrubbing never targets past INDEX end.
+  const track = currentTrack;
+  const seg = cueSegmentDuration(track);
+  const maxDur = seg != null && seg > 0 ? seg : duration;
+  const clamped = Math.max(0, maxDur > 0 ? Math.min(pos, maxDur) : pos);
   position = clamped;
   seekGuardPosition = clamped;
-  seekGuardUntil = Date.now() + 400;
+  seekGuardUntil = Date.now() + (isCueVirtualPath(currentFile) ? 700 : 400);
 
   try {
     await invoke('player_seek', { position: clamped });
@@ -1994,12 +2250,14 @@ function setPlaybackRate(rate: number) {
 
 function toggleLike(path: string) {
   const index = likedPaths.indexOf(path);
+  const liked = index === -1;
   if (index !== -1) {
     likedPaths = likedPaths.filter((p) => p !== path);
   } else {
     likedPaths = [...likedPaths, path];
   }
-  scheduleSave();
+  persistMutation('library_set_liked', { path, liked });
+  refreshPlayingQueueAfterMutation(VIRTUAL_LIKED_ID);
 }
 
 function isLiked(path: string): boolean {
@@ -2031,7 +2289,7 @@ async function nextTrack() {
   }
 
   // Use a fresh index lookup to avoid stale currentTrackIndex after rapid switches.
-  const idx = playingTracks.findIndex((t) => t.path === currentFile);
+  const idx = findTrackIndexByPath(playingTracks, currentFile);
   if (idx >= 0 && idx < playingTracks.length - 1) {
     const targetPath = playingTracks[idx + 1].path;
     await play(targetPath);
@@ -2060,7 +2318,7 @@ async function prevTrack() {
 
   // Capture the target path before calling play() which may mutate state.
   // Use a fresh index lookup to avoid stale currentTrackIndex.
-  const idx = playingTracks.findIndex((t) => t.path === currentFile);
+  const idx = findTrackIndexByPath(playingTracks, currentFile);
   if (idx > 0) {
     const targetPath = playingTracks[idx - 1].path;
     await play(targetPath);
@@ -2152,6 +2410,21 @@ function setupListeners() {
   if (listenersSetup) return;
   listenersSetup = true;
 
+  listen<{ current: number; total: number; label?: string }>('library:scan-progress', (event) => {
+    const { current, total, label } = event.payload;
+    if (!Number.isFinite(current) || !Number.isFinite(total)) return;
+    setImportProgress({
+      active: true,
+      current: Math.max(0, current),
+      total: Math.max(0, total),
+      label: label || 'Scanning music...',
+    });
+  });
+
+  listen('library:scan-finished', () => {
+    resetImportProgress();
+  });
+
   listen<{ shuffle_mode?: ShuffleMode }>('settings:updated', (event) => {
     const mode = applyShuffleModeFromSettings(event.payload?.shuffle_mode);
     applyShuffleMode(mode);
@@ -2178,31 +2451,47 @@ function setupListeners() {
     // Real gapless next after a short track ends inside this window and must update the UI.
     // Match against the queue we actually sent to the backend — not only the UI play order
     // (those can diverge under shuffle or right after playlist switches).
-    if (Date.now() - lastManualPlayAt < 600 && lastPlayedFile && path !== lastPlayedFile) {
+    if (Date.now() - lastManualPlayAt < 800 && lastPlayedFile && !sameTrackPath(path, lastPlayedFile)) {
+      // Queue not yet confirmed by backend → reject all non-matching events.
+      // The backend's suppress_gapless_until (400ms) guarantees no legitimate
+      // advance can happen before the IPC round-trip (~1-5ms) completes.
+      if (queueConfirmedForPlay !== playRequestId) {
+        return;
+      }
       if (!isLegitimateTrackAdvance(lastPlayedFile, path)) {
         return;
       }
     }
 
-    currentFile = path;
-    lastPlayedFile = path;
-    markSmartPlayed(path);
-    const track = trackByPath.get(path);
+    const track =
+      trackByPath.get(path) ??
+      findTrackByPath(playingTracks, path) ??
+      [...trackByPath.values()].find((t) => sameTrackPath(t.path, path));
+    // Record what we're transitioning from (for track-ended double-advance guard).
+    lastTrackChangedFromPath = currentFile ?? '';
+    lastTrackChangedAt = Date.now();
+    currentFile = track?.path ?? path;
+    lastPlayedFile = currentFile ?? path;
+    markSmartPlayed(currentFile ?? path);
     currentFileName = track
       ? trackDisplayTitle(track)
       : path.split(/[\\/]/).pop()?.replace(/\.[^/.]+$/, '') ?? null;
     position = 0;
     // Don't let seek-guard from the previous manual play swallow the next track's position.
     seekGuardPosition = 0;
-    seekGuardUntil = Date.now() + 200;
-    if (track?.duration_secs != null) {
+    seekGuardUntil = Date.now() + (isCueVirtualPath(path) ? 350 : 200);
+    const segDur = cueSegmentDuration(track);
+    if (segDur != null) {
+      duration = segDur;
+    } else if (track?.duration_secs != null) {
       duration = track.duration_secs;
     }
-    const playlistId = findPlaylistForTrack(path);
+    const playlistId = findPlaylistForTrack(currentFile ?? path);
     // Prefer to keep the current playingPlaylistId if the track is already in the current que/playing list.
     // This prevents findPlaylistForTrack (which returns the *first* matching playlist) from
     // switching us to a different playlist on manual clicks or gapless advances within the que.
-    const isInCurrentPlaying = playingPlaylistId && playingTracks.some((t) => t.path === path);
+    const isInCurrentPlaying =
+      playingPlaylistId && playingTracks.some((t) => sameTrackPath(t.path, path));
     if (!isInCurrentPlaying && playlistId && playingPlaylistId !== VIRTUAL_ALL_ID && playingPlaylistId !== VIRTUAL_LIKED_ID) {
       playingPlaylistId = playlistId;
     }
@@ -2217,7 +2506,7 @@ function setupListeners() {
     lastPauseRequestAt = 0;
     scheduleSave();
     lastGaplessChangeAt = Date.now();
-    void prepareGaplessNext(path);
+    void prepareGaplessNext(currentFile ?? path);
     syncWindowTitle();
   });
 
@@ -2226,7 +2515,24 @@ function setupListeners() {
   let lastHiddenPositionApply = 0;
   listen<{ position: number; duration: number; state?: string }>('player:position', (event) => {
     const newPos = event.payload.position;
-    duration = event.payload.duration;
+    const backendDur = event.payload.duration;
+    // Never let a full-file duration overwrite a tighter CUE INDEX length —
+    // that is what made the seekbar "fly" on multi-file / image CUE albums.
+    const track = currentTrack;
+    const segDur = cueSegmentDuration(track);
+    if (segDur != null && segDur > 0) {
+      if (
+        typeof backendDur === 'number' &&
+        backendDur > 0 &&
+        Math.abs(backendDur - segDur) <= 1.0
+      ) {
+        duration = backendDur;
+      } else {
+        duration = segDur;
+      }
+    } else if (typeof backendDur === 'number' && backendDur > 0) {
+      duration = backendDur;
+    }
     if (event.payload.state) {
       applyBackendPlaybackState({ state: event.payload.state });
     }
@@ -2250,11 +2556,37 @@ function setupListeners() {
       lastHiddenPositionApply = now;
     }
 
+    // Clamp to known duration so a single bad absolute read cannot pin the bar at 100%+.
+    if (duration > 0 && newPos > duration + 0.5) {
+      if (Date.now() - lastManualPlayAt < 1200 || Date.now() - lastGaplessChangeAt < 800) {
+        return;
+      }
+      position = Math.min(newPos, duration);
+      return;
+    }
     position = newPos;
   });
 
   listen<{ is_playing: boolean; is_paused: boolean }>('player:state', (event) => {
     applyBackendPlaybackState(event.payload);
+  });
+
+  listen('library:cleared', () => {
+    playlists = [];
+    libraryTracks = [];
+    allPaths = [];
+    likedPaths = [];
+    currentFile = null;
+    currentFileName = null;
+    currentTrackIndex = -1;
+    playingPlaylistId = null;
+    activePlaylistId = null;
+    shuffleOrder = [];
+    shufflePosition = 0;
+    isPlaying = false;
+    isPaused = false;
+    position = 0;
+    syncWindowTitle();
   });
 
   listen('covers:rebuilt', () => {
@@ -2296,12 +2628,19 @@ function setupListeners() {
     // Stale ended from a previous track (manual skip / gapless already advanced).
     // Prefer path match over a fixed time window so sub-second tracks can still
     // auto-advance after they legitimately finish.
-    if (endedPath && currentFile && endedPath !== currentFile) {
+    if (endedPath && currentFile && !sameTrackPath(endedPath, currentFile)) {
       return;
     }
     // Fallback when backend omits path: only ignore right after a gapless change,
     // and never for short tracks that finish inside that window.
     if (!endedPath && Date.now() - lastGaplessChangeAt < 600 && duration > 0.7) {
+      return;
+    }
+    // If track-changed already processed the transition from this track
+    // (gapless auto-advance), don't double-advance from track-ended.
+    if (endedPath && lastTrackChangedFromPath &&
+        sameTrackPath(endedPath, lastTrackChangedFromPath) &&
+        Date.now() - lastTrackChangedAt < 2000) {
       return;
     }
 
@@ -2325,7 +2664,10 @@ function setupListeners() {
       return;
     }
 
-    if (currentTrackIndex < playingTracks.length - 1) {
+    // Use a fresh index lookup — currentTrackIndex may be stale if
+    // playingTracks was reordered or the playlist changed.
+    const endedIdx = findTrackIndexByPath(playingTracks, currentFile);
+    if (endedIdx >= 0 && endedIdx < playingTracks.length - 1) {
       void nextTrack();
     } else if (repeatMode === 'all' && playingTracks.length > 0) {
       void play(playingTracks[0].path);
@@ -2341,7 +2683,7 @@ export function createPlayerStore() {
   void bootstrap();
 
   if (typeof window !== 'undefined') {
-    // Debounced playlists_save (250ms) can miss the last volume change on quit.
+    // Flush the small SQLite app-state row before the main window closes.
     window.addEventListener('pagehide', flushSave);
     window.addEventListener('beforeunload', flushSave);
   }
@@ -2401,6 +2743,7 @@ export function createPlayerStore() {
     addScannedTracks,
     createPlaylistsFromDroppedPaths,
     createPlaylistsFromScannedTracks,
+    clearAll,
 
     // Player actions
     play,
