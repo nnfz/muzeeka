@@ -1580,7 +1580,11 @@ function addScannedTracks(files: MusicFile[], playlistId?: string | null): numbe
 
 /** Basename of a filesystem path (folder or file). */
 function pathBasename(path: string): string {
-  const cleaned = path.replace(/[\\/]+$/, '').trim();
+  // Strip Windows extended-length prefix so `\\?\C:\Music\Album` → `Album`.
+  let cleaned = path.trim();
+  if (cleaned.startsWith('\\\\?\\')) cleaned = cleaned.slice(4);
+  else if (cleaned.startsWith('//?/')) cleaned = cleaned.slice(4);
+  cleaned = cleaned.replace(/[\\/]+$/, '').trim();
   if (!cleaned) return path;
   const parts = cleaned.split(/[\\/]/);
   return parts[parts.length - 1] || cleaned;
@@ -1600,8 +1604,13 @@ function looksLikeMediaFile(path: string): boolean {
   return MEDIA_DROP_EXTENSIONS.has(base.slice(dot + 1).toLowerCase());
 }
 
+/**
+ * Folder/file prefix for grouping drop results.
+ * Must match `pathKey` (strip `\\?\`, normalize slashes) — scanned tracks are
+ * canonicalized on Windows and otherwise never match the original drop folder.
+ */
 function normalizePathPrefix(path: string): string {
-  return path.trim().replace(/[\\/]+$/, '').replace(/\//g, '\\').toLowerCase();
+  return pathKey(path).replace(/[\\/]+$/, '');
 }
 
 export interface CreatePlaylistsFromDropResult {
@@ -1691,6 +1700,7 @@ async function createPlaylistsFromDroppedPaths(
 
 /**
  * Create playlists from already-scanned tracks, grouping by original drop paths when available.
+ * Each dropped folder becomes a playlist named after that folder.
  */
 function createPlaylistsFromScannedTracks(
   files: MusicFile[],
@@ -1701,6 +1711,8 @@ function createPlaylistsFromScannedTracks(
   }
 
   const paths = (sourcePaths ?? []).map((p) => p.trim()).filter(Boolean);
+  const dirSources = paths.filter((source) => !looksLikeMediaFile(source));
+
   if (paths.length === 0) {
     const name = nextPlaylistName();
     const id = ensurePlaylist(name, { select: true });
@@ -1714,14 +1726,20 @@ function createPlaylistsFromScannedTracks(
   const names: string[] = [];
   let lastId: string | null = null;
 
-  for (const source of paths) {
-    if (looksLikeMediaFile(source)) continue;
+  for (const source of dirSources) {
     const prefix = normalizePathPrefix(source);
     if (!prefix) continue;
 
     const group = files.filter((file) => {
-      const fileKey = normalizePathPrefix(file.path);
-      return fileKey === prefix || fileKey.startsWith(`${prefix}\\`);
+      // file.path may be CUE virtual (`…cue#cue:N`) or `\\?\…` — pathKey handles both.
+      const fileKey = normalizePathPrefix(file.path.split('#')[0] ?? file.path);
+      const audioKey = file.audio_path ? normalizePathPrefix(file.audio_path) : '';
+      return (
+        fileKey === prefix ||
+        fileKey.startsWith(`${prefix}\\`) ||
+        (audioKey !== '' &&
+          (audioKey === prefix || audioKey.startsWith(`${prefix}\\`)))
+      );
     });
     if (group.length === 0) continue;
 
@@ -1736,7 +1754,13 @@ function createPlaylistsFromScannedTracks(
 
   const rest = files.filter((file) => !claimed.has(file.path));
   if (rest.length > 0) {
-    const name = nextPlaylistName();
+    // If grouping failed for a single dropped folder, still name the playlist
+    // after that folder (not "Playlist N"). Don't reuse folder name when other
+    // groups already succeeded — those leftover tracks get a generic name.
+    const name =
+      playlistCount === 0 && dirSources.length === 1
+        ? pathBasename(dirSources[0]) || nextPlaylistName()
+        : nextPlaylistName();
     const id = ensurePlaylist(name, { select: true });
     trackCount += mergeTracksIntoPlaylist(id, rest);
     playlistCount += 1;
