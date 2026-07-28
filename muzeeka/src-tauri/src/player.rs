@@ -38,9 +38,16 @@ const RESUME_FADE_MS: u32 = 180;
 /// Duration of a smooth playback-rate transition (presets, slider settle, etc.).
 const PLAYBACK_RATE_RAMP_MS: u32 = 1000;
 
-// For seek: we want it instant.
-// Very short hard mute only during the flush to hide any restart artifact.
+// For seek: mute during flush (instant), then short fade-in so the first post-restart
+// sample isn't slammed in at full amplitude.
 const SEEK_DIP_LEVEL: f32 = 0.0;
+/// Fade-in after seek flush — long enough to de-click, short enough to feel instant.
+const SEEK_FADE_IN_MS: u32 = 28;
+/// Manual next/prev / track click: fade OUT the old track before teardown, then fade IN.
+/// Hard mute of a full-volume waveform is the classic switch click; seek doesn't need
+/// this because content continues and the dip is very short.
+const MANUAL_SWITCH_FADE_OUT_MS: u32 = 55;
+const MANUAL_SWITCH_FADE_IN_MS: u32 = 50;
 const MIXER_BUFFER_SECS: f32 = 0.2;
 
 // Gapless: treat as ended this far before INDEX/file end so the next source is
@@ -282,6 +289,64 @@ impl Player {
             bass::BASS_ATTRIB_BUFFER,
             MIXER_BUFFER_SECS,
         );
+    }
+
+    /// Start mixer volume from silence. Optional short slide prevents edge clicks
+    /// after a hard mute + buffer restart (seek / manual track switch).
+    fn set_mixer_volume_from_silence(
+        bass: &BassLibrary,
+        mixer: u32,
+        volume: f32,
+        fade_in_ms: u32,
+    ) {
+        if mixer == 0 {
+            return;
+        }
+        let vol = volume.clamp(0.0, 1.0);
+        // Cancels any in-flight VOL slide from pause/resume/previous seek.
+        let _ = bass.channel_set_attribute(mixer, bass::BASS_ATTRIB_VOL, 0.0);
+        if vol <= 0.0001 || fade_in_ms == 0 {
+            let _ = bass.channel_set_attribute(mixer, bass::BASS_ATTRIB_VOL, vol);
+            return;
+        }
+        let _ = bass.channel_slide_attribute(mixer, bass::BASS_ATTRIB_VOL, vol, fade_in_ms);
+    }
+
+    /// Soft-cut currently audible output before tearing sources down.
+    /// Without this, VOL→0 or channel remove mid-waveform is a sharp click.
+    fn fade_out_for_manual_switch(inner: &PlayerInner) {
+        let Some(bass) = inner.bass.as_ref() else {
+            return;
+        };
+        let mixer = inner.mixer_handle;
+        if mixer == 0 {
+            return;
+        }
+        // Already silent (paused after fade, or never started).
+        if inner.user_paused || inner.current_source == 0 {
+            let _ = bass.channel_set_attribute(mixer, bass::BASS_ATTRIB_VOL, 0.0);
+            return;
+        }
+        let current = bass
+            .channel_get_attribute(mixer, bass::BASS_ATTRIB_VOL)
+            .unwrap_or(inner.volume);
+        if current <= 0.001 {
+            let _ = bass.channel_set_attribute(mixer, bass::BASS_ATTRIB_VOL, 0.0);
+            return;
+        }
+        // Keep the mixer playing so BASS can process the slide on its update thread.
+        if bass.channel_is_active(mixer) != bass::BASS_ACTIVE_PLAYING {
+            let _ = bass.channel_play(mixer, false);
+        }
+        let _ = bass.channel_slide_attribute(
+            mixer,
+            bass::BASS_ATTRIB_VOL,
+            0.0,
+            MANUAL_SWITCH_FADE_OUT_MS,
+        );
+        // BASS slides on the audio thread; wait for the ramp (+ one update period).
+        std::thread::sleep(Duration::from_millis(MANUAL_SWITCH_FADE_OUT_MS as u64 + 15));
+        let _ = bass.channel_set_attribute(mixer, bass::BASS_ATTRIB_VOL, 0.0);
     }
 
     fn begin_manual_track_switch(
@@ -1039,15 +1104,25 @@ impl Player {
         Ok(source)
     }
 
-    fn add_source_to_mixer(inner: &mut PlayerInner, source: u32) -> Result<(), String> {
+    /// Plug a decode/tempo channel into the mixer.
+    /// `norampin = true` for gapless joins (instant); `false` lets BASS ramp the channel
+    /// in (manual track switches — less clicky with non-zero first samples).
+    fn add_source_to_mixer(
+        inner: &mut PlayerInner,
+        source: u32,
+        norampin: bool,
+    ) -> Result<(), String> {
         let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
         if inner.mixer_handle == 0 {
             return Err("Mixer not created".to_string());
         }
-        // NORAMPIN: no volume ramp on start (needed for file-to-file joins).
         // No AUTOFREE: rate/pitch rebuilds re-add the channel; AUTOFREE would free decode
         // and false-trigger end detection.
-        let add_flags = bass::BASS_MIXER_CHAN_NORAMPIN;
+        let add_flags = if norampin {
+            bass::BASS_MIXER_CHAN_NORAMPIN
+        } else {
+            0
+        };
         bass.mixer_stream_add_channel(inner.mixer_handle, source, add_flags)?;
         Ok(())
     }
@@ -1070,12 +1145,20 @@ impl Player {
             Self::wrap_decode_for_rate(bass, decode, rate, pitch_enabled)?
         };
 
-        Self::add_source_to_mixer(inner, mixer_channel)?;
+        // Soft channel ramp — manual open only (gapless uses activate_preloaded).
+        Self::add_source_to_mixer(inner, mixer_channel, false)?;
 
         if let Some(bass) = inner.bass.as_ref() {
-            let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_VOL, volume);
-            // Manual track switch: hard-restart to flush stale audio from pause/buffer.
+            // Stay silent through the flush, then ramp in — hard VOL restore after
+            // restart is the classic manual-switch click.
+            let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_VOL, 0.0);
             Self::restart_mixer_with_buffer(bass, inner.mixer_handle);
+            Self::set_mixer_volume_from_silence(
+                bass,
+                inner.mixer_handle,
+                volume,
+                MANUAL_SWITCH_FADE_IN_MS,
+            );
         }
 
         inner.current_source = mixer_channel;
@@ -1161,18 +1244,16 @@ impl Player {
         let old_source = inner.current_source;
         let old_decode = inner.current_decode;
 
-        Self::add_source_to_mixer(inner, mixer_channel)?;
+        // Gapless: NORAMPIN for seamless file→file joins.
+        Self::add_source_to_mixer(inner, mixer_channel, true)?;
 
         if let Some(bass) = inner.bass.as_ref() {
             if old_source != 0 && old_source != mixer_channel {
                 let _ = bass.mixer_channel_remove(old_source);
                 Self::free_playback_channel(bass, old_source, old_decode);
             }
-            let _ = bass.channel_set_attribute(
-                inner.mixer_handle,
-                bass::BASS_ATTRIB_VOL,
-                inner.volume,
-            );
+            // Leave mixer volume alone: gapless must not re-slam VOL (clicks).
+            // Manual callers re-apply volume with a short fade after this.
             if bass.channel_is_active(inner.mixer_handle) != bass::BASS_ACTIVE_PLAYING {
                 let _ = bass.channel_play(inner.mixer_handle, false);
             }
@@ -1213,18 +1294,16 @@ impl Player {
         }
 
         // Order: add next (playing) → remove old. Mixer stays running (no play restart).
-        Self::add_source_to_mixer(inner, preloaded)?;
+        // NORAMPIN: gapless must not ramp; manual path fades mixer VOL around this.
+        Self::add_source_to_mixer(inner, preloaded, true)?;
 
         if let Some(bass) = inner.bass.as_ref() {
             if old_source != 0 && old_source != preloaded {
                 let _ = bass.mixer_channel_remove(old_source);
                 Self::free_playback_channel(bass, old_source, old_decode);
             }
-            let _ = bass.channel_set_attribute(
-                inner.mixer_handle,
-                bass::BASS_ATTRIB_VOL,
-                inner.volume,
-            );
+            // Leave mixer volume alone: gapless must not re-slam VOL (clicks).
+            // Manual callers re-apply volume with a short fade after this.
             if bass.channel_is_active(inner.mixer_handle) != bass::BASS_ACTIVE_PLAYING {
                 let _ = bass.channel_play(inner.mixer_handle, false);
             }
@@ -1277,10 +1356,11 @@ impl Player {
             if let Some(bass) = inner.bass.as_ref() {
                 // Flush any silence produced between the first reset and the seek.
                 Self::restart_mixer_with_buffer(bass, inner.mixer_handle);
-                let _ = bass.channel_set_attribute(
+                Self::set_mixer_volume_from_silence(
+                    bass,
                     inner.mixer_handle,
-                    bass::BASS_ATTRIB_VOL,
                     inner.volume,
+                    MANUAL_SWITCH_FADE_IN_MS,
                 );
             }
             Self::detect_cue_position_mode(inner);
@@ -1304,6 +1384,10 @@ impl Player {
         cue_start: Option<f64>,
         cue_end: Option<f64>,
     ) -> Result<(), String> {
+        // Soft-cut the old track first. Hard VOL=0 / channel remove while still
+        // audible is the click on manual next/prev — seek doesn't hit this path
+        // the same way because content continues under a brief dip.
+        Self::fade_out_for_manual_switch(inner);
         Self::cancel_pending_pause(inner);
 
         let playback = cue::resolve_playback(track_path, audio_path, cue_start, cue_end)
@@ -1313,21 +1397,42 @@ impl Player {
 
         if Self::can_gapless_reuse(inner, &playback.audio_path) {
             // CUE same-file: seek within the already-open stream (instant, no reopening).
+            // Already faded to silence above.
+            if let Some(bass) = inner.bass.as_ref() {
+                if inner.mixer_handle != 0 {
+                    let _ =
+                        bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_VOL, 0.0);
+                }
+            }
             Self::apply_segment(inner, track_path, &playback)?;
             // Always flush the mixer buffer on a manual track switch.
             // Even if the mixer is playing, it holds up to buffer_size ms of old audio.
             // For gapless auto-advance we skip this (seamless), but for manual switches
             // the user wants the new segment to start immediately.
             if let Some(bass) = inner.bass.as_ref() {
-                let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_VOL, inner.volume);
                 Self::restart_mixer_with_buffer(bass, inner.mixer_handle);
+                Self::set_mixer_volume_from_silence(
+                    bass,
+                    inner.mixer_handle,
+                    inner.volume,
+                    MANUAL_SWITCH_FADE_IN_MS,
+                );
             }
             // Re-detect after the hard flush — position can look 0-based for a frame.
             Self::detect_cue_position_mode(inner);
         } else if Self::can_use_preloaded(inner, track_path, &playback.audio_path) {
             // Fast path for manual next/prev when the track was preloaded for gapless.
-            // This makes "hand switching" to the next track nearly instant.
             Self::activate_preloaded(inner, track_path, &playback)?;
+            if let Some(bass) = inner.bass.as_ref() {
+                // Preload path skips open_stream restart — flush stale buffer then soft-in.
+                Self::restart_mixer_with_buffer(bass, inner.mixer_handle);
+                Self::set_mixer_volume_from_silence(
+                    bass,
+                    inner.mixer_handle,
+                    inner.volume,
+                    MANUAL_SWITCH_FADE_IN_MS,
+                );
+            }
             inner.suppress_gapless_until =
                 Self::now_millis().saturating_add(MANUAL_SEGMENT_SUPPRESS_MS);
         } else {
@@ -1711,12 +1816,20 @@ impl Player {
                 true,
                 abs_pos,
             );
-            let vol = if was_paused { 0.0 } else { inner.volume };
-            let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_VOL, vol);
             if was_paused {
+                let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_VOL, 0.0);
                 let _ = bass.channel_pause(inner.mixer_handle);
             } else {
+                // open_stream already restarted + faded in at segment start; re-seek and
+                // soft-restore so the topology switch itself does not click.
+                let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_VOL, 0.0);
                 Self::restart_mixer_with_buffer(bass, inner.mixer_handle);
+                Self::set_mixer_volume_from_silence(
+                    bass,
+                    inner.mixer_handle,
+                    inner.volume,
+                    MANUAL_SWITCH_FADE_IN_MS,
+                );
             }
         }
 
@@ -2001,10 +2114,7 @@ impl Player {
     }
 
     /// Seek to a position in seconds.
-    /// "Наложение" (overlap) style, not full затухание:
-    /// Quick shallow volume dip (not to zero), immediate seek, quick restore.
-    /// Feels like a smooth blend/transition during scrub, similar to Spotify.
-    /// No full silence, short times. Not used on track changes.
+    /// Mute → jump + mixer flush → short fade-in (avoids post-seek clicks).
     /// While paused, position updates but playback stays paused (arrow keys / scrub).
     pub fn seek(&self, position_secs: f64) -> Result<(), String> {
         let _ops = self.ops.lock();
@@ -2027,8 +2137,7 @@ impl Player {
 
             {
                 let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
-                // Instant seek: hard jump + flush. No long animation.
-                // Dip only for the flush moment to avoid click, then immediate restore.
+                // Silent through the flush so restart doesn't spit a full-volume edge.
                 let _ = bass.channel_set_attribute(mixer, bass::BASS_ATTRIB_VOL, SEEK_DIP_LEVEL);
 
                 // Content timeline (decode) — correct for tempo wrappers and CUE segments.
@@ -2043,7 +2152,12 @@ impl Player {
                     // Match post-pause-fade state: silent until resume.
                     let _ = bass.channel_set_attribute(mixer, bass::BASS_ATTRIB_VOL, 0.0);
                 } else {
-                    let _ = bass.channel_set_attribute(mixer, bass::BASS_ATTRIB_VOL, target);
+                    Self::set_mixer_volume_from_silence(
+                        bass,
+                        mixer,
+                        target,
+                        SEEK_FADE_IN_MS,
+                    );
                 }
             }
 
