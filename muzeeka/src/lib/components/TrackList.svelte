@@ -29,6 +29,8 @@
   import { audioPathsForDrag, startFileDrag } from "$lib/fileDrag";
   import { exportAudioPathForTrack } from "$lib/trackPaths";
   import { reorderItemsAtBoundary } from "$lib/trackOrder";
+  import { getCoverSrc } from "$lib/coverCache";
+  import { COVER_PLACEHOLDER_SRC } from "$lib/coverPlaceholder";
   import TrackCover from "./TrackCover.svelte";
 
   type ColumnId = "index" | "title" | "album" | "duration";
@@ -76,6 +78,15 @@
   let resizingPair = $state<{ left: ColumnId; right: ColumnId } | null>(null);
 
   const ROW_HEIGHT = 52;
+  /** Visual gap opened between rows while reordering (px). */
+  const DROP_GAP_PX = 44;
+  /** Matches `.track-list-rows` vertical padding — used for drop-index math. */
+  const LIST_PAD_Y = 8;
+  /**
+   * Hysteresis (px) so the open gap doesn't flip dropIndex when the pointer
+   * sits on a boundary — that feedback loop is the "jitter while wiggling".
+   */
+  const DROP_INDEX_HYSTERESIS = 14;
   const VIRTUAL_OVERSCAN = 10;
 
   function isColumnId(value: unknown): value is ColumnId {
@@ -198,6 +209,9 @@
     isCopy: boolean;
     startX: number;
     startY: number;
+    /** Live pointer for floating cover preview. */
+    pointerX: number;
+    pointerY: number;
     active: boolean;
     dropIndex: number | null;
     dropPlaylistId: string | null;
@@ -207,9 +221,54 @@
   let trackDrag = $state<TrackDragState | null>(null);
   let dragCaptureEl = $state<HTMLElement | null>(null);
   let dragPointerId = $state<number | null>(null);
+  /**
+   * After an active drag, the browser may still fire a synthetic `click`.
+   * We swallow only that ghost click — auto-clear so the next real click plays.
+   */
   let suppressTrackClick = false;
+  let suppressTrackClickTimer: ReturnType<typeof setTimeout> | null = null;
+  let dragPreviewCoverFailed = $state(false);
+  /** Degrees — slight tilt that follows horizontal mouse velocity. */
+  let dragFloatRotate = $state(-2.5);
+  let dragFloatSample = { x: 0, y: 0, t: 0 };
 
   let canReorder = $derived(supportsPlaylistReorder(player.activePlaylistId));
+
+  /** True while reordering inside the list (not copy-to-playlist / file export). */
+  let reorderGapActive = $derived(
+    !!trackDrag?.active &&
+      !trackDrag.isCopy &&
+      trackDrag.dropPlaylistId == null &&
+      trackDrag.dropIndex != null &&
+      canReorder,
+  );
+
+  let reorderDropIndex = $derived(
+    reorderGapActive ? (trackDrag?.dropIndex ?? null) : null,
+  );
+
+  let dragPreview = $derived.by(() => {
+    const drag = trackDrag;
+    if (!drag?.active || drag.paths.length === 0) return null;
+    const leadPath = drag.paths[0];
+    const lead = displayedTracks.find(
+      (item) => item.track.path === leadPath,
+    )?.track;
+    const coverPath = lead?.cover_path ?? null;
+    const resolved = getCoverSrc(coverPath);
+    const src =
+      !dragPreviewCoverFailed && resolved ? resolved : COVER_PLACEHOLDER_SRC;
+    return {
+      x: drag.pointerX,
+      y: drag.pointerY,
+      rotate: dragFloatRotate,
+      count: drag.paths.length,
+      title: lead ? trackDisplayTitle(lead) : "Track",
+      artist: lead ? trackDisplayArtist(lead) : "",
+      coverSrc: src,
+      isCopy: drag.isCopy,
+    };
+  });
 
   let trackMenuItems = $derived.by((): ContextMenuItem[] => {
     const target = contextMenu?.item;
@@ -949,12 +1008,17 @@
       return;
     }
 
+    dragPreviewCoverFailed = false;
+    dragFloatRotate = -2.5;
+    dragFloatSample = { x: e.clientX, y: e.clientY, t: performance.now() };
     trackDrag = {
       paths: pathsForDrag(item),
       sourcePlaylistId: player.activePlaylistId!,
       isCopy: e.ctrlKey || e.metaKey,
       startX: e.clientX,
       startY: e.clientY,
+      pointerX: e.clientX,
+      pointerY: e.clientY,
       active: false,
       dropIndex: null,
       dropPlaylistId: null,
@@ -977,6 +1041,7 @@
     window.removeEventListener("pointercancel", onTrackPointerUp);
     window.removeEventListener("blur", onTrackPointerCancel);
     document.removeEventListener("visibilitychange", onTrackDragVisibility);
+    document.body.classList.remove("track-reorder-dragging");
 
     if (dragCaptureEl && dragPointerId !== null) {
       try {
@@ -991,6 +1056,9 @@
     dragCaptureEl = null;
     dragPointerId = null;
     trackDrag = null;
+    dragFloatRotate = -2.5;
+    // Do not clear suppressTrackClick here — pointerup arms it after cleanup
+    // so the synthetic click from this gesture can still be swallowed.
     if (resetUi) resetTrackDrag();
   }
 
@@ -1038,6 +1106,58 @@
     return !el?.closest(".track-row");
   }
 
+  /**
+   * Insert index from pointer Y using *untransformed* list geometry
+   * (scrollTop + fixed row height). Never use getBoundingClientRect of rows —
+   * those move when the gap opens and create a flip-flop loop.
+   */
+  function dropIndexFromPointerY(clientY: number): number | null {
+    const el = rowsEl;
+    if (!el || displayedTracks.length === 0) return null;
+
+    const rect = el.getBoundingClientRect();
+    // Outside the scroll viewport vertically → no reorder target.
+    if (clientY < rect.top - 4 || clientY > rect.bottom + 4) return null;
+
+    const yInContent =
+      clientY - rect.top + el.scrollTop - LIST_PAD_Y;
+    // Map Y onto insert slots [0 .. n] at row midpoints (stable coordinates).
+    const raw = yInContent / ROW_HEIGHT;
+    return Math.max(
+      0,
+      Math.min(displayedTracks.length, Math.round(raw)),
+    );
+  }
+
+  /**
+   * Only change dropIndex when the pointer has clearly crossed into a new
+   * slot — kills boundary jitter while still feeling responsive.
+   */
+  function stabilizeDropIndex(
+    next: number | null,
+    prev: number | null,
+    clientY: number,
+  ): number | null {
+    if (next == null) return null;
+    if (prev == null || prev === next) return next;
+
+    const el = rowsEl;
+    if (!el) return next;
+
+    const rect = el.getBoundingClientRect();
+    const yInContent = clientY - rect.top + el.scrollTop - LIST_PAD_Y;
+    // Boundary between prev and next slots (in content px).
+    // Slot k is centered at k * ROW_HEIGHT; boundary between k and k+1 at (k+0.5)*H.
+    const low = Math.min(prev, next);
+    const boundary = (low + 0.5) * ROW_HEIGHT;
+    const dist = yInContent - boundary;
+
+    // Must push past boundary by hysteresis before flipping.
+    if (next > prev && dist < DROP_INDEX_HYSTERESIS) return prev;
+    if (next < prev && dist > -DROP_INDEX_HYSTERESIS) return prev;
+    return next;
+  }
+
   function onTrackPointerMove(e: PointerEvent) {
     if (!trackDrag) return;
 
@@ -1047,12 +1167,28 @@
 
     if (!trackDrag.active) {
       setTrackDragActive(true, e.ctrlKey || e.metaKey);
+      document.body.classList.add("track-reorder-dragging");
     }
 
     trackDrag.active = true;
     trackDrag.isCopy = e.ctrlKey || e.metaKey;
+    trackDrag.pointerX = e.clientX;
+    trackDrag.pointerY = e.clientY;
     setTrackDragActive(true, trackDrag.isCopy);
 
+    // Tilt the float with horizontal velocity (smoothed, clamped).
+    {
+      const now = performance.now();
+      const dt = Math.max(8, now - dragFloatSample.t);
+      const vx = (e.clientX - dragFloatSample.x) / dt; // px/ms
+      const vy = (e.clientY - dragFloatSample.y) / dt;
+      // Right swipe → tip right (positive deg). Small base lean + motion.
+      const target = Math.max(-11, Math.min(11, -2.2 + vx * 55 + vy * 8));
+      dragFloatRotate = dragFloatRotate * 0.72 + target * 0.28;
+      dragFloatSample = { x: e.clientX, y: e.clientY, t: now };
+    }
+
+    // Float has pointer-events: none — hit-test reaches rows/sidebar under it.
     const el = document.elementFromPoint(e.clientX, e.clientY);
 
     if (
@@ -1090,14 +1226,18 @@
       trackDrag.dropIndex = null;
       setTrackDragCopyTarget(playlistId);
     } else if (canReorder) {
-      const row = el?.closest("[data-track-index]");
-      if (row) {
-        const idx = Number(row.getAttribute("data-track-index"));
-        const rect = row.getBoundingClientRect();
-        const before = e.clientY < rect.top + rect.height / 2;
-        trackDrag.dropIndex = before ? idx : idx + 1;
+      const overList =
+        !!el?.closest(".track-rows") ||
+        !!el?.closest("[data-track-drop-zone]");
+      if (overList) {
+        const rawIndex = dropIndexFromPointerY(e.clientY);
+        trackDrag.dropIndex = stabilizeDropIndex(
+          rawIndex,
+          trackDrag.dropIndex,
+          e.clientY,
+        );
       } else {
-        trackDrag.dropIndex = displayedTracks.length;
+        trackDrag.dropIndex = null;
       }
       trackDrag.dropPlaylistId = null;
       setTrackDragCopyTarget(null);
@@ -1140,6 +1280,18 @@
     }
   }
 
+  function armSuppressTrackClick() {
+    // Swallow the ghost click from this pointer gesture only.
+    // If the browser never fires that click (common after a real drag),
+    // clear the flag quickly so the next intentional click still plays.
+    suppressTrackClick = true;
+    if (suppressTrackClickTimer) clearTimeout(suppressTrackClickTimer);
+    suppressTrackClickTimer = setTimeout(() => {
+      suppressTrackClick = false;
+      suppressTrackClickTimer = null;
+    }, 80);
+  }
+
   function onTrackPointerUp() {
     const snapshot = trackDrag;
     const wasActive = snapshot?.active ?? false;
@@ -1148,7 +1300,7 @@
 
     if (!wasActive || !snapshot) return;
 
-    suppressTrackClick = true;
+    armSuppressTrackClick();
     const { paths, sourcePlaylistId, isCopy, dropIndex, dropPlaylistId } =
       snapshot;
 
@@ -1191,6 +1343,10 @@
   function handleTrackClick(item: ListedTrack, index: number, e: MouseEvent) {
     if (suppressTrackClick) {
       suppressTrackClick = false;
+      if (suppressTrackClickTimer) {
+        clearTimeout(suppressTrackClickTimer);
+        suppressTrackClickTimer = null;
+      }
       return;
     }
 
@@ -1351,10 +1507,18 @@
           class="track-rows"
           class:track-drag-active={trackDrag?.active ||
             trackDragUi.isExportSession}
+          class:has-reorder-gap={reorderGapActive}
           bind:this={rowsEl}
           onscroll={handleRowsScroll}
         >
-          <div class="track-list-rows">
+          <div
+            class="track-list-rows"
+            class:drop-at-end={reorderDropIndex === displayedTracks.length &&
+              displayedTracks.length > 0}
+            style={reorderGapActive
+              ? `padding-bottom: ${8 + DROP_GAP_PX}px`
+              : undefined}
+          >
             <div style="height: {visibleRange.top}px" aria-hidden="true"></div>
             {#each visibleTracks as item, localIndex (item.track.path)}
               {@const i = visibleRange.start + localIndex}
@@ -1365,6 +1529,12 @@
                 (trackDrag?.active && trackDrag.paths.includes(track.path)) ||
                 (trackDragUi.isExportSession &&
                   trackDragUi.draggingPaths.includes(track.path))}
+              {@const gapShift =
+                reorderDropIndex != null && i >= reorderDropIndex
+                  ? DROP_GAP_PX
+                  : 0}
+              {@const isGapEdge =
+                reorderDropIndex != null && i === reorderDropIndex}
               <button
                 class="track-row"
                 class:active={isActive}
@@ -1372,20 +1542,9 @@
                 class:paused={isActive && player.isPaused && !player.isPlaying}
                 class:selected={isSelected}
                 class:dragging={isDraggingRow}
-                class:drop-before={(trackDrag?.active &&
-                  !trackDrag.isCopy &&
-                  trackDrag.dropIndex === i) ||
-                  (trackDragUi.isExportSession &&
-                    !trackDragUi.isCopyDrag &&
-                    trackDragUi.dropIndex === i)}
-                class:drop-after={(trackDrag?.active &&
-                  !trackDrag.isCopy &&
-                  trackDrag.dropIndex === i + 1) ||
-                  (trackDragUi.isExportSession &&
-                    !trackDragUi.isCopyDrag &&
-                    trackDragUi.dropIndex === i + 1)}
+                class:gap-shift={isGapEdge}
                 data-track-index={i}
-                style="grid-template-columns: {gridTemplate}"
+                style="grid-template-columns: {gridTemplate}; transform: translate3d(0, {gapShift}px, 0)"
                 onclick={(e) => handleTrackClick(item, i, e)}
                 onpointerdown={(e) => onTrackPointerDown(e, item)}
                 oncontextmenu={(e) => openTrackContextMenu(e, item, i)}
@@ -1543,6 +1702,38 @@
 
 {#if dragToast}
   <div class="track-drag-toast" role="status">{dragToast}</div>
+{/if}
+
+{#if dragPreview}
+  <div
+    class="track-drag-float"
+    class:is-copy={dragPreview.isCopy}
+    style="left: {dragPreview.x + 14}px; top: {dragPreview.y + 12}px; transform: rotate({dragPreview.rotate.toFixed(2)}deg)"
+    aria-hidden="true"
+  >
+    <div class="track-drag-float-cover">
+      <img
+        src={dragPreview.coverSrc}
+        alt=""
+        draggable="false"
+        onerror={() => {
+          dragPreviewCoverFailed = true;
+        }}
+      />
+      {#if dragPreview.count > 1}
+        <span class="track-drag-float-badge">{dragPreview.count}</span>
+      {/if}
+    </div>
+    <div class="track-drag-float-meta">
+      <span class="track-drag-float-title">{dragPreview.title}</span>
+      {#if dragPreview.artist}
+        <span class="track-drag-float-artist">{dragPreview.artist}</span>
+      {/if}
+      {#if dragPreview.isCopy}
+        <span class="track-drag-float-mode">Copy</span>
+      {/if}
+    </div>
+  </div>
 {/if}
 
 <style>

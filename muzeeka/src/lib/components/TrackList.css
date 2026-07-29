@@ -167,6 +167,7 @@
 }
 
 .track-row {
+  position: relative;
   box-sizing: border-box;
   padding: 0;
   display: grid;
@@ -179,7 +180,12 @@
   background: transparent;
   text-align: left;
   cursor: default;
-  transition: background var(--transition-fast);
+  will-change: transform;
+  transition:
+    background var(--transition-fast),
+    opacity 0.16s ease,
+    filter 0.16s ease,
+    transform 0.18s cubic-bezier(0.22, 1, 0.36, 1);
 }
 
 .track-row:hover {
@@ -455,18 +461,191 @@
 
 .track-rows.track-drag-active {
   user-select: none;
+  cursor: grabbing;
+}
+
+.track-rows:not(.track-drag-active) .track-row {
+  /* Avoid transform transition when not dragging — cheaper paint. */
+  transition:
+    background var(--transition-fast),
+    opacity 0.16s ease,
+    filter 0.16s ease;
 }
 
 .track-row.dragging {
-  opacity: 0.45;
+  opacity: 0.28;
+  scale: 0.98;
+  filter: saturate(0.7);
 }
 
-.track-row.drop-before {
-  box-shadow: inset 0 2px 0 var(--accent);
+/* Soft accent wash in the opened gap (on the first row shifted down). */
+.track-row.gap-shift::before {
+  content: "";
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  top: -36px;
+  height: 28px;
+  border-radius: var(--radius-sm);
+  pointer-events: none;
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--accent) 0%, transparent) 0%,
+    color-mix(in srgb, var(--accent) 16%, transparent) 50%,
+    color-mix(in srgb, var(--accent) 0%, transparent) 100%
+  );
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 28%, transparent);
+  opacity: 0.95;
 }
 
-.track-row.drop-after {
-  box-shadow: inset 0 -2px 0 var(--accent);
+/* Gap when dropping after the last track. */
+.track-list-rows.drop-at-end::after {
+  content: "";
+  display: block;
+  height: 28px;
+  margin: 6px 8px 0;
+  border-radius: var(--radius-sm);
+  pointer-events: none;
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--accent) 0%, transparent) 0%,
+    color-mix(in srgb, var(--accent) 16%, transparent) 50%,
+    color-mix(in srgb, var(--accent) 0%, transparent) 100%
+  );
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 28%, transparent);
+  animation: track-drop-gap-in 0.18s ease both;
+}
+
+@keyframes track-drop-gap-in {
+  from {
+    opacity: 0;
+    transform: scaleY(0.6);
+  }
+  to {
+    opacity: 1;
+    transform: scaleY(1);
+  }
+}
+
+/* Floating cover that follows the cursor while reordering. */
+.track-drag-float {
+  position: fixed;
+  z-index: 400;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: 240px;
+  padding: 8px 12px 8px 8px;
+  border-radius: 12px;
+  pointer-events: none;
+  background: color-mix(in srgb, var(--bg-elevated) 92%, transparent);
+  border: 1px solid color-mix(in srgb, var(--border-subtle) 80%, var(--accent) 20%);
+  box-shadow:
+    0 12px 40px rgba(0, 0, 0, 0.45),
+    0 0 0 1px rgba(255, 255, 255, 0.04) inset;
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  transform-origin: 20% 80%;
+  /* Position via left/top; rotate via inline transform (velocity tilt). */
+  animation: track-drag-float-in 0.16s cubic-bezier(0.22, 1, 0.36, 1) both;
+  /* Soft settle when mouse slows — complements JS smoothing. */
+  transition: transform 0.09s ease-out;
+}
+
+.track-drag-float.is-copy {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border-subtle));
+}
+
+.track-drag-float-cover {
+  position: relative;
+  width: 44px;
+  height: 44px;
+  flex-shrink: 0;
+  border-radius: 8px;
+  overflow: hidden;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.track-drag-float-cover img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.track-drag-float-badge {
+  position: absolute;
+  right: -6px;
+  top: -6px;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 6px;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: #fff;
+  background: var(--accent);
+  box-shadow: 0 2px 8px color-mix(in srgb, var(--accent) 50%, transparent);
+}
+
+.track-drag-float-meta {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.track-drag-float-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 160px;
+}
+
+.track-drag-float-artist {
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 160px;
+}
+
+.track-drag-float-mode {
+  margin-top: 2px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+@keyframes track-drag-float-in {
+  from {
+    opacity: 0;
+    scale: 0.86;
+  }
+  to {
+    opacity: 1;
+    scale: 1;
+  }
+}
+
+:global(body.track-reorder-dragging) {
+  cursor: grabbing !important;
+  user-select: none !important;
+}
+
+:global(body.track-reorder-dragging *) {
+  cursor: grabbing !important;
 }
 
 .track-menu-layer {
