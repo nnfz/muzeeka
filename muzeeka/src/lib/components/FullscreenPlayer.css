@@ -665,13 +665,6 @@
     padding-inline: 16px;
   }
 
-  .fullscreen-volume {
-    max-width: 200px;
-  }
-
-  .fullscreen-volume :global(.media-slider.volume .slider-track) {
-    width: 64px;
-  }
 }
 
 @media (prefers-reduced-motion: reduce) {

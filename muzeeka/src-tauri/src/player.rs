@@ -48,7 +48,9 @@ const SEEK_FADE_IN_MS: u32 = 28;
 /// this because content continues and the dip is very short.
 const MANUAL_SWITCH_FADE_OUT_MS: u32 = 55;
 const MANUAL_SWITCH_FADE_IN_MS: u32 = 50;
-const MIXER_BUFFER_SECS: f32 = 0.2;
+/// Mixer playback buffer. Slightly larger than the device period stack so brief
+/// main-thread stalls (UI reload, SQLite, Discord) do not underrun into silence.
+const MIXER_BUFFER_SECS: f32 = 0.35;
 
 // Gapless: treat as ended this far before INDEX/file end so the next source is
 // already feeding the mixer while the last buffer of the current track plays out.
@@ -468,10 +470,11 @@ impl Player {
             }
         }
 
-        // 200ms buffer: 100ms faster than original 300ms for responsive switching,
-        // while leaving 150ms margin over the 50ms gapless poll interval.
-        let _ = bass.set_config(bass::BASS_CONFIG_BUFFER, 200.0);
-        let _ = bass.set_config(bass::BASS_CONFIG_UPDATEPERIOD, 20.0);
+        // Device playback buffer. 300ms absorbs short main-thread / decode stalls
+        // (Ctrl+R bootstrap, metadata, Discord) without audible dropouts. Was 200ms
+        // and could dip into silence under load. Update period 15ms keeps latency OK.
+        let _ = bass.set_config(bass::BASS_CONFIG_BUFFER, 300.0);
+        let _ = bass.set_config(bass::BASS_CONFIG_UPDATEPERIOD, 15.0);
 
         let fx_dll = inner.bass_dir.join("bass_fx.dll");
         if fx_dll.is_file() {
@@ -2181,14 +2184,24 @@ impl Player {
     /// Set volume (0.0 — 1.0).
     pub fn set_volume(&self, vol: f32) -> Result<(), String> {
         self.run_on_bass_thread(move |inner| {
-            inner.volume = vol.clamp(0.0, 1.0);
+            let next = vol.clamp(0.0, 1.0);
+            // Skip no-op writes so bootstrap re-apply after Ctrl+R does not cancel
+            // an in-flight VOL slide or touch the device for nothing.
+            if (inner.volume - next).abs() < 0.0005 {
+                return Ok(());
+            }
+            inner.volume = next;
             if let Some(bass) = inner.bass.as_ref() {
                 if inner.mixer_handle != 0 {
-                    bass.channel_set_attribute(
-                        inner.mixer_handle,
-                        bass::BASS_ATTRIB_VOL,
-                        inner.volume,
-                    )?;
+                    // While paused the mixer is intentionally silent (post fade-out).
+                    // Only store the target — resume() fades back up to inner.volume.
+                    if !inner.user_paused {
+                        bass.channel_set_attribute(
+                            inner.mixer_handle,
+                            bass::BASS_ATTRIB_VOL,
+                            inner.volume,
+                        )?;
+                    }
                 }
             }
             Ok(())

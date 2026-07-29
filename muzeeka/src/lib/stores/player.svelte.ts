@@ -149,6 +149,12 @@ let isPaused = $state(false);
 let position = $state(0);
 let duration = $state(0);
 let volume = $state(0.8);
+/**
+ * False until we know a real volume (library DB or live backend).
+ * Prevents bootstrap races from blasting the frontend default 0.8 into BASS
+ * while a quiet session is still playing after Ctrl+R.
+ */
+let volumeHydrated = false;
 let currentFile = $state<string | null>(null);
 let currentFileName = $state<string | null>(null);
 let playlists = $state<Playlist[]>([]);
@@ -1105,16 +1111,41 @@ function flushSave() {
   persistMutation('library_state_save', { state: buildLibraryState() });
 }
 
-/** Clamp and apply volume to the native player (safe before/after BASS init). */
-async function applyVolumeToPlayer(vol: number = volume) {
+/**
+ * Clamp and apply volume to the native player (safe before/after BASS init).
+ * Until volume is hydrated from DB/backend, skip the push — otherwise the
+ * JS default 0.8 overwrites a live quiet session for ~0.5s on Ctrl+R.
+ */
+async function applyVolumeToPlayer(
+  vol: number = volume,
+  options?: { force?: boolean },
+) {
   const clamped = Math.max(0, Math.min(1, vol));
   volume = clamped;
+  if (!volumeHydrated && !options?.force) {
+    return;
+  }
   try {
     await invoke('player_set_volume', { volume: clamped });
   } catch (e) {
     // Player may not be ready yet during very early startup; init() will re-apply.
     console.error('Failed to apply volume:', e);
   }
+}
+
+/** Prefer live BASS volume after webview reload (backend keeps playing). */
+async function hydrateVolumeFromBackend(): Promise<boolean> {
+  try {
+    const state = await invoke<PlayerState>('player_get_state');
+    if (typeof state.volume === 'number' && Number.isFinite(state.volume)) {
+      volume = Math.max(0, Math.min(1, state.volume));
+      volumeHydrated = true;
+      return true;
+    }
+  } catch {
+    // Player not ready yet
+  }
+  return false;
 }
 
 async function loadShuffleModeFromSettings() {
@@ -1135,10 +1166,15 @@ async function loadPlaylists() {
     activePlaylistId = data.active_playlist_id ?? playlists[0]?.id ?? null;
     if (typeof data.volume === 'number' && Number.isFinite(data.volume)) {
       volume = Math.max(0, Math.min(1, data.volume));
+      volumeHydrated = true;
+    } else if (!volumeHydrated) {
+      // No saved volume — adopt whatever BASS is already using (Ctrl+R case).
+      await hydrateVolumeFromBackend();
     }
-    // Settings bootstrap can call player init in parallel and stamp the default
-    // 0.8 into BASS before this load finishes — always re-push restored volume.
-    await applyVolumeToPlayer(volume);
+    // Push the known volume only after hydration (never the blind 0.8 default).
+    if (volumeHydrated) {
+      await applyVolumeToPlayer(volume, { force: true });
+    }
     if (Array.isArray(data.liked_paths)) {
       likedPaths = data.liked_paths.filter((p: any) => typeof p === 'string' && p);
     }
@@ -1814,22 +1850,39 @@ async function addDroppedPaths(paths: string[], playlistId?: string | null) {
 // --- Player Actions ---
 
 async function init() {
-  // Already initialized: still re-apply volume. Settings-store bootstrap can finish
-  // init before loadPlaylists restores the saved level; a bare early return left BASS
-  // stuck at the default 0.8 while the UI showed the real value (or vice versa).
+  // Already initialized: only re-push volume once we know the real value.
+  // Settings bootstrap often calls ensureInit() before loadPlaylists finishes —
+  // never stamp the JS default 0.8 over a live session.
   if (isInitialized) {
-    await applyVolumeToPlayer(volume);
+    if (!volumeHydrated) {
+      await hydrateVolumeFromBackend();
+    }
+    if (volumeHydrated) {
+      await applyVolumeToPlayer(volume, { force: true });
+    }
     return;
   }
   if (initPromise) {
     await initPromise;
-    await applyVolumeToPlayer(volume);
+    if (!volumeHydrated) {
+      await hydrateVolumeFromBackend();
+    }
+    if (volumeHydrated) {
+      await applyVolumeToPlayer(volume, { force: true });
+    }
     return;
   }
 
   initPromise = (async () => {
     await invoke('player_init');
-    await applyVolumeToPlayer(volume);
+    // After Ctrl+R the backend is already playing at the correct volume.
+    // Pull it before any push so we never blast 0.8 over a quiet session.
+    if (!volumeHydrated) {
+      await hydrateVolumeFromBackend();
+    }
+    if (volumeHydrated) {
+      await applyVolumeToPlayer(volume, { force: true });
+    }
 
     // Restore persisted playback rate from settings (so rate survives app restart)
     try {
@@ -2259,7 +2312,8 @@ async function seek(pos: number) {
 
 function setVolume(vol: number) {
   volume = Math.max(0, Math.min(1, vol));
-  void applyVolumeToPlayer(volume);
+  volumeHydrated = true;
+  void applyVolumeToPlayer(volume, { force: true });
   scheduleSave();
 }
 

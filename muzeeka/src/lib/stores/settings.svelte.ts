@@ -239,13 +239,19 @@ export function createSettingsStore(
       // Never re-apply DSP from the settings/download webview on open: that races the
       // main player, can rebuild pitch topology mid-playback, and freezes the UI via
       // run_on_main_thread while BASS is busy.
+      // On main window: push EQ (cheap, live coeffs). Rate/pitch only when non-default —
+      // backend no-ops when already matching, so this is safe after Ctrl+R.
       if (applyToPlayer) {
         await ensurePlayerReady();
-        await invoke('player_set_equalizer', { settings: equalizer });
+        await invoke('player_set_equalizer', { settings: equalizer }).catch(() => {});
         if (playbackRate !== 1.0) {
           await invoke('player_set_playback_rate', { rate: playbackRate }).catch(() => {});
         }
-        await invoke('player_set_pitch_enabled', { enabled: pitchEnabled }).catch(() => {});
+        // pitch_enabled defaults true on backend; only push when user disabled pitch
+        // (avoids a redundant IPC on every reload).
+        if (!pitchEnabled) {
+          await invoke('player_set_pitch_enabled', { enabled: false }).catch(() => {});
+        }
       }
     } catch (e) {
       console.error('Failed to load settings:', e);
