@@ -1226,17 +1226,42 @@ async function loadPlaylists() {
 
 function ensurePlaylist(name: string, options?: { select?: boolean }): string {
   const trimmed = name.trim();
+  if (!trimmed) {
+    return ensurePlaylist(nextPlaylistName(), options);
+  }
   const existing = playlists.find(
     (p) => p.name.toLowerCase() === trimmed.toLowerCase()
   );
-  if (existing) return existing.id;
+  if (existing) {
+    if (options?.select) {
+      activePlaylistId = existing.id;
+    }
+    return existing.id;
+  }
 
   const playlist: Playlist = {
     id: crypto.randomUUID(),
     name: trimmed,
     tracks: [],
   };
+  // Append via functional read of current state so a concurrent import that
+  // already inserted another playlist is not wiped by a stale spread.
   playlists = [...playlists, playlist];
+  // Re-check: if two creates raced on the same name (shouldn't in single-thread,
+  // but dual drop handlers can interleave around awaits), keep the first.
+  const sameName = playlists.filter(
+    (p) => p.name.toLowerCase() === trimmed.toLowerCase(),
+  );
+  if (sameName.length > 1) {
+    const keeper = sameName[0];
+    playlists = playlists.filter(
+      (p) => p.name.toLowerCase() !== trimmed.toLowerCase() || p.id === keeper.id,
+    );
+    if (options?.select) {
+      activePlaylistId = keeper.id;
+    }
+    return keeper.id;
+  }
   persistMutation('playlist_create', { id: playlist.id, name: playlist.name });
   if (options?.select) {
     activePlaylistId = playlist.id;
@@ -1779,7 +1804,7 @@ function createPlaylistsFromScannedTracks(
     });
     if (group.length === 0) continue;
 
-    for (const file of group) claimed.add(file.path);
+    for (const file of group) claimed.add(pathKey(file.path));
     const name = pathBasename(source) || nextPlaylistName();
     const id = ensurePlaylist(name, { select: true });
     trackCount += mergeTracksIntoPlaylist(id, group);
@@ -1788,20 +1813,35 @@ function createPlaylistsFromScannedTracks(
     lastId = id;
   }
 
-  const rest = files.filter((file) => !claimed.has(file.path));
+  const rest = files.filter((file) => !claimed.has(pathKey(file.path)));
   if (rest.length > 0) {
-    // If grouping failed for a single dropped folder, still name the playlist
-    // after that folder (not "Playlist N"). Don't reuse folder name when other
-    // groups already succeeded — those leftover tracks get a generic name.
-    const name =
-      playlistCount === 0 && dirSources.length === 1
-        ? pathBasename(dirSources[0]) || nextPlaylistName()
-        : nextPlaylistName();
-    const id = ensurePlaylist(name, { select: true });
-    trackCount += mergeTracksIntoPlaylist(id, rest);
-    playlistCount += 1;
-    names.push(name);
-    lastId = id;
+    // One dropped folder → exactly one playlist. Leftovers from imperfect path
+    // matching (\\?\ vs normal, CUE virtual paths) must NOT spawn "Playlist N".
+    // That second row was written to SQLite while a race could hide it in the UI
+    // until Ctrl+R.
+    if (dirSources.length === 1) {
+      const name = pathBasename(dirSources[0]) || nextPlaylistName();
+      const id = lastId ?? ensurePlaylist(name, { select: true });
+      if (!lastId) {
+        playlistCount += 1;
+        names.push(name);
+        lastId = id;
+      }
+      trackCount += mergeTracksIntoPlaylist(id, rest);
+    } else if (playlistCount === 0) {
+      const name = nextPlaylistName();
+      const id = ensurePlaylist(name, { select: true });
+      trackCount += mergeTracksIntoPlaylist(id, rest);
+      playlistCount += 1;
+      names.push(name);
+      lastId = id;
+    } else {
+      // Multi-folder drop: attach leftovers to the last successful group rather
+      // than inventing a second silent playlist.
+      if (lastId) {
+        trackCount += mergeTracksIntoPlaylist(lastId, rest);
+      }
+    }
   }
 
   if (lastId) {

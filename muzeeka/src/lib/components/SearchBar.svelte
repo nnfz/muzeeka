@@ -177,6 +177,7 @@
     <input
       type="text"
       class="search-input"
+      data-app-search-input
       placeholder="Search or paste URL"
       bind:this={inputEl}
       bind:value={searchQuery}

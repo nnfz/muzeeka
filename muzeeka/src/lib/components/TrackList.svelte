@@ -779,20 +779,64 @@
     closeContextMenu();
   }
 
-  function handleTrackMenuWindowKeydown(e: KeyboardEvent) {
-    if (e.key !== "Escape") return;
-    if (!contextMenu && !playlistSubmenu) return;
-    e.preventDefault();
-    if (playlistSubmenu) {
-      closePlaylistSubmenu();
+  function isTypingTarget(target: EventTarget | null): boolean {
+    return (
+      target instanceof HTMLInputElement ||
+      target instanceof HTMLTextAreaElement ||
+      (target instanceof HTMLElement && target.isContentEditable)
+    );
+  }
+
+  function selectAllDisplayedTracks() {
+    if (displayedTracks.length === 0) {
+      selectedPaths = new Set();
+      selectionAnchor = null;
       return;
     }
-    closeContextMenu();
+    selectedPaths = new Set(displayedTracks.map((item) => item.track.path));
+    selectionAnchor = 0;
+  }
+
+  function handleTrackMenuWindowKeydown(e: KeyboardEvent) {
+    if (e.key === "Escape") {
+      if (contextMenu || playlistSubmenu) {
+        e.preventDefault();
+        if (playlistSubmenu) {
+          closePlaylistSubmenu();
+          return;
+        }
+        closeContextMenu();
+        return;
+      }
+      // Escape clears multi-selection when no menu is open.
+      if (selectedPaths.size > 0) {
+        e.preventDefault();
+        selectedPaths = new Set();
+        selectionAnchor = null;
+      }
+      return;
+    }
+
+    // Ctrl/Cmd+A — select every track currently shown in the playlist table.
+    if ((e.ctrlKey || e.metaKey) && !e.altKey && e.code === "KeyA") {
+      if (isTypingTarget(e.target)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      selectAllDisplayedTracks();
+    }
   }
 
   function handleTrackMenuWindowKeydownProxy(e: KeyboardEvent) {
     handleTrackMenuWindowKeydown(e);
   }
+
+  // Drop multi-selection when switching playlists.
+  $effect(() => {
+    const _playlistId = player.activePlaylistId;
+    selectedPaths = new Set();
+    selectionAnchor = null;
+    void _playlistId;
+  });
 
   function playlistSubmenuItems(): ContextMenuItem[] {
     if (!playlistSubmenu) return [];

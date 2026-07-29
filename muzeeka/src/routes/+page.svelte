@@ -155,8 +155,38 @@
     }
   }
 
+  function focusAppSearch() {
+    const input = document.querySelector<HTMLInputElement>('[data-app-search-input]');
+    if (!input || input.disabled) return;
+    input.focus();
+    input.select();
+  }
+
   function handleKeydown(e: KeyboardEvent) {
     if (isSecondaryWindow || !player) return;
+
+    const mod = e.ctrlKey || e.metaKey;
+
+    // Ctrl/Cmd+F → app search (works even while typing in other fields).
+    if (mod && !e.altKey && e.code === 'KeyF') {
+      e.preventDefault();
+      e.stopPropagation();
+      focusAppSearch();
+      return;
+    }
+
+    // Block WebView/Edge print & find chrome (Ctrl+P / F3 / Ctrl+G).
+    if (mod && !e.altKey && e.code === 'KeyP') {
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+    if (e.code === 'F3' || (mod && !e.altKey && e.code === 'KeyG')) {
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+
     if (isTypingTarget(e.target)) return;
 
     switch (e.code) {
@@ -199,6 +229,27 @@
       e.preventDefault();
     }
 
+    // Capture phase so Edge/WebView2 never opens Find / Print before our handler.
+    function handleBrowserChromeKeys(e: KeyboardEvent) {
+      const mod = e.ctrlKey || e.metaKey;
+      if (mod && !e.altKey && e.code === 'KeyF') {
+        e.preventDefault();
+        e.stopPropagation();
+        focusAppSearch();
+        return;
+      }
+      if (mod && !e.altKey && e.code === 'KeyP') {
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
+      // Find next / previous (browser find UI).
+      if (e.code === 'F3' || (mod && !e.altKey && e.code === 'KeyG')) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    }
+
     function handleWheel(e: WheelEvent) {
       if (!e.altKey || !player) return;
 
@@ -218,10 +269,12 @@
     }
 
     window.addEventListener('keydown', handleAltKeydown, { capture: true });
+    window.addEventListener('keydown', handleBrowserChromeKeys, { capture: true });
     window.addEventListener('wheel', handleWheel, { passive: false });
     window.addEventListener('keyup', handleKeyup);
     return () => {
       window.removeEventListener('keydown', handleAltKeydown, { capture: true } as EventListenerOptions);
+      window.removeEventListener('keydown', handleBrowserChromeKeys, { capture: true } as EventListenerOptions);
       window.removeEventListener('wheel', handleWheel);
       window.removeEventListener('keyup', handleKeyup);
     };

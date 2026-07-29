@@ -30,6 +30,31 @@
         (event) => event.preventDefault(),
         { capture: true }
       );
+
+      // Kill WebView2/Edge default accelerators before they open Find/Print chrome.
+      // (Ctrl+F focus for in-app search is handled in +page.svelte.)
+      document.addEventListener(
+        'keydown',
+        (event) => {
+          const mod = event.ctrlKey || event.metaKey;
+          if (!mod && event.code !== 'F3') return;
+          if (event.code === 'KeyP' && mod && !event.altKey) {
+            event.preventDefault();
+            event.stopPropagation();
+            return;
+          }
+          if (event.code === 'KeyF' && mod && !event.altKey) {
+            event.preventDefault();
+            event.stopPropagation();
+            return;
+          }
+          if (event.code === 'F3' || (mod && !event.altKey && event.code === 'KeyG')) {
+            event.preventDefault();
+            event.stopPropagation();
+          }
+        },
+        { capture: true }
+      );
     </script>
     %sveltekit.head%
   </head>

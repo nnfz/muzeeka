@@ -38,6 +38,10 @@
   let pendingPaths = $state<string[]>([]);
   let toastTimer: ReturnType<typeof setTimeout> | null = null;
   let lastHandledDropAt = 0;
+  /** Serialize imports: Rust + WebView can both fire for one OS drop. */
+  let importChain: Promise<void> = Promise.resolve();
+  let lastImportKey = '';
+  let lastImportAt = 0;
   let ctrlHeld = $state(false);
   let sidebarHintStyle = $state('');
   let tracksHintStyle = $state('');
@@ -210,9 +214,69 @@
 
   function shouldHandleDrop(): boolean {
     const now = Date.now();
+    // Short guard for double-clicks / export drops — path-level dedup is below.
     if (now - lastHandledDropAt < 400) return false;
     lastHandledDropAt = now;
     return true;
+  }
+
+  function normalizeImportPath(path: string): string {
+    let p = path.trim().toLowerCase().replace(/\//g, '\\');
+    if (p.startsWith('\\\\?\\')) p = p.slice(4);
+    return p.replace(/\\+$/, '');
+  }
+
+  /** Stable key for a drop so Rust + WebView paths do not create two playlists. */
+  function importKey(paths: string[] | null | undefined, files: MusicFile[] | null | undefined): string {
+    const fromPaths = (paths ?? [])
+      .map(normalizeImportPath)
+      .filter(Boolean)
+      .sort();
+    if (fromPaths.length > 0) {
+      return `p:${fromPaths.join('|')}`;
+    }
+    // Derive folder roots from scanned files so this matches a pure-path drop
+    // of the same folder (otherwise Rust uses f:… and WebView uses p:… → 2 playlists).
+    const parents = new Set<string>();
+    for (const file of files ?? []) {
+      const raw = (file.path ?? '').split('#')[0] ?? '';
+      const p = normalizeImportPath(raw);
+      if (!p) continue;
+      const slash = p.lastIndexOf('\\');
+      if (slash > 0) parents.add(p.slice(0, slash));
+    }
+    if (parents.size === 1) {
+      return `p:${[...parents][0]}`;
+    }
+    if (parents.size > 1) {
+      return `p:${[...parents].sort().join('|')}`;
+    }
+    return '';
+  }
+
+  /**
+   * Run one import at a time. Duplicate keys within a few seconds (typical
+   * Rust + WebView double-delivery) are skipped so we do not create a ghost
+   * playlist that only appears after Ctrl+R.
+   */
+  function enqueueImport(key: string, work: () => Promise<void>): Promise<void> {
+    const run = async () => {
+      const now = Date.now();
+      if (key && key === lastImportKey && now - lastImportAt < 4000) {
+        return;
+      }
+      if (key) {
+        lastImportKey = key;
+        lastImportAt = Date.now();
+      }
+      await work();
+    };
+    const next = importChain.then(run, run);
+    importChain = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    return next;
   }
 
   async function resolveCtrlHeld(hint?: boolean | null): Promise<boolean> {
@@ -298,8 +362,6 @@
     sourcePaths?: string[],
     ctrlHint?: boolean | null,
   ) {
-    if (!shouldHandleDrop()) return;
-
     let paths = sourcePaths?.map((p) => p.trim()).filter(Boolean) ?? [];
     if (paths.length > 0) {
       const importPaths = filterIncomingDropPaths(paths);
@@ -319,30 +381,33 @@
       return;
     }
 
-    const { x, y } = toClientPoint(position[0], position[1]);
-    const importMode = await resolveCtrlHeld(ctrlHint);
+    const key = importKey(paths, files);
+    await enqueueImport(key, async () => {
+      const { x, y } = toClientPoint(position[0], position[1]);
+      const importMode = await resolveCtrlHeld(ctrlHint);
 
-    if (isOverPlaylistSidebar(x, y)) {
-      await handleSidebarDrop(paths.length > 0 ? paths : null, files, x, y, importMode);
-      return;
-    }
+      if (isOverPlaylistSidebar(x, y)) {
+        await handleSidebarDrop(paths.length > 0 ? paths : null, files, x, y, importMode);
+        return;
+      }
 
-    if (!isOverTrackZone(x, y)) {
-      return;
-    }
+      if (!isOverTrackZone(x, y)) {
+        return;
+      }
 
-    const added = player.addScannedTracks(files, player.activePlaylistId);
+      const added = player.addScannedTracks(files, player.activePlaylistId);
 
-    if (added > 0) {
-      const target = player.activePlaylist?.name ?? 'playlist';
-      showToast(`Added ${added} track${added !== 1 ? 's' : ''} to ${target}`);
-    } else if (files.length > 0) {
-      showToast('Tracks are already in this playlist');
-    } else if (message) {
-      showToast(message);
-    } else {
-      showToast('No supported audio files found');
-    }
+      if (added > 0) {
+        const target = player.activePlaylist?.name ?? 'playlist';
+        showToast(`Added ${added} track${added !== 1 ? 's' : ''} to ${target}`);
+      } else if (files.length > 0) {
+        showToast('Tracks are already in this playlist');
+      } else if (message) {
+        showToast(message);
+      } else {
+        showToast('No supported audio files found');
+      }
+    });
   }
 
   async function handleNativeDrop(
@@ -351,31 +416,32 @@
     physicalY: number,
     ctrlHint?: boolean | null,
   ) {
-    if (!shouldHandleDrop()) return;
-
     const importPaths = filterIncomingDropPaths(paths);
     if (!importPaths) return;
 
-    const { x, y } = toClientPoint(physicalX, physicalY);
-    const importMode = await resolveCtrlHeld(ctrlHint);
+    const key = importKey(importPaths, null);
+    await enqueueImport(key, async () => {
+      const { x, y } = toClientPoint(physicalX, physicalY);
+      const importMode = await resolveCtrlHeld(ctrlHint);
 
-    if (isOverPlaylistSidebar(x, y)) {
-      await handleSidebarDrop(importPaths, null, x, y, importMode);
-      return;
-    }
+      if (isOverPlaylistSidebar(x, y)) {
+        await handleSidebarDrop(importPaths, null, x, y, importMode);
+        return;
+      }
 
-    if (!isOverTrackZone(x, y)) {
-      return;
-    }
+      if (!isOverTrackZone(x, y)) {
+        return;
+      }
 
-    const added = await player.addDroppedPaths(importPaths, player.activePlaylistId);
+      const added = await player.addDroppedPaths(importPaths, player.activePlaylistId);
 
-    if (added > 0) {
-      const target = player.activePlaylist?.name ?? 'playlist';
-      showToast(`Added ${added} track${added !== 1 ? 's' : ''} to ${target}`);
-    } else if (importPaths.length > 0) {
-      showToast('No supported audio files found');
-    }
+      if (added > 0) {
+        const target = player.activePlaylist?.name ?? 'playlist';
+        showToast(`Added ${added} track${added !== 1 ? 's' : ''} to ${target}`);
+      } else if (importPaths.length > 0) {
+        showToast('No supported audio files found');
+      }
+    });
   }
 
   function isCtrlKey(e: KeyboardEvent): boolean {
