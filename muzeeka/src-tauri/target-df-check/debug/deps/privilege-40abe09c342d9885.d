@@ -1,0 +1,11 @@
+Z:\code\muzeeka\muzeeka\src-tauri\target-df-check\debug\deps\privilege-40abe09c342d9885.d: C:\Users\botni\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\privilege-0.3.0\src\lib.rs C:\Users\botni\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\privilege-0.3.0\src\runas\mod.rs C:\Users\botni\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\privilege-0.3.0\src\runas\shared.rs C:\Users\botni\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\privilege-0.3.0\src\runas\windows.rs C:\Users\botni\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\privilege-0.3.0\src\user\mod.rs C:\Users\botni\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\privilege-0.3.0\src\user\shared.rs C:\Users\botni\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\privilege-0.3.0\src\user\windows.rs
+
+Z:\code\muzeeka\muzeeka\src-tauri\target-df-check\debug\deps\libprivilege-40abe09c342d9885.rmeta: C:\Users\botni\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\privilege-0.3.0\src\lib.rs C:\Users\botni\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\privilege-0.3.0\src\runas\mod.rs C:\Users\botni\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\privilege-0.3.0\src\runas\shared.rs C:\Users\botni\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\privilege-0.3.0\src\runas\windows.rs C:\Users\botni\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\privilege-0.3.0\src\user\mod.rs C:\Users\botni\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\privilege-0.3.0\src\user\shared.rs C:\Users\botni\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\privilege-0.3.0\src\user\windows.rs
+
+C:\Users\botni\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\privilege-0.3.0\src\lib.rs:
+C:\Users\botni\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\privilege-0.3.0\src\runas\mod.rs:
+C:\Users\botni\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\privilege-0.3.0\src\runas\shared.rs:
+C:\Users\botni\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\privilege-0.3.0\src\runas\windows.rs:
+C:\Users\botni\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\privilege-0.3.0\src\user\mod.rs:
+C:\Users\botni\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\privilege-0.3.0\src\user\shared.rs:
+C:\Users\botni\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\privilege-0.3.0\src\user\windows.rs:

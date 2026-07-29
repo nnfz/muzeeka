@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount } from "svelte";
   import ContextMenu from "./ContextMenu.svelte";
   import {
     getPlayerStore,
@@ -13,6 +14,7 @@
   } from "$lib/stores/player.svelte";
   import {
     beginExportTrackDragUi,
+    endExportTrackDragUi,
     resetTrackDrag,
     setTrackDragActive,
     setTrackDragCopyTarget,
@@ -31,6 +33,7 @@
   import { reorderItemsAtBoundary } from "$lib/trackOrder";
   import { getCoverSrc } from "$lib/coverCache";
   import { COVER_PLACEHOLDER_SRC } from "$lib/coverPlaceholder";
+  import { dragFloatHide } from "$lib/dragFloat";
   import TrackCover from "./TrackCover.svelte";
 
   type ColumnId = "index" | "title" | "album" | "duration";
@@ -69,10 +72,11 @@
 
   const DRAG_THRESHOLD = 4;
   /**
-   * OS file-export only after a long deliberate dwell outside the window.
-   * Short leave→re-enter must never hand off (WebView kills the pointer).
+   * Hand off to OS file-drag after the cursor is fully outside this long.
+   * Short enough to feel like a normal "pull out", long enough to not fire
+   * on a 1px overshoot while reordering.
    */
-  const FILE_EXPORT_OUTSIDE_MS = 1200;
+  const FILE_EXPORT_OUTSIDE_MS = 180;
 
   let rowsEl = $state<HTMLDivElement | null>(null);
   let gridWidth = $state(0);
@@ -222,21 +226,15 @@
     fileExportStarted: boolean;
     /** performance.now() when pointer first went outside the window; null if inside. */
     outsideSince: number | null;
+    /** Alt held — user is forcing OS file export. */
+    exportMode: boolean;
   }
 
   let trackDrag = $state<TrackDragState | null>(null);
-  /**
-   * WebView2 fires pointercancel / lostpointercapture when the cursor leaves
-   * the window. We park the session here so re-entry with the button still
-   * held can resume (float stays visible the whole time).
-   */
-  let suspendedTrackDrag = $state<TrackDragState | null>(null);
-  let dragCaptureEl = $state<HTMLElement | null>(null);
   let dragPointerId = $state<number | null>(null);
-  let suspendedWatchAttached = false;
   /**
    * After an active drag, the browser may still fire a synthetic `click`.
-   * We swallow only that ghost click — auto-clear so the next real click plays.
+   * Swallow only that ghost click — auto-clear so the next real click plays.
    */
   let suppressTrackClick = false;
   let suppressTrackClickTimer: ReturnType<typeof setTimeout> | null = null;
@@ -247,24 +245,30 @@
 
   let canReorder = $derived(supportsPlaylistReorder(player.activePlaylistId));
 
-  /** Live or suspended session used for float / gap UI. */
-  let visualDrag = $derived(trackDrag?.active ? trackDrag : suspendedTrackDrag);
-
   /** True while reordering inside the list (not copy-to-playlist / file export). */
   let reorderGapActive = $derived(
-    !!visualDrag?.active &&
-      !visualDrag.isCopy &&
-      visualDrag.dropPlaylistId == null &&
-      visualDrag.dropIndex != null &&
+    !!trackDrag?.active &&
+      !trackDrag.isCopy &&
+      trackDrag.dropPlaylistId == null &&
+      trackDrag.dropIndex != null &&
       canReorder,
   );
 
   let reorderDropIndex = $derived(
-    reorderGapActive ? (visualDrag?.dropIndex ?? null) : null,
+    reorderGapActive ? (trackDrag?.dropIndex ?? null) : null,
   );
 
+  function isOutsideViewport(clientX: number, clientY: number): boolean {
+    return (
+      clientX <= 0 ||
+      clientY <= 0 ||
+      clientX >= window.innerWidth ||
+      clientY >= window.innerHeight
+    );
+  }
+
   let dragPreview = $derived.by(() => {
-    const drag = visualDrag;
+    const drag = trackDrag;
     if (!drag?.active || drag.paths.length === 0) return null;
     const leadPath = drag.paths[0];
     const lead = displayedTracks.find(
@@ -283,8 +287,33 @@
       artist: lead ? trackDisplayArtist(lead) : "",
       coverSrc: src,
       isCopy: drag.isCopy,
-      suspended: !!suspendedTrackDrag && !trackDrag?.active,
+      exportMode: drag.exportMode,
     };
+  });
+
+  /** Wipe any leftover drag state that can freeze clicks (run on mount + Escape). */
+  function hardResetDragUi() {
+    detachLiveDragListeners();
+    document.body.classList.remove("track-reorder-dragging");
+    trackDrag = null;
+    dragFloatRotate = -2.5;
+    suppressTrackClick = false;
+    if (suppressTrackClickTimer) {
+      clearTimeout(suppressTrackClickTimer);
+      suppressTrackClickTimer = null;
+    }
+    resetTrackDrag();
+    // Best-effort: hide/destroy any leftover outside-window float from earlier experiments.
+    void dragFloatHide();
+  }
+
+  // On mount / unmount — clear any leftover drag float / body class from a
+  // previous crash. Must NOT be a reactive $effect (that would reset mid-drag).
+  onMount(() => {
+    hardResetDragUi();
+    // Kill any orphan always-on-top drag-float window from earlier builds.
+    void dragFloatHide();
+    return () => hardResetDragUi();
   });
 
   let trackMenuItems = $derived.by((): ContextMenuItem[] => {
@@ -875,6 +904,11 @@
 
   function handleTrackMenuWindowKeydown(e: KeyboardEvent) {
     if (e.key === "Escape") {
+      if (trackDrag) {
+        e.preventDefault();
+        hardResetDragUi();
+        return;
+      }
       if (contextMenu || playlistSubmenu) {
         e.preventDefault();
         if (playlistSubmenu) {
@@ -1012,9 +1046,34 @@
     return [item.track.path];
   }
 
+  function detachLiveDragListeners() {
+    window.removeEventListener("pointermove", onTrackPointerMove);
+    window.removeEventListener("pointerup", onTrackPointerUp);
+    window.removeEventListener("pointercancel", onTrackPointerCancel);
+    dragPointerId = null;
+  }
+
+  function attachLiveDragListeners(pointerId: number) {
+    dragPointerId = pointerId;
+    // No setPointerCapture — capture previously froze the UI after leave/cancel.
+    window.addEventListener("pointermove", onTrackPointerMove);
+    window.addEventListener("pointerup", onTrackPointerUp);
+    window.addEventListener("pointercancel", onTrackPointerCancel);
+  }
+
+  function cleanupTrackPointerDrag(resetUi = true) {
+    detachLiveDragListeners();
+    document.body.classList.remove("track-reorder-dragging");
+    trackDrag = null;
+    dragFloatRotate = -2.5;
+    if (resetUi) resetTrackDrag();
+    void dragFloatHide();
+  }
+
   function onTrackPointerDown(e: PointerEvent, item: ListedTrack) {
-    if (!supportsPlaylistReorder(player.activePlaylistId)) return;
+    // Drag is always allowed: reorder (when supported) and/or OS file export.
     if (e.button !== 0) return;
+    if (!player.activePlaylistId) return;
 
     const target = e.target as HTMLElement;
     if (
@@ -1025,8 +1084,8 @@
       return;
     }
 
-    // Starting a new gesture clears any parked leave→re-enter session.
-    clearSuspendedTrackDrag();
+    if (trackDrag) cleanupTrackPointerDrag();
+
     dragPreviewCoverFailed = false;
     dragFloatRotate = -2.5;
     dragFloatSample = { x: e.clientX, y: e.clientY, t: performance.now() };
@@ -1043,229 +1102,57 @@
       dropPlaylistId: null,
       fileExportStarted: false,
       outsideSince: null,
+      exportMode: e.altKey,
     };
 
-    attachLiveDragListeners(e.currentTarget as HTMLElement, e.pointerId);
-  }
-
-  function attachLiveDragListeners(captureEl: HTMLElement, pointerId: number) {
-    dragCaptureEl = captureEl;
-    dragPointerId = pointerId;
-    try {
-      // Prefer documentElement — survives better when leaving a single row.
-      document.documentElement.setPointerCapture(pointerId);
-      dragCaptureEl = document.documentElement;
-    } catch {
-      try {
-        captureEl.setPointerCapture(pointerId);
-      } catch {
-        /* capture optional — window listeners still work while over the webview */
-      }
-    }
-    window.addEventListener("pointermove", onTrackPointerMove);
-    window.addEventListener("pointerup", onTrackPointerUp);
-    window.addEventListener("pointercancel", onTrackPointerCancel);
-    window.addEventListener("lostpointercapture", onLostPointerCapture);
-  }
-
-  function detachLiveDragListeners() {
-    window.removeEventListener("pointermove", onTrackPointerMove);
-    window.removeEventListener("pointerup", onTrackPointerUp);
-    window.removeEventListener("pointercancel", onTrackPointerCancel);
-    window.removeEventListener("lostpointercapture", onLostPointerCapture);
-
-    if (dragCaptureEl && dragPointerId !== null) {
-      try {
-        if (dragCaptureEl.hasPointerCapture(dragPointerId)) {
-          dragCaptureEl.releasePointerCapture(dragPointerId);
-        }
-      } catch {
-        /* pointer may already be released */
-      }
-    }
-    dragCaptureEl = null;
-    dragPointerId = null;
-  }
-
-  function attachSuspendedWatch() {
-    if (suspendedWatchAttached) return;
-    suspendedWatchAttached = true;
-    // Capture phase so we see re-entry even if something stops propagation.
-    window.addEventListener("pointermove", onSuspendedPointerActivity, true);
-    window.addEventListener("pointerdown", onSuspendedPointerActivity, true);
-    window.addEventListener("pointerup", onSuspendedPointerUp, true);
-    window.addEventListener("mouseup", onSuspendedMouseUp, true);
-  }
-
-  function detachSuspendedWatch() {
-    if (!suspendedWatchAttached) return;
-    suspendedWatchAttached = false;
-    window.removeEventListener("pointermove", onSuspendedPointerActivity, true);
-    window.removeEventListener("pointerdown", onSuspendedPointerActivity, true);
-    window.removeEventListener("pointerup", onSuspendedPointerUp, true);
-    window.removeEventListener("mouseup", onSuspendedMouseUp, true);
-  }
-
-  function clearSuspendedTrackDrag() {
-    detachSuspendedWatch();
-    suspendedTrackDrag = null;
-  }
-
-  /**
-   * Park an active drag when WebView cancels the pointer (leave window).
-   * Keeps the float visible; resume when the cursor re-enters with button held.
-   */
-  function suspendActiveTrackDrag() {
-    const drag = trackDrag;
-    if (!drag?.active) {
-      cleanupTrackPointerDrag();
-      return;
-    }
-    suspendedTrackDrag = {
-      ...drag,
-      active: true,
-      dropIndex: null,
-      dropPlaylistId: null,
-      outsideSince: null,
-    };
-    detachLiveDragListeners();
-    trackDrag = null;
-    document.body.classList.add("track-reorder-dragging");
-    setTrackDragActive(true, suspendedTrackDrag.isCopy);
-    attachSuspendedWatch();
-  }
-
-  function resumeTrackDragFromSuspended(e: PointerEvent) {
-    const parked = suspendedTrackDrag;
-    if (!parked) return;
-    clearSuspendedTrackDrag();
-    trackDrag = {
-      ...parked,
-      active: true,
-      pointerX: e.clientX,
-      pointerY: e.clientY,
-      isCopy: e.ctrlKey || e.metaKey || parked.isCopy,
-      outsideSince: null,
-    };
-    dragFloatSample = { x: e.clientX, y: e.clientY, t: performance.now() };
-    document.body.classList.add("track-reorder-dragging");
-    setTrackDragActive(true, trackDrag.isCopy);
-    attachLiveDragListeners(document.documentElement, e.pointerId);
-    // Recompute drop targets under the cursor immediately.
-    onTrackPointerMove(e);
-  }
-
-  function cleanupTrackPointerDrag(resetUi = true) {
-    detachLiveDragListeners();
-    clearSuspendedTrackDrag();
-    document.body.classList.remove("track-reorder-dragging");
-    trackDrag = null;
-    dragFloatRotate = -2.5;
-    // Do not clear suppressTrackClick here — pointerup arms it after cleanup
-    // so the synthetic click from this gesture can still be swallowed.
-    if (resetUi) resetTrackDrag();
-  }
-
-  /** WebView cancelled the pointer (typical when leaving the window). */
-  function onTrackPointerCancel(e: PointerEvent) {
-    if (dragPointerId !== null && e.pointerId !== dragPointerId) return;
-    if (trackDrag?.active) {
-      suspendActiveTrackDrag();
-      return;
-    }
-    // Already parked — ignore duplicate cancel so we don't wipe suspendedDrag.
-    if (suspendedTrackDrag) return;
-    cleanupTrackPointerDrag();
-  }
-
-  function onLostPointerCapture(e: PointerEvent) {
-    if (dragPointerId !== null && e.pointerId !== dragPointerId) return;
-    // Only suspend live drags. Do not clear a session that is already parked.
-    if (trackDrag?.active) {
-      suspendActiveTrackDrag();
-    }
-  }
-
-  function onSuspendedPointerActivity(e: PointerEvent) {
-    if (!suspendedTrackDrag) return;
-    // Primary button still down → resume in-app drag.
-    if ((e.buttons & 1) === 0) return;
-    if (isOutsideViewport(e.clientX, e.clientY)) {
-      // Still outside — keep parked, just track last coords for the float.
-      suspendedTrackDrag = {
-        ...suspendedTrackDrag,
-        pointerX: e.clientX,
-        pointerY: e.clientY,
-      };
-      return;
-    }
-    resumeTrackDragFromSuspended(e);
-  }
-
-  function onSuspendedPointerUp(e: PointerEvent) {
-    if (!suspendedTrackDrag) return;
-    if (e.button !== 0 && e.type === "pointerup") return;
-    finishSuspendedDrag(e.clientX, e.clientY, e.ctrlKey || e.metaKey);
-  }
-
-  function onSuspendedMouseUp(e: MouseEvent) {
-    if (!suspendedTrackDrag) return;
-    if (e.button !== 0) return;
-    finishSuspendedDrag(e.clientX, e.clientY, e.ctrlKey || e.metaKey);
-  }
-
-  /** Button released while session was parked outside the webview. */
-  function finishSuspendedDrag(
-    clientX: number,
-    clientY: number,
-    copy: boolean,
-  ) {
-    const parked = suspendedTrackDrag;
-    if (!parked) return;
-    clearSuspendedTrackDrag();
-
-    // Best-effort drop target at release position (if back over the list).
-    let dropIndex = parked.dropIndex;
-    let dropPlaylistId = parked.dropPlaylistId;
-    if (!isOutsideViewport(clientX, clientY) && canReorder) {
-      dropIndex = dropIndexFromPointerY(clientY);
-      dropPlaylistId = null;
-    }
-
-    document.body.classList.remove("track-reorder-dragging");
-    resetTrackDrag();
-    armSuppressTrackClick();
-    applyTrackDragDrop({
-      ...parked,
-      isCopy: copy || parked.isCopy,
-      dropIndex,
-      dropPlaylistId,
-      active: true,
-    });
+    attachLiveDragListeners(e.pointerId);
   }
 
   function trackByPath(path: string): MusicFile | undefined {
     return displayedTracks.find((item) => item.track.path === path)?.track;
   }
 
-  function isOutsideViewport(clientX: number, clientY: number): boolean {
-    return (
-      clientX <= 0 ||
-      clientY <= 0 ||
-      clientX >= window.innerWidth ||
-      clientY >= window.innerHeight
-    );
+  /**
+   * Hand files to the OS (Explorer / Telegram / Discord…).
+   * Returns true if export was started (or already in progress).
+   */
+  function beginOsFileExport(drag: TrackDragState): boolean {
+    if (drag.fileExportStarted) return true;
+    const audioPaths = audioPathsForDrag(drag.paths, trackByPath);
+    if (audioPaths.length === 0) {
+      showDragToast("No local file to export");
+      return false;
+    }
+    drag.fileExportStarted = true;
+    const iconPath = trackByPath(drag.paths[0])?.cover_path ?? null;
+    const { paths, sourcePlaylistId, isCopy } = drag;
+    beginExportTrackDragUi(paths, isCopy);
+    cleanupTrackPointerDrag(false);
+    void startFileDrag(audioPaths, {
+      iconPath,
+      trackSession: { paths, sourcePlaylistId, isCopy },
+    }).catch((err) => {
+      console.error("Failed to start file drag:", err);
+      showDragToast("Could not start file drag");
+      endExportTrackDragUi();
+      resetTrackDrag();
+    });
+    return true;
   }
 
   /**
-   * OS file export only after a long dwell fully outside the window.
-   * Never trigger on mere edge hover — that killed leave→re-enter reorder.
+   * When to switch from in-app drag → OS file drag:
+   * - Alt held (explicit export), once the drag is active
+   * - Cursor fully outside the window for FILE_EXPORT_OUTSIDE_MS
    */
   function shouldStartNativeFileDrag(
     drag: TrackDragState,
     clientX: number,
     clientY: number,
+    altHeld: boolean,
   ): boolean {
+    if (altHeld) return true;
+
     const outside = isOutsideViewport(clientX, clientY);
     if (!outside) {
       drag.outsideSince = null;
@@ -1345,6 +1232,7 @@
 
     trackDrag.active = true;
     trackDrag.isCopy = e.ctrlKey || e.metaKey;
+    trackDrag.exportMode = e.altKey;
     trackDrag.pointerX = e.clientX;
     trackDrag.pointerY = e.clientY;
     setTrackDragActive(true, trackDrag.isCopy);
@@ -1355,43 +1243,27 @@
       const dt = Math.max(8, now - dragFloatSample.t);
       const vx = (e.clientX - dragFloatSample.x) / dt; // px/ms
       const vy = (e.clientY - dragFloatSample.y) / dt;
-      // Right swipe → tip right (positive deg). Small base lean + motion.
       const target = Math.max(-11, Math.min(11, -2.2 + vx * 55 + vy * 8));
       dragFloatRotate = dragFloatRotate * 0.72 + target * 0.28;
       dragFloatSample = { x: e.clientX, y: e.clientY, t: now };
     }
 
-    // Outside the window elementFromPoint is useless — skip hit-test there.
-    const outside = isOutsideViewport(e.clientX, e.clientY);
-    const el = outside
-      ? null
-      : document.elementFromPoint(e.clientX, e.clientY);
-
-    // Optional OS export: only after long deliberate dwell fully outside.
+    // Alt+drag → immediate OS file export (explicit "pull song out").
+    // Fully outside for ~180ms → same (natural pull to Explorer / messengers).
     if (
       !trackDrag.fileExportStarted &&
-      shouldStartNativeFileDrag(trackDrag, e.clientX, e.clientY)
+      shouldStartNativeFileDrag(
+        trackDrag,
+        e.clientX,
+        e.clientY,
+        e.altKey,
+      )
     ) {
-      trackDrag.fileExportStarted = true;
-      const { paths, sourcePlaylistId, isCopy } = trackDrag;
-      const audioPaths = audioPathsForDrag(paths, trackByPath);
-      if (audioPaths.length > 0) {
-        const iconPath = trackByPath(paths[0])?.cover_path ?? null;
-        beginExportTrackDragUi(paths, isCopy);
-        cleanupTrackPointerDrag(false);
-        void startFileDrag(audioPaths, {
-          iconPath,
-          trackSession: { paths, sourcePlaylistId, isCopy },
-        }).catch((err) => {
-          console.error("Failed to start file drag:", err);
-        });
-      } else {
-        cleanupTrackPointerDrag();
-      }
+      beginOsFileExport(trackDrag);
       return;
     }
 
-    // While outside: keep session + float alive, just clear drop targets.
+    const outside = isOutsideViewport(e.clientX, e.clientY);
     if (outside) {
       trackDrag.dropPlaylistId = null;
       trackDrag.dropIndex = null;
@@ -1400,6 +1272,7 @@
       return;
     }
 
+    const el = document.elementFromPoint(e.clientX, e.clientY);
     const playlistId =
       el?.closest("[data-playlist-id]")?.getAttribute("data-playlist-id") ??
       null;
@@ -1519,6 +1392,17 @@
     }
   }
 
+  function onTrackPointerCancel(e: PointerEvent) {
+    if (dragPointerId !== null && e.pointerId !== dragPointerId) return;
+    const snapshot = trackDrag;
+    // WebView often cancels the pointer when leaving the window — treat that
+    // as "user is pulling the file out" and hand off to OS drag.
+    if (snapshot?.active && !snapshot.fileExportStarted) {
+      if (beginOsFileExport(snapshot)) return;
+    }
+    cleanupTrackPointerDrag();
+  }
+
   function onTrackPointerUp(e?: PointerEvent) {
     if (
       e &&
@@ -1531,6 +1415,16 @@
 
     const snapshot = trackDrag;
     const wasActive = snapshot?.active ?? false;
+
+    // If released while clearly outside, export files instead of in-app drop.
+    if (
+      wasActive &&
+      snapshot &&
+      !snapshot.fileExportStarted &&
+      isOutsideViewport(snapshot.pointerX, snapshot.pointerY)
+    ) {
+      if (beginOsFileExport(snapshot)) return;
+    }
 
     cleanupTrackPointerDrag();
 
@@ -1705,7 +1599,7 @@
         </div>
         <div
           class="track-rows"
-          class:track-drag-active={!!visualDrag?.active ||
+          class:track-drag-active={!!trackDrag?.active ||
             trackDragUi.isExportSession}
           class:has-reorder-gap={reorderGapActive}
           bind:this={rowsEl}
@@ -1726,8 +1620,8 @@
               {@const isActive = sameTrackPath(track.path, player.currentFile)}
               {@const isSelected = selectedPaths.has(track.path)}
               {@const isDraggingRow =
-                (!!visualDrag?.active &&
-                  visualDrag.paths.includes(track.path)) ||
+                (!!trackDrag?.active &&
+                  trackDrag.paths.includes(track.path)) ||
                 (trackDragUi.isExportSession &&
                   trackDragUi.draggingPaths.includes(track.path))}
               {@const gapShift =
@@ -1909,7 +1803,7 @@
   <div
     class="track-drag-float"
     class:is-copy={dragPreview.isCopy}
-    class:is-suspended={dragPreview.suspended}
+    class:is-export={dragPreview.exportMode}
     style="left: {dragPreview.x + 14}px; top: {dragPreview.y + 12}px; transform: rotate({dragPreview.rotate.toFixed(2)}deg)"
     aria-hidden="true"
   >
@@ -1931,7 +1825,9 @@
       {#if dragPreview.artist}
         <span class="track-drag-float-artist">{dragPreview.artist}</span>
       {/if}
-      {#if dragPreview.isCopy}
+      {#if dragPreview.exportMode}
+        <span class="track-drag-float-mode">Export file</span>
+      {:else if dragPreview.isCopy}
         <span class="track-drag-float-mode">Copy</span>
       {/if}
     </div>

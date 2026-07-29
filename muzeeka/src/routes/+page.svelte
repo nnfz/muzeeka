@@ -7,6 +7,7 @@
   import WindowControls from '$lib/components/WindowControls.svelte';
   import SettingsWindow from '$lib/components/SettingsWindow.svelte';
   import DownloadWindow from '$lib/components/DownloadWindow.svelte';
+  import DragFloatWindow from '$lib/components/DragFloatWindow.svelte';
   import SearchBar from '$lib/components/SearchBar.svelte';
   import ImportProgressBar from '$lib/components/ImportProgressBar.svelte';
   import { precreateDownloadWindow } from '$lib/stores/download.svelte';
@@ -19,12 +20,22 @@
   const currentWin = getCurrentWindow();
   const isSettingsWindow = currentWin.label === 'settings';
   const isDownloadWindow = currentWin.label === 'download';
-  const isSecondaryWindow = isSettingsWindow || isDownloadWindow;
+  const isDragFloatWindow = currentWin.label === 'drag-float';
+  const isSecondaryWindow =
+    isSettingsWindow || isDownloadWindow || isDragFloatWindow;
 
   let player = $state<ReturnType<typeof getPlayerStore> | null>(null);
   let ensurePlayerReady: () => Promise<void>;
 
-  if (isSettingsWindow) {
+  if (isDragFloatWindow) {
+    ensurePlayerReady = async () => {};
+    // Overlay must be fully transparent (app.css paints a dark body by default).
+    if (typeof document !== 'undefined') {
+      document.documentElement.style.background = 'transparent';
+      document.body.style.background = 'transparent';
+      document.body.style.overflow = 'hidden';
+    }
+  } else if (isSettingsWindow) {
     ensurePlayerReady = async () => {
       try {
         await invoke('player_init');
@@ -41,12 +52,25 @@
 
   // Secondary windows only read settings for UI — do not re-push EQ/rate/pitch
   // into the live player (that was freezing the app on Settings open).
-  const settings = createSettingsStore(ensurePlayerReady, {
-    applyToPlayer: !isSecondaryWindow,
-  });
-  setSettingsStore(settings);
+  // Drag-float is a tiny transparent overlay — skip settings store entirely.
+  if (!isDragFloatWindow) {
+    const settings = createSettingsStore(ensurePlayerReady, {
+      applyToPlayer: !isSecondaryWindow,
+    });
+    setSettingsStore(settings);
+  }
   let searchQuery = $state('');
   let fullscreenOpen = $state(false);
+
+  // Unstick UI if a previous drag-float / pointer-capture experiment left leftovers.
+  if (!isSecondaryWindow && typeof document !== 'undefined') {
+    document.body.classList.remove('track-reorder-dragging');
+    void invoke('drag_float_hide').catch(() => {});
+    // Close orphan drag-float window if it still exists.
+    void WebviewWindow.getByLabel('drag-float').then((w) => {
+      void w?.close();
+    }).catch(() => {});
+  }
 
   if (!isSecondaryWindow) {
     const precreateSettingsWindow = async () => {
@@ -131,7 +155,7 @@
   }
 
   function handleMouseDown(e: MouseEvent) {
-    if (isSecondaryWindow || !player) return;
+    if (isDragFloatWindow || isSecondaryWindow || !player) return;
     if (e.button !== 3 && e.button !== 4) return;
     if (isTypingTarget(e.target)) return;
 
@@ -163,7 +187,7 @@
   }
 
   function handleKeydown(e: KeyboardEvent) {
-    if (isSecondaryWindow || !player) return;
+    if (isDragFloatWindow || isSecondaryWindow || !player) return;
 
     const mod = e.ctrlKey || e.metaKey;
 
@@ -283,7 +307,9 @@
 
 <svelte:window onkeydown={handleKeydown} onmousedown={handleMouseDown} />
 
-{#if isSettingsWindow}
+{#if isDragFloatWindow}
+  <DragFloatWindow />
+{:else if isSettingsWindow}
   <SettingsWindow />
 {:else if isDownloadWindow}
   <DownloadWindow />

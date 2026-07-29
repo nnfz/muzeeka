@@ -7,6 +7,7 @@ mod commands;
 mod cue;
 mod discord_rpc;
 mod drop_handler;
+mod drag_float;
 mod file_drag;
 mod cover_url_cache;
 mod imgbb;
@@ -278,6 +279,11 @@ pub fn run() {
             let remote_http =
                 RemoteServer::new(remote_controller, remote_enabled, remote_port);
             app.manage(remote_http);
+            app.manage(drag_float::DragFloatState::new());
+            // Never leave a leftover always-on-top overlay from a previous crash.
+            if let Some(win) = app.get_webview_window(drag_float::DRAG_FLOAT_LABEL) {
+                let _ = win.close();
+            }
 
             Ok(())
         })
@@ -342,6 +348,10 @@ pub fn run() {
             commands::vk_login,
             commands::vk_logout,
             file_drag::start_file_drag,
+            drag_float::drag_float_show,
+            drag_float::drag_float_update,
+            drag_float::drag_float_hide,
+            drag_float::drag_float_get_payload,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

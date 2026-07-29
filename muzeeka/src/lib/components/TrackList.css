@@ -556,10 +556,12 @@
   border-color: color-mix(in srgb, var(--accent) 45%, var(--border-subtle));
 }
 
-/* Parked while cursor is outside the WebView — still visible, slightly dim. */
-.track-drag-float.is-suspended {
-  opacity: 0.88;
-  filter: saturate(0.85);
+.track-drag-float.is-export {
+  border-color: color-mix(in srgb, #3dd68c 50%, var(--border-subtle));
+}
+
+.track-drag-float.is-export .track-drag-float-mode {
+  color: #3dd68c;
 }
 
 .track-drag-float-cover {
