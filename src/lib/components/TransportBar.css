@@ -31,7 +31,7 @@
 .transport-info {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 12px;
   flex: 1;
   min-width: 0;
   max-width: 310px;
@@ -185,44 +185,43 @@
   overflow: visible;
 }
 
-/* Like button at the bottom (TransportBar) */
 .like-btn-transport {
   display: flex;
   align-items: center;
   justify-content: center;
   width: 26px;
   height: 26px;
-  margin-left: 2px;
   background: transparent;
   border: none;
-  color: var(--text-muted);
-  opacity: 0.65;
+  color: var(--text-secondary);
   border-radius: 5px;
   cursor: pointer;
-  transition: all var(--transition-fast);
+  transition: color var(--transition-fast);
   flex-shrink: 0;
 }
 
 .like-btn-transport:hover {
+  color: #e25555;
+}
+
+.like-icon-stack {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+}
+
+.like-icon-layer {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  opacity: 0;
+  transition: opacity 150ms ease;
+}
+
+.like-icon-layer.visible {
   opacity: 1;
-  color: #e25555;
-  /* background: rgba(226, 85, 85, 0.1); */
-}
-
-.like-btn-transport.liked {
-  color: #e25555;
-  opacity: 0.95;
-}
-
-.like-btn-transport .like-icon {
-  transition: transform var(--transition-fast);
-}
-
-.like-btn-transport.liked .like-icon {
-  transform: scale(1.02);
-}
-
-.like-btn-transport.liked:hover {
-  color: #c93f3f;
-  background: rgba(226, 85, 85, 0.16);
 }

@@ -13,7 +13,6 @@
   align-items: center;
 }
 
-/* Track aligned with mute icon; % floats above the fill edge */
 .volume-track-wrap {
   position: relative;
   width: 110px;
@@ -43,11 +42,9 @@
   user-select: none;
   z-index: 6;
   opacity: 1;
-  /* Auto-hide without JS timers (timers were getting cleared and leaving % stuck). */
   animation: volume-pct-hold-fade 0.85s ease forwards;
 }
 
-/* While dragging: stay fully visible, no fade */
 .volume-pct.sticky {
   animation: none;
   opacity: 1;
@@ -88,7 +85,6 @@
   touch-action: none;
 }
 
-/* Invisible hit pad — bar stays 4px, grab zone ~28px tall */
 .slider-track::before {
   content: '';
   position: absolute;
@@ -136,7 +132,6 @@
   max-width: 100%;
 }
 
-/* Volume: no width animation — % and fill move in lockstep */
 .media-slider.volume .slider-fill {
   transition: none;
 }
@@ -174,12 +169,11 @@
   width: 32px;
   height: 32px;
   border-radius: var(--radius-full);
-  color: var(--text-primary);
-  transition: color var(--transition-fast), background var(--transition-fast);
+  color: var(--text-secondary);
+  transition: all var(--transition-fast);
 }
 
 .volume-btn:hover {
-
   background: rgba(255, 255, 255, 0.06);
 }
 
@@ -196,8 +190,11 @@
   display: block;
   width: 18px;
   height: 18px;
-  object-fit: contain;
   flex-shrink: 0;
+  background-color: currentColor;
+  -webkit-mask: var(--control-icon) center / contain no-repeat;
+  mask: var(--control-icon) center / contain no-repeat;
+  transition: all var(--transition-fast);
 }
 
 .volume-icon-append {
@@ -208,6 +205,29 @@
   display: block;
   width: 18px;
   height: 18px;
-  object-fit: contain;
+  background-color: currentColor;
+  -webkit-mask: var(--control-icon) center / contain no-repeat;
+  mask: var(--control-icon) center / contain no-repeat;
   pointer-events: none;
+  opacity: 0;
+  transition: all var(--transition-fast);
+}
+
+
+.volume-btn:hover .volume-icon-base, .volume-btn:hover .volume-icon-append {
+  color: var(--text-primary);
+}
+
+
+.volume-icon-append.visible {
+  opacity: 1;
+}
+
+.volume-icon-append.slide {
+  transform: translate(calc(-50% - 4px), -50%) scale(0.8);
+  transition: all var(--transition-fast);
+}
+
+.volume-icon-append.slide.visible {
+  transform: translate(-50%, -50%);
 }

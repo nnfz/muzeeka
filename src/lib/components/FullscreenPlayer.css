@@ -457,7 +457,7 @@
   justify-self: end;
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: 12px;
   min-width: 0;
   max-width: 240px;
 }

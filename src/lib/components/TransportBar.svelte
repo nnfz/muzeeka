@@ -200,12 +200,22 @@
         {#if player.hasTrack && player.currentFile}
           <button
             class="like-btn-transport"
-            class:liked={player.isLiked(player.currentFile)}
             onclick={() => { if (player.currentFile) player.toggleLike(player.currentFile); }}
             title={player.isLiked(player.currentFile) ? 'Remove from Liked' : 'Add to Liked'}
             aria-label={player.isLiked(player.currentFile) ? 'Unlike current track' : 'Like current track'}
           >
-            <span class="control-icon like-icon" style:--control-icon={"url('/icons/heart.svg')"} aria-hidden="true"></span>
+            <span class="like-icon-stack" aria-hidden="true">
+              <span
+                class="control-icon like-icon like-icon-layer"
+                class:visible={!player.isLiked(player.currentFile)}
+                style:--control-icon={"url('/icons/heart.svg')"}
+              ></span>
+              <span
+                class="control-icon like-icon like-icon-layer"
+                class:visible={player.isLiked(player.currentFile)}
+                style:--control-icon={"url('/icons/heartfilled.svg')"}
+              ></span>
+            </span>
           </button>
         {/if}
       {/if}
@@ -293,7 +303,7 @@
     </div>
 
     <div class="transport-right"> 
-      <MediaSlider variant="volume" useStaticIcons />
+      <MediaSlider variant="volume"/>
     </div>
   </div>
   <div class="transport-progress">

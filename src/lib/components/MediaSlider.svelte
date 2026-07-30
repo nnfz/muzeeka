@@ -1,14 +1,12 @@
 <script lang="ts">
-  import { onDestroy, onMount } from 'svelte';
+  import { onDestroy } from 'svelte';
   import { getPlayerStore } from '$lib/stores/player.svelte';
 
   interface Props {
     variant: 'progress' | 'volume';
-    /** Use /static/icons volume set instead of inline SVG. */
-    useStaticIcons?: boolean;
   }
 
-  let { variant, useStaticIcons = true }: Props = $props();
+  let { variant }: Props = $props();
 
   const player = getPlayerStore();
   const SEEK_STEP_SEC = 5;
@@ -21,25 +19,13 @@
   let previousVolume = $state(0.8);
   let liveVolume = $state(player.volume);
 
-  /** % bubble: shown only while this is true; hide via CSS animation end (no sticky timers). */
   let showPct = $state(false);
-  /** Bump to remount bubble and restart fade-out animation. */
   let pctKey = $state(0);
-  /** True while pointer is over this volume control (for window wheel). */
   let hovered = $state(false);
 
   let isMuted = $derived(liveVolume === 0);
-  let volumeIcon = $derived(
-    isMuted
-      ? 'muted'
-      : liveVolume > 0.66
-        ? 'high'
-        : liveVolume > 0.33
-          ? 'med'
-          : liveVolume > 0
-            ? 'low'
-            : 'muted'
-  );
+  let showMed = $derived(!isMuted && liveVolume > 0.33);
+  let showMax = $derived(!isMuted && liveVolume > 0.66);
 
   let activeRatio = $derived(
     isDragging
@@ -66,17 +52,12 @@
     player.setVolume(v);
   }
 
-  /**
-   * Show % and restart CSS auto-hide (unless sticky drag).
-   * Remount via pctKey so animation always restarts cleanly.
-   */
   function flashPct() {
     if (variant !== 'volume') return;
     showPct = true;
     pctKey += 1;
   }
 
-  /** Ignore animationend from a replaced (stale) bubble after pctKey bump. */
   function onPctAnimationEnd(forKey: number, e: AnimationEvent) {
     if (e.target !== e.currentTarget) return;
     if (forKey !== pctKey) return;
@@ -84,7 +65,6 @@
     showPct = false;
   }
 
-  // Sync from store (keyboard / remote) — never opens %.
   $effect(() => {
     if (variant !== 'volume' || isDragging) return;
     const remote = player.volume;
@@ -101,7 +81,6 @@
     }
   });
 
-  // Window wheel while hovered — works in fullscreen where element wheel is unreliable.
   $effect(() => {
     if (variant !== 'volume') return;
 
@@ -133,7 +112,6 @@
     window.removeEventListener('pointerup', endDragFromWindow);
     window.removeEventListener('pointercancel', endDragFromWindow);
     setVolumeUi(dragValue);
-    // Remount bubble with fade-out animation
     flashPct();
   }
 
@@ -163,7 +141,6 @@
 
     if (variant === 'volume') {
       setVolumeUi(dragValue);
-      // Sticky while dragging: show without relying on fade-out yet
       showPct = true;
       pctKey += 1;
       window.addEventListener('pointerup', endDragFromWindow);
@@ -250,7 +227,6 @@
 
   function onVolumeLeave() {
     hovered = false;
-    // If not dragging, let current fade finish / force hide if stuck solid
     if (!isDragging && showPct) {
       flashPct();
     }
@@ -270,36 +246,24 @@
       onclick={toggleMute}
       aria-label={isMuted ? 'Unmute' : 'Mute'}
     >
-      {#if useStaticIcons}
-        <span class="volume-icon-stack" aria-hidden="true">
-          <img class="volume-icon-base" src="/icons/volmin.svg" alt="" loading="eager" decoding="sync" />
-          {#if isMuted}
-            <img class="volume-icon-append" src="/icons/mute.svg" alt="" loading="eager" decoding="sync" />
-          {:else if liveVolume > 0.66}
-            <img class="volume-icon-append" src="/icons/volmed.svg" alt="" loading="eager" decoding="sync" />
-            <img class="volume-icon-append volume-icon-append--second" src="/icons/volmax.svg" alt="" loading="eager" decoding="sync" />
-          {:else if liveVolume > 0.33}
-            <img class="volume-icon-append" src="/icons/volmed.svg" alt="" loading="eager" decoding="sync" />
-          {/if}
-        </span>
-      {:else if volumeIcon === 'muted'}
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
-          <line x1="23" y1="9" x2="17" y2="15"/>
-          <line x1="17" y1="9" x2="23" y2="15"/>
-        </svg>
-      {:else if volumeIcon === 'low' || volumeIcon === 'med'}
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
-          <path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>
-        </svg>
-      {:else}
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
-          <path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>
-          <path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>
-        </svg>
-      {/if}
+      <span class="volume-icon-stack" aria-hidden="true">
+        <span class="volume-icon-base" style:--control-icon={"url('/icons/volmin.svg')"}></span>
+        <span
+          class="volume-icon-append"
+          class:visible={isMuted}
+          style:--control-icon={"url('/icons/mute.svg')"}
+        ></span>
+        <span
+          class="volume-icon-append slide"
+          class:visible={showMed}
+          style:--control-icon={"url('/icons/volmed.svg')"}
+        ></span>
+        <span
+          class="volume-icon-append volume-icon-append--second slide"
+          class:visible={showMax}
+          style:--control-icon={"url('/icons/volmax.svg')"}
+        ></span>
+      </span>
     </button>
 
     <div class="volume-track-wrap">
