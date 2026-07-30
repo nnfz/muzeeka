@@ -1,6 +1,162 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+
+const BASS_CORE_URL: &str = "https://www.un4seen.com/files/bass24.zip";
+const BASS_DOWNLOADS: &[(&str, &str)] = &[
+    ("bass_fx.dll", "https://www.un4seen.com/files/z/0/bass_fx24.zip"),
+    ("bassalac.dll", "https://www.un4seen.com/files/bassalac24.zip"),
+    ("bassape.dll", "https://www.un4seen.com/files/bassape24.zip"),
+    ("bassflac.dll", "https://www.un4seen.com/files/bassflac24.zip"),
+    ("basshls.dll", "https://www.un4seen.com/files/basshls24.zip"),
+    ("bassmidi.dll", "https://www.un4seen.com/files/bassmidi24.zip"),
+    ("bassmix.dll", "https://www.un4seen.com/files/bassmix24.zip"),
+    ("bassopus.dll", "https://www.un4seen.com/files/bassopus24.zip"),
+    ("basswasapi.dll", "https://www.un4seen.com/files/basswasapi24.zip"),
+    ("basswma.dll", "https://www.un4seen.com/files/basswm24.zip"),
+    ("basswv.dll", "https://www.un4seen.com/files/basswv24.zip"),
+];
+
+const TOOL_DOWNLOADS: &[(&str, &str)] = &[
+    ("yt-dlp.exe", "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"),
+    ("spotdl.exe", "https://github.com/spotDL/spotify-downloader/releases/latest/download/spotDL"),
+];
+
+const FFMPEG_URL: &str = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip";
+
+fn run_powershell(script: &str) -> Result<(), String> {
+    let status = Command::new("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ])
+        .status()
+        .map_err(|error| format!("Failed to start PowerShell: {error}"))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("PowerShell exited with status {status}"))
+    }
+}
+
+fn escape_ps(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
+fn ensure_download(url: &str, destination: &Path) -> Result<(), String> {
+    if destination.is_file() {
+        return Ok(());
+    }
+
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Failed to create {}: {error}", parent.display()))?;
+    }
+
+    let destination = escape_ps(&destination.display().to_string());
+    let url = escape_ps(url);
+    let script = format!(
+        "$ErrorActionPreference='Stop'; [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri '{url}' -OutFile '{destination}'"
+    );
+    run_powershell(&script)
+}
+
+fn extract_selected(zip_path: &Path, destination: &Path, wanted_names: &[&str]) -> Result<(), String> {
+    if wanted_names.iter().all(|name| destination.join(name).is_file()) {
+        return Ok(());
+    }
+
+    fs::create_dir_all(destination)
+        .map_err(|error| format!("Failed to create {}: {error}", destination.display()))?;
+
+    let zip_path = escape_ps(&zip_path.display().to_string());
+    let destination = escape_ps(&destination.display().to_string());
+    let wanted = wanted_names
+        .iter()
+        .map(|name| format!("'{}'", escape_ps(name)))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let script = format!(
+        r#"$ErrorActionPreference='Stop';
+$zip = '{zip_path}';
+$dest = '{destination}';
+$tmp = Join-Path $env:TEMP ('muzeeka-' + [guid]::NewGuid().ToString());
+New-Item -ItemType Directory -Path $tmp | Out-Null;
+Expand-Archive -LiteralPath $zip -DestinationPath $tmp -Force;
+$wanted = @({wanted});
+Get-ChildItem -LiteralPath $tmp -Recurse -File | Where-Object {{ $wanted -contains $_.Name }} | ForEach-Object {{ Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $dest $_.Name) -Force }};
+Remove-Item -LiteralPath $tmp -Recurse -Force;"#
+    );
+
+    run_powershell(&script)
+}
+
+fn ensure_native_assets(manifest_dir: &Path) -> Result<(), String> {
+    if !cfg!(windows) {
+        return Ok(());
+    }
+
+    let bass_dir = manifest_dir.join("bass");
+    let bin_dir = manifest_dir.join("bin");
+
+    let bass_required = [
+        "bass.dll",
+        "bass_fx.dll",
+        "bassalac.dll",
+        "bassape.dll",
+        "bassflac.dll",
+        "basshls.dll",
+        "bassmidi.dll",
+        "bassmix.dll",
+        "bassopus.dll",
+        "basswasapi.dll",
+        "basswma.dll",
+        "basswv.dll",
+    ];
+
+    if !bass_required.iter().all(|name| bass_dir.join(name).is_file()) {
+        let temp_dir = env::temp_dir().join("muzeeka-bass");
+        let core_zip = temp_dir.join("bass24.zip");
+        ensure_download(BASS_CORE_URL, &core_zip)?;
+        extract_selected(&core_zip, &bass_dir, &["bass.dll"])?;
+
+        for (file_name, url) in BASS_DOWNLOADS {
+            let zip_path = temp_dir.join(file_name.replace(".dll", ".zip"));
+            ensure_download(url, &zip_path)?;
+            extract_selected(&zip_path, &bass_dir, &[*file_name])?;
+        }
+    }
+
+    let tool_targets = ["yt-dlp.exe", "spotdl.exe", "ffmpeg.exe", "ffprobe.exe", "ffplay.exe"];
+    let ffmpeg_ready = tool_targets.iter().all(|name| bin_dir.join(name).is_file());
+    if !ffmpeg_ready {
+        let temp_dir = env::temp_dir().join("muzeeka-tools");
+        fs::create_dir_all(&temp_dir)
+            .map_err(|error| format!("Failed to create {}: {error}", temp_dir.display()))?;
+
+        for (file_name, url) in TOOL_DOWNLOADS {
+            let destination = bin_dir.join(file_name);
+            ensure_download(url, &destination)?;
+        }
+
+        let ffmpeg_zip = temp_dir.join("ffmpeg-release-essentials.zip");
+        ensure_download(FFMPEG_URL, &ffmpeg_zip)?;
+        extract_selected(
+            &ffmpeg_zip,
+            &bin_dir,
+            &["ffmpeg.exe", "ffprobe.exe", "ffplay.exe"],
+        )?;
+    }
+
+    Ok(())
+}
 
 fn copy_bin_tree(src: &Path, dst: &Path) -> usize {
     if !src.is_dir() {
@@ -34,9 +190,13 @@ fn copy_bin_tree(src: &Path, dst: &Path) -> usize {
 }
 
 fn main() {
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    if let Err(error) = ensure_native_assets(&manifest_dir) {
+        panic!("{error}");
+    }
+
     tauri_build::build();
 
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let bass_src = manifest_dir.join("bass");
     if !bass_src.join("bass.dll").is_file() {
         return;

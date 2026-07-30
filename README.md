@@ -12,16 +12,34 @@
 	A desktop music player built with Tauri, SvelteKit, and Rust.
 </p>
 
+<p align="center">
+	<a href="https://github.com/nnfz/muzeeka/releases">Releases</a> ·
+	<a href="https://github.com/nnfz/muzeeka/issues">Issues</a>
+</p>
+
+> **Status:** early beta.  
+> It works, but expect rough edges, incomplete features and occasional weirdness.
+
 ## What is it?
 
-Muzeeka is a cross-platform desktop audio player focused on local library playback, playlist management, and a polished native-feeling UI.
+Muzeeka is a desktop audio player focused on local library playback, playlist management, and a polished UI.
+
+**Supported platforms:** Windows only (for now).
 
 ## Features
 
-- Desktop app built with Tauri + SvelteKit
-- Local audio library and playlist workflows
-- Modern UI with lyrics, search, drag-and-drop, and playback controls
-- Rust-powered backend for media handling and app integration
+- Local library with folder scanning, metadata & cover art
+- Playlists (create, reorder, custom covers, liked tracks)
+- Gapless playback powered by BASS
+- Equalizer with custom presets
+- Synchronized lyrics (LRC/TTML) + fullscreen lyrics view
+- Search, drag-and-drop, context menus
+- Download audio via yt-dlp, spotDL and VK
+- Discord Rich Presence
+- Built-in remote control over local network
+- Playback speed control with optional pitch correction
+- CUE sheet support
+- Frameless modern UI with fullscreen player
 
 ## Getting Started
 
@@ -64,11 +82,11 @@ src-tauri/target/release/bundle/nsis/
 npm run build:portable
 ```
 
-After building, create a portable package by placing these together:
+The folder is generated in:
 
-1. `src-tauri/target/release/muzeeka.exe`
-2. `src-tauri/bass/`
-3. Zip the folder contents
+```text
+src-tauri/target/release/
+```
 
 ### Both builds
 
@@ -92,9 +110,10 @@ Contributions are welcome. If you want to help, a good workflow is:
 
 1. Fork or branch from the main repository
 2. Install dependencies with `npm install`
-3. Make your changes
-4. Run `npm run check` and any relevant build or test commands
-5. Open a pull request with a short description of what changed and why
+3. Run `npm run tauri dev` to test your changes locally
+4. Make your changes
+5. Run `npm run check` and ensure `npm run tauri build` passes without errors
+6. Open a pull request with a short description of what changed and why
 
 If you are fixing a bug, please include the reproduction steps and what you verified.
 
@@ -102,6 +121,10 @@ If you are fixing a bug, please include the reproduction steps and what you veri
 
 Muzeeka depends on a number of great projects and libraries:
 
+- [BASS](https://www.un4seen.com/) - the core audio playback engine
+- [FFmpeg](https://ffmpeg.org/) - multimedia processing and conversion
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp) - media extraction capabilities
+- [spotDL](https://github.com/spotDL/spotify-downloader) - track integration and downloading
 - [Tauri](https://tauri.app/) - the desktop application framework
 - [SvelteKit](https://svelte.dev/docs/kit) - application framework for the UI
 - [Svelte](https://svelte.dev/) - reactive component framework
@@ -123,22 +146,17 @@ Muzeeka depends on a number of great projects and libraries:
 - [rusqlite](https://crates.io/crates/rusqlite) - SQLite access
 - [axum](https://crates.io/crates/axum) - backend HTTP server components
 
-## Possible additions for this README
+## Legal & Third-Party Notices
 
-- Screenshots or a short animated demo
-- A release download section
-- A feature roadmap
-- A troubleshooting section for common Windows issues
-- A license badge and a short license summary
-- A changelog or version history
+Muzeeka integrates several powerful third-party libraries and CLI tools to handle media playback and extraction. These tools are governed by their own respective licenses:
 
-## Notes
-
-- Portable builds require the `bass/` folder next to `muzeeka.exe`.
-- On Windows, WebView2 is usually required, and Visual C++ Redistributable may also be needed.
+- **[BASS Audio Library](https://www.un4seen.com/)**: Audio playback is powered by the BASS library. BASS is a product of Un4seen Developments Ltd. It is free for non-commercial use. If you intend to distribute or use Muzeeka commercially, you must obtain a separate commercial license from Un4seen Developments.
+- **[FFmpeg](https://ffmpeg.org/)**: This software uses the code of FFmpeg to handle audio processing, licensed under the LGPLv2.1 / GPLv3. FFmpeg is a trademark of Fabrice Bellard, originator of the FFmpeg project.
+- **[yt-dlp](https://github.com/yt-dlp/yt-dlp)**: Used for media extraction. Released into the public domain (Unlicense).
+- **[spotDL](https://github.com/spotDL/spotify-downloader)**: Utilized for Spotify track capabilities. Licensed under the MIT License.
 
 ## License
 
-This project is licensed under the MIT License. See [LICENSE](LICENSE) for the full text.
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for the full text. 
 
-Third-party dependencies keep their own upstream licenses. If you want, I can also add a short third-party notices section or generate a dependency license list.
+*Note: The MIT license applies only to the source code of Muzeeka itself, not to the pre-compiled third-party binaries (such as BASS or FFmpeg) required to run the application.*
