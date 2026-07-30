@@ -80,6 +80,38 @@ function toHex(r: number, g: number, b: number): string {
   );
 }
 
+function hexToRgb(hex: string): [number, number, number] | null {
+  const value = hex.trim().replace(/^#/, '');
+  if (value.length !== 3 && value.length !== 6) return null;
+
+  const normalized = value.length === 3 ? value.split('').map((part) => part + part).join('') : value;
+  const parsed = Number.parseInt(normalized, 16);
+  if (!Number.isFinite(parsed) || normalized.length !== 6) return null;
+
+  return [(parsed >> 16) & 255, (parsed >> 8) & 255, parsed & 255];
+}
+
+function channelToLinear(value: number): number {
+  const srgb = value / 255;
+  return srgb <= 0.04045 ? srgb / 12.92 : ((srgb + 0.055) / 1.055) ** 2.4;
+}
+
+function relativeLuminance(r: number, g: number, b: number): number {
+  return 0.2126 * channelToLinear(r) + 0.7152 * channelToLinear(g) + 0.0722 * channelToLinear(b);
+}
+
+function playButtonColors(accent: string): { bg: string; fg: string } {
+  const rgb = hexToRgb(accent);
+  if (!rgb) return { bg: accent, fg: '#ffffff' };
+
+  const luminance = relativeLuminance(rgb[0], rgb[1], rgb[2]);
+  if (luminance > 0.55) {
+    return { bg: '#111111', fg: '#ffffff' };
+  }
+
+  return { bg: accent, fg: '#ffffff' };
+}
+
 function juicyScore(r: number, g: number, b: number): number {
   const [, s, l] = rgbToHsl(r, g, b);
   if (s < 0.18) return 0;
@@ -111,6 +143,10 @@ function writeAccentVars(palette: AccentPalette) {
   root.style.setProperty('--accent-glow', palette.glow);
   root.style.setProperty('--accent-soft', palette.soft);
   root.style.setProperty('--border-accent', palette.border);
+
+  const playButton = playButtonColors(palette.accent);
+  root.style.setProperty('--play-btn-bg', playButton.bg);
+  root.style.setProperty('--play-btn-fg', playButton.fg);
 }
 
 /** Apply accent CSS vars (used by secondary windows + main). */

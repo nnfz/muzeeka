@@ -205,9 +205,7 @@
             title={player.isLiked(player.currentFile) ? 'Remove from Liked' : 'Add to Liked'}
             aria-label={player.isLiked(player.currentFile) ? 'Unlike current track' : 'Like current track'}
           >
-            <svg width="16" height="16" viewBox="0 0 24 24" fill={player.isLiked(player.currentFile) ? 'currentColor' : 'none'} stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z" />
-            </svg>
+            <span class="control-icon like-icon" style:--control-icon={"url('/icons/heart.svg')"} aria-hidden="true"></span>
           </button>
         {/if}
       {/if}
@@ -222,9 +220,11 @@
         aria-label={player.shuffleEnabled ? 'Disable shuffle' : 'Enable shuffle'}
         title={player.shuffleEnabled ? 'Shuffle on' : 'Shuffle'}
       >
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-          <path d="M10.59 9.17 5.41 4 4 5.41l5.17 5.17 1.42-1.41zM14.5 4l2.04 2.04L4 18.59 5.41 20 17.96 7.46 20 9.5V4h-5.5zm.33 9.41-1.41 1.41 3.13 3.13L14.5 20H20v-5.51l-2.04 2.04-3.13-3.12z"/>
-        </svg>
+      {#if player.shuffleEnabled}
+        <span class="control-icon" style:--control-icon={"url('/icons/shuffle.svg')"} aria-hidden="true"></span>
+      {:else}
+        <span class="control-icon" style:--control-icon={"url('/icons/noshuffle.svg')"} aria-hidden="true"></span>
+      {/if}
       </button>
 
       <button
@@ -233,9 +233,7 @@
         disabled={!player.hasTrack}
         aria-label="Previous track"
       >
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
-          <path d="M6 6h2v12H6zm3.5 6 8.5 6V6z"/>
-        </svg>
+        <span class="control-icon" style:--control-icon={"url('/icons/playbackward.svg')"} aria-hidden="true"></span>
       </button>
 
       <button
@@ -246,14 +244,9 @@
         aria-label={player.isPlaying ? 'Pause' : player.isPaused ? 'Resume' : 'Play'}
       >
         {#if player.isPlaying}
-          <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor">
-            <rect x="6" y="4" width="4" height="16" rx="1"/>
-            <rect x="14" y="4" width="4" height="16" rx="1"/>
-          </svg>
+          <span class="control-icon play-icon" style:--control-icon={"url('/icons/pause.svg')"} aria-hidden="true"></span>
         {:else}
-          <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor">
-            <path d="M8 5v14l11-7z"/>
-          </svg>
+          <span class="control-icon play-icon" style:--control-icon={"url('/icons/play.svg')"} aria-hidden="true"></span>
         {/if}
       </button>
 
@@ -263,9 +256,7 @@
         disabled={!player.hasNext}
         aria-label="Next track"
       >
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
-          <path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z"/>
-        </svg>
+        <span class="control-icon" style:--control-icon={"url('/icons/playforward.svg')"} aria-hidden="true"></span>
       </button>
 
       <button
@@ -289,17 +280,19 @@
               : 'Repeat'
         }
       >
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-          <path d="M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4z"/>
-        </svg>
+        <!-- <span class="control-icon" style:--control-icon={"url('/icons/repeat.svg')"} aria-hidden="true"></span> -->
         {#if player.repeatMode === 'one'}
-          <span class="repeat-one-badge" aria-hidden="true">1</span>
+          <span class="control-icon" style:--control-icon={"url('/icons/repeat.svg')"} aria-hidden="true"></span>
+        {:else if player.repeatMode === 'all'}
+          <span class="control-icon" style:--control-icon={"url('/icons/repeatplaylist.svg')"} aria-hidden="true"></span>
+        {:else}
+          <span class="control-icon" style:--control-icon={"url('/icons/norepeat.svg')"} aria-hidden="true"></span>
         {/if}
       </button>
 
     </div>
 
-    <div class="transport-right">
+    <div class="transport-right"> 
       <MediaSlider variant="volume" />
     </div>
   </div>

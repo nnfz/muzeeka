@@ -55,11 +55,15 @@
   --accent-hover: #7c3aed;
   --accent-glow: rgba(139, 92, 246, 0.35);
   --accent-soft: rgba(139, 92, 246, 0.12);
+  --play-btn-bg: var(--accent);
+  --play-btn-fg: #ffffff;
   transition:
     --accent 420ms ease,
     --accent-hover 420ms ease,
     --accent-glow 420ms ease,
     --accent-soft 420ms ease,
+    --play-btn-bg 420ms ease,
+    --play-btn-fg 420ms ease,
     --border-accent 420ms ease;
 
   /* Text palette */
