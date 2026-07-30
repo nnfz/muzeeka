@@ -293,7 +293,7 @@
     </div>
 
     <div class="transport-right"> 
-      <MediaSlider variant="volume" />
+      <MediaSlider variant="volume" useStaticIcons />
     </div>
   </div>
   <div class="transport-progress">

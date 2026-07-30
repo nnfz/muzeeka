@@ -1,14 +1,14 @@
 <script lang="ts">
-  import { onDestroy } from 'svelte';
+  import { onDestroy, onMount } from 'svelte';
   import { getPlayerStore } from '$lib/stores/player.svelte';
 
   interface Props {
     variant: 'progress' | 'volume';
-    /** Fullscreen: use /static/icons volume set instead of inline SVG. */
+    /** Use /static/icons volume set instead of inline SVG. */
     useStaticIcons?: boolean;
   }
 
-  let { variant, useStaticIcons = false }: Props = $props();
+  let { variant, useStaticIcons = true }: Props = $props();
 
   const player = getPlayerStore();
   const SEEK_STEP_SEC = 5;
@@ -39,16 +39,6 @@
           : liveVolume > 0
             ? 'low'
             : 'muted'
-  );
-
-  let staticVolumeIconUrl = $derived(
-    volumeIcon === 'muted'
-      ? '/icons/mute.svg'
-      : volumeIcon === 'high'
-        ? '/icons/volmax.svg'
-        : volumeIcon === 'med'
-          ? '/icons/volmed.svg'
-          : '/icons/volmin.svg'
   );
 
   let activeRatio = $derived(
@@ -281,11 +271,17 @@
       aria-label={isMuted ? 'Unmute' : 'Mute'}
     >
       {#if useStaticIcons}
-        <span
-          class="volume-static-icon"
-          style:--vol-icon={"url('" + staticVolumeIconUrl + "')"}
-          aria-hidden="true"
-        ></span>
+        <span class="volume-icon-stack" aria-hidden="true">
+          <img class="volume-icon-base" src="/icons/volmin.svg" alt="" loading="eager" decoding="sync" />
+          {#if isMuted}
+            <img class="volume-icon-append" src="/icons/mute.svg" alt="" loading="eager" decoding="sync" />
+          {:else if liveVolume > 0.66}
+            <img class="volume-icon-append" src="/icons/volmed.svg" alt="" loading="eager" decoding="sync" />
+            <img class="volume-icon-append volume-icon-append--second" src="/icons/volmax.svg" alt="" loading="eager" decoding="sync" />
+          {:else if liveVolume > 0.33}
+            <img class="volume-icon-append" src="/icons/volmed.svg" alt="" loading="eager" decoding="sync" />
+          {/if}
+        </span>
       {:else if volumeIcon === 'muted'}
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
