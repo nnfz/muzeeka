@@ -114,7 +114,6 @@ interface PlaylistsData {
   shuffle_enabled?: boolean;
   repeat_mode?: RepeatMode;
   playback_position?: number | null;
-  was_playing?: boolean;
 }
 
 interface LibraryState {
@@ -125,7 +124,6 @@ interface LibraryState {
   shuffle_enabled: boolean;
   repeat_mode: RepeatMode;
   playback_position: number | null;
-  was_playing: boolean;
 }
 
 interface StoreSyncPayload {
@@ -1088,8 +1086,6 @@ function buildLibraryState(): LibraryState {
     // Persist seekbar so cold start can restore the scrub position.
     playback_position:
       Number.isFinite(position) && position > 0 ? position : null,
-    // Only true when audio is actually running — never "play then pause" on restore.
-    was_playing: isPlaying === true && isPaused === false,
   };
 }
 
@@ -1170,7 +1166,6 @@ async function loadShuffleModeFromSettings() {
 let pendingSessionRestore: {
   file: string;
   position: number;
-  wasPlaying: boolean;
 } | null = null;
 
 /**
@@ -1242,9 +1237,8 @@ async function loadPlaylists() {
         pendingSessionRestore = {
           file: track.path,
           position: savedPos,
-          wasPlaying: !!data.was_playing,
         };
-        // So the first Play after restart (or auto-resume) seeks instead of 0:00.
+        // So the first Play after restart seeks instead of 0:00.
         if (savedPos > 0.25) {
           pendingResumePosition = { file: track.path, position: savedPos };
         }
@@ -2001,7 +1995,6 @@ function ensureInit() {
 async function restorePlaybackSession(session: {
   file: string;
   position: number;
-  wasPlaying: boolean;
 }) {
   // UI: remembered track + seekbar. Do NOT set isPaused=true without a BASS stream —
   // that makes the first Play call resume() (fails) → play() from 0:00 → second click
@@ -2017,27 +2010,6 @@ async function restorePlaybackSession(session: {
   }
   syncTrackIndex();
   syncWindowTitle();
-
-  // Was not actively playing — leave engine alone; first Play uses play()+seek.
-  if (!session.wasPlaying) {
-    return;
-  }
-
-  try {
-    await ensureInit();
-    if (!volumeHydrated) {
-      volume = Math.max(0, Math.min(1, volume));
-      volumeHydrated = true;
-    }
-    await applyVolumeToPlayer(volume, { force: true });
-    // play() applies pendingResumePosition after the stream opens.
-    await play(session.file);
-    await applyVolumeToPlayer(volume, { force: true });
-  } catch (e) {
-    console.error('Failed to restore playback session:', e);
-    isPlaying = false;
-    isPaused = false;
-  }
 }
 
 /** Seek after stream open; retry once if BASS wasn't ready yet. */
