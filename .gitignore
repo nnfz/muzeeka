@@ -16,12 +16,9 @@ task.md
 dist/
 coverage/
 *.tsbuildinfo
-src-tauri/Cargo.lock
 *.log
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 /.vscode
-src-tauri/bin/*
-src-tauri/bass/*
