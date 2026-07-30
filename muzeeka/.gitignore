@@ -11,3 +11,4 @@ vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 task.md
 dist/
+src-tauri/target-df-check

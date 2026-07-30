@@ -1,8 +1,11 @@
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
+use image::ImageFormat;
 use tauri::{Manager, Window};
 
 use crate::drop_handler::{ExportDragContext, ExportDragState};
+use crate::metadata;
 
 fn is_image_path(path: &Path) -> bool {
     path.extension()
@@ -19,28 +22,78 @@ fn canonical_file(path: &Path) -> Option<PathBuf> {
     if !path.is_file() {
         return None;
     }
-    std::fs::canonicalize(path).ok().or_else(|| Some(path.to_path_buf()))
+    std::fs::canonicalize(path)
+        .ok()
+        .or_else(|| Some(path.to_path_buf()))
 }
 
-fn drag_preview_image(icon_path: Option<&str>, fallback: &Path) -> Result<drag::Image, String> {
-    if let Some(icon) = icon_path {
+/// Ghost size under the cursor (px). Shell drag previews look huge above ~64.
+const DRAG_GHOST_SIZE: u32 = 48;
+
+/// Encode an on-disk image as PNG bytes for the Windows drag ghost.
+///
+/// Covers are stored as WebP; WIC (used by the `drag` crate) often fails to
+/// decode WebP → empty ghost → shell falls back to the app icon. Re-encoding
+/// through the `image` crate fixes that.
+fn image_path_to_png_bytes(path: &Path) -> Option<Vec<u8>> {
+    let path = canonical_file(path)?;
+    let img = image::open(&path).ok()?;
+    // Exact small square — `thumbnail` only shrinks if larger, still can leave
+    // long sides big; resize forces a compact OS drag icon.
+    let thumb = img.resize_exact(
+        DRAG_GHOST_SIZE,
+        DRAG_GHOST_SIZE,
+        image::imageops::FilterType::Triangle,
+    );
+    let mut buf = Vec::new();
+    thumb
+        .write_to(&mut Cursor::new(&mut buf), ImageFormat::Png)
+        .ok()?;
+    if buf.is_empty() {
+        return None;
+    }
+    Some(buf)
+}
+
+fn app_icon_png() -> Vec<u8> {
+    include_bytes!("../icons/32x32.png").to_vec()
+}
+
+/// Build the OS drag preview: prefer track cover (any format we can decode),
+/// then embedded art from the audio file, then app icon.
+fn drag_preview_image(icon_path: Option<&str>, audio_file: &Path) -> drag::Image {
+    // 1) Explicit cover path from the UI (thumb or full).
+    if let Some(icon) = icon_path.map(str::trim).filter(|s| !s.is_empty()) {
         let path = PathBuf::from(icon);
-        if is_image_path(&path) {
-            if let Some(abs) = canonical_file(&path) {
-                return Ok(drag::Image::File(abs));
+        if path.is_file() {
+            if let Some(png) = image_path_to_png_bytes(&path) {
+                return drag::Image::Raw(png);
             }
         }
     }
 
-    if is_image_path(fallback) {
-        if let Some(abs) = canonical_file(fallback) {
-            return Ok(drag::Image::File(abs));
+    // 2) Resolve / extract cover from the audio file itself.
+    if let Some(cover) = metadata::resolve_list_cover(audio_file) {
+        let path = PathBuf::from(&cover);
+        if let Some(png) = image_path_to_png_bytes(&path) {
+            return drag::Image::Raw(png);
+        }
+    }
+    if let Some(cover) = metadata::resolve_full_cover(audio_file) {
+        let path = PathBuf::from(&cover);
+        if let Some(png) = image_path_to_png_bytes(&path) {
+            return drag::Image::Raw(png);
         }
     }
 
-    Ok(drag::Image::Raw(
-        include_bytes!("../icons/32x32.png").to_vec(),
-    ))
+    // 3) If the file itself is an image (rare), use it.
+    if is_image_path(audio_file) {
+        if let Some(png) = image_path_to_png_bytes(audio_file) {
+            return drag::Image::Raw(png);
+        }
+    }
+
+    drag::Image::Raw(app_icon_png())
 }
 
 /// Start a native OS drag with local file paths (e.g. drag to Telegram or Explorer).
@@ -63,17 +116,17 @@ pub fn start_file_drag(
     }
 
     let export_state = window.state::<ExportDragState>();
-    let context = track_paths.filter(|tracks| !tracks.is_empty()).map(|track_paths| {
-        ExportDragContext {
+    let context = track_paths
+        .filter(|tracks| !tracks.is_empty())
+        .map(|track_paths| ExportDragContext {
             track_paths,
             source_playlist_id,
             is_copy: is_copy.unwrap_or(false),
-        }
-    });
+        });
     export_state.register_export(&files, context);
 
     let item = drag::DragItem::Files(files.clone());
-    let image = drag_preview_image(icon_path.as_deref(), &files[0])?;
+    let image = drag_preview_image(icon_path.as_deref(), &files[0]);
 
     // start_drag blocks until the OS drag ends; export paths stay suppressed until finish_export.
     let drag_result = drag::start_drag(

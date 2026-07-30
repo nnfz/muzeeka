@@ -309,6 +309,8 @@ impl RemoteController {
             volume: data.volume,
             shuffle_enabled: data.shuffle_enabled,
             repeat_mode: data.repeat_mode.clone(),
+            playback_position: data.playback_position,
+            was_playing: data.was_playing,
         })?;
         *self.playlists_cache.lock() = None;
         Ok(())

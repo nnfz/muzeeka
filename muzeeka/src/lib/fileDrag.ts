@@ -125,12 +125,13 @@ export async function startFileDrag(
   prepareExportDropSuppress(unique);
 
   try {
+    // Tauri 2 maps camelCase IPC keys → snake_case Rust params.
     await invoke('start_file_drag', {
       paths: unique,
-      icon_path: iconPath,
-      track_paths: trackSession?.paths ?? null,
-      source_playlist_id: trackSession?.sourcePlaylistId ?? null,
-      is_copy: trackSession?.isCopy ?? false,
+      iconPath: iconPath,
+      trackPaths: trackSession?.paths ?? null,
+      sourcePlaylistId: trackSession?.sourcePlaylistId ?? null,
+      isCopy: trackSession?.isCopy ?? false,
     });
   } finally {
     finishDropSuppress();

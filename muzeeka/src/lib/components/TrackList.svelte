@@ -1124,7 +1124,12 @@
       return false;
     }
     drag.fileExportStarted = true;
-    const iconPath = trackByPath(drag.paths[0])?.cover_path ?? null;
+    // Prefer full cover, then list thumb — Rust re-encodes to PNG for the OS ghost.
+    const lead = trackByPath(drag.paths[0]);
+    const iconPath =
+      lead?.cover_path_full?.trim() ||
+      lead?.cover_path?.trim() ||
+      null;
     const { paths, sourcePlaylistId, isCopy } = drag;
     beginExportTrackDragUi(paths, isCopy);
     cleanupTrackPointerDrag(false);

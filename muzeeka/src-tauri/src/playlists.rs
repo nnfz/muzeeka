@@ -36,6 +36,12 @@ pub struct LibraryState {
     pub volume: Option<f32>,
     pub shuffle_enabled: bool,
     pub repeat_mode: Option<String>,
+    /// Seekbar position in seconds (restored on cold start).
+    #[serde(default)]
+    pub playback_position: Option<f64>,
+    /// True if audio was playing when the app last saved state.
+    #[serde(default)]
+    pub was_playing: bool,
 }
 
 impl Default for LibraryState {
@@ -47,6 +53,8 @@ impl Default for LibraryState {
             volume: None,
             shuffle_enabled: false,
             repeat_mode: Some("off".to_string()),
+            playback_position: None,
+            was_playing: false,
         }
     }
 }
@@ -63,6 +71,10 @@ pub struct PlaylistsData {
     pub all_paths: Vec<String>,
     pub shuffle_enabled: bool,
     pub repeat_mode: Option<String>,
+    #[serde(default)]
+    pub playback_position: Option<f64>,
+    #[serde(default)]
+    pub was_playing: bool,
 }
 
 struct DatabaseInner {
@@ -158,11 +170,23 @@ impl LibraryDatabase {
                      current_file TEXT,
                      volume REAL,
                      shuffle_enabled INTEGER NOT NULL DEFAULT 0,
-                     repeat_mode TEXT NOT NULL DEFAULT 'off'
+                     repeat_mode TEXT NOT NULL DEFAULT 'off',
+                     playback_position REAL,
+                     was_playing INTEGER NOT NULL DEFAULT 0
                  );
                  INSERT OR IGNORE INTO app_state(id) VALUES (1);",
             )
             .map_err(db_error)?;
+
+        // Older DBs created before position/was_playing columns — add if missing.
+        let _ = connection.execute(
+            "ALTER TABLE app_state ADD COLUMN playback_position REAL",
+            [],
+        );
+        let _ = connection.execute(
+            "ALTER TABLE app_state ADD COLUMN was_playing INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
 
         let version = connection
             .query_row("SELECT version FROM schema_info LIMIT 1", [], |row| {
@@ -268,7 +292,8 @@ impl LibraryDatabase {
         let state = connection
             .query_row(
                 "SELECT active_playlist_id, playing_playlist_id, current_file,
-                        volume, shuffle_enabled, repeat_mode
+                        volume, shuffle_enabled, repeat_mode,
+                        playback_position, was_playing
                    FROM app_state WHERE id = 1",
                 [],
                 |row| {
@@ -279,6 +304,8 @@ impl LibraryDatabase {
                         volume: row.get(3)?,
                         shuffle_enabled: row.get::<_, i64>(4)? != 0,
                         repeat_mode: row.get(5)?,
+                        playback_position: row.get(6)?,
+                        was_playing: row.get::<_, i64>(7).unwrap_or(0) != 0,
                     })
                 },
             )
@@ -295,6 +322,8 @@ impl LibraryDatabase {
             all_paths,
             shuffle_enabled: state.shuffle_enabled,
             repeat_mode: state.repeat_mode,
+            playback_position: state.playback_position,
+            was_playing: state.was_playing,
         })
     }
 
@@ -324,7 +353,9 @@ impl LibraryDatabase {
                         current_file = ?3,
                         volume = ?4,
                         shuffle_enabled = ?5,
-                        repeat_mode = ?6
+                        repeat_mode = ?6,
+                        playback_position = ?7,
+                        was_playing = ?8
                   WHERE id = 1",
                 params![
                     state.active_playlist_id,
@@ -333,6 +364,8 @@ impl LibraryDatabase {
                     state.volume,
                     state.shuffle_enabled as i64,
                     state.repeat_mode.as_deref().unwrap_or("off"),
+                    state.playback_position,
+                    state.was_playing as i64,
                 ],
             )
             .map_err(db_error)?;
@@ -1007,6 +1040,8 @@ mod tests {
             volume: Some(0.42),
             shuffle_enabled: true,
             repeat_mode: Some("all".into()),
+            playback_position: Some(123.5),
+            was_playing: true,
         })
         .unwrap();
 
@@ -1016,5 +1051,7 @@ mod tests {
         assert_eq!(data.volume, Some(0.42));
         assert!(data.shuffle_enabled);
         assert_eq!(data.repeat_mode.as_deref(), Some("all"));
+        assert_eq!(data.playback_position, Some(123.5));
+        assert!(data.was_playing);
     }
 }

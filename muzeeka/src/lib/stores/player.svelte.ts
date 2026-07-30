@@ -113,6 +113,8 @@ interface PlaylistsData {
   all_paths?: string[];
   shuffle_enabled?: boolean;
   repeat_mode?: RepeatMode;
+  playback_position?: number | null;
+  was_playing?: boolean;
 }
 
 interface LibraryState {
@@ -122,6 +124,8 @@ interface LibraryState {
   volume: number | null;
   shuffle_enabled: boolean;
   repeat_mode: RepeatMode;
+  playback_position: number | null;
+  was_playing: boolean;
 }
 
 interface StoreSyncPayload {
@@ -1081,6 +1085,11 @@ function buildLibraryState(): LibraryState {
     volume,
     shuffle_enabled: shuffleEnabled,
     repeat_mode: repeatMode,
+    // Persist seekbar so cold start can restore the scrub position.
+    playback_position:
+      Number.isFinite(position) && position > 0 ? position : null,
+    // Only true when audio is actually running — never "play then pause" on restore.
+    was_playing: isPlaying === true && isPaused === false,
   };
 }
 
@@ -1157,22 +1166,37 @@ async function loadShuffleModeFromSettings() {
   }
 }
 
+/** Session snapshot loaded from SQLite — applied after player init (cold start). */
+let pendingSessionRestore: {
+  file: string;
+  position: number;
+  wasPlaying: boolean;
+} | null = null;
+
+/**
+ * After cold start, the next play() of this file should seek here.
+ * play() always opens at 0; without this, "resume" / first Play after restart
+ * restarts the track from the beginning.
+ */
+let pendingResumePosition: { file: string; position: number } | null = null;
+
+/** Throttle how often seekbar position is flushed to disk while playing. */
+let lastPositionPersistAt = 0;
+const POSITION_PERSIST_MS = 2000;
+
 async function loadPlaylists() {
   try {
     await loadShuffleModeFromSettings();
     const data = await invoke<PlaylistsData>('playlists_load');
     libraryTracks = data.library_tracks ?? [];
     playlists = (data.playlists ?? []).map(repairPlaylistTracks);
+    // Open playlist (or All/Liked virtual ids) from last session.
     activePlaylistId = data.active_playlist_id ?? playlists[0]?.id ?? null;
+    // Volume: SQLite only. Never pull BASS default (1.0) here — that blasted
+    // full volume on cold start when the DB row was missing/null.
     if (typeof data.volume === 'number' && Number.isFinite(data.volume)) {
       volume = Math.max(0, Math.min(1, data.volume));
       volumeHydrated = true;
-    } else if (!volumeHydrated) {
-      // No saved volume — adopt whatever BASS is already using (Ctrl+R case).
-      await hydrateVolumeFromBackend();
-    }
-    // Push the known volume only after hydration (never the blind 0.8 default).
-    if (volumeHydrated) {
       await applyVolumeToPlayer(volume, { force: true });
     }
     if (Array.isArray(data.liked_paths)) {
@@ -1190,16 +1214,40 @@ async function loadPlaylists() {
     if (data.playing_playlist_id) {
       playingPlaylistId = data.playing_playlist_id;
     }
-    // Restore last playing track so metadata/status survive Ctrl+R
+    // Restore last track into UI (+ queue cold-start resume after init).
     if (data.current_file) {
-      const track = trackByPath.get(data.current_file);
+      const track =
+        trackByPath.get(data.current_file) ??
+        findTrackByPath(libraryTracks, data.current_file) ??
+        [...trackByPath.values()].find((t) => sameTrackPath(t.path, data.current_file!));
       if (track) {
-        currentFile = data.current_file;
-        currentFileName = track ? trackDisplayTitle(track) : data.current_file.split(/[\\/]/).pop()?.replace(/\.[^/.]+$/, '') ?? null;
+        currentFile = track.path;
+        currentFileName = trackDisplayTitle(track);
         if (!data.playing_playlist_id) {
-          playingPlaylistId = findPlaylistForTrack(data.current_file);
+          playingPlaylistId = findPlaylistForTrack(track.path);
         }
-        // Note: isPaused stays false — player is freshly started, track is just "remembered"
+        const savedPos =
+          typeof data.playback_position === 'number' &&
+          Number.isFinite(data.playback_position) &&
+          data.playback_position > 0
+            ? data.playback_position
+            : 0;
+        position = savedPos;
+        const seg = cueSegmentDuration(track);
+        if (seg != null && seg > 0) {
+          duration = seg;
+        } else if (typeof track.duration_secs === 'number' && track.duration_secs > 0) {
+          duration = track.duration_secs;
+        }
+        pendingSessionRestore = {
+          file: track.path,
+          position: savedPos,
+          wasPlaying: !!data.was_playing,
+        };
+        // So the first Play after restart (or auto-resume) seeks instead of 0:00.
+        if (savedPos > 0.25) {
+          pendingResumePosition = { file: track.path, position: savedPos };
+        }
         syncWindowTitle();
       }
     }
@@ -1894,9 +1942,6 @@ async function init() {
   // Settings bootstrap often calls ensureInit() before loadPlaylists finishes —
   // never stamp the JS default 0.8 over a live session.
   if (isInitialized) {
-    if (!volumeHydrated) {
-      await hydrateVolumeFromBackend();
-    }
     if (volumeHydrated) {
       await applyVolumeToPlayer(volume, { force: true });
     }
@@ -1904,9 +1949,6 @@ async function init() {
   }
   if (initPromise) {
     await initPromise;
-    if (!volumeHydrated) {
-      await hydrateVolumeFromBackend();
-    }
     if (volumeHydrated) {
       await applyVolumeToPlayer(volume, { force: true });
     }
@@ -1915,11 +1957,8 @@ async function init() {
 
   initPromise = (async () => {
     await invoke('player_init');
-    // After Ctrl+R the backend is already playing at the correct volume.
-    // Pull it before any push so we never blast 0.8 over a quiet session.
-    if (!volumeHydrated) {
-      await hydrateVolumeFromBackend();
-    }
+    // Only push volume if we already know it from SQLite (loadPlaylists first).
+    // Never adopt BASS default 1.0 here — that caused full-blast on cold start.
     if (volumeHydrated) {
       await applyVolumeToPlayer(volume, { force: true });
     }
@@ -1950,23 +1989,131 @@ function ensureInit() {
   return init();
 }
 
+/**
+ * Cold start restore.
+ *
+ * IMPORTANT:
+ * - Never "play then pause" — that blasts a half-second of audio and feels broken.
+ * - If the session was not actively playing, only restore UI (track + seekbar).
+ * - Seek is handled inside play() via pendingResumePosition (play always opens at 0).
+ * - Volume must already be applied from SQLite before any resume.
+ */
+async function restorePlaybackSession(session: {
+  file: string;
+  position: number;
+  wasPlaying: boolean;
+}) {
+  // UI: remembered track + seekbar. Do NOT set isPaused=true without a BASS stream —
+  // that makes the first Play call resume() (fails) → play() from 0:00 → second click
+  // pauses → third click finally works. Use stopped+selected instead.
+  isPlaying = false;
+  isPaused = false;
+  position = Math.max(0, session.position);
+  if (session.position > 0.25) {
+    pendingResumePosition = {
+      file: session.file,
+      position: session.position,
+    };
+  }
+  syncTrackIndex();
+  syncWindowTitle();
+
+  // Was not actively playing — leave engine alone; first Play uses play()+seek.
+  if (!session.wasPlaying) {
+    return;
+  }
+
+  try {
+    await ensureInit();
+    if (!volumeHydrated) {
+      volume = Math.max(0, Math.min(1, volume));
+      volumeHydrated = true;
+    }
+    await applyVolumeToPlayer(volume, { force: true });
+    // play() applies pendingResumePosition after the stream opens.
+    await play(session.file);
+    await applyVolumeToPlayer(volume, { force: true });
+  } catch (e) {
+    console.error('Failed to restore playback session:', e);
+    isPlaying = false;
+    isPaused = false;
+  }
+}
+
+/** Seek after stream open; retry once if BASS wasn't ready yet. */
+async function applyResumeSeek(filePath: string, pos: number) {
+  if (pos <= 0.25) return;
+  const trySeek = async () => {
+    position = pos;
+    seekGuardPosition = pos;
+    // Keep guard while we snap — block stale 0.0 position events from play().
+    seekGuardUntil = Date.now() + (isCueVirtualPath(filePath) ? 900 : 500);
+    await invoke('player_seek', { position: pos });
+    position = pos;
+    scheduleSave();
+  };
+  try {
+    await trySeek();
+  } catch {
+    await new Promise((r) => setTimeout(r, 120));
+    try {
+      await trySeek();
+    } catch (e) {
+      console.error('Failed to apply resume seek:', e);
+      seekGuardUntil = 0;
+    }
+  }
+}
+
 async function bootstrap() {
   await loadPlaylists();
   await syncDownloadPlaylistFromLibrary();
   await init();
-  // Sync frontend state with backend after reload (Ctrl+R).
-  // The backend may still be playing audio, but the frontend starts
-  // with isPlaying=false / isPaused=false. Query the actual state.
+  // Sync frontend with backend after reload (Ctrl+R) or cold-start restore.
   try {
     const state = await invoke<PlayerState>('player_get_state');
     if (state.is_playing || state.is_paused) {
+      // Backend still has the session — only refresh UI (do not re-play).
       isPlaying = state.is_playing;
       isPaused = state.is_paused;
       position = state.position;
       duration = state.duration;
+      // Prefer SQLite volume; only fall back to live BASS if DB had none.
+      if (
+        !volumeHydrated &&
+        typeof state.volume === 'number' &&
+        Number.isFinite(state.volume)
+      ) {
+        volume = Math.max(0, Math.min(1, state.volume));
+        volumeHydrated = true;
+      }
+      if (volumeHydrated) {
+        await applyVolumeToPlayer(volume, { force: true });
+      }
+      if (state.current_file) {
+        const track =
+          trackByPath.get(state.current_file) ??
+          findTrackByPath(libraryTracks, state.current_file);
+        currentFile = track?.path ?? state.current_file;
+        currentFileName = track
+          ? trackDisplayTitle(track)
+          : state.current_file_name ?? currentFileName;
+        syncTrackIndex();
+        syncWindowTitle();
+      }
+      pendingSessionRestore = null;
+    } else if (pendingSessionRestore) {
+      const session = pendingSessionRestore;
+      pendingSessionRestore = null;
+      await restorePlaybackSession(session);
     }
   } catch (e) {
     console.error('Failed to sync player state after init:', e);
+    if (pendingSessionRestore) {
+      const session = pendingSessionRestore;
+      pendingSessionRestore = null;
+      await restorePlaybackSession(session);
+    }
   }
 }
 
@@ -2174,6 +2321,14 @@ async function play(filePath: string) {
     await ensureInit();
     if (requestId !== playRequestId) return;
 
+    // Resume-position is only for the remembered track — drop it on another title.
+    if (
+      pendingResumePosition &&
+      !sameTrackPath(pendingResumePosition.file, filePath)
+    ) {
+      pendingResumePosition = null;
+    }
+
     lastManualPlayAt = Date.now();
     lastPlayedFile = filePath;
     lastPauseRequestAt = 0;
@@ -2238,11 +2393,19 @@ async function play(filePath: string) {
     // in the same audio file, the backend buffer still holds the old absolute
     // position (e.g. 130s), but cue_start gets updated to 0 → relative
     // position = 130 → seekbar jumps to max for a frame before resetting.
-    seekGuardPosition = 0;
+    // If we will seek after open, keep UI on the target time (don't flash 0:00).
+    const resumeAt =
+      pendingResumePosition &&
+      sameTrackPath(pendingResumePosition.file, filePath) &&
+      pendingResumePosition.position > 0.25
+        ? pendingResumePosition.position
+        : 0;
+
+    seekGuardPosition = resumeAt;
     // CUE same-image seeks need a longer guard — BASS can report the previous
     // absolute offset for several poll ticks after apply_segment.
     seekGuardUntil = Date.now() + (isCueVirtualPath(filePath) ? 900 : 600);
-    position = 0;
+    position = resumeAt;
 
     // Update UI immediately — don't wait for IPC (file open + Discord sync can take 100ms+).
     const resolvedTrack =
@@ -2266,24 +2429,34 @@ async function play(filePath: string) {
 
     if (requestId !== playRequestId) return;
 
-    void invoke('player_play', {
-      ...playOptionsForTrack(resolvedTrack, currentFile ?? filePath),
-      queue: queueToSend,
-    }).then(() => {
+    try {
+      await invoke('player_play', {
+        ...playOptionsForTrack(resolvedTrack, currentFile ?? filePath),
+        queue: queueToSend,
+      });
       // Confirm queue only after backend accepted the play command.
       // Before this callback, stale track-changed from the old gapless queue
       // are rejected by the queueConfirmedForPlay guard.
       if (requestId === playRequestId) {
         rememberGaplessQueue(queueToSend);
         queueConfirmedForPlay = requestId;
+
+        // Seek immediately after open (saved position after restart / first Play).
+        if (resumeAt > 0.25) {
+          pendingResumePosition = null;
+          await new Promise((r) => setTimeout(r, 30));
+          if (requestId === playRequestId) {
+            await applyResumeSeek(currentFile ?? filePath, resumeAt);
+          }
+        }
       }
-    }).catch((e) => {
+    } catch (e) {
       if (requestId !== playRequestId) return;
       const message = typeof e === 'string' ? e : String(e);
       console.error('Failed to play:', message);
       // Backend did not switch audio — restore previous track in the UI.
       restorePlayUi(previousUi);
-    });
+    }
   } catch (e) {
     if (requestId !== playRequestId) return;
     const message = typeof e === 'string' ? e : String(e);
@@ -2296,6 +2469,7 @@ function pause() {
   lastPauseRequestAt = Date.now();
   isPaused = true;
   isPlaying = false;
+  scheduleSave();
   void invoke('player_pause').catch((e) => {
     console.error('Failed to pause:', e);
     isPaused = false;
@@ -2303,18 +2477,44 @@ function pause() {
   });
 }
 
-function resume() {
+/**
+ * Resume if BASS still has a paused stream; otherwise open via play()
+ * (and honor pendingResumePosition for post-restart seek).
+ */
+async function resume() {
   lastPauseRequestAt = 0;
-  isPaused = false;
-  isPlaying = true;
-  void invoke('player_resume').catch((e) => {
+  try {
+    await ensureInit();
+    const state = await invoke<PlayerState>('player_get_state');
+    // Only call BASS resume when something is actually paused in the engine.
+    if (state.is_paused) {
+      isPaused = false;
+      isPlaying = true;
+      scheduleSave();
+      await invoke('player_resume');
+      return;
+    }
+    if (state.is_playing) {
+      isPaused = false;
+      isPlaying = true;
+      return;
+    }
+    // Cold start / stopped: no stream — must open via play() (+ optional seek).
     if (currentFile) {
-      void play(currentFile);
+      await play(currentFile);
       return;
     }
     isPlaying = false;
+    isPaused = false;
+  } catch (e) {
+    if (currentFile) {
+      await play(currentFile);
+      return;
+    }
+    isPlaying = false;
+    isPaused = false;
     console.error('Failed to resume:', e);
-  });
+  }
 }
 
 async function stop() {
@@ -2344,6 +2544,7 @@ async function seek(pos: number) {
 
   try {
     await invoke('player_seek', { position: clamped });
+    scheduleSave();
   } catch (e) {
     seekGuardUntil = 0;
     console.error('Failed to seek:', e);
@@ -2385,13 +2586,30 @@ function isLiked(path: string): boolean {
 function togglePlayPause() {
   if (isPlaying) {
     pause();
-  } else if (isPaused) {
-    resume();
-  } else if (currentFile) {
+    return;
+  }
+  // Prefer play() when we still owe a post-restart seek — resume() has no stream.
+  if (
+    currentFile &&
+    pendingResumePosition &&
+    sameTrackPath(pendingResumePosition.file, currentFile)
+  ) {
     void play(currentFile);
-  } else if (hasPlayingTracks && currentTrackIndex >= 0) {
+    return;
+  }
+  if (isPaused) {
+    void resume();
+    return;
+  }
+  if (currentFile) {
+    void play(currentFile);
+    return;
+  }
+  if (hasPlayingTracks && currentTrackIndex >= 0) {
     void play(playingTracks[currentTrackIndex].path);
-  } else if (hasPlayingTracks) {
+    return;
+  }
+  if (hasPlayingTracks) {
     void play(playingTracks[0].path);
   }
 }
@@ -2683,6 +2901,15 @@ function setupListeners() {
       return;
     }
     position = newPos;
+
+    // Persist seekbar while playing (throttled) so cold start resumes mid-track.
+    if (isPlaying && !isPaused) {
+      const now = Date.now();
+      if (now - lastPositionPersistAt >= POSITION_PERSIST_MS) {
+        lastPositionPersistAt = now;
+        scheduleSave();
+      }
+    }
   });
 
   listen<{ is_playing: boolean; is_paused: boolean }>('player:state', (event) => {
