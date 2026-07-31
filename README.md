@@ -1,4 +1,5 @@
 # Muzeeka
+**Pronunciation:** *moo-ZEE-kah* (рус. «музыка»)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Tauri](https://img.shields.io/badge/Tauri-v2-24C8DB)](https://tauri.app/)
