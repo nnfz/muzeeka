@@ -157,38 +157,6 @@ struct SpotifyOEmbed {
     thumbnail_url: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct DeezerSearch {
-    data: Option<Vec<DeezerTrack>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct DeezerTrack {
-    title: Option<String>,
-    title_short: Option<String>,
-    artist: Option<DeezerArtist>,
-}
-
-#[derive(Debug, Deserialize)]
-struct DeezerArtist {
-    name: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ItunesSearch {
-    results: Option<Vec<ItunesTrack>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ItunesTrack {
-    track_name: Option<String>,
-    #[serde(rename = "trackName")]
-    track_name_camel: Option<String>,
-    artist_name: Option<String>,
-    #[serde(rename = "artistName")]
-    artist_name_camel: Option<String>,
-}
-
 fn http_get_text(url: &str, accept: &str) -> Result<String, String> {
     let mut response = ureq::get(url)
         .header(
@@ -206,112 +174,6 @@ fn http_get_text(url: &str, accept: &str) -> Result<String, String> {
         .map_err(|e| format!("Failed to read response: {e}"))
 }
 
-fn titles_match(a: &str, b: &str) -> bool {
-    let norm = |s: &str| {
-        s.chars()
-            .filter(|c| c.is_alphanumeric() || c.is_whitespace())
-            .collect::<String>()
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .to_ascii_lowercase()
-    };
-    let na = norm(a);
-    let nb = norm(b);
-    !na.is_empty() && (na == nb || na.contains(&nb) || nb.contains(&na))
-}
-
-/// Spotify web pages no longer expose track meta to plain HTTP scrapers.
-/// Resolve artist via free music search APIs using the oEmbed title.
-fn lookup_artist_by_title(title: &str) -> Option<String> {
-    let title = title.trim();
-    if title.is_empty() {
-        return None;
-    }
-
-    // 1) Deezer
-    let deezer_url = format!(
-        "https://api.deezer.com/search?q={}&limit=10",
-        urlencoding::encode(title)
-    );
-    if let Ok(raw) = http_get_text(&deezer_url, "application/json") {
-        if let Ok(search) = serde_json::from_str::<DeezerSearch>(&raw) {
-            if let Some(tracks) = search.data {
-                // Prefer exact-ish title match
-                for t in &tracks {
-                    let t_title = t
-                        .title
-                        .as_deref()
-                        .or(t.title_short.as_deref())
-                        .unwrap_or("");
-                    if titles_match(title, t_title) {
-                        if let Some(name) = t.artist.as_ref().and_then(|a| a.name.clone()) {
-                            let name = name.trim();
-                            if !name.is_empty() && !name.eq_ignore_ascii_case("spotify") {
-                                return Some(name.to_string());
-                            }
-                        }
-                    }
-                }
-                // Fallback: first result with an artist
-                for t in &tracks {
-                    if let Some(name) = t.artist.as_ref().and_then(|a| a.name.clone()) {
-                        let name = name.trim();
-                        if !name.is_empty() && !name.eq_ignore_ascii_case("spotify") {
-                            return Some(name.to_string());
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // 2) iTunes Search
-    let itunes_url = format!(
-        "https://itunes.apple.com/search?term={}&entity=song&limit=10",
-        urlencoding::encode(title)
-    );
-    if let Ok(raw) = http_get_text(&itunes_url, "application/json") {
-        if let Ok(search) = serde_json::from_str::<ItunesSearch>(&raw) {
-            if let Some(results) = search.results {
-                for t in &results {
-                    let t_title = t
-                        .track_name_camel
-                        .as_deref()
-                        .or(t.track_name.as_deref())
-                        .unwrap_or("");
-                    let artist = t
-                        .artist_name_camel
-                        .as_deref()
-                        .or(t.artist_name.as_deref())
-                        .unwrap_or("")
-                        .trim();
-                    if artist.is_empty() || artist.eq_ignore_ascii_case("spotify") {
-                        continue;
-                    }
-                    if titles_match(title, t_title) {
-                        return Some(artist.to_string());
-                    }
-                }
-                for t in &results {
-                    if let Some(artist) = t
-                        .artist_name_camel
-                        .as_deref()
-                        .or(t.artist_name.as_deref())
-                    {
-                        let artist = artist.trim();
-                        if !artist.is_empty() && !artist.eq_ignore_ascii_case("spotify") {
-                            return Some(artist.to_string());
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    None
-}
-
 pub fn probe(app: &AppHandle, url: &str) -> Result<YtdlpProbeResult, String> {
     let trimmed = url.trim();
     if !is_spotify_url(trimmed) {
@@ -323,32 +185,52 @@ pub fn probe(app: &AppHandle, url: &str) -> Result<YtdlpProbeResult, String> {
         );
     }
 
+    let is_playlist = is_playlist_like(trimmed);
+
     let oembed = format!(
         "https://open.spotify.com/oembed?url={}",
         urlencoding::encode(trimmed)
     );
-    let raw = http_get_text(&oembed, "application/json")?;
-    let data: SpotifyOEmbed = serde_json::from_str(&raw)
-        .map_err(|e| format!("Failed to parse Spotify metadata: {e}"))?;
+    let oembed_raw = http_get_text(&oembed, "application/json").unwrap_or_default();
+    let data: Option<SpotifyOEmbed> = serde_json::from_str(&oembed_raw).ok();
 
-    let title = data
-        .title
+    let title = data.as_ref()
+        .and_then(|d| d.title.clone())
         .filter(|t| !t.trim().is_empty())
         .unwrap_or_else(|| "Unknown".to_string());
 
-    // Never show "Spotify" as artist. For tracks, resolve real artist by title.
-    let artist = if is_playlist_like(trimmed) {
+    let thumbnail = data.and_then(|d| d.thumbnail_url);
+
+    let artist = if is_playlist {
         None
     } else {
-        lookup_artist_by_title(&title)
+        http_get_text(trimmed, "text/html").ok().and_then(|html| {
+            let re_desc = Regex::new(r#"<meta\s+property="og:description"\s+content="[^"]*?(?:Listen to [^"]+ on Spotify\.\s*)?([^·"<>]+)\s*·\s*Song\s*·"#).unwrap();
+            if let Some(caps) = re_desc.captures(&html) {
+                let found = caps[1].trim();
+                if !found.is_empty() {
+                    return Some(found.to_string());
+                }
+            }
+
+            let re_title = Regex::new(r#"<title>[^-]+ - song(?: and lyrics)? by ([^|]+) \| Spotify</title>"#).unwrap();
+            if let Some(caps) = re_title.captures(&html) {
+                let found = caps[1].trim();
+                if !found.is_empty() {
+                    return Some(found.to_string());
+                }
+            }
+
+            None
+        })
     };
 
     Ok(YtdlpProbeResult {
         title,
         uploader: artist,
         duration_secs: None,
-        thumbnail: data.thumbnail_url,
-        is_playlist: is_playlist_like(trimmed),
+        thumbnail,
+        is_playlist,
         entry_count: None,
     })
 }
@@ -481,9 +363,8 @@ pub fn download(
     let dir_str = dir.to_string_lossy().to_string();
     let before = snapshot_audio_dir(&dir);
 
-    // spotDL output template — writes into download folder with artist/title.
     let output_template = format!(
-        "{}{}{{artists}} - {{title}}.{{output-ext}}",
+        "{}{}{{artist}} - {{title}}.{{output-ext}}",
         dir_str.trim_end_matches(['/', '\\']),
         std::path::MAIN_SEPARATOR
     );

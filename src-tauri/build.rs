@@ -20,7 +20,7 @@ const BASS_DOWNLOADS: &[(&str, &str)] = &[
 
 const TOOL_DOWNLOADS: &[(&str, &str)] = &[
     ("yt-dlp.exe", "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"),
-    ("spotdl.exe", "https://github.com/spotDL/spotify-downloader/releases/latest/download/spotDL"),
+    ("spotdl.exe", "github_win32:spotDL/spotify-downloader"),
 ];
 
 const FFMPEG_URL: &str = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip";
@@ -59,11 +59,20 @@ fn ensure_download(url: &str, destination: &Path) -> Result<(), String> {
             .map_err(|error| format!("Failed to create {}: {error}", parent.display()))?;
     }
 
-    let destination = escape_ps(&destination.display().to_string());
-    let url = escape_ps(url);
-    let script = format!(
-        "$ErrorActionPreference='Stop'; [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri '{url}' -OutFile '{destination}'"
-    );
+    let destination_ps = escape_ps(&destination.display().to_string());
+    
+    let script = if let Some(repo) = url.strip_prefix("github_win32:") {
+        let repo_ps = escape_ps(repo);
+        format!(
+            "$ErrorActionPreference='Stop'; [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/{repo_ps}/releases/latest'; $asset = $release.assets | Where-Object {{ $_.name -like '*win32.exe' }} | Select-Object -First 1; if (-not $asset) {{ throw 'Windows executable asset not found' }}; Invoke-WebRequest -Uri $asset.browser_download_url -OutFile '{destination_ps}'"
+        )
+    } else {
+        let url_ps = escape_ps(url);
+        format!(
+            "$ErrorActionPreference='Stop'; [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri '{url_ps}' -OutFile '{destination_ps}'"
+        )
+    };
+
     run_powershell(&script)
 }
 

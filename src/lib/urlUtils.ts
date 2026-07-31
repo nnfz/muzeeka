@@ -3,8 +3,18 @@ export function normalizeMediaUrl(text: string): string | null {
   const trimmed = text.trim();
   if (!trimmed) return null;
 
+  const cleanUrl = (url: string) => {
+    try {
+      const parsed = new URL(url);
+      parsed.search = '';
+      return parsed.toString();
+    } catch {
+      return url;
+    }
+  };
+
   if (/^https?:\/\//i.test(trimmed)) {
-    return trimmed;
+    return cleanUrl(trimmed);
   }
 
   // spotify:track:xxx → https://open.spotify.com/track/xxx
@@ -16,7 +26,7 @@ export function normalizeMediaUrl(text: string): string | null {
   }
 
   if (/^www\./i.test(trimmed)) {
-    return `https://${trimmed}`;
+    return cleanUrl(`https://${trimmed}`);
   }
 
   return null;

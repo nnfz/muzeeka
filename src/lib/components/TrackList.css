@@ -505,9 +505,7 @@
   backdrop-filter: blur(14px);
   -webkit-backdrop-filter: blur(14px);
   transform-origin: 20% 80%;
-  /* Position via left/top; rotate via inline transform (velocity tilt). */
   animation: track-drag-float-in 0.16s cubic-bezier(0.22, 1, 0.36, 1) both;
-  /* Soft settle when mouse slows — complements JS smoothing. */
   transition: transform 0.09s ease-out;
 }
 
