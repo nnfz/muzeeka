@@ -1,13 +1,17 @@
 <script lang="ts">
-  import { getCoverSrc, resolveCoverSrc } from '$lib/coverCache';
-  import { setAccentFromCoverSrc } from '$lib/coverAccent';
-  import { COVER_PLACEHOLDER_SRC } from '$lib/coverPlaceholder';
-  import { getPlayerStore, trackDisplayArtist } from '$lib/stores/player.svelte';
-  import { exportAudioPathForTrack } from '$lib/trackPaths';
-  import { startFileDrag } from '$lib/fileDrag';
-  import FullscreenPlayer from './FullscreenPlayer.svelte';
-  import MediaSlider from './MediaSlider.svelte';
-  import TrackCover from './TrackCover.svelte';
+  import { getCoverSrc, resolveCoverSrc } from "$lib/coverCache";
+  import { setAccentFromCoverSrc } from "$lib/coverAccent";
+  import { COVER_PLACEHOLDER_SRC } from "$lib/coverPlaceholder";
+  import {
+    getPlayerStore,
+    trackDisplayArtist,
+  } from "$lib/stores/player.svelte";
+  import { exportAudioPathForTrack } from "$lib/trackPaths";
+  import { startFileDrag } from "$lib/fileDrag";
+  import FullscreenPlayer from "./FullscreenPlayer.svelte";
+  import MediaSlider from "./MediaSlider.svelte";
+  import TrackCover from "./TrackCover.svelte";
+  import LikeButton from "./LikeButton.svelte";
 
   interface Props {
     fullscreenOpen?: boolean;
@@ -31,11 +35,14 @@
   let fileDragPointerId = $state<number | null>(null);
 
   function cleanupFileDragSession() {
-    window.removeEventListener('pointermove', onPlayerPointerMove);
-    window.removeEventListener('pointerup', onPlayerPointerUp);
-    window.removeEventListener('pointercancel', onPlayerPointerUp);
-    window.removeEventListener('blur', onPlayerPointerCancel);
-    document.removeEventListener('visibilitychange', onPlayerFileDragVisibility);
+    window.removeEventListener("pointermove", onPlayerPointerMove);
+    window.removeEventListener("pointerup", onPlayerPointerUp);
+    window.removeEventListener("pointercancel", onPlayerPointerUp);
+    window.removeEventListener("blur", onPlayerPointerCancel);
+    document.removeEventListener(
+      "visibilitychange",
+      onPlayerFileDragVisibility,
+    );
 
     if (fileDragCaptureEl && fileDragPointerId !== null) {
       try {
@@ -57,20 +64,23 @@
   }
 
   function onPlayerFileDragVisibility() {
-    if (document.visibilityState === 'hidden') {
+    if (document.visibilityState === "hidden") {
       onPlayerPointerCancel();
     }
   }
 
   function beginFileDragSession(
     e: PointerEvent,
-    options?: { openFullscreenOnClick?: boolean }
+    options?: { openFullscreenOnClick?: boolean },
   ) {
     if (e.button !== 0) return;
     if (!player.currentFile || !player.currentTrack) return;
-    if ((e.target as HTMLElement).closest('.like-btn-transport')) return;
+    if ((e.target as HTMLElement).closest(".like-btn-transport")) return;
 
-    const path = exportAudioPathForTrack(player.currentTrack, player.currentFile);
+    const path = exportAudioPathForTrack(
+      player.currentTrack,
+      player.currentFile,
+    );
     if (!path) return;
 
     cleanupFileDragSession();
@@ -87,11 +97,11 @@
     fileDragPointerId = e.pointerId;
     fileDragCaptureEl.setPointerCapture(e.pointerId);
 
-    window.addEventListener('pointermove', onPlayerPointerMove);
-    window.addEventListener('pointerup', onPlayerPointerUp);
-    window.addEventListener('pointercancel', onPlayerPointerUp);
-    window.addEventListener('blur', onPlayerPointerCancel);
-    document.addEventListener('visibilitychange', onPlayerFileDragVisibility);
+    window.addEventListener("pointermove", onPlayerPointerMove);
+    window.addEventListener("pointerup", onPlayerPointerUp);
+    window.addEventListener("pointercancel", onPlayerPointerUp);
+    window.addEventListener("blur", onPlayerPointerCancel);
+    document.addEventListener("visibilitychange", onPlayerFileDragVisibility);
   }
 
   function onCoverPointerDown(e: PointerEvent) {
@@ -113,13 +123,14 @@
     const { path, iconPath } = session;
     cleanupFileDragSession();
     void startFileDrag([path], { iconPath }).catch((err) => {
-      console.error('Failed to start file drag:', err);
+      console.error("Failed to start file drag:", err);
     });
   }
 
   function onPlayerPointerUp() {
     const session = fileDragSession;
-    const shouldOpenFullscreen = !!session?.openFullscreenOnClick && !session.started;
+    const shouldOpenFullscreen =
+      !!session?.openFullscreenOnClick && !session.started;
     cleanupFileDragSession();
     if (shouldOpenFullscreen) {
       fullscreenOpen = true;
@@ -127,9 +138,12 @@
   }
 
   $effect(() => {
-    document.documentElement.classList.toggle('fullscreen-active', fullscreenOpen);
+    document.documentElement.classList.toggle(
+      "fullscreen-active",
+      fullscreenOpen,
+    );
     return () => {
-      document.documentElement.classList.remove('fullscreen-active');
+      document.documentElement.classList.remove("fullscreen-active");
     };
   });
 
@@ -190,33 +204,17 @@
             onpointerdown={onTextPointerDown}
             title="Drag file to share"
           >
-            <span class="np-title">{player.currentFileName ?? ''}</span>
+            <span class="np-title">{player.currentFileName ?? ""}</span>
             {#if player.currentTrack}
-              <span class="np-artist">{trackDisplayArtist(player.currentTrack)}</span>
+              <span class="np-artist"
+                >{trackDisplayArtist(player.currentTrack)}</span
+              >
             {/if}
           </div>
         </div>
 
         {#if player.hasTrack && player.currentFile}
-          <button
-            class="like-btn-transport"
-            onclick={() => { if (player.currentFile) player.toggleLike(player.currentFile); }}
-            title={player.isLiked(player.currentFile) ? 'Remove from Liked' : 'Add to Liked'}
-            aria-label={player.isLiked(player.currentFile) ? 'Unlike current track' : 'Like current track'}
-          >
-            <span class="like-icon-stack" aria-hidden="true">
-              <span
-                class="control-icon like-icon like-icon-layer"
-                class:visible={!player.isLiked(player.currentFile)}
-                style:--control-icon={"url('/icons/heart.svg')"}
-              ></span>
-              <span
-                class="control-icon like-icon like-icon-layer"
-                class:visible={player.isLiked(player.currentFile)}
-                style:--control-icon={"url('/icons/heartfilled.svg')"}
-              ></span>
-            </span>
-          </button>
+          <LikeButton file={player.currentFile} class="like-btn-transport" />
         {/if}
       {/if}
     </div>
@@ -227,14 +225,24 @@
         class:active={player.shuffleEnabled}
         onclick={() => player.toggleShuffle()}
         disabled={!player.hasPlayingTracks}
-        aria-label={player.shuffleEnabled ? 'Disable shuffle' : 'Enable shuffle'}
-        title={player.shuffleEnabled ? 'Shuffle on' : 'Shuffle'}
+        aria-label={player.shuffleEnabled
+          ? "Disable shuffle"
+          : "Enable shuffle"}
+        title={player.shuffleEnabled ? "Shuffle on" : "Shuffle"}
       >
-      {#if player.shuffleEnabled}
-        <span class="control-icon" style:--control-icon={"url('/icons/shuffle.svg')"} aria-hidden="true"></span>
-      {:else}
-        <span class="control-icon" style:--control-icon={"url('/icons/noshuffle.svg')"} aria-hidden="true"></span>
-      {/if}
+        {#if player.shuffleEnabled}
+          <span
+            class="control-icon"
+            style:--control-icon={"url('/icons/shuffle.svg')"}
+            aria-hidden="true"
+          ></span>
+        {:else}
+          <span
+            class="control-icon"
+            style:--control-icon={"url('/icons/noshuffle.svg')"}
+            aria-hidden="true"
+          ></span>
+        {/if}
       </button>
 
       <button
@@ -243,7 +251,11 @@
         disabled={!player.hasTrack}
         aria-label="Previous track"
       >
-        <span class="control-icon" style:--control-icon={"url('/icons/playbackward.svg')"} aria-hidden="true"></span>
+        <span
+          class="control-icon"
+          style:--control-icon={"url('/icons/playbackward.svg')"}
+          aria-hidden="true"
+        ></span>
       </button>
 
       <button
@@ -251,12 +263,24 @@
         class:playing={player.isPlaying}
         onclick={() => player.togglePlayPause()}
         disabled={!player.hasPlayingTracks && !player.hasTrack}
-        aria-label={player.isPlaying ? 'Pause' : player.isPaused ? 'Resume' : 'Play'}
+        aria-label={player.isPlaying
+          ? "Pause"
+          : player.isPaused
+            ? "Resume"
+            : "Play"}
       >
         {#if player.isPlaying}
-          <span class="control-icon play-icon" style:--control-icon={"url('/icons/pause.svg')"} aria-hidden="true"></span>
+          <span
+            class="control-icon play-icon"
+            style:--control-icon={"url('/icons/pause.svg')"}
+            aria-hidden="true"
+          ></span>
         {:else}
-          <span class="control-icon play-icon" style:--control-icon={"url('/icons/play.svg')"} aria-hidden="true"></span>
+          <span
+            class="control-icon play-icon"
+            style:--control-icon={"url('/icons/play.svg')"}
+            aria-hidden="true"
+          ></span>
         {/if}
       </button>
 
@@ -266,50 +290,60 @@
         disabled={!player.hasNext}
         aria-label="Next track"
       >
-        <span class="control-icon" style:--control-icon={"url('/icons/playforward.svg')"} aria-hidden="true"></span>
+        <span
+          class="control-icon"
+          style:--control-icon={"url('/icons/playforward.svg')"}
+          aria-hidden="true"
+        ></span>
       </button>
 
       <button
         class="control-btn mode-btn"
-        class:active={player.repeatMode !== 'off'}
-        class:repeat-one={player.repeatMode === 'one'}
+        class:active={player.repeatMode !== "off"}
+        class:repeat-one={player.repeatMode === "one"}
         onclick={() => player.toggleRepeat()}
         disabled={!player.hasPlayingTracks}
-        aria-label={
-          player.repeatMode === 'one'
-            ? 'Disable repeat'
-            : player.repeatMode === 'all'
-              ? 'Repeat one'
-              : 'Repeat all'
-        }
-        title={
-          player.repeatMode === 'one'
-            ? 'Repeat one'
-            : player.repeatMode === 'all'
-              ? 'Repeat all'
-              : 'Repeat'
-        }
+        aria-label={player.repeatMode === "one"
+          ? "Disable repeat"
+          : player.repeatMode === "all"
+            ? "Repeat one"
+            : "Repeat all"}
+        title={player.repeatMode === "one"
+          ? "Repeat one"
+          : player.repeatMode === "all"
+            ? "Repeat all"
+            : "Repeat"}
       >
         <!-- <span class="control-icon" style:--control-icon={"url('/icons/repeat.svg')"} aria-hidden="true"></span> -->
-        {#if player.repeatMode === 'one'}
-          <span class="control-icon" style:--control-icon={"url('/icons/repeat.svg')"} aria-hidden="true"></span>
-        {:else if player.repeatMode === 'all'}
-          <span class="control-icon" style:--control-icon={"url('/icons/repeatplaylist.svg')"} aria-hidden="true"></span>
+        {#if player.repeatMode === "one"}
+          <span
+            class="control-icon"
+            style:--control-icon={"url('/icons/repeat.svg')"}
+            aria-hidden="true"
+          ></span>
+        {:else if player.repeatMode === "all"}
+          <span
+            class="control-icon"
+            style:--control-icon={"url('/icons/repeatplaylist.svg')"}
+            aria-hidden="true"
+          ></span>
         {:else}
-          <span class="control-icon" style:--control-icon={"url('/icons/norepeat.svg')"} aria-hidden="true"></span>
+          <span
+            class="control-icon"
+            style:--control-icon={"url('/icons/norepeat.svg')"}
+            aria-hidden="true"
+          ></span>
         {/if}
       </button>
-
     </div>
 
-    <div class="transport-right"> 
-      <MediaSlider variant="volume"/>
+    <div class="transport-right">
+      <MediaSlider variant="volume" />
     </div>
   </div>
   <div class="transport-progress">
     <MediaSlider variant="progress" />
   </div>
-
 </div>
 
 {#if fullscreenOpen}
@@ -317,5 +351,5 @@
 {/if}
 
 <style>
-  @import './TransportBar.css';
+  @import "./TransportBar.css";
 </style>

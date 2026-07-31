@@ -87,7 +87,7 @@
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  padding: 0 6px 6px;
+  padding: 0 0 0 6px;
 }
 
 .virtual-playlists {
@@ -101,7 +101,7 @@
   min-height: 0;
   overflow-x: hidden;
   overflow-y: auto;
-  padding-top: 8px;
+  padding: 6px 6px 6px 0;
   display: flex;
   flex-direction: column;
 }
@@ -139,6 +139,17 @@
   border-radius: var(--radius-mini);
   overflow: hidden;
   flex-shrink: 0;
+}
+
+.playlist-icon-svg {
+  display: block; 
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+  background-color: currentColor;
+  -webkit-mask: var(--playlist-icon-svg) center / contain no-repeat;
+  mask: var(--playlist-icon-svg) center / contain no-repeat;
+  transition: all var(--transition-fast);
 }
 
 .playlist-icon :global(.track-cover) {

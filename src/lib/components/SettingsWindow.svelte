@@ -4,6 +4,7 @@
   import WindowControls from './WindowControls.svelte';
   import SettingsSidebar from './SettingsSidebar.svelte';
   import Equalizer from './Equalizer.svelte';
+  import Dropdown from '$lib/components/Dropdown.svelte';
   import { getSettingsStore, type RemoteStatus } from '$lib/stores/settings.svelte';
   import {
     applyAccentPalette,

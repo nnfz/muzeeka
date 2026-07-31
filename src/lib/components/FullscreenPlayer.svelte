@@ -4,28 +4,29 @@
     preferFullCoverPath,
     resolveCoverSrc,
     warmImageSrc,
-  } from '$lib/coverCache';
-  import { COVER_PLACEHOLDER_SRC } from '$lib/coverPlaceholder';
+  } from "$lib/coverCache";
+  import { COVER_PLACEHOLDER_SRC } from "$lib/coverPlaceholder";
   import {
     getPlayerStore,
     trackDisplayArtist,
     trackDisplayTitle,
     type MusicFile,
-  } from '$lib/stores/player.svelte';
-  import { invoke } from '@tauri-apps/api/core';
-  import { listen } from '@tauri-apps/api/event';
-  import type { LyricsResult } from '$lib/lyrics/types';
+  } from "$lib/stores/player.svelte";
+  import { invoke } from "@tauri-apps/api/core";
+  import { listen } from "@tauri-apps/api/event";
+  import type { LyricsResult } from "$lib/lyrics/types";
   import {
     invalidateLyricsCache,
     loadLyricsForPath,
     peekLyricsCache,
     prefetchLyricsForPath,
     setLyricsCache,
-  } from '$lib/lyrics/lyricsCache';
-  import FullscreenLyrics from './FullscreenLyrics.svelte';
-  import KawarpBackground from './KawarpBackground.svelte';
-  import MediaSlider from './MediaSlider.svelte';
-  import { untrack } from 'svelte';
+  } from "$lib/lyrics/lyricsCache";
+  import FullscreenLyrics from "./FullscreenLyrics.svelte";
+  import KawarpBackground from "./KawarpBackground.svelte";
+  import MediaSlider from "./MediaSlider.svelte";
+  import { untrack } from "svelte";
+  import LikeButton from "./LikeButton.svelte";
 
   interface Props {
     open?: boolean;
@@ -41,11 +42,11 @@
   let thumbPath = $derived(player.currentTrack?.cover_path?.trim() || null);
   /** Sharper fullscreen cover (capped on disk at ~720px). */
   let fullPath = $derived(
-    resolvedFullCoverPath
-      ?? preferFullCoverPath(
+    resolvedFullCoverPath ??
+      preferFullCoverPath(
         player.currentTrack?.cover_path,
         player.currentTrack?.cover_path_full,
-      )
+      ),
   );
 
   /** Kawarp background URL. */
@@ -68,12 +69,7 @@
     const target = next ?? COVER_PLACEHOLDER_SRC;
 
     // Keep real art if path briefly empty while full-res resolve is in flight.
-    if (
-      !next
-      && file
-      && artFile === file
-      && artSrc !== COVER_PLACEHOLDER_SRC
-    ) {
+    if (!next && file && artFile === file && artSrc !== COVER_PLACEHOLDER_SRC) {
       return;
     }
 
@@ -118,7 +114,7 @@
    * - `done`: settled (same as enterDone for lyrics timing)
    */
   /** Component only mounts while open — start on the oversized first frame. */
-  let enterPhase = $state<'idle' | 'from' | 'active' | 'done'>('from');
+  let enterPhase = $state<"idle" | "from" | "active" | "done">("from");
   /** Full open zoom/blur duration — keep in sync with FullscreenPlayer.css. */
   const FS_ENTER_MS = 480;
   /**
@@ -146,8 +142,10 @@
       artist: trackDisplayArtist(track),
       album: track.album,
       durationSecs:
-        track.duration_secs
-        ?? (durationFallback != null && durationFallback > 0 ? durationFallback : null),
+        track.duration_secs ??
+        (durationFallback != null && durationFallback > 0
+          ? durationFallback
+          : null),
     };
   }
 
@@ -163,7 +161,11 @@
     clearLyricsReopenTimer();
     const openNow = () => {
       if (gen !== lyricsSwitchGen) return;
-      if (!untrack(() => open) || !untrack(() => enterDone) || !untrack(() => lyricsVisible)) {
+      if (
+        !untrack(() => open) ||
+        !untrack(() => enterDone) ||
+        !untrack(() => lyricsVisible)
+      ) {
         return;
       }
       if (!untrack(() => hasLyrics)) return;
@@ -171,7 +173,11 @@
       requestAnimationFrame(() => {
         requestAnimationFrame(() => {
           if (gen !== lyricsSwitchGen) return;
-          if (!untrack(() => hasLyrics) || !untrack(() => lyricsVisible) || !untrack(() => enterDone)) {
+          if (
+            !untrack(() => hasLyrics) ||
+            !untrack(() => lyricsVisible) ||
+            !untrack(() => enterDone)
+          ) {
             return;
           }
           lyricsLayoutActive = true;
@@ -189,7 +195,11 @@
     }, delayMs);
   }
 
-  function applyLyricsForFile(file: string, result: LyricsResult | null, gen: number) {
+  function applyLyricsForFile(
+    file: string,
+    result: LyricsResult | null,
+    gen: number,
+  ) {
     setLyricsCache(file, result);
     if (gen !== lyricsSwitchGen) return;
     if (untrack(() => player.currentFile) !== file) return;
@@ -206,9 +216,8 @@
 
     // Finish the close animation, then open cleanly (no half-state thrash).
     const closedAt = layoutClosedAt;
-    const delay = closedAt > 0
-      ? Math.max(0, LAYOUT_CLOSE_MS - (Date.now() - closedAt))
-      : 0;
+    const delay =
+      closedAt > 0 ? Math.max(0, LAYOUT_CLOSE_MS - (Date.now() - closedAt)) : 0;
     scheduleLyricsLayoutOpen(gen, delay);
   }
 
@@ -252,7 +261,7 @@
   function computePointerOverChrome(): boolean {
     if (!chromeEl) return false;
     try {
-      if (chromeEl.matches(':hover')) return true;
+      if (chromeEl.matches(":hover")) return true;
     } catch {
       /* ignore */
     }
@@ -269,7 +278,8 @@
 
   function scheduleChromeHide() {
     clearHideTimer();
-    if (!sawPointerMove || pointerOverChrome || computePointerOverChrome()) return;
+    if (!sawPointerMove || pointerOverChrome || computePointerOverChrome())
+      return;
     hideTimer = setTimeout(() => {
       hideTimer = null;
       const over = computePointerOverChrome();
@@ -321,7 +331,7 @@
 
   function handleKeydown(e: KeyboardEvent) {
     if (!open) return;
-    if (e.key === 'Escape') {
+    if (e.key === "Escape") {
       e.preventDefault();
       close();
     }
@@ -330,7 +340,7 @@
   $effect(() => {
     if (!open) return;
     const prev = document.body.style.overflow;
-    document.body.style.overflow = 'hidden';
+    document.body.style.overflow = "hidden";
     return () => {
       document.body.style.overflow = prev;
     };
@@ -381,7 +391,7 @@
       lyricsVisible = true;
       lyricsMounted = true;
       enterDone = false;
-      enterPhase = 'idle';
+      enterPhase = "idle";
       lyricsLayoutActive = false;
       layoutClosedAt = 0;
       clearArt();
@@ -399,16 +409,16 @@
     layoutClosedAt = 0;
 
     // Paint first frame oversized/blurred without transition, then animate in.
-    enterPhase = 'from';
+    enterPhase = "from";
     let raf1 = 0;
     let raf2 = 0;
     let enterTimer: ReturnType<typeof setTimeout> | null = null;
 
     raf1 = requestAnimationFrame(() => {
       raf2 = requestAnimationFrame(() => {
-        enterPhase = 'active';
+        enterPhase = "active";
         enterTimer = setTimeout(() => {
-          enterPhase = 'done';
+          enterPhase = "done";
           enterDone = true;
         }, FS_ENTER_MS);
       });
@@ -456,7 +466,7 @@
       preferFullCoverPath(
         player.currentTrack?.cover_path,
         player.currentTrack?.cover_path_full,
-      )
+      ),
     );
     resolvedFullCoverPath = knownFull;
 
@@ -471,7 +481,7 @@
 
     let cancelled = false;
 
-    void invoke<string | null>('library_resolve_full_cover', { path: file })
+    void invoke<string | null>("library_resolve_full_cover", { path: file })
       .then((fullPath) => {
         if (cancelled || !fullPath) return;
         if (untrack(() => player.currentFile) !== file) return;
@@ -546,7 +556,7 @@
   $effect(() => {
     const unlisteners: Array<() => void> = [];
     const onLyricsCacheChanged = (payload: string | undefined) => {
-      const changedPath = payload?.trim() || '';
+      const changedPath = payload?.trim() || "";
       const current = untrack(() => player.currentFile);
       if (changedPath) {
         invalidateLyricsCache(changedPath);
@@ -559,7 +569,11 @@
       }
     };
 
-    for (const eventName of ['lyrics:imported', 'lyrics:cleared', 'lyrics:refetched'] as const) {
+    for (const eventName of [
+      "lyrics:imported",
+      "lyrics:cleared",
+      "lyrics:refetched",
+    ] as const) {
       void listen<string>(eventName, (event) => {
         onLyricsCacheChanged(event.payload);
       }).then((fn) => {
@@ -606,7 +620,9 @@
         return;
       }
 
-      const params = untrack(() => lyricsParamsForTrack(player.currentTrack, player.duration));
+      const params = untrack(() =>
+        lyricsParamsForTrack(player.currentTrack, player.duration),
+      );
       if (!params) {
         retryTimer = setTimeout(run, 80);
         return;
@@ -636,7 +652,6 @@
     void player.repeatMode;
     prefetchUpcomingLyrics();
   });
-
 </script>
 
 <svelte:window
@@ -648,8 +663,8 @@
   <div
     class="fullscreen-player"
     class:enter-done={enterDone}
-    class:fs-enter-from={enterPhase === 'from'}
-    class:fs-enter-active={enterPhase === 'active' || enterPhase === 'done'}
+    class:fs-enter-from={enterPhase === "from"}
+    class:fs-enter-active={enterPhase === "active" || enterPhase === "done"}
     role="dialog"
     aria-modal="true"
     aria-label="Now playing"
@@ -666,10 +681,7 @@
       <div class="fullscreen-backdrop-shade"></div>
     </div>
 
-    <div
-      class="fullscreen-layout"
-      class:lyrics-hidden={!showLyricsPanel}
-    >
+    <div class="fullscreen-layout" class:lyrics-hidden={!showLyricsPanel}>
       <aside class="fullscreen-side">
         <div class="fullscreen-side-scale" class:is-paused={player.isPaused}>
           <div class="fullscreen-art-wrap">
@@ -681,14 +693,20 @@
                 draggable="false"
                 decoding="async"
                 onerror={() => {
-                  if (artSrc === COVER_PLACEHOLDER_SRC) placeholderFailed = true;
+                  if (artSrc === COVER_PLACEHOLDER_SRC)
+                    placeholderFailed = true;
                   else setArtSrc(COVER_PLACEHOLDER_SRC, artFile);
                 }}
               />
             {:else}
               <div class="fullscreen-art-placeholder" aria-hidden="true">
-                <svg width="72" height="72" viewBox="0 0 24 24" fill="currentColor">
-                  <path d="M12 3v10.55A4 4 0 1 0 14 17V7h4V3h-6z"/>
+                <svg
+                  width="72"
+                  height="72"
+                  viewBox="0 0 24 24"
+                  fill="currentColor"
+                >
+                  <path d="M12 3v10.55A4 4 0 1 0 14 17V7h4V3h-6z" />
                 </svg>
               </div>
             {/if}
@@ -697,24 +715,21 @@
           <div class="fullscreen-meta">
             <div class="fullscreen-meta-text">
               <h2 class="fullscreen-title">
-                {player.currentTrack ? trackDisplayTitle(player.currentTrack) : player.currentFileName ?? ''}
+                {player.currentTrack
+                  ? trackDisplayTitle(player.currentTrack)
+                  : (player.currentFileName ?? "")}
               </h2>
               {#if player.currentTrack}
-                <p class="fullscreen-artist">{trackDisplayArtist(player.currentTrack)}</p>
+                <p class="fullscreen-artist">
+                  {trackDisplayArtist(player.currentTrack)}
+                </p>
               {/if}
             </div>
             {#if player.hasTrack && player.currentFile}
-              <button
+              <LikeButton
+                file={player.currentFile}
                 class="like-btn-fullscreen"
-                class:liked={player.isLiked(player.currentFile)}
-                onclick={() => { if (player.currentFile) player.toggleLike(player.currentFile); }}
-                title={player.isLiked(player.currentFile) ? 'Remove from Liked' : 'Add to Liked'}
-                aria-label={player.isLiked(player.currentFile) ? 'Unlike current track' : 'Like current track'}
-              >
-                <svg width="20" height="20" viewBox="0 0 24 24" fill={player.isLiked(player.currentFile) ? 'currentColor' : 'none'} stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                  <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z" />
-                </svg>
-              </button>
+              />
             {/if}
           </div>
         </div>
@@ -725,10 +740,10 @@
         {#if hasLyrics && lyricsMounted}
           <FullscreenLyrics
             lines={lyricsState?.lines ?? []}
-            syncType={lyricsState?.syncType ?? 'none'}
+            syncType={lyricsState?.syncType ?? "none"}
             currentTime={player.position}
             isPlaying={player.isPlaying}
-            chromeVisible={chromeVisible}
+            {chromeVisible}
             onSeek={(time) => void player.seek(time)}
           />
         {/if}
@@ -742,82 +757,92 @@
       >
         <div class="fullscreen-toolbar">
           <div class="fullscreen-controls">
-          <button
-            class="fs-control-btn mode-btn"
-            class:active={player.shuffleEnabled}
-            onclick={() => player.toggleShuffle()}
-            disabled={!player.hasPlayingTracks}
-            aria-label={player.shuffleEnabled ? 'Disable shuffle' : 'Enable shuffle'}
-            title={player.shuffleEnabled ? 'Shuffle on' : 'Shuffle'}
-          >
-            <span
-              class="fs-icon"
-              style:--fs-icon={player.shuffleEnabled
-                ? "url('/icons/shuffle.svg')"
-                : "url('/icons/noshuffle.svg')"}
-              aria-hidden="true"
-            ></span>
-          </button>
+            <button
+              class="fs-control-btn mode-btn"
+              class:active={player.shuffleEnabled}
+              onclick={() => player.toggleShuffle()}
+              disabled={!player.hasPlayingTracks}
+              aria-label={player.shuffleEnabled
+                ? "Disable shuffle"
+                : "Enable shuffle"}
+              title={player.shuffleEnabled ? "Shuffle on" : "Shuffle"}
+            >
+              <span
+                class="fs-icon"
+                style:--fs-icon={player.shuffleEnabled
+                  ? "url('/icons/shuffle.svg')"
+                  : "url('/icons/noshuffle.svg')"}
+                aria-hidden="true"
+              ></span>
+            </button>
 
-          <button
-            class="fs-control-btn"
-            onclick={() => player.prevTrack()}
-            disabled={!player.hasTrack}
-            aria-label="Previous track"
-          >
-            <span class="fs-icon" style:--fs-icon={"url('/icons/playbackward.svg')"} aria-hidden="true"></span>
-          </button>
+            <button
+              class="fs-control-btn"
+              onclick={() => player.prevTrack()}
+              disabled={!player.hasTrack}
+              aria-label="Previous track"
+            >
+              <span
+                class="fs-icon"
+                style:--fs-icon={"url('/icons/playbackward.svg')"}
+                aria-hidden="true"
+              ></span>
+            </button>
 
-          <button
-            class="fs-control-btn play-btn"
-            class:playing={player.isPlaying}
-            onclick={() => player.togglePlayPause()}
-            disabled={!player.hasPlayingTracks && !player.hasTrack}
-            aria-label={player.isPlaying ? 'Pause' : player.isPaused ? 'Resume' : 'Play'}
-          >
-            <span
-              class="fs-icon fs-icon-play"
-              style:--fs-icon={player.isPlaying
-                ? "url('/icons/pause.svg')"
-                : "url('/icons/play.svg')"}
-              aria-hidden="true"
-            ></span>
-          </button>
+            <button
+              class="fs-control-btn play-btn"
+              class:playing={player.isPlaying}
+              onclick={() => player.togglePlayPause()}
+              disabled={!player.hasPlayingTracks && !player.hasTrack}
+              aria-label={player.isPlaying
+                ? "Pause"
+                : player.isPaused
+                  ? "Resume"
+                  : "Play"}
+            >
+              <span
+                class="fs-icon fs-icon-play"
+                style:--fs-icon={player.isPlaying
+                  ? "url('/icons/pause.svg')"
+                  : "url('/icons/play.svg')"}
+                aria-hidden="true"
+              ></span>
+            </button>
 
-          <button
-            class="fs-control-btn"
-            onclick={() => player.nextTrack()}
-            disabled={!player.hasNext}
-            aria-label="Next track"
-          >
-            <span class="fs-icon" style:--fs-icon={"url('/icons/playforward.svg')"} aria-hidden="true"></span>
-          </button>
+            <button
+              class="fs-control-btn"
+              onclick={() => player.nextTrack()}
+              disabled={!player.hasNext}
+              aria-label="Next track"
+            >
+              <span
+                class="fs-icon"
+                style:--fs-icon={"url('/icons/playforward.svg')"}
+                aria-hidden="true"
+              ></span>
+            </button>
 
-          <button
-            class="fs-control-btn mode-btn"
-            class:active={player.repeatMode !== 'off'}
-            onclick={() => player.toggleRepeat()}
-            disabled={!player.hasPlayingTracks}
-            aria-label={
-              player.repeatMode === 'one'
-                ? 'Disable repeat'
-                : player.repeatMode === 'all'
-                  ? 'Repeat one'
-                  : 'Repeat all'
-            }
-          >
-            <span
-              class="fs-icon"
-              style:--fs-icon={
-                player.repeatMode === 'one'
+            <button
+              class="fs-control-btn mode-btn"
+              class:active={player.repeatMode !== "off"}
+              onclick={() => player.toggleRepeat()}
+              disabled={!player.hasPlayingTracks}
+              aria-label={player.repeatMode === "one"
+                ? "Disable repeat"
+                : player.repeatMode === "all"
+                  ? "Repeat one"
+                  : "Repeat all"}
+            >
+              <span
+                class="fs-icon"
+                style:--fs-icon={player.repeatMode === "one"
                   ? "url('/icons/repeat.svg')"
-                  : player.repeatMode === 'all'
+                  : player.repeatMode === "all"
                     ? "url('/icons/repeatplaylist.svg')"
-                    : "url('/icons/norepeat.svg')"
-              }
-              aria-hidden="true"
-            ></span>
-          </button>
+                    : "url('/icons/norepeat.svg')"}
+                aria-hidden="true"
+              ></span>
+            </button>
           </div>
 
           <div class="fullscreen-volume">
@@ -826,8 +851,8 @@
               class="lyrics-toggle-btn"
               class:active={lyricsVisible}
               onclick={toggleLyrics}
-              aria-label={lyricsVisible ? 'Hide lyrics' : 'Show lyrics'}
-              title={lyricsVisible ? 'Hide lyrics' : 'Show lyrics'}
+              aria-label={lyricsVisible ? "Hide lyrics" : "Show lyrics"}
+              title={lyricsVisible ? "Hide lyrics" : "Show lyrics"}
             >
               <span
                 class="fs-icon fs-icon-sm"
@@ -837,7 +862,7 @@
                 aria-hidden="true"
               ></span>
             </button>
-            <MediaSlider variant="volume" useStaticIcons />
+            <MediaSlider variant="volume" />
           </div>
         </div>
 
@@ -850,5 +875,5 @@
 {/if}
 
 <style>
-  @import './FullscreenPlayer.css';
+  @import "./FullscreenPlayer.css";
 </style>

@@ -35,6 +35,7 @@
   import { COVER_PLACEHOLDER_SRC } from "$lib/coverPlaceholder";
   import { dragFloatHide } from "$lib/dragFloat";
   import TrackCover from "./TrackCover.svelte";
+  import LikeButton from "./LikeButton.svelte";
 
   type ColumnId = "index" | "title" | "album" | "duration";
   type SortDirection = "asc" | "desc";
@@ -1700,44 +1701,12 @@
                   {:else}
                     <span class="col-duration">
                       <span
-                        role="button"
-                        tabindex="0"
-                        class="like-btn like-duration"
-                        class:liked={player.isLiked(track.path)}
-                        onclick={(e) => {
-                          e.stopPropagation();
-                          player.toggleLike(track.path);
-                        }}
-                        onkeydown={(e) => {
-                          if (e.key === "Enter" || e.key === " ") {
-                            e.stopPropagation();
-                            e.preventDefault();
-                            player.toggleLike(track.path);
-                          }
-                        }}
-                        title={player.isLiked(track.path)
-                          ? "Remove from Liked"
-                          : "Add to Liked"}
-                        aria-label={player.isLiked(track.path)
-                          ? "Unlike track"
-                          : "Like track"}
+                        role="presentation"
+                        onclick={(e) => e.stopPropagation()}
+                        onkeydown={(e) => e.stopPropagation()}
+                        style="display: contents;"
                       >
-                        <svg
-                          width="13"
-                          height="13"
-                          viewBox="0 0 24 24"
-                          fill={player.isLiked(track.path)
-                            ? "currentColor"
-                            : "none"}
-                          stroke="currentColor"
-                          stroke-width="2.2"
-                          stroke-linecap="round"
-                          stroke-linejoin="round"
-                        >
-                          <path
-                            d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"
-                          />
-                        </svg>
+                        <LikeButton file={track.path} class="like-duration" />
                       </span>
                       <span class="duration-text"
                         >{formatDuration(track.duration_secs)}</span

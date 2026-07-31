@@ -5,15 +5,14 @@
     BAND_FREQUENCIES,
     getSettingsStore,
   } from '$lib/stores/settings.svelte';
+  import Dropdown from '$lib/components/Dropdown.svelte';
 
   const settings = getSettingsStore();
 
-  /** Visual fader values (animated on preset/reset; instant on drag). */
   let displayPreamp = $state(settings.equalizer.preamp_db);
   let displayBands = $state<number[]>(
     Array.from({ length: BAND_COUNT }, (_, i) => settings.equalizer.bands_db[i] ?? 0),
   );
-  /** False until user drags / preset / reset — so bootstrap can fill display values. */
   let userTouched = $state(false);
   let animRaf = 0;
 
@@ -22,7 +21,6 @@
     return String(freq);
   }
 
-  /** 0–100 fill for seekbar-style track (min → max). */
   function fillPct(value: number, min: number, max: number): number {
     if (max <= min) return 0;
     return Math.max(0, Math.min(100, ((value - min) / (max - min)) * 100));
@@ -62,7 +60,6 @@
     animRaf = requestAnimationFrame(tick);
   }
 
-  // Follow store until the user interacts (covers async settings_load).
   $effect(() => {
     const eq = settings.equalizer;
     if (userTouched || animRaf) return;
@@ -90,7 +87,9 @@
     const p = settings.customPresets.find((x) => x.name === name);
     if (!p) return;
     userTouched = true;
-    closeDropdown();
+    dropdownOpen = false;
+    saveMode = false;
+    newPresetName = '';
     void settings.applyPreset(name);
     animateDisplay(p.preamp_db, p.bands_db);
   }
@@ -101,7 +100,6 @@
     animateDisplay(0, Array(BAND_COUNT).fill(0));
   }
 
-  // Custom dropdown state
   let dropdownOpen = $state(false);
   let saveMode = $state(false);
   let newPresetName = $state('');
@@ -120,23 +118,8 @@
     return null;
   });
 
-  function toggleDropdown(e?: MouseEvent) {
-    e?.stopPropagation();
-    dropdownOpen = !dropdownOpen;
-    if (!dropdownOpen) {
-      saveMode = false;
-      newPresetName = '';
-    }
-  }
-
-  function closeDropdown() {
-    dropdownOpen = false;
-    saveMode = false;
-    newPresetName = '';
-  }
-
-  function startSaveMode(e?: MouseEvent) {
-    e?.stopPropagation();
+  function startSaveMode(e?: Event) {
+    e?.stopPropagation?.();
     saveMode = true;
     newPresetName = '';
     setTimeout(() => {
@@ -151,7 +134,9 @@
     const name = newPresetName.trim();
     if (!name) return;
     await settings.savePreset(name);
-    closeDropdown();
+    dropdownOpen = false;
+    saveMode = false;
+    newPresetName = '';
   }
 
   function cancelSaveMode(e?: Event) {
@@ -168,24 +153,13 @@
     }
   }
 
-  function handleGlobalClick(e: MouseEvent) {
-    if (!dropdownOpen) return;
-    const target = e.target as HTMLElement;
-    if (!target.closest('.preset-dropdown')) {
-      closeDropdown();
-    }
-  }
-
-  function handleGlobalKey(e: KeyboardEvent) {
-    if (dropdownOpen && e.key === 'Escape') {
-      closeDropdown();
-    }
+  function handleDeletePreset(e: MouseEvent | KeyboardEvent, name: string) {
+    e.stopPropagation();
+    void settings.deletePreset(name);
   }
 
   onDestroy(() => cancelAnim());
 </script>
-
-<svelte:window onclick={handleGlobalClick} onkeydown={handleGlobalKey} />
 
 <div class="equalizer">
   <div class="eq-toolbar">
@@ -200,79 +174,66 @@
 
     <div class="eq-presets">
       <span class="eq-presets-label">Preset:</span>
-      <div class="preset-dropdown">
-        <button
-          type="button"
-          class="preset-trigger"
-          class:custom={!currentPresetName && settings.customPresets.length > 0}
-          onclick={toggleDropdown}
-          aria-haspopup="listbox"
-          aria-expanded={dropdownOpen}
-        >
-          <span class="preset-label">{currentPresetName || (settings.customPresets.length ? 'Custom' : 'None')}</span>
-          <span class="preset-chevron">▾</span>
-        </button>
-
-        {#if dropdownOpen}
-          <div class="preset-menu glass" role="listbox">
-            {#if saveMode}
-              <div class="preset-save">
-                <input
-                  type="text"
-                  class="preset-save-input"
-                  placeholder="Preset name"
-                  bind:value={newPresetName}
-                  onkeydown={handleSaveKeydown}
-                />
-                <div class="preset-save-actions">
-                  <button type="button" class="preset-action-btn" onclick={confirmSavePreset}>Save</button>
-                  <button type="button" class="preset-action-btn cancel" onclick={cancelSaveMode}>Cancel</button>
-                </div>
+      <Dropdown class="preset-dropdown" bind:open={dropdownOpen} align="right">
+        {#snippet trigger({ toggle })}
+          <button
+            type="button"
+            class="preset-trigger"
+            class:custom={!currentPresetName && settings.customPresets.length > 0}
+            onclick={toggle}
+            aria-haspopup="listbox"
+            aria-expanded={dropdownOpen}
+          >
+            <span class="preset-label">{currentPresetName || (settings.customPresets.length ? 'Custom' : 'None')}</span>
+            <span class="preset-chevron">▾</span>
+          </button>
+        {/snippet}
+        {#snippet menu()}
+          {#if saveMode}
+            <div class="preset-save">
+              <input
+                type="text"
+                class="preset-save-input"
+                placeholder="Preset name"
+                bind:value={newPresetName}
+                onkeydown={handleSaveKeydown}
+              />
+              <div class="preset-save-actions">
+                <button type="button" class="preset-action-btn" onclick={confirmSavePreset}>Save</button>
+                <button type="button" class="preset-action-btn cancel" onclick={cancelSaveMode}>Cancel</button>
               </div>
-            {:else}
-              <button
-                type="button"
-                class="preset-menu-item save"
-                onclick={startSaveMode}
-              >
-                + Save current as...
-              </button>
+            </div>
+          {:else}
+            <button type="button" class="dropdown-item accent" onclick={startSaveMode}>
+              <span class="dropdown-item-label">+ Save current as...</span>
+            </button>
 
-              {#if settings.customPresets.length > 0}
-                <div class="preset-divider"></div>
+            {#if settings.customPresets.length > 0}
+              <div class="dropdown-divider"></div>
 
-                {#each settings.customPresets as preset (preset.name)}
-                  <button
-                    type="button"
-                    class="preset-menu-item"
-                    onclick={() => applyPresetAndClose(preset.name)}
+              {#each settings.customPresets as preset (preset.name)}
+                <button type="button" class="dropdown-item" onclick={() => applyPresetAndClose(preset.name)}>
+                  <span class="dropdown-item-label">{preset.name}</span>
+                  <span
+                    class="dropdown-item-action danger"
+                    title="Delete preset"
+                    role="button"
+                    tabindex="0"
+                    onclick={(e) => handleDeletePreset(e, preset.name)}
+                    onkeydown={(e) => {
+                      if (e.key !== 'Enter' && e.key !== ' ') return;
+                      e.preventDefault();
+                      handleDeletePreset(e, preset.name);
+                    }}
                   >
-                    <span class="preset-name">{preset.name}</span>
-                    <span
-                      class="preset-delete-btn"
-                      title="Delete preset"
-                      role="button"
-                      tabindex="0"
-                      onclick={(e) => {
-                        e.stopPropagation();
-                        void settings.deletePreset(preset.name);
-                      }}
-                      onkeydown={(e) => {
-                        if (e.key !== 'Enter' && e.key !== ' ') return;
-                        e.preventDefault();
-                        e.stopPropagation();
-                        void settings.deletePreset(preset.name);
-                      }}
-                    >
-                      ×
-                    </span>
-                  </button>
-                {/each}
-              {/if}
+                    ×
+                  </span>
+                </button>
+              {/each}
             {/if}
-          </div>
-        {/if}
-      </div>
+          {/if}
+        {/snippet}
+      </Dropdown>
     </div>
 
     <button type="button" class="eq-reset" onclick={handleReset}>

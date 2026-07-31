@@ -17,6 +17,7 @@
   font-size: 12px;
   color: var(--text-secondary);
   cursor: pointer;
+  line-height: 1;
 }
 
 .eq-toggle input {
@@ -24,7 +25,6 @@
 }
 
 .eq-reset {
-  margin-left: auto;
   padding: 6px 12px;
   border-radius: var(--radius-sm);
   font-size: 11px;
@@ -40,6 +40,7 @@
 }
 
 .eq-presets {
+  margin-left: auto;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -48,11 +49,6 @@
 .eq-presets-label {
   font-size: 11px;
   color: var(--text-muted);
-}
-
-/* Custom preset dropdown - matches app glass style */
-.preset-dropdown {
-  position: relative;
 }
 
 .preset-trigger {
@@ -95,103 +91,8 @@
   margin-left: 2px;
 }
 
-.preset-menu {
-  position: absolute;
-  top: calc(100% + 4px);
-  left: 0;
-  z-index: 200;
-  min-width: 168px;
-  max-height: 240px;
-  overflow-y: auto;
-  padding: 4px;
-  border-radius: var(--radius-sm);
-  background: var(--bg-glass-hover-transp);
-  backdrop-filter: blur(16px) saturate(130%);
-  -webkit-backdrop-filter: blur(16px) saturate(130%);
-  border: 1px solid var(--border-subtle);
-  box-shadow: var(--shadow-md);
-  animation: fade-in 0.1s ease;
-}
-
-.preset-menu-item,
-.preset-menu-item.save {
-  position: relative;
-  display: flex;
-  align-items: center;
-  width: 100%;
-  padding: 7px 10px;
-  padding-right: 26px;
-  font-size: 12px;
-  text-align: left;
-  color: var(--text-primary);
-  background: transparent;
-  border: none;
-  border-radius: var(--radius-mini);
-  cursor: pointer;
-  transition: background var(--transition-fast);
-}
-
-.preset-menu-item:hover {
-  background: rgba(255, 255, 255, 0.07);
-}
-
-.preset-menu-item.save {
-  color: var(--accent);
-  font-weight: 500;
-}
-
-.preset-menu-item.save:hover {
-  background: var(--accent-soft);
-}
-
-.preset-divider {
-  height: 1px;
-  background: var(--border-subtle);
-  margin: 4px 4px;
-}
-
-.preset-name {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  padding-right: 4px;
-}
-
-.preset-delete-btn {
-  position: absolute;
-  right: 4px;
-  top: 50%;
-  transform: translateY(-50%);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 18px;
-  height: 18px;
-  font-size: 13px;
-  line-height: 1;
-  color: var(--text-muted);
-  background: transparent;
-  border: none;
-  border-radius: 3px;
-  cursor: pointer;
-  opacity: 0;
-  transition: opacity 0.1s ease, color 0.1s ease, background 0.1s ease;
-}
-
-.preset-menu-item:hover .preset-delete-btn {
-  opacity: 1;
-}
-
-.preset-delete-btn:hover {
-  color: #f87171;
-  background: rgba(248, 113, 113, 0.12);
-}
-
-/* Save mode inside dropdown */
 .preset-save {
-  padding: 6px 4px 4px;
+  /* padding: 6px 4px 4px; */
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -272,7 +173,6 @@
   border-right: 1px solid var(--border-subtle);
 }
 
-/* Seekbar-style vertical faders: muted track + solid accent fill + white thumb */
 .eq-slider {
   flex: 1;
   width: 4px;
@@ -283,7 +183,6 @@
   cursor: pointer;
   writing-mode: vertical-lr;
   direction: rtl;
-  /* Hard cut fill (not a soft gradient), same idea as .slider-fill */
   background: linear-gradient(
     to top,
     var(--accent) 0%,
@@ -292,7 +191,6 @@
     rgba(255, 255, 255, 0.08) 100%
   );
 }
-
 
 .eq-slider::-webkit-slider-runnable-track {
   width: 100%;
