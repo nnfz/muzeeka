@@ -561,7 +561,8 @@ impl LibraryDatabase {
         path: &str,
     ) -> Result<Option<(Option<String>, Option<String>)>, String> {
         let connection = self.inner.connection.lock();
-        let Some(track_id) = find_track_id(&connection, path)? else {
+        let roots = load_roots(&connection)?;
+        let Some(track_id) = find_track_id(&connection, path, &roots)? else {
             return Ok(None);
         };
         let cover_id: Option<String> = connection
@@ -593,7 +594,8 @@ impl LibraryDatabase {
             return Ok(());
         };
         let connection = self.inner.connection.lock();
-        let Some(track_id) = find_track_id(&connection, path)? else {
+        let roots = load_roots(&connection)?;
+        let Some(track_id) = find_track_id(&connection, path, &roots)? else {
             return Ok(());
         };
         connection
@@ -624,8 +626,10 @@ impl LibraryDatabase {
         }
         let mut connection = self.inner.connection.lock();
         let transaction = connection.transaction().map_err(db_error)?;
+        // Roots do not change during this transaction — load once, not per track.
+        let roots = load_roots(&transaction)?;
         for track in tracks {
-            upsert_track(&transaction, track)?;
+            upsert_track(&transaction, track, &roots)?;
         }
         transaction.commit().map_err(db_error)?;
         drop(connection);
@@ -643,6 +647,7 @@ impl LibraryDatabase {
         }
         let mut connection = self.inner.connection.lock();
         let transaction = connection.transaction().map_err(db_error)?;
+        let roots = load_roots(&transaction)?;
         let mut next_position: i64 = transaction
             .query_row(
                 "SELECT COALESCE(MAX(position), -1) + 1
@@ -652,7 +657,7 @@ impl LibraryDatabase {
             )
             .map_err(db_error)?;
         for track in tracks {
-            let track_id = upsert_track(&transaction, track)?;
+            let track_id = upsert_track(&transaction, track, &roots)?;
             let inserted = transaction
                 .execute(
                     "INSERT OR IGNORE INTO playlist_tracks(playlist_id, track_id, position)
@@ -680,8 +685,9 @@ impl LibraryDatabase {
         }
         let mut connection = self.inner.connection.lock();
         let transaction = connection.transaction().map_err(db_error)?;
+        let roots = load_roots(&transaction)?;
         for path in paths {
-            if let Some(track_id) = find_track_id(&transaction, path)? {
+            if let Some(track_id) = find_track_id(&transaction, path, &roots)? {
                 transaction
                     .execute(
                         "DELETE FROM playlist_tracks
@@ -758,8 +764,9 @@ impl LibraryDatabase {
         }
         let mut connection = self.inner.connection.lock();
         let transaction = connection.transaction().map_err(db_error)?;
+        let roots = load_roots(&transaction)?;
         for path in paths {
-            if let Some(track_id) = find_track_id(&transaction, path)? {
+            if let Some(track_id) = find_track_id(&transaction, path, &roots)? {
                 transaction
                     .execute("DELETE FROM tracks WHERE id = ?1", [track_id])
                     .map_err(db_error)?;
@@ -788,7 +795,8 @@ impl LibraryDatabase {
     pub fn set_liked(&self, path: &str, liked: bool) -> Result<(), String> {
         let mut connection = self.inner.connection.lock();
         let transaction = connection.transaction().map_err(db_error)?;
-        let track_id = find_track_id(&transaction, path)?;
+        let roots = load_roots(&transaction)?;
+        let track_id = find_track_id(&transaction, path, &roots)?;
         if let Some(track_id) = track_id {
             if liked {
                 transaction
@@ -1178,14 +1186,14 @@ fn resolve_stored_path(
     rel_path.to_string()
 }
 
+/// Map absolute path → (root_id, rel_path, path_key).
+/// `roots` must be longest-first (as returned by `load_roots`).
 fn split_for_storage(
-    connection: &Connection,
     absolute: &str,
+    roots: &[(i64, String)],
 ) -> Result<(Option<i64>, String, String), String> {
-    let roots = load_roots(connection)?;
     let abs = path_store::normalize_display_path(absolute);
-    // Longest root first (load_roots orders by length DESC).
-    for (id, root) in &roots {
+    for (id, root) in roots {
         if let Some(rel) = to_relative(root, &abs) {
             let key = storage_path_key(Some(*id), &rel);
             return Ok((Some(*id), rel, key));
@@ -1195,10 +1203,13 @@ fn split_for_storage(
     Ok((None, abs, key))
 }
 
-fn find_track_id(connection: &Connection, absolute: &str) -> Result<Option<i64>, String> {
-    let roots = load_roots(connection)?;
+fn find_track_id(
+    connection: &Connection,
+    absolute: &str,
+    roots: &[(i64, String)],
+) -> Result<Option<i64>, String> {
     let mut candidates = vec![storage_path_key(None, absolute), path_key(absolute)];
-    for (id, root) in &roots {
+    for (id, root) in roots {
         if let Some(rel) = to_relative(root, absolute) {
             candidates.push(storage_path_key(Some(*id), &rel));
         }
@@ -1221,28 +1232,31 @@ fn find_track_id(connection: &Connection, absolute: &str) -> Result<Option<i64>,
     Ok(None)
 }
 
-fn upsert_track(transaction: &Transaction<'_>, track: &MusicFile) -> Result<i64, String> {
+fn upsert_track(
+    transaction: &Transaction<'_>,
+    track: &MusicFile,
+    roots: &[(i64, String)],
+) -> Result<i64, String> {
     if track.path.trim().is_empty() {
         return Err("Cannot store a track with an empty path".to_string());
     }
-    let (root_id, rel_path, key) = split_for_storage(transaction, &track.path)?;
+    let (root_id, rel_path, key) = split_for_storage(&track.path, roots)?;
     let audio_rel = match track.audio_path.as_deref() {
         Some(audio) if !audio.is_empty() => {
             if let Some(rid) = root_id {
-                let roots = load_roots(transaction)?;
                 if let Some((_, root)) = roots.iter().find(|(i, _)| *i == rid) {
                     if let Some(rel) = to_relative(root, audio) {
                         Some(rel)
                     } else {
-                        let (_, rel, _) = split_for_storage(transaction, audio)?;
+                        let (_, rel, _) = split_for_storage(audio, roots)?;
                         Some(rel)
                     }
                 } else {
-                    let (_, rel, _) = split_for_storage(transaction, audio)?;
+                    let (_, rel, _) = split_for_storage(audio, roots)?;
                     Some(rel)
                 }
             } else {
-                let (_, rel, _) = split_for_storage(transaction, audio)?;
+                let (_, rel, _) = split_for_storage(audio, roots)?;
                 Some(rel)
             }
         }
@@ -1370,10 +1384,11 @@ fn track_ids_for_paths(
     transaction: &Transaction<'_>,
     paths: &[String],
 ) -> Result<Vec<i64>, String> {
+    let roots = load_roots(transaction)?;
     let mut ids = Vec::with_capacity(paths.len());
     let mut seen = HashSet::with_capacity(paths.len());
     for path in paths {
-        let track_id = find_track_id(transaction, path)?
+        let track_id = find_track_id(transaction, path, &roots)?
             .ok_or_else(|| format!("Track is not in the library: {path}"))?;
         if !seen.insert(track_id) {
             return Err(format!("Duplicate track in order: {path}"));
