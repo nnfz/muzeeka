@@ -21,6 +21,7 @@ mod lyrics;
 mod unison;
 mod metadata;
 mod player;
+mod path_store;
 mod playlists;
 mod process_util;
 mod remote_control;

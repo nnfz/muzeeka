@@ -54,6 +54,8 @@ pub struct TrackMetadata {
     pub genre: Option<String>,
     pub cover_path: Option<String>,
     pub cover_path_full: Option<String>,
+    /// Content-addressed cover id (no directory, no suffix). Prefer this in SQLite.
+    pub cover_id: Option<String>,
 }
 
 /// Content-addressed cover pair written under the covers/ cache directory.
@@ -61,6 +63,8 @@ pub struct TrackMetadata {
 pub struct CoverPaths {
     pub thumb: Option<String>,
     pub full: Option<String>,
+    /// Stable content hash (`c-{id}-thumb.webp` / `c-{id}-full.jpg`). Stored in SQLite.
+    pub id: Option<String>,
 }
 
 /// Initialize the on-disk cover art cache under the app data directory.
@@ -302,10 +306,11 @@ fn ensure_content_cover_files(data: &[u8], _mime: &str) -> Option<(String, Cover
     if thumb_ok && full_ok {
         let full_path = find_ok_full(&content_id)?;
         return Some((
-            content_id,
+            content_id.clone(),
             CoverPaths {
                 thumb: Some(thumb_path.to_string_lossy().to_string()),
                 full: Some(full_path.to_string_lossy().to_string()),
+                id: Some(content_id),
             },
         ));
     }
@@ -347,10 +352,11 @@ fn ensure_content_cover_files(data: &[u8], _mime: &str) -> Option<(String, Cover
         .map(|p| p.to_string_lossy().to_string());
 
     Some((
-        content_id,
+        content_id.clone(),
         CoverPaths {
             thumb: Some(thumb_path.to_string_lossy().to_string()),
             full,
+            id: Some(content_id),
         },
     ))
 }
@@ -1041,10 +1047,72 @@ pub fn fresh_cover_paths_for_track(track_path: &str) -> (Option<String>, Option<
 
 fn cache_cover_bytes(data: &[u8], mime: &str) -> CoverPaths {
     // Content-addressed: identical APIC/cover bytes (same album) → one image pair.
-    // Track→path mapping is stored in SQLite (`tracks.cover_path*`), not sidecar .ref files.
-    ensure_content_cover_files(data, mime)
-        .map(|(_, paths)| paths)
-        .unwrap_or_default()
+    // SQLite stores only `cover_id`; thumb/full paths are reconstructed at read time.
+    match ensure_content_cover_files(data, mime) {
+        Some((id, mut paths)) => {
+            paths.id = Some(id);
+            paths
+        }
+        None => CoverPaths::default(),
+    }
+}
+
+/// Parse `c-{16 hex}-(thumb|full).*` → content id. Also accepts a bare 16-hex id.
+pub fn cover_id_from_cache_path(path: &str) -> Option<String> {
+    let name = Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(path.trim());
+    let lower = name.to_ascii_lowercase();
+    if lower.len() == 16 && lower.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Some(lower);
+    }
+    // c-<id>-thumb.webp / c-<id>-full.jpg
+    let rest = lower.strip_prefix("c-")?;
+    let (id, suffix) = rest.split_once('-')?;
+    if id.len() == 16
+        && id.chars().all(|c| c.is_ascii_hexdigit())
+        && (suffix.starts_with("thumb.") || suffix.starts_with("full."))
+    {
+        return Some(id.to_string());
+    }
+    // Full path containing .../c-<id>-thumb.webp
+    if let Some(pos) = lower.rfind("c-") {
+        let slice = &lower[pos + 2..];
+        if slice.len() >= 16 {
+            let id = &slice[..16];
+            if id.chars().all(|c| c.is_ascii_hexdigit()) {
+                let after = &slice[16..];
+                if after.starts_with("-thumb.") || after.starts_with("-full.") {
+                    return Some(id.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn cover_id_from_paths(thumb: Option<&str>, full: Option<&str>) -> Option<String> {
+    thumb
+        .and_then(cover_id_from_cache_path)
+        .or_else(|| full.and_then(cover_id_from_cache_path))
+}
+
+/// Expand a stored cover_id into on-disk thumb/full paths (files may be missing).
+pub fn cover_paths_for_id(cover_id: &str) -> CoverPaths {
+    let id = cover_id.trim().to_ascii_lowercase();
+    if id.len() != 16 || !id.chars().all(|c| c.is_ascii_hexdigit()) {
+        return CoverPaths::default();
+    }
+    let thumb = content_thumb_path(&id).filter(|p| p.is_file());
+    let full = find_ok_full(&id).or_else(|| find_any_full(&id));
+    CoverPaths {
+        thumb: thumb.map(|p| p.to_string_lossy().to_string()),
+        full: full
+            .filter(|p| !is_thumb_cache_path(&p.to_string_lossy()))
+            .map(|p| p.to_string_lossy().to_string()),
+        id: Some(id),
+    }
 }
 
 fn cache_cover_file(source: &Path) -> CoverPaths {
@@ -1242,6 +1310,7 @@ fn read_metadata_impl(path: &Path, file_name: &str, resolve_covers: bool) -> Tra
                 let covers = resolve_cover_paths(path, Some(tagged_file));
                 meta.cover_path = covers.thumb;
                 meta.cover_path_full = covers.full;
+                meta.cover_id = covers.id;
             }
         }
         Err(_) => {
@@ -1250,6 +1319,7 @@ fn read_metadata_impl(path: &Path, file_name: &str, resolve_covers: bool) -> Tra
                 let covers = resolve_cover_paths(path, None);
                 meta.cover_path = covers.thumb;
                 meta.cover_path_full = covers.full;
+                meta.cover_id = covers.id;
             }
         }
     }

@@ -277,9 +277,12 @@ fn scan_progress_label(path: &std::path::Path) -> String {
 #[tauri::command]
 pub async fn library_scan(
     app: AppHandle,
+    database: State<'_, LibraryDatabase>,
     directory: String,
 ) -> Result<Vec<library::MusicFile>, String> {
+    let database = database.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let _ = database.ensure_root(&directory);
         let last_emitted = std::sync::Mutex::new(0usize);
         library::scan_directory_with_progress(&directory, &|current, total, path| {
             let step = (total / 200).max(1);
@@ -311,9 +314,19 @@ pub async fn library_scan(
 #[tauri::command]
 pub async fn library_scan_paths(
     app: AppHandle,
+    database: State<'_, LibraryDatabase>,
     paths: Vec<String>,
 ) -> Result<Vec<library::MusicFile>, String> {
+    let database = database.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
+        for path in &paths {
+            let p = std::path::Path::new(path);
+            if p.is_dir() {
+                let _ = database.ensure_root(path);
+            } else if let Some(parent) = p.parent() {
+                let _ = database.ensure_root(&parent.to_string_lossy());
+            }
+        }
         let last_emitted = std::sync::Mutex::new(0usize);
         library::scan_paths_with_progress(&paths, &|current, total, path| {
             let step = (total / 200).max(1);

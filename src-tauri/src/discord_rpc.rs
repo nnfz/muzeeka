@@ -461,6 +461,7 @@ fn metadata_for_path_uncached(track_path: &str) -> TrackMetadata {
             genre: track.genre,
             cover_path,
             cover_path_full: track.cover_path_full.clone(),
+            cover_id: None,
         };
     }
 

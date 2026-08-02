@@ -11,8 +11,14 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 
 use crate::library::MusicFile;
+use crate::metadata;
+use crate::path_store::{self, join_root, path_key, storage_path_key, to_relative};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
+
+const TRACK_SELECT: &str = "t.id, t.root_id, t.rel_path, t.path_key, t.file_name, t.extension, t.size,
+     t.title, t.artist, t.album, t.duration_secs, t.year, t.track_number, t.genre,
+     t.cover_id, t.audio_rel_path, t.cue_start_secs, t.cue_end_secs, t.library_position";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SavedPlaylist {
@@ -138,32 +144,11 @@ impl LibraryDatabase {
                 "CREATE TABLE IF NOT EXISTS schema_info (
                      version INTEGER NOT NULL
                  );
-                 CREATE TABLE IF NOT EXISTS tracks (
+                 CREATE TABLE IF NOT EXISTS library_roots (
                      id INTEGER PRIMARY KEY,
                      path TEXT NOT NULL,
-                     path_key TEXT NOT NULL UNIQUE,
-                     file_name TEXT NOT NULL,
-                     extension TEXT NOT NULL,
-                     size INTEGER NOT NULL,
-                     title TEXT,
-                     artist TEXT,
-                     album TEXT,
-                     duration_secs REAL,
-                     year INTEGER,
-                     track_number INTEGER,
-                     genre TEXT,
-                     cover_path TEXT,
-                     cover_path_full TEXT,
-                     audio_path TEXT,
-                     cue_start_secs REAL,
-                     cue_end_secs REAL,
-                     library_position INTEGER NOT NULL
+                     path_key TEXT NOT NULL UNIQUE
                  );
-                 CREATE INDEX IF NOT EXISTS tracks_library_position
-                     ON tracks(library_position);
-                 CREATE INDEX IF NOT EXISTS tracks_artist ON tracks(artist);
-                 CREATE INDEX IF NOT EXISTS tracks_album ON tracks(album);
-                 CREATE INDEX IF NOT EXISTS tracks_title ON tracks(title);
                  CREATE TABLE IF NOT EXISTS playlists (
                      id TEXT PRIMARY KEY,
                      name TEXT NOT NULL,
@@ -171,22 +156,6 @@ impl LibraryDatabase {
                      position INTEGER NOT NULL
                  );
                  CREATE INDEX IF NOT EXISTS playlists_position ON playlists(position);
-                 CREATE TABLE IF NOT EXISTS playlist_tracks (
-                     playlist_id TEXT NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
-                     track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
-                     position INTEGER NOT NULL,
-                     PRIMARY KEY (playlist_id, track_id)
-                 );
-                 CREATE INDEX IF NOT EXISTS playlist_tracks_order
-                     ON playlist_tracks(playlist_id, position);
-                 -- Reverse lookups + efficient ON DELETE CASCADE from tracks(id).
-                 CREATE INDEX IF NOT EXISTS playlist_tracks_track
-                     ON playlist_tracks(track_id);
-                 CREATE TABLE IF NOT EXISTS liked_tracks (
-                     track_id INTEGER PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE,
-                     position INTEGER NOT NULL
-                 );
-                 CREATE INDEX IF NOT EXISTS liked_tracks_order ON liked_tracks(position);
                  CREATE TABLE IF NOT EXISTS app_state (
                      id INTEGER PRIMARY KEY CHECK (id = 1),
                      active_playlist_id TEXT,
@@ -212,7 +181,94 @@ impl LibraryDatabase {
             [],
         );
 
-        // If foreign_keys was ever off historically, orphan membership rows can linger.
+        let version = connection
+            .query_row("SELECT version FROM schema_info LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(db_error)?;
+
+        let tracks_is_v1 = table_has_column(&connection, "tracks", "cover_path")?;
+        let tracks_is_v2 = table_has_column(&connection, "tracks", "cover_id")?;
+
+        match version {
+            None if !tracks_is_v1 && !tracks_is_v2 => {
+                create_tracks_v2(&connection)?;
+                connection
+                    .execute(
+                        "INSERT INTO schema_info(version) VALUES (?1)",
+                        [SCHEMA_VERSION],
+                    )
+                    .map_err(db_error)?;
+            }
+            None | Some(1) if tracks_is_v1 && !tracks_is_v2 => {
+                migrate_v1_to_v2(&connection)?;
+                if version.is_none() {
+                    connection
+                        .execute(
+                            "INSERT INTO schema_info(version) VALUES (?1)",
+                            [SCHEMA_VERSION],
+                        )
+                        .map_err(db_error)?;
+                } else {
+                    connection
+                        .execute("UPDATE schema_info SET version = ?1", [SCHEMA_VERSION])
+                        .map_err(db_error)?;
+                }
+            }
+            Some(SCHEMA_VERSION) | None if tracks_is_v2 => {
+                ensure_tracks_v2_indexes(&connection)?;
+                if version.is_none() {
+                    connection
+                        .execute(
+                            "INSERT INTO schema_info(version) VALUES (?1)",
+                            [SCHEMA_VERSION],
+                        )
+                        .map_err(db_error)?;
+                }
+            }
+            Some(SCHEMA_VERSION) => {
+                ensure_tracks_v2_indexes(&connection)?;
+            }
+            Some(other) => {
+                return Err(format!(
+                    "Unsupported library database schema {other}; expected {SCHEMA_VERSION}"
+                ));
+            }
+            None => {
+                // Ambiguous empty-ish DB: create v2 tracks.
+                create_tracks_v2(&connection)?;
+                connection
+                    .execute(
+                        "INSERT INTO schema_info(version) VALUES (?1)",
+                        [SCHEMA_VERSION],
+                    )
+                    .map_err(db_error)?;
+            }
+        }
+
+        // Membership tables need tracks() to exist for FK references.
+        connection
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS playlist_tracks (
+                     playlist_id TEXT NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+                     track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+                     position INTEGER NOT NULL,
+                     PRIMARY KEY (playlist_id, track_id)
+                 );
+                 CREATE INDEX IF NOT EXISTS playlist_tracks_order
+                     ON playlist_tracks(playlist_id, position);
+                 CREATE INDEX IF NOT EXISTS playlist_tracks_track
+                     ON playlist_tracks(track_id);
+                 CREATE TABLE IF NOT EXISTS liked_tracks (
+                     track_id INTEGER PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE,
+                     position INTEGER NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS liked_tracks_order ON liked_tracks(position);",
+            )
+            .map_err(db_error)?;
+
+        // Orphans if FK was ever off historically.
         connection
             .execute_batch(
                 "DELETE FROM playlist_tracks
@@ -223,35 +279,47 @@ impl LibraryDatabase {
             )
             .map_err(db_error)?;
 
-        let version = connection
-            .query_row("SELECT version FROM schema_info LIMIT 1", [], |row| {
-                row.get(0)
-            })
-            .optional()
-            .map_err(db_error)?;
-        match version {
-            None => {
-                connection
-                    .execute(
-                        "INSERT INTO schema_info(version) VALUES (?1)",
-                        [SCHEMA_VERSION],
-                    )
-                    .map_err(db_error)?;
-            }
-            Some(SCHEMA_VERSION) => {}
-            Some(other) => {
-                return Err(format!(
-                    "Unsupported library database schema {other}; expected {SCHEMA_VERSION}"
-                ));
-            }
-        }
-
         Ok(Self {
             inner: Arc::new(DatabaseInner {
                 connection: Mutex::new(connection),
                 revision: AtomicU64::new(1),
             }),
         })
+    }
+
+    /// Register a library root (scan/drop folder). Tracks under it are stored relatively.
+    pub fn ensure_root(&self, absolute_path: &str) -> Result<i64, String> {
+        let mut connection = self.inner.connection.lock();
+        let id = ensure_root_tx(&connection, absolute_path)?;
+        // Best-effort: rewrite absolute tracks under this root to relative form.
+        rewrite_tracks_under_root(&mut connection, id)?;
+        drop(connection);
+        self.changed();
+        Ok(id)
+    }
+
+    /// Point an existing root at a new absolute path (drive letter / machine move).
+    pub fn relocate_root(&self, root_id: i64, new_absolute: &str) -> Result<(), String> {
+        let cleaned = path_store::normalize_display_path(new_absolute);
+        if cleaned.trim().is_empty() {
+            return Err("Root path is empty".into());
+        }
+        let key = path_key(&cleaned);
+        let connection = self.inner.connection.lock();
+        connection
+            .execute(
+                "UPDATE library_roots SET path = ?2, path_key = ?3 WHERE id = ?1",
+                params![root_id, cleaned, key],
+            )
+            .map_err(db_error)?;
+        drop(connection);
+        self.changed();
+        Ok(())
+    }
+
+    pub fn list_roots(&self) -> Result<Vec<(i64, String)>, String> {
+        let connection = self.inner.connection.lock();
+        load_roots(&connection)
     }
 
     pub fn revision(&self) -> u64 {
@@ -264,10 +332,14 @@ impl LibraryDatabase {
 
     pub fn load(&self) -> Result<PlaylistsData, String> {
         let connection = self.inner.connection.lock();
+        let roots = load_roots(&connection)?;
         let library_tracks = query_tracks(
             &connection,
-            "SELECT t.* FROM tracks t ORDER BY t.library_position, t.id",
+            &format!(
+                "SELECT {TRACK_SELECT} FROM tracks t ORDER BY t.library_position, t.id"
+            ),
             [],
+            &roots,
         )?;
         let all_paths = library_tracks
             .iter()
@@ -294,12 +366,15 @@ impl LibraryDatabase {
         for (id, name, cover_path) in playlist_headers {
             let tracks = query_tracks(
                 &connection,
-                "SELECT t.*
-                   FROM playlist_tracks pt
-                   JOIN tracks t ON t.id = pt.track_id
-                  WHERE pt.playlist_id = ?1
-                  ORDER BY pt.position, t.id",
+                &format!(
+                    "SELECT {TRACK_SELECT}
+                       FROM playlist_tracks pt
+                       JOIN tracks t ON t.id = pt.track_id
+                      WHERE pt.playlist_id = ?1
+                      ORDER BY pt.position, pt.track_id"
+                ),
                 [&id],
+                &roots,
             )?;
             playlists.push(SavedPlaylist {
                 id,
@@ -310,18 +385,18 @@ impl LibraryDatabase {
         }
 
         let liked_paths = {
-            let mut statement = connection
-                .prepare(
-                    "SELECT t.path
+            let liked = query_tracks(
+                &connection,
+                &format!(
+                    "SELECT {TRACK_SELECT}
                        FROM liked_tracks l
                        JOIN tracks t ON t.id = l.track_id
-                      ORDER BY l.position, t.id",
-                )
-                .map_err(db_error)?;
-            let rows = statement
-                .query_map([], |row| row.get(0))
-                .map_err(db_error)?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(db_error)?
+                      ORDER BY l.position, t.id"
+                ),
+                [],
+                &roots,
+            )?;
+            liked.into_iter().map(|t| t.path).collect::<Vec<_>>()
         };
 
         let state = connection
@@ -486,39 +561,45 @@ impl LibraryDatabase {
         path: &str,
     ) -> Result<Option<(Option<String>, Option<String>)>, String> {
         let connection = self.inner.connection.lock();
-        connection
+        let Some(track_id) = find_track_id(&connection, path)? else {
+            return Ok(None);
+        };
+        let cover_id: Option<String> = connection
             .query_row(
-                "SELECT cover_path, cover_path_full FROM tracks WHERE path_key = ?1",
-                params![path_key(path)],
-                |row| {
-                    Ok((
-                        row.get::<_, Option<String>>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                    ))
-                },
+                "SELECT cover_id FROM tracks WHERE id = ?1",
+                [track_id],
+                |row| row.get(0),
             )
-            .optional()
-            .map_err(db_error)
+            .map_err(db_error)?;
+        let Some(cover_id) = cover_id.filter(|id| !id.is_empty()) else {
+            return Ok(Some((None, None)));
+        };
+        let covers = metadata::cover_paths_for_id(&cover_id);
+        Ok(Some((covers.thumb, covers.full)))
     }
 
     /// Persist cover paths for an existing track row (no-op if the path is not in the library).
+    /// Accepts full disk paths or a bare content id; stores only `cover_id`.
     pub fn set_track_covers(
         &self,
         path: &str,
         cover_path: Option<&str>,
         cover_path_full: Option<&str>,
     ) -> Result<(), String> {
-        if cover_path.is_none() && cover_path_full.is_none() {
+        let cover_id = metadata::cover_id_from_paths(cover_path, cover_path_full)
+            .or_else(|| cover_path.and_then(metadata::cover_id_from_cache_path))
+            .or_else(|| cover_path_full.and_then(metadata::cover_id_from_cache_path));
+        let Some(cover_id) = cover_id else {
             return Ok(());
-        }
+        };
         let connection = self.inner.connection.lock();
+        let Some(track_id) = find_track_id(&connection, path)? else {
+            return Ok(());
+        };
         connection
             .execute(
-                "UPDATE tracks SET
-                    cover_path = CASE WHEN ?2 IS NOT NULL THEN ?2 ELSE cover_path END,
-                    cover_path_full = CASE WHEN ?3 IS NOT NULL THEN ?3 ELSE cover_path_full END
-                 WHERE path_key = ?1",
-                params![path_key(path), cover_path, cover_path_full],
+                "UPDATE tracks SET cover_id = ?2 WHERE id = ?1",
+                params![track_id, cover_id],
             )
             .map_err(db_error)?;
         Ok(())
@@ -600,14 +681,15 @@ impl LibraryDatabase {
         let mut connection = self.inner.connection.lock();
         let transaction = connection.transaction().map_err(db_error)?;
         for path in paths {
-            transaction
-                .execute(
-                    "DELETE FROM playlist_tracks
-                      WHERE playlist_id = ?1
-                        AND track_id = (SELECT id FROM tracks WHERE path_key = ?2)",
-                    params![playlist_id, path_key(path)],
-                )
-                .map_err(db_error)?;
+            if let Some(track_id) = find_track_id(&transaction, path)? {
+                transaction
+                    .execute(
+                        "DELETE FROM playlist_tracks
+                          WHERE playlist_id = ?1 AND track_id = ?2",
+                        params![playlist_id, track_id],
+                    )
+                    .map_err(db_error)?;
+            }
         }
         compact_positions(
             &transaction,
@@ -677,9 +759,11 @@ impl LibraryDatabase {
         let mut connection = self.inner.connection.lock();
         let transaction = connection.transaction().map_err(db_error)?;
         for path in paths {
-            transaction
-                .execute("DELETE FROM tracks WHERE path_key = ?1", [path_key(path)])
-                .map_err(db_error)?;
+            if let Some(track_id) = find_track_id(&transaction, path)? {
+                transaction
+                    .execute("DELETE FROM tracks WHERE id = ?1", [track_id])
+                    .map_err(db_error)?;
+            }
         }
         compact_positions(&transaction, "tracks", "id", None)?;
         compact_positions(&transaction, "liked_tracks", "track_id", None)?;
@@ -704,14 +788,7 @@ impl LibraryDatabase {
     pub fn set_liked(&self, path: &str, liked: bool) -> Result<(), String> {
         let mut connection = self.inner.connection.lock();
         let transaction = connection.transaction().map_err(db_error)?;
-        let track_id = transaction
-            .query_row(
-                "SELECT id FROM tracks WHERE path_key = ?1",
-                [path_key(path)],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()
-            .map_err(db_error)?;
+        let track_id = find_track_id(&transaction, path)?;
         if let Some(track_id) = track_id {
             if liked {
                 transaction
@@ -759,40 +836,436 @@ impl LibraryDatabase {
     }
 }
 
-fn path_key(path: &str) -> String {
-    let trimmed = path.trim();
-    let without_prefix = trimmed
-        .strip_prefix(r"\\?\")
-        .or_else(|| trimmed.strip_prefix("//?/"))
-        .unwrap_or(trimmed);
-    if cfg!(windows) {
-        without_prefix.replace('/', "\\").to_lowercase()
-    } else {
-        without_prefix.to_string()
-    }
-}
-
 fn db_error(error: rusqlite::Error) -> String {
     format!("Library database error: {error}")
 }
 
+fn table_has_column(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+) -> Result<bool, String> {
+    if !table_exists(connection, table)? {
+        return Ok(false);
+    }
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(db_error)?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(db_error)?;
+    for name in rows {
+        if name.map_err(db_error)? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn table_exists(connection: &Connection, table: &str) -> Result<bool, String> {
+    let count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    Ok(count > 0)
+}
+
+fn create_tracks_v2(connection: &Connection) -> Result<(), String> {
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS tracks (
+                 id INTEGER PRIMARY KEY,
+                 root_id INTEGER REFERENCES library_roots(id) ON DELETE SET NULL,
+                 rel_path TEXT NOT NULL,
+                 path_key TEXT NOT NULL UNIQUE,
+                 file_name TEXT NOT NULL,
+                 extension TEXT NOT NULL,
+                 size INTEGER NOT NULL,
+                 title TEXT,
+                 artist TEXT,
+                 album TEXT,
+                 duration_secs REAL,
+                 year INTEGER,
+                 track_number INTEGER,
+                 genre TEXT,
+                 cover_id TEXT,
+                 audio_rel_path TEXT,
+                 cue_start_secs REAL,
+                 cue_end_secs REAL,
+                 library_position INTEGER NOT NULL
+             );",
+        )
+        .map_err(db_error)?;
+    ensure_tracks_v2_indexes(connection)
+}
+
+fn ensure_tracks_v2_indexes(connection: &Connection) -> Result<(), String> {
+    connection
+        .execute_batch(
+            "CREATE INDEX IF NOT EXISTS tracks_library_position ON tracks(library_position);
+             CREATE INDEX IF NOT EXISTS tracks_artist ON tracks(artist);
+             CREATE INDEX IF NOT EXISTS tracks_album ON tracks(album);
+             CREATE INDEX IF NOT EXISTS tracks_title ON tracks(title);
+             CREATE INDEX IF NOT EXISTS tracks_root ON tracks(root_id);
+             CREATE INDEX IF NOT EXISTS tracks_cover_id ON tracks(cover_id);",
+        )
+        .map_err(db_error)
+}
+
+fn migrate_v1_to_v2(connection: &Connection) -> Result<(), String> {
+    // Rebuild tracks: absolute path → rel_path (no root yet), cover_path* → cover_id.
+    connection
+        .execute_batch(
+            "CREATE TABLE tracks_v2 (
+                 id INTEGER PRIMARY KEY,
+                 root_id INTEGER REFERENCES library_roots(id) ON DELETE SET NULL,
+                 rel_path TEXT NOT NULL,
+                 path_key TEXT NOT NULL UNIQUE,
+                 file_name TEXT NOT NULL,
+                 extension TEXT NOT NULL,
+                 size INTEGER NOT NULL,
+                 title TEXT,
+                 artist TEXT,
+                 album TEXT,
+                 duration_secs REAL,
+                 year INTEGER,
+                 track_number INTEGER,
+                 genre TEXT,
+                 cover_id TEXT,
+                 audio_rel_path TEXT,
+                 cue_start_secs REAL,
+                 cue_end_secs REAL,
+                 library_position INTEGER NOT NULL
+             );",
+        )
+        .map_err(db_error)?;
+
+    {
+        let mut select = connection
+            .prepare(
+                "SELECT id, path, path_key, file_name, extension, size, title, artist, album,
+                        duration_secs, year, track_number, genre, cover_path, cover_path_full,
+                        audio_path, cue_start_secs, cue_end_secs, library_position
+                   FROM tracks",
+            )
+            .map_err(db_error)?;
+        let rows = select
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<f64>>(9)?,
+                    row.get::<_, Option<i64>>(10)?,
+                    row.get::<_, Option<i64>>(11)?,
+                    row.get::<_, Option<String>>(12)?,
+                    row.get::<_, Option<String>>(13)?,
+                    row.get::<_, Option<String>>(14)?,
+                    row.get::<_, Option<String>>(15)?,
+                    row.get::<_, Option<f64>>(16)?,
+                    row.get::<_, Option<f64>>(17)?,
+                    row.get::<_, i64>(18)?,
+                ))
+            })
+            .map_err(db_error)?;
+
+        let mut insert = connection
+            .prepare(
+                "INSERT INTO tracks_v2(
+                     id, root_id, rel_path, path_key, file_name, extension, size,
+                     title, artist, album, duration_secs, year, track_number, genre,
+                     cover_id, audio_rel_path, cue_start_secs, cue_end_secs, library_position
+                 ) VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+            )
+            .map_err(db_error)?;
+
+        for row in rows {
+            let (
+                id,
+                path,
+                old_key,
+                file_name,
+                extension,
+                size,
+                title,
+                artist,
+                album,
+                duration_secs,
+                year,
+                track_number,
+                genre,
+                cover_path,
+                cover_path_full,
+                audio_path,
+                cue_start,
+                cue_end,
+                library_position,
+            ) = row.map_err(db_error)?;
+            let cover_id = metadata::cover_id_from_paths(
+                cover_path.as_deref(),
+                cover_path_full.as_deref(),
+            );
+            // Keep absolute in rel_path with root_id NULL until ensure_root rewrites.
+            let rel_path = path;
+            let path_key = if old_key.is_empty() {
+                storage_path_key(None, &rel_path)
+            } else {
+                old_key
+            };
+            insert
+                .execute(params![
+                    id,
+                    rel_path,
+                    path_key,
+                    file_name,
+                    extension,
+                    size,
+                    title,
+                    artist,
+                    album,
+                    duration_secs,
+                    year,
+                    track_number,
+                    genre,
+                    cover_id,
+                    audio_path,
+                    cue_start,
+                    cue_end,
+                    library_position,
+                ])
+                .map_err(db_error)?;
+        }
+    }
+
+    connection
+        .execute_batch(
+            "DROP TABLE tracks;
+             ALTER TABLE tracks_v2 RENAME TO tracks;",
+        )
+        .map_err(db_error)?;
+    ensure_tracks_v2_indexes(connection)
+}
+
+fn load_roots(connection: &Connection) -> Result<Vec<(i64, String)>, String> {
+    let mut statement = connection
+        .prepare("SELECT id, path FROM library_roots ORDER BY length(path) DESC, id")
+        .map_err(db_error)?;
+    let rows = statement
+        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+        .map_err(db_error)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
+}
+
+fn ensure_root_tx(connection: &Connection, absolute_path: &str) -> Result<i64, String> {
+    let cleaned = path_store::normalize_display_path(absolute_path);
+    let cleaned = cleaned
+        .trim_end_matches(['/', '\\'])
+        .to_string();
+    if cleaned.is_empty() {
+        return Err("Root path is empty".into());
+    }
+    let key = path_key(&cleaned);
+    if let Some(id) = connection
+        .query_row(
+            "SELECT id FROM library_roots WHERE path_key = ?1",
+            [&key],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(db_error)?
+    {
+        // Refresh display path casing if needed.
+        let _ = connection.execute(
+            "UPDATE library_roots SET path = ?2 WHERE id = ?1",
+            params![id, cleaned],
+        );
+        return Ok(id);
+    }
+    connection
+        .execute(
+            "INSERT INTO library_roots(path, path_key) VALUES (?1, ?2)",
+            params![cleaned, key],
+        )
+        .map_err(db_error)?;
+    Ok(connection.last_insert_rowid())
+}
+
+fn rewrite_tracks_under_root(connection: &mut Connection, root_id: i64) -> Result<(), String> {
+    let root_path: String = connection
+        .query_row(
+            "SELECT path FROM library_roots WHERE id = ?1",
+            [root_id],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+
+    let mut select = connection
+        .prepare(
+            "SELECT id, rel_path, audio_rel_path FROM tracks
+              WHERE root_id IS NULL OR root_id = ?1",
+        )
+        .map_err(db_error)?;
+    let rows = select
+        .query_map([root_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .map_err(db_error)?;
+
+    let mut updates: Vec<(i64, String, Option<String>, String)> = Vec::new();
+    for row in rows {
+        let (id, rel_path, audio_rel) = row.map_err(db_error)?;
+        // Treat current rel_path as absolute if no root or still absolute-looking.
+        let looks_absolute = (rel_path.len() >= 2 && rel_path.as_bytes()[1] == b':')
+            || rel_path.starts_with('\\')
+            || rel_path.starts_with('/');
+        if !looks_absolute {
+            continue;
+        }
+        let abs = rel_path.clone();
+        let Some(new_rel) = to_relative(&root_path, &abs) else {
+            continue;
+        };
+        let new_audio = audio_rel.and_then(|a| {
+            let abs_audio = (a.len() >= 2 && a.as_bytes().get(1) == Some(&b':'))
+                || a.starts_with('\\')
+                || a.starts_with('/');
+            if abs_audio {
+                to_relative(&root_path, &a)
+            } else {
+                Some(a)
+            }
+        });
+        let new_key = storage_path_key(Some(root_id), &new_rel);
+        updates.push((id, new_rel, new_audio, new_key));
+    }
+    drop(select);
+
+    for (id, new_rel, new_audio, new_key) in updates {
+        connection
+            .execute(
+                "UPDATE tracks SET root_id = ?2, rel_path = ?3, audio_rel_path = ?4, path_key = ?5
+                  WHERE id = ?1",
+                params![id, root_id, new_rel, new_audio, new_key],
+            )
+            .map_err(db_error)?;
+    }
+    Ok(())
+}
+
+fn resolve_stored_path(
+    roots: &[(i64, String)],
+    root_id: Option<i64>,
+    rel_path: &str,
+) -> String {
+    if let Some(id) = root_id {
+        if let Some((_, root)) = roots.iter().find(|(rid, _)| *rid == id) {
+            return join_root(root, rel_path);
+        }
+    }
+    rel_path.to_string()
+}
+
+fn split_for_storage(
+    connection: &Connection,
+    absolute: &str,
+) -> Result<(Option<i64>, String, String), String> {
+    let roots = load_roots(connection)?;
+    let abs = path_store::normalize_display_path(absolute);
+    // Longest root first (load_roots orders by length DESC).
+    for (id, root) in &roots {
+        if let Some(rel) = to_relative(root, &abs) {
+            let key = storage_path_key(Some(*id), &rel);
+            return Ok((Some(*id), rel, key));
+        }
+    }
+    let key = storage_path_key(None, &abs);
+    Ok((None, abs, key))
+}
+
+fn find_track_id(connection: &Connection, absolute: &str) -> Result<Option<i64>, String> {
+    let roots = load_roots(connection)?;
+    let mut candidates = vec![storage_path_key(None, absolute), path_key(absolute)];
+    for (id, root) in &roots {
+        if let Some(rel) = to_relative(root, absolute) {
+            candidates.push(storage_path_key(Some(*id), &rel));
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+    for key in candidates {
+        if let Some(id) = connection
+            .query_row(
+                "SELECT id FROM tracks WHERE path_key = ?1",
+                [&key],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(db_error)?
+        {
+            return Ok(Some(id));
+        }
+    }
+    Ok(None)
+}
+
 fn upsert_track(transaction: &Transaction<'_>, track: &MusicFile) -> Result<i64, String> {
-    let key = path_key(&track.path);
-    if key.is_empty() {
+    if track.path.trim().is_empty() {
         return Err("Cannot store a track with an empty path".to_string());
     }
+    let (root_id, rel_path, key) = split_for_storage(transaction, &track.path)?;
+    let audio_rel = match track.audio_path.as_deref() {
+        Some(audio) if !audio.is_empty() => {
+            if let Some(rid) = root_id {
+                let roots = load_roots(transaction)?;
+                if let Some((_, root)) = roots.iter().find(|(i, _)| *i == rid) {
+                    if let Some(rel) = to_relative(root, audio) {
+                        Some(rel)
+                    } else {
+                        let (_, rel, _) = split_for_storage(transaction, audio)?;
+                        Some(rel)
+                    }
+                } else {
+                    let (_, rel, _) = split_for_storage(transaction, audio)?;
+                    Some(rel)
+                }
+            } else {
+                let (_, rel, _) = split_for_storage(transaction, audio)?;
+                Some(rel)
+            }
+        }
+        _ => None,
+    };
+    let cover_id = metadata::cover_id_from_paths(
+        track.cover_path.as_deref(),
+        track.cover_path_full.as_deref(),
+    );
+
     let mut statement = transaction
         .prepare_cached(
             "INSERT INTO tracks(
-                 path, path_key, file_name, extension, size, title, artist, album,
-                 duration_secs, year, track_number, genre, cover_path, cover_path_full,
-                 audio_path, cue_start_secs, cue_end_secs, library_position
+                 root_id, rel_path, path_key, file_name, extension, size, title, artist, album,
+                 duration_secs, year, track_number, genre, cover_id, audio_rel_path,
+                 cue_start_secs, cue_end_secs, library_position
              ) VALUES (
-                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                 ?15, ?16, ?17, (SELECT COALESCE(MAX(library_position), -1) + 1 FROM tracks)
+                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                 ?16, ?17, (SELECT COALESCE(MAX(library_position), -1) + 1 FROM tracks)
              )
              ON CONFLICT(path_key) DO UPDATE SET
-                 path = excluded.path,
+                 root_id = excluded.root_id,
+                 rel_path = excluded.rel_path,
                  file_name = excluded.file_name,
                  extension = excluded.extension,
                  size = excluded.size,
@@ -803,9 +1276,8 @@ fn upsert_track(transaction: &Transaction<'_>, track: &MusicFile) -> Result<i64,
                  year = COALESCE(excluded.year, tracks.year),
                  track_number = COALESCE(excluded.track_number, tracks.track_number),
                  genre = COALESCE(excluded.genre, tracks.genre),
-                 cover_path = COALESCE(excluded.cover_path, tracks.cover_path),
-                 cover_path_full = COALESCE(excluded.cover_path_full, tracks.cover_path_full),
-                 audio_path = COALESCE(excluded.audio_path, tracks.audio_path),
+                 cover_id = COALESCE(excluded.cover_id, tracks.cover_id),
+                 audio_rel_path = COALESCE(excluded.audio_rel_path, tracks.audio_rel_path),
                  cue_start_secs = COALESCE(excluded.cue_start_secs, tracks.cue_start_secs),
                  cue_end_secs = COALESCE(excluded.cue_end_secs, tracks.cue_end_secs)
              RETURNING id",
@@ -815,7 +1287,8 @@ fn upsert_track(transaction: &Transaction<'_>, track: &MusicFile) -> Result<i64,
     statement
         .query_row(
             params![
-                track.path,
+                root_id,
+                rel_path,
                 key,
                 track.file_name,
                 track.extension,
@@ -827,9 +1300,8 @@ fn upsert_track(transaction: &Transaction<'_>, track: &MusicFile) -> Result<i64,
                 track.year.map(i64::from),
                 track.track_number.map(i64::from),
                 track.genre,
-                track.cover_path,
-                track.cover_path_full,
-                track.audio_path,
+                cover_id,
+                audio_rel,
                 track.cue_start_secs,
                 track.cue_end_secs,
             ],
@@ -838,41 +1310,58 @@ fn upsert_track(transaction: &Transaction<'_>, track: &MusicFile) -> Result<i64,
         .map_err(db_error)
 }
 
-fn row_to_track(row: &Row<'_>) -> rusqlite::Result<MusicFile> {
-    let size = row.get::<_, i64>(5)?.max(0) as u64;
+/// Columns: see TRACK_SELECT
+fn row_to_track(row: &Row<'_>, roots: &[(i64, String)]) -> rusqlite::Result<MusicFile> {
+    let root_id: Option<i64> = row.get(1)?;
+    let rel_path: String = row.get(2)?;
+    let path = resolve_stored_path(roots, root_id, &rel_path);
+    let size = row.get::<_, i64>(6)?.max(0) as u64;
     let year = row
-        .get::<_, Option<i64>>(10)?
-        .and_then(|value| u32::try_from(value).ok());
-    let track_number = row
         .get::<_, Option<i64>>(11)?
         .and_then(|value| u32::try_from(value).ok());
+    let track_number = row
+        .get::<_, Option<i64>>(12)?
+        .and_then(|value| u32::try_from(value).ok());
+    let cover_id: Option<String> = row.get(14)?;
+    let covers = cover_id
+        .as_deref()
+        .map(metadata::cover_paths_for_id)
+        .unwrap_or_default();
+    let audio_rel: Option<String> = row.get(15)?;
+    let audio_path = audio_rel.map(|rel| resolve_stored_path(roots, root_id, &rel));
+
     Ok(MusicFile {
-        path: row.get(1)?,
-        file_name: row.get(3)?,
-        extension: row.get(4)?,
+        path,
+        file_name: row.get(4)?,
+        extension: row.get(5)?,
         size,
-        title: row.get(6)?,
-        artist: row.get(7)?,
-        album: row.get(8)?,
-        duration_secs: row.get(9)?,
+        title: row.get(7)?,
+        artist: row.get(8)?,
+        album: row.get(9)?,
+        duration_secs: row.get(10)?,
         year,
         track_number,
-        genre: row.get(12)?,
-        cover_path: row.get(13)?,
-        cover_path_full: row.get(14)?,
-        audio_path: row.get(15)?,
+        genre: row.get(13)?,
+        cover_path: covers.thumb,
+        cover_path_full: covers.full,
+        audio_path,
         cue_start_secs: row.get(16)?,
         cue_end_secs: row.get(17)?,
     })
 }
 
-fn query_tracks<P>(connection: &Connection, sql: &str, params: P) -> Result<Vec<MusicFile>, String>
+fn query_tracks<P>(
+    connection: &Connection,
+    sql: &str,
+    params: P,
+    roots: &[(i64, String)],
+) -> Result<Vec<MusicFile>, String>
 where
     P: rusqlite::Params,
 {
     let mut statement = connection.prepare(sql).map_err(db_error)?;
     let rows = statement
-        .query_map(params, row_to_track)
+        .query_map(params, |row| row_to_track(row, roots))
         .map_err(db_error)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
 }
@@ -884,14 +1373,7 @@ fn track_ids_for_paths(
     let mut ids = Vec::with_capacity(paths.len());
     let mut seen = HashSet::with_capacity(paths.len());
     for path in paths {
-        let track_id = transaction
-            .query_row(
-                "SELECT id FROM tracks WHERE path_key = ?1",
-                [path_key(path)],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(db_error)?
+        let track_id = find_track_id(transaction, path)?
             .ok_or_else(|| format!("Track is not in the library: {path}"))?;
         if !seen.insert(track_id) {
             return Err(format!("Duplicate track in order: {path}"));
@@ -1028,6 +1510,47 @@ mod tests {
             .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
             .unwrap();
         assert_eq!(fk_on, 1, "foreign_keys must be ON for CASCADE");
+    }
+
+    #[test]
+    fn stores_relative_paths_and_cover_id() {
+        let db = database();
+        let root = if cfg!(windows) {
+            r"Z:\library_root"
+        } else {
+            "/library_root"
+        };
+        db.ensure_root(root).unwrap();
+        let track_path = if cfg!(windows) {
+            r"Z:\library_root\Album\a.flac"
+        } else {
+            "/library_root/Album/a.flac"
+        };
+        let mut t = track(track_path, None);
+        t.cover_path = Some(
+            r"C:\Users\x\AppData\Roaming\com.nnfz.muzeeka\covers\c-0123456789abcdef-thumb.webp"
+                .into(),
+        );
+        db.upsert_tracks(&[t]).unwrap();
+
+        let connection = db.inner.connection.lock();
+        let (rel, cover_id, root_id): (String, Option<String>, Option<i64>) = connection
+            .query_row(
+                "SELECT rel_path, cover_id, root_id FROM tracks LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert!(root_id.is_some());
+        assert!(
+            !rel.contains(':') || rel.starts_with("Album") || rel.starts_with("album"),
+            "expected relative path, got {rel}"
+        );
+        assert_eq!(cover_id.as_deref(), Some("0123456789abcdef"));
+        drop(connection);
+
+        let data = db.load().unwrap();
+        assert_eq!(path_key(&data.library_tracks[0].path), path_key(track_path));
     }
 
     #[test]

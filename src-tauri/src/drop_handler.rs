@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use tauri::{DragDropEvent, Emitter, Manager, Window, WindowEvent};
 
 use crate::library;
+use crate::playlists::LibraryDatabase;
 
 const EXPORT_DROP_SUPPRESS_FOR: Duration = Duration::from_secs(8);
 
@@ -223,6 +224,17 @@ fn effective_paths(drop_paths: &[PathBuf], fallback: &[PathBuf]) -> Vec<String> 
 }
 
 fn emit_drop_result(window: &Window, position: [f64; 2], paths: Vec<String>, ctrl: bool) {
+    if let Some(db) = window.try_state::<LibraryDatabase>() {
+        for path in &paths {
+            let p = Path::new(path);
+            if p.is_dir() {
+                let _ = db.ensure_root(path);
+            } else if let Some(parent) = p.parent() {
+                let _ = db.ensure_root(&parent.to_string_lossy());
+            }
+        }
+    }
+
     let source_paths = paths.clone();
     let last_emitted = std::sync::Mutex::new(0usize);
     let payload = match library::scan_paths_with_progress(&paths, &|current, total, path| {
