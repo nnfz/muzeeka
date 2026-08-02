@@ -13,14 +13,28 @@ use tauri_plugin_taskbar::TaskbarExt;
 use crate::remote_control::RemoteController;
 
 const TOGGLE_DEBOUNCE_MS: u64 = 120;
+const NAV_DEBOUNCE_MS: u64 = 120;
 
 static LAST_TOGGLE_MS: AtomicU64 = AtomicU64::new(0);
+static LAST_NAV_MS: AtomicU64 = AtomicU64::new(0);
 
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Claim a debounce slot. Returns false if another thread already acted recently
+/// (or won the CAS race).
+fn claim_debounce(slot: &AtomicU64, debounce_ms: u64) -> bool {
+    let now = now_ms();
+    let last = slot.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < debounce_ms {
+        return false;
+    }
+    slot.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
 }
 
 /// Refresh play/pause and prev/next enabled state on the taskbar preview.
@@ -46,7 +60,10 @@ pub fn sync_taskbar(controller: &RemoteController) {
     }
 }
 
-fn spawn_action(controller: Arc<RemoteController>, action: fn(&RemoteController) -> Result<(), String>) {
+fn spawn_action<F>(controller: Arc<RemoteController>, action: F)
+where
+    F: FnOnce(&RemoteController) -> Result<(), String> + Send + 'static,
+{
     std::thread::spawn(move || {
         if let Err(error) = action(&controller) {
             eprintln!("Taskbar action failed: {error}");
@@ -56,13 +73,24 @@ fn spawn_action(controller: Arc<RemoteController>, action: fn(&RemoteController)
 }
 
 fn toggle_action(controller: &RemoteController) -> Result<(), String> {
-    let now = now_ms();
-    let last = LAST_TOGGLE_MS.load(Ordering::Relaxed);
-    if now.saturating_sub(last) < TOGGLE_DEBOUNCE_MS {
+    if !claim_debounce(&LAST_TOGGLE_MS, TOGGLE_DEBOUNCE_MS) {
         return Ok(());
     }
-    LAST_TOGGLE_MS.store(now, Ordering::Relaxed);
     controller.toggle()
+}
+
+fn prev_action(controller: &RemoteController) -> Result<(), String> {
+    if !claim_debounce(&LAST_NAV_MS, NAV_DEBOUNCE_MS) {
+        return Ok(());
+    }
+    controller.prev()
+}
+
+fn next_action(controller: &RemoteController) -> Result<(), String> {
+    if !claim_debounce(&LAST_NAV_MS, NAV_DEBOUNCE_MS) {
+        return Ok(());
+    }
+    controller.next()
 }
 
 pub fn setup(app: &AppHandle, controller: Arc<RemoteController>) {
@@ -75,12 +103,12 @@ pub fn setup(app: &AppHandle, controller: Arc<RemoteController>) {
 
         let ctrl = controller.clone();
         let _ = app.listen("media-prev", move |_event| {
-            spawn_action(ctrl.clone(), |c| c.prev());
+            spawn_action(ctrl.clone(), prev_action);
         });
 
         let ctrl = controller.clone();
         let _ = app.listen("media-next", move |_event| {
-            spawn_action(ctrl.clone(), |c| c.next());
+            spawn_action(ctrl.clone(), next_action);
         });
 
         let ctrl = controller.clone();
