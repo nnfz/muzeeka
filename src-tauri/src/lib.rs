@@ -145,8 +145,33 @@ fn resolve_bass_dir(app: Option<&tauri::AppHandle>) -> PathBuf {
     fallback
 }
 
+/// Load secrets / local overrides from `.env` (project root or `src-tauri/`).
+/// Existing process env vars always win — `.env` only fills missing keys.
+fn load_dotenv() {
+    let candidates = [
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join(".env"),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".env"),
+        PathBuf::from(".env"),
+    ];
+    for path in candidates {
+        if path.is_file() {
+            match dotenvy::from_path(&path) {
+                Ok(()) => {
+                    eprintln!("Loaded env from {}", path.display());
+                    return;
+                }
+                Err(error) => {
+                    eprintln!("Failed to load {}: {error}", path.display());
+                }
+            }
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    load_dotenv();
+
     let player = Player::new();
     let player_for_close = player.clone();
     let player_for_focus = player.clone();

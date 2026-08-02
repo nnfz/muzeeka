@@ -10,6 +10,9 @@ use std::sync::OnceLock;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
+/// Negative-cache marker for uploads that failed (not a real URL).
+pub const FAILED_MARKER: &str = "__failed__";
+
 static CACHE: OnceLock<Mutex<CoverUrlCache>> = OnceLock::new();
 
 struct CoverUrlCache {
@@ -29,6 +32,14 @@ struct DiskFormatRef<'a> {
     entries: &'a HashMap<String, String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheLookup {
+    Url(String),
+    /// Previous attempt failed; callers should not retry until the entry is cleared.
+    Failed,
+    Miss,
+}
+
 /// Initialize the on-disk cache under the app data directory.
 pub fn init(app_data_dir: PathBuf) {
     let path = app_data_dir.join("discord_cover_urls.json");
@@ -38,9 +49,23 @@ pub fn init(app_data_dir: PathBuf) {
 
 /// Return a previously stored public HTTPS cover URL, if any.
 pub fn get(key: &str) -> Option<String> {
-    let cache = CACHE.get()?;
+    match lookup(key) {
+        CacheLookup::Url(url) => Some(url),
+        CacheLookup::Failed | CacheLookup::Miss => None,
+    }
+}
+
+/// Full lookup including negative-cache hits.
+pub fn lookup(key: &str) -> CacheLookup {
+    let Some(cache) = CACHE.get() else {
+        return CacheLookup::Miss;
+    };
     let guard = cache.lock();
-    guard.entries.get(key).cloned().filter(|url| is_http_url(url))
+    match guard.entries.get(key).map(String::as_str) {
+        Some(url) if is_http_url(url) => CacheLookup::Url(url.to_string()),
+        Some(v) if is_failed_marker(v) => CacheLookup::Failed,
+        _ => CacheLookup::Miss,
+    }
 }
 
 /// Store a successful cover URL under `key` and flush to disk.
@@ -48,6 +73,18 @@ pub fn set(key: &str, url: &str) {
     if key.is_empty() || !is_http_url(url) {
         return;
     }
+    write_entry(key, url);
+}
+
+/// Remember a failed upload so we do not hammer the network every session.
+pub fn set_failed(key: &str) {
+    if key.is_empty() {
+        return;
+    }
+    write_entry(key, FAILED_MARKER);
+}
+
+fn write_entry(key: &str, value: &str) {
     let Some(cache) = CACHE.get() else {
         return;
     };
@@ -55,10 +92,10 @@ pub fn set(key: &str, url: &str) {
     // Mutate under the lock, then release before disk I/O so get() isn't blocked on fsync.
     let (path, entries) = {
         let mut guard = cache.lock();
-        if guard.entries.get(key).map(String::as_str) == Some(url) {
+        if guard.entries.get(key).map(String::as_str) == Some(value) {
             return;
         }
-        guard.entries.insert(key.to_string(), url.to_string());
+        guard.entries.insert(key.to_string(), value.to_string());
         (guard.path.clone(), guard.entries.clone())
     };
 
@@ -71,6 +108,14 @@ fn is_http_url(url: &str) -> bool {
     url.starts_with("https://") || url.starts_with("http://")
 }
 
+fn is_failed_marker(value: &str) -> bool {
+    value == FAILED_MARKER
+}
+
+fn is_persistable_value(value: &str) -> bool {
+    is_http_url(value) || is_failed_marker(value)
+}
+
 fn load(path: &Path) -> HashMap<String, String> {
     let Ok(raw) = fs::read_to_string(path) else {
         return HashMap::new();
@@ -79,7 +124,7 @@ fn load(path: &Path) -> HashMap<String, String> {
         Ok(disk) => disk
             .entries
             .into_iter()
-            .filter(|(_, url)| is_http_url(url))
+            .filter(|(_, value)| is_persistable_value(value))
             .collect(),
         Err(error) => {
             eprintln!("Discord cover URL cache parse failed: {error}");
