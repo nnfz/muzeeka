@@ -17,7 +17,11 @@
   let animRaf = 0;
 
   function formatFreq(freq: number): string {
-    if (freq >= 1000) return `${freq / 1000}k`;
+    if (freq >= 1000) {
+      const k = freq / 1000;
+      // 12.5k not 12.5k with trailing noise; 16k / 20k stay clean integers.
+      return Number.isInteger(k) ? `${k}k` : `${k.toFixed(1)}k`;
+    }
     return String(freq);
   }
 

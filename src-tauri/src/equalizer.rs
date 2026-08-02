@@ -3,24 +3,42 @@
 // Processes PCM in a BASS DSP callback. All filter math is done in f64
 // (double precision), matching foobar2000's internal DSP pipeline. This
 // eliminates coefficient quantization errors and rounding noise that
-// accumulate across a 15-band biquad cascade when using f32.
+// accumulate across a multi-band biquad cascade when using f32.
+//
+// Realtime notes:
+// - Coefficients + preamp + channel count live in ArcSwap so the audio
+//   callback never waits on UI writes (set_settings / configure_stream).
+// - Only IIR filter memory (`states`) uses a Mutex — must be shared mutably
+//   across callbacks; reconfigure is rare.
+// - f32 / i16 process paths are intentionally duplicated (not templated)
+//   so the per-sample loop stays monomorphized without an is_float branch.
 
 use std::f64::consts::PI;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Deserializer, Serialize};
 
-pub const BAND_COUNT: usize = 15;
+pub const BAND_COUNT: usize = 17;
 
-/// Standard 1/3-octave center frequencies (Hz), matching foobar2000's built-in EQ.
+/// Graphic EQ centers (Hz) through 20 kHz — closer to foobar2000's upper range.
+/// Top band (20 kHz) is a high-shelf so cut/boost holds to Nyquist (not a peaking bell).
 pub const BAND_FREQUENCIES: [f32; BAND_COUNT] = [
     25.0, 40.0, 63.0, 100.0, 160.0, 250.0, 400.0, 630.0, 1000.0, 1600.0, 2500.0, 4000.0,
-    6300.0, 10000.0, 16000.0,
+    6300.0, 10000.0, 12500.0, 16000.0, 20000.0,
 ];
 
-/// Q factor for 1/3-octave bandwidth: Q = 1 / (2 * sinh(ln(2)/2 * 1/3)) ≈ 4.318
+/// Q factor for 1/3-octave peaking bandwidth: Q = 1 / (2 * sinh(ln(2)/2 * 1/3)) ≈ 4.318
 const BAND_Q: f64 = 4.318;
+
+/// Shelf slope for the top high-shelf band (S = 1 → steepest RBJ shelf).
+const HIGH_SHELF_S: f64 = 1.0;
+
+/// Index of the highest band — peaking would return to 0 dB above the center,
+/// so harsh air / cymbals come back. High-shelf keeps the cut (or boost) to Nyquist.
+const HIGH_SHELF_BAND: usize = BAND_COUNT - 1;
 
 fn deserialize_bands<'de, D>(deserializer: D) -> Result<[f32; BAND_COUNT], D::Error>
 where
@@ -142,6 +160,39 @@ fn peaking_coeffs(sample_rate: f64, freq: f64, gain_db: f64, q: f64) -> BiquadCo
     }
 }
 
+/// High-shelf coefficients (RBJ Audio EQ Cookbook).
+/// Gain applies from ~freq up through Nyquist — does not return to 0 dB like a bell.
+fn high_shelf_coeffs(sample_rate: f64, freq: f64, gain_db: f64, shelf_slope: f64) -> BiquadCoeffs {
+    if gain_db.abs() < 0.001 {
+        return BiquadCoeffs::default();
+    }
+
+    let a = 10f64.powf(gain_db / 40.0);
+    // Keep w0 safely below Nyquist so cos/sin stay well-behaved at high rates.
+    let w0 = (2.0 * PI * freq / sample_rate).min(PI * 0.99);
+    let cos_w0 = w0.cos();
+    let sin_w0 = w0.sin();
+    let s = shelf_slope.max(0.1);
+    let alpha = (sin_w0 / 2.0) * ((a + 1.0 / a) * (1.0 / s - 1.0) + 2.0).sqrt();
+    let two_sqrt_a_alpha = 2.0 * a.sqrt() * alpha;
+
+    let b0 = a * ((a + 1.0) + (a - 1.0) * cos_w0 + two_sqrt_a_alpha);
+    let b1 = -2.0 * a * ((a - 1.0) + (a + 1.0) * cos_w0);
+    let b2 = a * ((a + 1.0) + (a - 1.0) * cos_w0 - two_sqrt_a_alpha);
+    let a0 = (a + 1.0) - (a - 1.0) * cos_w0 + two_sqrt_a_alpha;
+    let a1 = 2.0 * ((a - 1.0) - (a + 1.0) * cos_w0);
+    let a2 = (a + 1.0) - (a - 1.0) * cos_w0 - two_sqrt_a_alpha;
+
+    let inv_a0 = 1.0 / a0;
+    BiquadCoeffs {
+        b0: b0 * inv_a0,
+        b1: b1 * inv_a0,
+        b2: b2 * inv_a0,
+        a1: a1 * inv_a0,
+        a2: a2 * inv_a0,
+    }
+}
+
 #[inline(always)]
 fn db_to_linear(db: f64) -> f64 {
     10f64.powf(db / 20.0)
@@ -151,7 +202,7 @@ fn db_to_linear(db: f64) -> f64 {
 fn process_frame(
     sample: f64,
     preamp: f64,
-    coeffs: &[BiquadCoeffs],
+    coeffs: &[BiquadCoeffs; BAND_COUNT],
     states: &mut [BiquadState],
 ) -> f64 {
     let mut value = sample * preamp;
@@ -161,13 +212,30 @@ fn process_frame(
     value
 }
 
+/// Immutable DSP parameters published atomically to the audio thread.
+struct EqRuntimeSnapshot {
+    channels: usize,
+    preamp_linear: f64,
+    coeffs: [BiquadCoeffs; BAND_COUNT],
+}
+
+impl Default for EqRuntimeSnapshot {
+    fn default() -> Self {
+        Self {
+            channels: 2,
+            preamp_linear: 1.0,
+            coeffs: [BiquadCoeffs::default(); BAND_COUNT],
+        }
+    }
+}
+
 /// Thread-safe EQ context passed as BASS DSP user data.
 pub struct EqDspContext {
     settings: RwLock<EqualizerSettings>,
-    enabled: AtomicBool,  // fast path check, updated on set_settings
+    enabled: AtomicBool,
     coeffs_dirty: AtomicBool,
-    sample_rate: RwLock<f64>,
-    channels: RwLock<usize>,
+    sample_rate_hz: AtomicU32,
+    channels: AtomicUsize,
     /// Bytes per sample in the DSP buffer (2 = int16, 4 = float32).
     bytes_per_sample: AtomicU32,
     /// Set when BASS_CONFIG_FLOATDSP is active — buffer is always float32.
@@ -175,10 +243,10 @@ pub struct EqDspContext {
     /// Set when DSP was attached with BASS_DSP_FLOAT.
     dsp_float_forced: AtomicBool,
     process_count: AtomicU64,
-    coeffs: RwLock<Vec<BiquadCoeffs>>,
+    /// Coeffs / preamp / channel count — lock-free load in the audio callback.
+    runtime: ArcSwap<EqRuntimeSnapshot>,
+    /// IIR memory only; must stay Mutex (mutated every buffer).
     states: Mutex<Vec<Vec<BiquadState>>>,
-    /// Cached preamp linear gain, recomputed when coeffs are dirty.
-    preamp_linear: RwLock<f64>,
 }
 
 impl EqDspContext {
@@ -187,15 +255,14 @@ impl EqDspContext {
             settings: RwLock::new(EqualizerSettings::default()),
             enabled: AtomicBool::new(false),
             coeffs_dirty: AtomicBool::new(true),
-            sample_rate: RwLock::new(44100.0),
-            channels: RwLock::new(2),
+            sample_rate_hz: AtomicU32::new(44100),
+            channels: AtomicUsize::new(2),
             bytes_per_sample: AtomicU32::new(4),
             float_dsp: AtomicBool::new(false),
             dsp_float_forced: AtomicBool::new(false),
             process_count: AtomicU64::new(0),
-            coeffs: RwLock::new(vec![BiquadCoeffs::default(); BAND_COUNT]),
+            runtime: ArcSwap::from_pointee(EqRuntimeSnapshot::default()),
             states: Mutex::new(vec![vec![BiquadState::default(); BAND_COUNT]; 2]),
-            preamp_linear: RwLock::new(1.0),
         }
     }
 
@@ -237,18 +304,15 @@ impl EqDspContext {
             2
         };
 
-        let rate = if sample_rate > 0 {
-            sample_rate as f64
-        } else {
-            44100.0
-        };
-        *self.sample_rate.write() = rate;
-        *self.channels.write() = chans;
+        let rate = if sample_rate > 0 { sample_rate } else { 44100 };
+        self.sample_rate_hz.store(rate, Ordering::Release);
+        self.channels.store(chans, Ordering::Release);
         self.bytes_per_sample
             .store(bytes_per_sample, Ordering::Release);
-        *self.states.lock() =
-            vec![vec![BiquadState::default(); BAND_COUNT]; chans];
+        *self.states.lock() = vec![vec![BiquadState::default(); BAND_COUNT]; chans];
         self.coeffs_dirty.store(true, Ordering::Release);
+        // Publish matching channel count immediately so the next buffer is consistent.
+        self.rebuild_coeffs_if_needed();
     }
 
     fn rebuild_coeffs_if_needed(&self) {
@@ -256,42 +320,51 @@ impl EqDspContext {
             return;
         }
 
-        let settings = self.settings.read();
-        let sample_rate = (*self.sample_rate.read()).max(8000.0);
-        let mut coeffs = self.coeffs.write();
-        coeffs.clear();
-        coeffs.reserve(BAND_COUNT);
+        let settings = self.settings.read().clone();
+        let sample_rate = self.sample_rate_hz.load(Ordering::Acquire).max(8000) as f64;
+        let channels = self.channels.load(Ordering::Acquire).max(1);
 
+        let mut coeffs = [BiquadCoeffs::default(); BAND_COUNT];
         for (i, &freq) in BAND_FREQUENCIES.iter().enumerate() {
-            coeffs.push(peaking_coeffs(
-                sample_rate,
-                freq as f64,
-                settings.bands_db[i] as f64,
-                BAND_Q,
-            ));
+            let gain = settings.bands_db[i] as f64;
+            coeffs[i] = if i == HIGH_SHELF_BAND {
+                // Top band: high shelf so cut/boost holds to Nyquist (foobar-style).
+                high_shelf_coeffs(sample_rate, freq as f64, gain, HIGH_SHELF_S)
+            } else {
+                peaking_coeffs(sample_rate, freq as f64, gain, BAND_Q)
+            };
         }
 
-        *self.preamp_linear.write() = db_to_linear(settings.preamp_db as f64);
+        self.runtime.store(Arc::new(EqRuntimeSnapshot {
+            channels,
+            preamp_linear: db_to_linear(settings.preamp_db as f64),
+            coeffs,
+        }));
     }
 
     /// Process interleaved 32-bit float PCM.
     /// Samples are promoted to f64 for processing, then truncated back to f32.
+    ///
+    /// Intentionally separate from `process_buffer_i16` (not a shared generic body)
+    /// so the hot loop stays free of format branches and inlines cleanly.
     pub fn process_buffer_f32(&self, samples: &mut [f32]) {
-        // Fast path: avoid heavy locking if EQ off
         if !self.enabled.load(Ordering::Acquire) {
             return;
         }
 
         self.rebuild_coeffs_if_needed();
 
-        let channels = *self.channels.read();
+        let snap = self.runtime.load_full();
+        let channels = snap.channels;
         if channels == 0 || samples.is_empty() {
             return;
         }
 
-        let preamp = *self.preamp_linear.read();
-        let coeffs = self.coeffs.read();
         let mut states = self.states.lock();
+        if states.len() != channels {
+            // Mid-reconfigure race: skip this buffer rather than panic / desync.
+            return;
+        }
 
         let frames = samples.len() / channels;
         self.process_count.fetch_add(1, Ordering::Relaxed);
@@ -299,29 +372,33 @@ impl EqDspContext {
             for ch in 0..channels {
                 let idx = frame * channels + ch;
                 let sample = samples[idx] as f64;
-                samples[idx] = process_frame(sample, preamp, &coeffs, &mut states[ch]) as f32;
+                samples[idx] =
+                    process_frame(sample, snap.preamp_linear, &snap.coeffs, &mut states[ch]) as f32;
             }
         }
     }
 
     /// Process interleaved 16-bit PCM.
     /// Samples are promoted to f64 for processing, then quantized back to i16.
+    ///
+    /// Duplicated vs f32 path on purpose — see `process_buffer_f32`.
     pub fn process_buffer_i16(&self, samples: &mut [i16]) {
-        // Fast path: avoid heavy locking if EQ off
         if !self.enabled.load(Ordering::Acquire) {
             return;
         }
 
         self.rebuild_coeffs_if_needed();
 
-        let channels = *self.channels.read();
+        let snap = self.runtime.load_full();
+        let channels = snap.channels;
         if channels == 0 || samples.is_empty() {
             return;
         }
 
-        let preamp = *self.preamp_linear.read();
-        let coeffs = self.coeffs.read();
         let mut states = self.states.lock();
+        if states.len() != channels {
+            return;
+        }
 
         let frames = samples.len() / channels;
         self.process_count.fetch_add(1, Ordering::Relaxed);
@@ -329,7 +406,8 @@ impl EqDspContext {
             for ch in 0..channels {
                 let idx = frame * channels + ch;
                 let sample = samples[idx] as f64 / 32768.0;
-                let processed = process_frame(sample, preamp, &coeffs, &mut states[ch]);
+                let processed =
+                    process_frame(sample, snap.preamp_linear, &snap.coeffs, &mut states[ch]);
                 samples[idx] = (processed.clamp(-1.0, 1.0) * 32767.0).round() as i16;
             }
         }
@@ -357,16 +435,57 @@ pub unsafe extern "system" fn eq_dsp_callback(
         if sample_count == 0 {
             return;
         }
-        let samples =
-            std::slice::from_raw_parts_mut(buffer as *mut f32, sample_count);
+        let samples = std::slice::from_raw_parts_mut(buffer as *mut f32, sample_count);
         ctx.process_buffer_f32(samples);
     } else {
         let sample_count = (length / 2) as usize;
         if sample_count == 0 {
             return;
         }
-        let samples =
-            std::slice::from_raw_parts_mut(buffer as *mut i16, sample_count);
+        let samples = std::slice::from_raw_parts_mut(buffer as *mut i16, sample_count);
         ctx.process_buffer_i16(samples);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// High shelf at −12 dB / 16 kHz must still attenuate near Nyquist, unlike peaking.
+    #[test]
+    fn high_shelf_stays_down_above_center() {
+        let sr = 48000.0;
+        let peak = peaking_coeffs(sr, 20000.0, -12.0, BAND_Q);
+        let shelf = high_shelf_coeffs(sr, 20000.0, -12.0, HIGH_SHELF_S);
+
+        // Frequency response magnitude of a biquad at normalized ω.
+        fn mag(c: &BiquadCoeffs, w: f64) -> f64 {
+            let z1_re = w.cos();
+            let z1_im = -w.sin();
+            let z2_re = (2.0 * w).cos();
+            let z2_im = -(2.0 * w).sin();
+            let num_re = c.b0 + c.b1 * z1_re + c.b2 * z2_re;
+            let num_im = c.b1 * z1_im + c.b2 * z2_im;
+            let den_re = 1.0 + c.a1 * z1_re + c.a2 * z2_re;
+            let den_im = c.a1 * z1_im + c.a2 * z2_im;
+            let num = (num_re * num_re + num_im * num_im).sqrt();
+            let den = (den_re * den_re + den_im * den_im).sqrt();
+            num / den
+        }
+
+        // Just below Nyquist (24 kHz @ 48 kHz) — above the 20 kHz center.
+        let w = 2.0 * PI * 23000.0 / sr;
+        let peak_db = 20.0 * mag(&peak, w).log10();
+        let shelf_db = 20.0 * mag(&shelf, w).log10();
+
+        // Peaking has largely returned toward 0 dB; shelf should still be strongly cut.
+        assert!(
+            peak_db > -6.0,
+            "peaking should recover toward 0 dB above center, got {peak_db:.2} dB"
+        );
+        assert!(
+            shelf_db < -8.0,
+            "high shelf should stay cut above center, got {shelf_db:.2} dB"
+        );
     }
 }

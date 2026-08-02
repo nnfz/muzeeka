@@ -1,10 +1,11 @@
 import { invoke } from '@tauri-apps/api/core';
 import { getContext, setContext } from 'svelte';
 
-export const BAND_COUNT = 15;
+export const BAND_COUNT = 17;
 
+/** Must match `BAND_FREQUENCIES` in src-tauri/src/equalizer.rs (top band = high-shelf). */
 export const BAND_FREQUENCIES = [
-  25, 40, 63, 100, 160, 250, 400, 630, 1000, 1600, 2500, 4000, 6300, 10000, 16000,
+  25, 40, 63, 100, 160, 250, 400, 630, 1000, 1600, 2500, 4000, 6300, 10000, 12500, 16000, 20000,
 ] as const;
 
 export interface EqualizerSettings {
@@ -72,10 +73,14 @@ let rateApplyTimer: ReturnType<typeof setTimeout> | null = null;
 let rateApplySeq = 0;
 
 function clampEqualizer(settings: EqualizerSettings): EqualizerSettings {
+  const bands = Array.from(
+    { length: BAND_COUNT },
+    (_, i) => Math.max(-20, Math.min(20, settings.bands_db[i] ?? 0)),
+  );
   return {
     enabled: settings.enabled,
     preamp_db: Math.max(-15, Math.min(15, settings.preamp_db)),
-    bands_db: settings.bands_db.map((g) => Math.max(-20, Math.min(20, g))),
+    bands_db: bands,
   };
 }
 
