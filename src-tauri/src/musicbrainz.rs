@@ -1,20 +1,27 @@
 // MusicBrainz + Cover Art Archive lookup for album cover URLs.
 
-use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
+use ureq::Agent;
 
-use crate::cover_url_cache;
+use crate::cover_url_cache::{self, CacheLookup};
 
 const USER_AGENT: &str = "Muzeeka/0.1.0 (https://github.com/muzeeka/muzeeka)";
 const MB_BASE: &str = "https://musicbrainz.org/ws/2";
 const CAA_BASE: &str = "https://coverartarchive.org";
 const DISK_KEY_PREFIX: &str = "mb:";
+/// MusicBrainz asks for ~1 req/s with a descriptive User-Agent.
+const MB_MIN_GAP: Duration = Duration::from_millis(1100);
+const HTTP_TIMEOUT: Duration = Duration::from_secs(12);
+const MEMORY_CACHE_CAP: usize = 128;
 
-static RATE_LIMIT: Mutex<Option<Instant>> = Mutex::new(None);
-static COVER_CACHE: Mutex<Option<HashMap<String, Option<String>>>> = Mutex::new(None);
+/// Only MusicBrainz WS is rate-limited under this timer — CAA is a different host.
+static MB_RATE_LIMIT: Mutex<Option<Instant>> = Mutex::new(None);
+/// Session MRU: key → cover URL (None = known miss this session, not a rate-limit).
+static COVER_CACHE: Mutex<Vec<(String, Option<String>)>> = Mutex::new(Vec::new());
+static HTTP_AGENT: OnceLock<Agent> = OnceLock::new();
 
 #[derive(Debug, Deserialize)]
 struct MbRecordingSearch {
@@ -43,12 +50,22 @@ struct CaaImage {
     image: Option<String>,
 }
 
-fn cache() -> std::sync::MutexGuard<'static, Option<HashMap<String, Option<String>>>> {
-    let mut guard = COVER_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    if guard.is_none() {
-        *guard = Some(HashMap::new());
-    }
-    guard
+/// Distinguish "nothing found" from "don't cache this, try later".
+enum LookupOutcome {
+    Found(String),
+    /// 404 / empty / no match — safe to remember for this session.
+    Miss,
+    /// 429/503 or network — do not poison in-memory or disk miss caches.
+    Transient,
+}
+
+fn http_agent() -> &'static Agent {
+    HTTP_AGENT.get_or_init(|| {
+        let config = Agent::config_builder()
+            .timeout_global(Some(HTTP_TIMEOUT))
+            .build();
+        config.into()
+    })
 }
 
 fn cache_key(artist: &str, title: &str, album: Option<&str>) -> String {
@@ -60,31 +77,83 @@ fn cache_key(artist: &str, title: &str, album: Option<&str>) -> String {
     )
 }
 
+fn memory_get(key: &str) -> Option<Option<String>> {
+    let mut cache = COVER_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(pos) = cache.iter().position(|(k, _)| k == key) {
+        let entry = cache.remove(pos);
+        let value = entry.1.clone();
+        cache.push(entry);
+        return Some(value);
+    }
+    None
+}
+
+fn memory_put(key: String, value: Option<String>) {
+    let mut cache = COVER_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    cache.retain(|(k, _)| k != &key);
+    if cache.len() >= MEMORY_CACHE_CAP {
+        cache.remove(0);
+    }
+    cache.push((key, value));
+}
+
 fn mb_escape(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-fn throttle_mb() {
-    let mut guard = RATE_LIMIT.lock().unwrap_or_else(|e| e.into_inner());
+fn throttle_musicbrainz() {
+    let mut guard = MB_RATE_LIMIT.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(last) = *guard {
         let elapsed = last.elapsed();
-        if elapsed < Duration::from_millis(1100) {
-            std::thread::sleep(Duration::from_millis(1100) - elapsed);
+        if elapsed < MB_MIN_GAP {
+            std::thread::sleep(MB_MIN_GAP - elapsed);
         }
     }
     *guard = Some(Instant::now());
 }
 
-fn http_get_json<T: serde::de::DeserializeOwned>(url: &str) -> Option<T> {
-    let mut response = ::ureq::get(url)
+fn http_get_json<T: serde::de::DeserializeOwned>(url: &str) -> Result<Option<T>, LookupOutcome> {
+    match http_agent()
+        .get(url)
         .header("User-Agent", USER_AGENT)
         .header("Accept", "application/json")
         .call()
-        .ok()?;
-    response.body_mut().read_json::<T>().ok()
+    {
+        Ok(mut response) => {
+            let status = response.status();
+            let code = status.as_u16();
+            if matches!(code, 429 | 503) {
+                eprintln!("[musicbrainz] rate limited or unavailable (HTTP {code}) for {url}");
+                return Err(LookupOutcome::Transient);
+            }
+            if code == 404 {
+                return Ok(None);
+            }
+            if !status.is_success() {
+                eprintln!("[musicbrainz] HTTP {code} for {url}");
+                return Err(LookupOutcome::Transient);
+            }
+            match response.body_mut().read_json::<T>() {
+                Ok(body) => Ok(Some(body)),
+                Err(error) => {
+                    eprintln!("[musicbrainz] JSON parse failed: {error}");
+                    Err(LookupOutcome::Transient)
+                }
+            }
+        }
+        Err(ureq::Error::StatusCode(code)) if matches!(code, 429 | 503) => {
+            eprintln!("[musicbrainz] rate limited or unavailable (HTTP {code}) for {url}");
+            Err(LookupOutcome::Transient)
+        }
+        Err(ureq::Error::StatusCode(404)) => Ok(None),
+        Err(error) => {
+            eprintln!("[musicbrainz] request failed: {error}");
+            Err(LookupOutcome::Transient)
+        }
+    }
 }
 
-fn release_mbid(artist: &str, title: &str, album: Option<&str>) -> Option<String> {
+fn release_mbid(artist: &str, title: &str, album: Option<&str>) -> Result<Option<String>, LookupOutcome> {
     let query = match album.filter(|value| !value.trim().is_empty()) {
         Some(album) => format!(
             r#"recording:"{}" AND artist:"{}" AND release:"{}""#,
@@ -99,38 +168,69 @@ fn release_mbid(artist: &str, title: &str, album: Option<&str>) -> Option<String
         ),
     };
 
-    throttle_mb();
+    throttle_musicbrainz();
     let url = format!(
         "{}/recording?query={}&fmt=json&limit=1",
         MB_BASE,
         urlencoding::encode(&query)
     );
 
-    let search: MbRecordingSearch = http_get_json(&url)?;
-    let recording = search.recordings?.into_iter().next()?;
-    let release = recording.releases?.into_iter().next()?;
+    let search: MbRecordingSearch = match http_get_json(&url)? {
+        Some(body) => body,
+        None => return Ok(None),
+    };
+    let recording = match search.recordings.and_then(|r| r.into_iter().next()) {
+        Some(r) => r,
+        None => return Ok(None),
+    };
+    let release = match recording.releases.and_then(|r| r.into_iter().next()) {
+        Some(r) => r,
+        None => return Ok(None),
+    };
     if release.id.is_empty() {
-        None
+        Ok(None)
     } else {
-        Some(release.id)
+        Ok(Some(release.id))
     }
 }
 
-fn cover_from_release(mbid: &str) -> Option<String> {
-    throttle_mb();
+/// Cover Art Archive — separate host; no MusicBrainz 1 req/s throttle.
+fn cover_from_release(mbid: &str) -> Result<Option<String>, LookupOutcome> {
     let url = format!("{}/release/{}", CAA_BASE, mbid);
-    let payload: CaaRelease = http_get_json(&url)?;
+    let payload: CaaRelease = match http_get_json(&url)? {
+        Some(body) => body,
+        None => return Ok(None),
+    };
 
-    let images = payload.images?;
+    let images = match payload.images {
+        Some(images) if !images.is_empty() => images,
+        _ => return Ok(None),
+    };
     let front = images
         .iter()
         .find(|image| image.front)
-        .or_else(|| images.first())?;
+        .or_else(|| images.first());
 
-    front
+    let Some(front) = front else {
+        return Ok(None);
+    };
+
+    Ok(front
         .image
         .clone()
-        .filter(|url| url.starts_with("http://") || url.starts_with("https://"))
+        .filter(|u| u.starts_with("http://") || u.starts_with("https://")))
+}
+
+fn resolve_cover(artist: &str, title: &str, album: Option<&str>) -> LookupOutcome {
+    match release_mbid(artist, title, album) {
+        Ok(Some(mbid)) => match cover_from_release(&mbid) {
+            Ok(Some(url)) => LookupOutcome::Found(url),
+            Ok(None) => LookupOutcome::Miss,
+            Err(outcome) => outcome,
+        },
+        Ok(None) => LookupOutcome::Miss,
+        Err(outcome) => outcome,
+    }
 }
 
 /// Look up a Cover Art Archive image URL for a track.
@@ -142,34 +242,39 @@ pub fn lookup_cover_url(artist: &str, title: &str, album: Option<&str>) -> Optio
     }
 
     let key = cache_key(artist, title, album);
-    {
-        let mut guard = cache();
-        if let Some(map) = guard.as_mut() {
-            if let Some(cached) = map.get(&key) {
-                return cached.clone();
-            }
-        }
+    if let Some(cached) = memory_get(&key) {
+        return cached;
     }
 
     let disk_key = format!("{DISK_KEY_PREFIX}{key}");
-    if let Some(url) = cover_url_cache::get(&disk_key) {
-        let mut guard = cache();
-        if let Some(map) = guard.as_mut() {
-            map.insert(key, Some(url.clone()));
+    match cover_url_cache::lookup(&disk_key) {
+        CacheLookup::Url(url) => {
+            memory_put(key, Some(url.clone()));
+            return Some(url);
         }
-        return Some(url);
+        CacheLookup::Failed => {
+            // Hard miss from a previous confirmed failure (not rate-limit).
+            memory_put(key, None);
+            return None;
+        }
+        CacheLookup::Miss => {}
     }
 
-    let result = release_mbid(artist, title, album).and_then(|mbid| cover_from_release(&mbid));
-
-    if let Some(url) = result.as_deref() {
-        cover_url_cache::set(&disk_key, url);
+    match resolve_cover(artist, title, album) {
+        LookupOutcome::Found(url) => {
+            cover_url_cache::set(&disk_key, &url);
+            memory_put(key, Some(url.clone()));
+            Some(url)
+        }
+        LookupOutcome::Miss => {
+            // Session-only miss — do not write disk negative cache for MB
+            // (track may get a release later; 429 must never become a permanent miss).
+            memory_put(key, None);
+            None
+        }
+        LookupOutcome::Transient => {
+            // Leave memory empty so a later track / retry can try again.
+            None
+        }
     }
-
-    let mut guard = cache();
-    if let Some(map) = guard.as_mut() {
-        map.insert(key, result.clone());
-    }
-
-    result
 }

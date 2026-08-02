@@ -15,6 +15,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use id3::TagLike;
 
@@ -22,6 +23,8 @@ static COVER_CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();
 static PLAYLIST_COVER_DIR: OnceLock<PathBuf> = OnceLock::new();
 /// Bundled ffmpeg binary (for GIF → animated WebP). Set once at app startup.
 static FFMPEG_BIN: OnceLock<Option<PathBuf>> = OnceLock::new();
+/// Unique suffix for parallel ffmpeg temp inputs (same APIC content_id across tracks).
+static COVER_FFMPEG_TMP_SEQ: AtomicU64 = AtomicU64::new(1);
 
 const PLAYLIST_COVER_SIZE: u32 = 256;
 const MAX_PLAYLIST_GIF_BYTES: u64 = 20 * 1024 * 1024;
@@ -440,7 +443,10 @@ fn encode_full_cover_ffmpeg(data: &[u8], dest: &Path, ffmpeg: &Path) -> bool {
         let _ = fs::create_dir_all(parent);
     }
 
-    let tmp_in = dest.with_extension("src-tmp");
+    // Must be unique per call: same album APIC → same content_id → same `dest`,
+    // and rayon can encode many tracks in parallel on first library scan.
+    let seq = COVER_FFMPEG_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp_in = dest.with_extension(format!("src-tmp-{}-{}", std::process::id(), seq));
     if fs::write(&tmp_in, data).is_err() {
         return false;
     }
@@ -1349,7 +1355,16 @@ pub fn write_track_tags(
 
     let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
     if ext.as_deref() == Some("mp3") {
-        let mut tag = id3::Tag::read_from_path(path).unwrap_or_else(|_| id3::Tag::new());
+        let mut tag = match id3::Tag::read_from_path(path) {
+            Ok(tag) => tag,
+            Err(error) => {
+                eprintln!(
+                    "[metadata] id3 read failed for {}: {error} — writing a new tag (existing frames may be lost)",
+                    path.display()
+                );
+                id3::Tag::new()
+            }
+        };
         if let Some(t) = title { tag.set_title(t); }
         if let Some(a) = artist { tag.set_artist(a); }
         tag.write_to_path(path, id3::Version::Id3v23).map_err(|e| format!("id3 save error: {}", e))?;
@@ -1447,7 +1462,16 @@ pub fn write_track_cover(path: &Path, data: &[u8], mime_hint: Option<&str>) -> R
 
     let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
     if ext.as_deref() == Some("mp3") {
-        let mut tag = id3::Tag::read_from_path(path).unwrap_or_else(|_| id3::Tag::new());
+        let mut tag = match id3::Tag::read_from_path(path) {
+            Ok(tag) => tag,
+            Err(error) => {
+                eprintln!(
+                    "[metadata] id3 read failed for {}: {error} — writing a new tag (existing frames may be lost)",
+                    path.display()
+                );
+                id3::Tag::new()
+            }
+        };
         tag.remove_picture_by_type(id3::frame::PictureType::CoverFront);
         
         let mime_str = match mime {

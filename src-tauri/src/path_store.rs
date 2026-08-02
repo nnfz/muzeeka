@@ -7,13 +7,18 @@
 
 use std::path::{Component, Path, PathBuf};
 
-/// Normalize for equality / DB keys (Windows: strip `\\?\`, `\` separators, lowercase).
-pub fn path_key(path: &str) -> String {
+/// Strip Windows extended-length prefix (`\\?\` / `//?/`) without changing case.
+fn strip_extended_path_prefix(path: &str) -> &str {
     let trimmed = path.trim();
-    let without_prefix = trimmed
+    trimmed
         .strip_prefix(r"\\?\")
         .or_else(|| trimmed.strip_prefix("//?/"))
-        .unwrap_or(trimmed);
+        .unwrap_or(trimmed)
+}
+
+/// Normalize for equality / DB keys (Windows: strip `\\?\`, `\` separators, lowercase).
+pub fn path_key(path: &str) -> String {
+    let without_prefix = strip_extended_path_prefix(path);
     if cfg!(windows) {
         without_prefix.replace('/', "\\").to_lowercase()
     } else {
@@ -58,6 +63,8 @@ pub fn join_root(root: &str, rel: &str) -> String {
 /// If `absolute` is under `root`, return relative path (with cue suffix preserved).
 pub fn to_relative(root: &str, absolute: &str) -> Option<String> {
     let (abs_base, cue) = split_cue_suffix(absolute);
+
+    // Compare with normalized keys (handles `\\?\` + case).
     let root_key = path_key(root);
     let abs_key = path_key(abs_base);
     if abs_key == root_key {
@@ -73,9 +80,14 @@ pub fn to_relative(root: &str, absolute: &str) -> Option<String> {
     if !abs_key.starts_with(&prefix) {
         return None;
     }
-    // Build relative from original abs_base casing when possible.
-    let root_len = root.trim_end_matches(['/', '\\']).len();
-    let mut rel = abs_base[root_len.min(abs_base.len())..].to_string();
+
+    // Slice raw strings *after* stripping `\\?\` from both — otherwise
+    // root without prefix + canonicalize abs with `\\?\` shifts root_len by 4
+    // and produces garbage relatives (e.g. `ic\Album\01.flac`).
+    let root_raw = strip_extended_path_prefix(root).trim_end_matches(['/', '\\']);
+    let abs_raw = strip_extended_path_prefix(abs_base);
+    let root_len = root_raw.len();
+    let mut rel = abs_raw[root_len.min(abs_raw.len())..].to_string();
     while rel.starts_with(['/', '\\']) {
         rel.remove(0);
     }
@@ -92,10 +104,7 @@ pub fn to_relative(root: &str, absolute: &str) -> Option<String> {
 /// Collapse `.` / `..` and normalize separators (best-effort, no filesystem access).
 pub fn normalize_display_path(path: &str) -> String {
     let (base, cue) = split_cue_suffix(path);
-    let stripped = base
-        .strip_prefix(r"\\?\")
-        .or_else(|| base.strip_prefix("//?/"))
-        .unwrap_or(base);
+    let stripped = strip_extended_path_prefix(base);
     let path = Path::new(stripped);
     let mut out = PathBuf::new();
     for comp in path.components() {
@@ -126,6 +135,29 @@ mod tests {
         assert_eq!(rel.replace('/', "\\").to_lowercase(), r"album\01.flac");
         let back = join_root(root, &rel);
         assert_eq!(path_key(&back), path_key(abs));
+    }
+
+    #[test]
+    fn relative_handles_extended_path_prefix_on_abs() {
+        // User root without `\\?\`, canonicalize-style abs with it (common on Windows).
+        let root = r"Z:\torrent\music";
+        let abs = r"\\?\Z:\torrent\music\Album\01.flac";
+        let rel = to_relative(root, abs).expect("under root with extended prefix");
+        assert_eq!(
+            rel.replace('/', "\\").to_lowercase(),
+            r"album\01.flac",
+            "got relative {rel:?}"
+        );
+        assert_eq!(path_key(&join_root(root, &rel)), path_key(abs));
+    }
+
+    #[test]
+    fn relative_handles_extended_prefix_on_both() {
+        let root = r"\\?\Z:\torrent\music";
+        let abs = r"\\?\Z:\torrent\music\Nested\track.flac#cue:2";
+        let rel = to_relative(root, abs).expect("under extended root");
+        assert!(rel.replace('/', "\\").to_lowercase().starts_with(r"nested\track.flac"));
+        assert!(rel.ends_with("#cue:2"));
     }
 
     #[test]
