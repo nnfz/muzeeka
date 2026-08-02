@@ -464,7 +464,7 @@ impl Player {
         match bass.init(-1, 44100) {
             Ok(()) => {}
             Err(e) => {
-                if bass.last_error() != bass::BASS_ERROR_ALREADY {
+                if bass.last_error() != bass::BassError::Already {
                     return Err(e);
                 }
             }

@@ -6,13 +6,13 @@
 
 use libloading::{Library, Symbol};
 use std::ffi::OsStr;
+use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::ptr;
 
 use super::types::*;
 
 /// Holds the loaded bass.dll and its resolved function pointers.
-#[allow(dead_code)]
 pub struct BassLibrary {
     // Keep the library alive so function pointers remain valid.
     _lib: Library,
@@ -56,6 +56,7 @@ pub struct BassLibrary {
     bass_channel_get_info:
         unsafe extern "system" fn(handle: DWORD, info: *mut BassChannelInfo) -> BOOL,
     bass_channel_is_active: unsafe extern "system" fn(handle: DWORD) -> DWORD,
+    #[allow(dead_code)] // used by channel_get_level
     bass_channel_get_level: unsafe extern "system" fn(handle: DWORD) -> DWORD,
 
     // ── Config / DSP ──────────────────────────────────────────────────────────
@@ -76,36 +77,36 @@ pub struct BassLibrary {
     bass_plugin_load:
         unsafe extern "system" fn(file: *const u16, flags: DWORD) -> HPLUGIN,
 
-    // ── Mixer (bassmix) ───────────────────────────────────────────────────────
+    // ── Mixer (bassmix) — None when bassmix.dll is missing ──────────────────
     _mixer_lib: Option<Library>,
     bass_mixer_stream_create:
-        unsafe extern "system" fn(freq: DWORD, chans: DWORD, flags: DWORD) -> HSTREAM,
+        Option<unsafe extern "system" fn(freq: DWORD, chans: DWORD, flags: DWORD) -> HSTREAM>,
     bass_mixer_stream_add_channel:
-        unsafe extern "system" fn(handle: DWORD, channel: DWORD, flags: DWORD) -> BOOL,
-    bass_mixer_channel_remove: unsafe extern "system" fn(channel: DWORD) -> BOOL,
+        Option<unsafe extern "system" fn(handle: DWORD, channel: DWORD, flags: DWORD) -> BOOL>,
+    bass_mixer_channel_remove: Option<unsafe extern "system" fn(channel: DWORD) -> BOOL>,
     bass_mixer_channel_set_position:
-        unsafe extern "system" fn(channel: DWORD, pos: QWORD, mode: DWORD) -> BOOL,
+        Option<unsafe extern "system" fn(channel: DWORD, pos: QWORD, mode: DWORD) -> BOOL>,
     bass_mixer_channel_get_position:
-        unsafe extern "system" fn(channel: DWORD, mode: DWORD) -> QWORD,
+        Option<unsafe extern "system" fn(channel: DWORD, mode: DWORD) -> QWORD>,
+    #[allow(dead_code)] // used by mixer_channel_flags
     bass_mixer_channel_flags:
-        unsafe extern "system" fn(channel: DWORD, flags: DWORD, mask: DWORD) -> DWORD,
+        Option<unsafe extern "system" fn(channel: DWORD, flags: DWORD, mask: DWORD) -> DWORD>,
 
-    // ── FX (bass_fx.dll — loaded as a separate Library) ─────────────────────
+    // ── FX (bass_fx.dll) — None until enable_fx_from_plugin succeeds ────────
     _fx_lib: Option<Library>,
-    fx_ready: bool,
     bass_fx_tempo_create:
-        unsafe extern "system" fn(chan: DWORD, flags: DWORD) -> HSTREAM,
-    bass_fx_tempo_get_source: unsafe extern "system" fn(chan: HSTREAM) -> DWORD,
+        Option<unsafe extern "system" fn(chan: DWORD, flags: DWORD) -> HSTREAM>,
+    bass_fx_tempo_get_source: Option<unsafe extern "system" fn(chan: HSTREAM) -> DWORD>,
 }
 
-// Safety: BassLibrary is always used behind a parking_lot::Mutex.
-// All BASS calls must happen from the same thread that called BASS_Init (the main thread
-// in our design), so the Mutex serialization guarantees correct access.
+// BassLibrary holds raw FFI function pointers into loaded DLLs. Access is always
+// serialized via `parking_lot::Mutex<PlayerInner>` (BassLibrary is never shared
+// as bare Arc/& without that mutex). We only need Send so the mutex can cross
+// threads; Sync is intentionally not claimed here.
 unsafe impl Send for BassLibrary {}
-unsafe impl Sync for BassLibrary {}
 
 /// Resolve a function pointer from a loaded library.
-///  
+///
 /// # Safety
 /// The caller must ensure the symbol exists and has the correct signature.
 macro_rules! load_fn {
@@ -126,8 +127,29 @@ macro_rules! try_load_fn {
     }};
 }
 
-#[allow(dead_code)]
+fn to_wide(path: &str) -> Vec<u16> {
+    OsStr::new(path)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
 impl BassLibrary {
+    fn check(&self, ok: BOOL) -> Result<(), String> {
+        if ok == 0 {
+            Err(self.last_error_string())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn require_mixer_fn<'a, T>(
+        &self,
+        f: Option<&'a T>,
+    ) -> Result<&'a T, String> {
+        f.ok_or_else(|| "bassmix.dll not loaded".to_string())
+    }
+
     /// Load bass.dll from the given directory.
     ///
     /// `bass_dir` should be the folder containing `bass.dll`.
@@ -152,26 +174,16 @@ impl BassLibrary {
             if let Some(ref mlib) = mixer_lib {
                 unsafe {
                     (
-                        load_fn!(mlib, b"BASS_Mixer_StreamCreate\0"),
-                        load_fn!(mlib, b"BASS_Mixer_StreamAddChannel\0"),
-                        load_fn!(mlib, b"BASS_Mixer_ChannelRemove\0"),
-                        load_fn!(mlib, b"BASS_Mixer_ChannelSetPosition\0"),
-                        load_fn!(mlib, b"BASS_Mixer_ChannelGetPosition\0"),
-                        load_fn!(mlib, b"BASS_Mixer_ChannelFlags\0"),
+                        Some(load_fn!(mlib, b"BASS_Mixer_StreamCreate\0")),
+                        Some(load_fn!(mlib, b"BASS_Mixer_StreamAddChannel\0")),
+                        Some(load_fn!(mlib, b"BASS_Mixer_ChannelRemove\0")),
+                        Some(load_fn!(mlib, b"BASS_Mixer_ChannelSetPosition\0")),
+                        Some(load_fn!(mlib, b"BASS_Mixer_ChannelGetPosition\0")),
+                        Some(load_fn!(mlib, b"BASS_Mixer_ChannelFlags\0")),
                     )
                 }
             } else {
-                // Provide dummy fns; will error if used without bassmix
-                unsafe {
-                    (
-                        std::mem::transmute::<*const (), _>(ptr::null::<()> as *const ()),
-                        std::mem::transmute::<*const (), _>(ptr::null::<()> as *const ()),
-                        std::mem::transmute::<*const (), _>(ptr::null::<()> as *const ()),
-                        std::mem::transmute::<*const (), _>(ptr::null::<()> as *const ()),
-                        std::mem::transmute::<*const (), _>(ptr::null::<()> as *const ()),
-                        std::mem::transmute::<*const (), _>(ptr::null::<()> as *const ()),
-                    )
-                }
+                (None, None, None, None, None, None)
             };
 
         unsafe {
@@ -211,9 +223,8 @@ impl BassLibrary {
                 bass_mixer_channel_get_position: mixer_get_pos,
                 bass_mixer_channel_flags: mixer_flags,
                 _fx_lib: None,
-                fx_ready: false,
-                bass_fx_tempo_create: std::mem::transmute::<*const (), _>(ptr::null::<()>()),
-                bass_fx_tempo_get_source: std::mem::transmute::<*const (), _>(ptr::null::<()>()),
+                bass_fx_tempo_create: None,
+                bass_fx_tempo_get_source: None,
             })
         }
     }
@@ -234,24 +245,20 @@ impl BassLibrary {
             let Some(get_source) = try_load_fn!(fx_lib, b"BASS_FX_TempoGetSource\0") else {
                 return false;
             };
-            self.bass_fx_tempo_create = create;
-            self.bass_fx_tempo_get_source = get_source;
+            self.bass_fx_tempo_create = Some(create);
+            self.bass_fx_tempo_get_source = Some(get_source);
             self._fx_lib = Some(fx_lib);
-            self.fx_ready = true;
             true
         }
     }
 
     pub fn has_fx(&self) -> bool {
-        self.fx_ready
+        self.bass_fx_tempo_create.is_some()
     }
 
     /// Load a BASS format plugin (bassflac.dll, bassape.dll, etc.).
     pub fn plugin_load(&self, path: &str) -> Result<HPLUGIN, String> {
-        let wide: Vec<u16> = OsStr::new(path)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
+        let wide = to_wide(path);
         let handle = unsafe { (self.bass_plugin_load)(wide.as_ptr(), BASS_UNICODE) };
         if handle == 0 {
             Err(self.last_error_string())
@@ -267,29 +274,18 @@ impl BassLibrary {
         let ok = unsafe {
             (self.bass_init)(device, freq, 0, ptr::null_mut(), ptr::null())
         };
-        if ok == 0 {
-            Err(self.last_error_string())
-        } else {
-            Ok(())
-        }
+        self.check(ok)
     }
 
     /// Free all BASS resources.
     pub fn free(&self) -> Result<(), String> {
         let ok = unsafe { (self.bass_free)() };
-        if ok == 0 {
-            Err(self.last_error_string())
-        } else {
-            Ok(())
-        }
+        self.check(ok)
     }
 
     /// Create a stream from a file path (Windows wide-string).
     pub fn stream_create_file(&self, path: &str, flags: DWORD) -> Result<HSTREAM, String> {
-        let wide: Vec<u16> = OsStr::new(path)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
+        let wide = to_wide(path);
         let handle = unsafe {
             (self.bass_stream_create_file)(
                 0, // mem = FALSE (file path, not memory)
@@ -309,10 +305,7 @@ impl BassLibrary {
     /// Load a tracker/module (e.g. .it, .xm, .mod, .s3m) using BASS_MusicLoad.
     /// Many tracker plugins work best (or only) through the music API.
     pub fn music_load(&self, path: &str, flags: DWORD) -> Result<HSTREAM, String> {
-        let wide: Vec<u16> = OsStr::new(path)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
+        let wide = to_wide(path);
         let handle = unsafe {
             (self.bass_music_load)(
                 0, // mem = FALSE
@@ -332,17 +325,17 @@ impl BassLibrary {
 
     pub fn channel_play(&self, handle: DWORD, restart: bool) -> Result<(), String> {
         let ok = unsafe { (self.bass_channel_play)(handle, if restart { 1 } else { 0 }) };
-        if ok == 0 { Err(self.last_error_string()) } else { Ok(()) }
+        self.check(ok)
     }
 
     pub fn channel_pause(&self, handle: DWORD) -> Result<(), String> {
         let ok = unsafe { (self.bass_channel_pause)(handle) };
-        if ok == 0 { Err(self.last_error_string()) } else { Ok(()) }
+        self.check(ok)
     }
 
     pub fn channel_stop(&self, handle: DWORD) -> Result<(), String> {
         let ok = unsafe { (self.bass_channel_stop)(handle) };
-        if ok == 0 { Err(self.last_error_string()) } else { Ok(()) }
+        self.check(ok)
     }
 
     /// Free a stream or music handle. Tries StreamFree then MusicFree.
@@ -364,7 +357,7 @@ impl BassLibrary {
 
     pub fn channel_set_position(&self, handle: DWORD, pos: QWORD, mode: DWORD) -> Result<(), String> {
         let ok = unsafe { (self.bass_channel_set_position)(handle, pos, mode) };
-        if ok == 0 { Err(self.last_error_string()) } else { Ok(()) }
+        self.check(ok)
     }
 
     pub fn channel_get_position(&self, handle: DWORD, mode: DWORD) -> QWORD {
@@ -385,13 +378,17 @@ impl BassLibrary {
 
     pub fn channel_set_attribute(&self, handle: DWORD, attrib: DWORD, value: f32) -> Result<(), String> {
         let ok = unsafe { (self.bass_channel_set_attribute)(handle, attrib, value) };
-        if ok == 0 { Err(self.last_error_string()) } else { Ok(()) }
+        self.check(ok)
     }
 
     pub fn channel_get_attribute(&self, handle: DWORD, attrib: DWORD) -> Result<f32, String> {
         let mut value: f32 = 0.0;
         let ok = unsafe { (self.bass_channel_get_attribute)(handle, attrib, &mut value) };
-        if ok == 0 { Err(self.last_error_string()) } else { Ok(value) }
+        if ok == 0 {
+            Err(self.last_error_string())
+        } else {
+            Ok(value)
+        }
     }
 
     pub fn channel_slide_attribute(
@@ -402,34 +399,31 @@ impl BassLibrary {
         time_ms: DWORD,
     ) -> Result<(), String> {
         let ok = unsafe { (self.bass_channel_slide_attribute)(handle, attrib, value, time_ms) };
-        if ok == 0 {
-            Err(self.last_error_string())
-        } else {
-            Ok(())
-        }
+        self.check(ok)
     }
 
     pub fn channel_get_info(&self, handle: DWORD) -> Result<BassChannelInfo, String> {
         let mut info = BassChannelInfo::default();
         let ok = unsafe { (self.bass_channel_get_info)(handle, &mut info) };
-        if ok == 0 { Err(self.last_error_string()) } else { Ok(info) }
+        if ok == 0 {
+            Err(self.last_error_string())
+        } else {
+            Ok(info)
+        }
     }
 
     pub fn channel_is_active(&self, handle: DWORD) -> DWORD {
         unsafe { (self.bass_channel_is_active)(handle) }
     }
 
+    #[allow(dead_code)] // public BASS API surface; not yet used by player
     pub fn channel_get_level(&self, handle: DWORD) -> DWORD {
         unsafe { (self.bass_channel_get_level)(handle) }
     }
 
     pub fn set_config(&self, option: DWORD, value: f32) -> Result<(), String> {
         let ok = unsafe { (self.bass_set_config)(option, value) };
-        if ok == 0 {
-            Err(self.last_error_string())
-        } else {
-            Ok(())
-        }
+        self.check(ok)
     }
 
     pub fn channel_set_dsp(
@@ -466,20 +460,14 @@ impl BassLibrary {
 
     pub fn channel_remove_dsp(&self, handle: DWORD, dsp: HDSP) -> Result<(), String> {
         let ok = unsafe { (self.bass_channel_remove_dsp)(handle, dsp) };
-        if ok == 0 {
-            Err(self.last_error_string())
-        } else {
-            Ok(())
-        }
+        self.check(ok)
     }
 
     // ── Mixer wrappers (require bassmix.dll) ────────────────────────────────
 
     pub fn mixer_stream_create(&self, freq: u32, chans: u32, flags: DWORD) -> Result<HSTREAM, String> {
-        if self._mixer_lib.is_none() {
-            return Err("bassmix.dll not found/loaded — gapless uses mixer".to_string());
-        }
-        let handle = unsafe { (self.bass_mixer_stream_create)(freq, chans, flags) };
+        let f = self.require_mixer_fn(self.bass_mixer_stream_create.as_ref())?;
+        let handle = unsafe { f(freq, chans, flags) };
         if handle == 0 {
             Err(self.last_error_string())
         } else {
@@ -488,50 +476,43 @@ impl BassLibrary {
     }
 
     pub fn mixer_stream_add_channel(&self, mixer: DWORD, channel: DWORD, flags: DWORD) -> Result<(), String> {
-        if self._mixer_lib.is_none() {
-            return Err("bassmix.dll not loaded".to_string());
-        }
-        let ok = unsafe { (self.bass_mixer_stream_add_channel)(mixer, channel, flags) };
-        if ok == 0 {
-            Err(self.last_error_string())
-        } else {
-            Ok(())
-        }
+        let f = self.require_mixer_fn(self.bass_mixer_stream_add_channel.as_ref())?;
+        let ok = unsafe { f(mixer, channel, flags) };
+        self.check(ok)
     }
 
     pub fn mixer_channel_remove(&self, channel: DWORD) -> Result<(), String> {
-        if self._mixer_lib.is_none() { return Err("bassmix.dll not loaded".to_string()); }
-        let ok = unsafe { (self.bass_mixer_channel_remove)(channel) };
-        if ok == 0 {
-            Err(self.last_error_string())
-        } else {
-            Ok(())
-        }
+        let f = self.require_mixer_fn(self.bass_mixer_channel_remove.as_ref())?;
+        let ok = unsafe { f(channel) };
+        self.check(ok)
     }
 
     pub fn mixer_channel_set_position(&self, channel: DWORD, pos: QWORD, mode: DWORD) -> Result<(), String> {
-        if self._mixer_lib.is_none() { return Err("bassmix.dll not loaded".to_string()); }
-        let ok = unsafe { (self.bass_mixer_channel_set_position)(channel, pos, mode) };
-        if ok == 0 {
-            Err(self.last_error_string())
-        } else {
-            Ok(())
-        }
+        let f = self.require_mixer_fn(self.bass_mixer_channel_set_position.as_ref())?;
+        let ok = unsafe { f(channel, pos, mode) };
+        self.check(ok)
     }
 
     pub fn mixer_channel_get_position(&self, channel: DWORD, mode: DWORD) -> QWORD {
-        unsafe { (self.bass_mixer_channel_get_position)(channel, mode) }
+        match self.bass_mixer_channel_get_position {
+            Some(f) => unsafe { f(channel, mode) },
+            None => 0,
+        }
     }
 
+    #[allow(dead_code)] // public BASS API surface; not yet used by player
     pub fn mixer_channel_flags(&self, channel: DWORD, flags: DWORD, mask: DWORD) -> DWORD {
-        unsafe { (self.bass_mixer_channel_flags)(channel, flags, mask) }
+        match self.bass_mixer_channel_flags {
+            Some(f) => unsafe { f(channel, flags, mask) },
+            None => 0,
+        }
     }
 
     pub fn fx_tempo_create(&self, chan: DWORD, flags: DWORD) -> Result<HSTREAM, String> {
-        if !self.fx_ready {
-            return Err("bass_fx is not loaded".to_string());
-        }
-        let tempo = unsafe { (self.bass_fx_tempo_create)(chan, flags) };
+        let f = self
+            .bass_fx_tempo_create
+            .ok_or_else(|| "bass_fx is not loaded".to_string())?;
+        let tempo = unsafe { f(chan, flags) };
         if tempo == 0 {
             Err(self.last_error_string())
         } else {
@@ -540,23 +521,19 @@ impl BassLibrary {
     }
 
     pub fn fx_tempo_get_source(&self, tempo: HSTREAM) -> DWORD {
-        if !self.fx_ready {
-            return 0;
+        match self.bass_fx_tempo_get_source {
+            Some(f) => unsafe { f(tempo) },
+            None => 0,
         }
-        unsafe { (self.bass_fx_tempo_get_source)(tempo) }
     }
 
     // ── Error helpers ─────────────────────────────────────────────────────
 
-    pub fn last_error(&self) -> i32 {
-        unsafe { (self.bass_error_get_code)() }
+    pub fn last_error(&self) -> BassError {
+        BassError::from(unsafe { (self.bass_error_get_code)() })
     }
 
     pub fn last_error_string(&self) -> String {
-        let code = self.last_error();
-        format!("BASS error {}: {}", code, bass_error_to_string(code))
+        self.last_error().to_string()
     }
 }
-
-// We need OsStrExt for encode_wide on Windows
-use std::os::windows::ffi::OsStrExt;
