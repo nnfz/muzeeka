@@ -1,52 +1,24 @@
 // Library, playlist, and cover-related Tauri commands.
 
-use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 
 use crate::library;
 use crate::player::Player;
 use crate::playlists::{LibraryDatabase, LibraryState, PlaylistMeta, PlaylistsData};
 
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct LibraryScanProgress {
-    current: usize,
-    total: usize,
-    label: String,
-}
-
-fn scan_progress_label(path: &std::path::Path) -> String {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("Scanning music...")
-        .to_string()
-}
-
 fn make_scan_progress_emitter(
     app: AppHandle,
 ) -> impl Fn(usize, usize, &std::path::Path) + Send + Sync + 'static {
-    let last_emitted = std::sync::Mutex::new(0usize);
-    move |current, total, path| {
-        let step = (total / 200).max(1);
-        if current > 0 && current < total && current % step != 0 {
-            return;
-        }
-        let Ok(mut last) = last_emitted.lock() else {
-            return;
-        };
-        if current > 0 && current < *last {
-            return;
-        }
-        *last = current;
+    library::make_throttled_scan_progress(move |current, total, label| {
         let _ = app.emit(
             "library:scan-progress",
-            LibraryScanProgress {
+            library::LibraryScanProgress {
                 current,
                 total,
-                label: scan_progress_label(path),
+                label: label.to_string(),
             },
         );
-    }
+    })
 }
 
 /// Scan a directory recursively for music files.

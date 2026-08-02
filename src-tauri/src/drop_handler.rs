@@ -53,13 +53,19 @@ pub struct ExportDragContext {
     pub is_copy: bool,
 }
 
+/// All export-suppress state under one lock — updated/read atomically together.
+#[derive(Default)]
+struct ExportDragInner {
+    suppressed_keys: HashSet<String>,
+    suppress_until: Option<Instant>,
+    export_in_progress: bool,
+    context: Option<ExportDragContext>,
+}
+
 /// Tracks files dragged out of the app so re-entering the window is not treated as import.
 #[derive(Default)]
 pub struct ExportDragState {
-    suppressed_keys: Mutex<HashSet<String>>,
-    suppress_until: Mutex<Option<Instant>>,
-    export_in_progress: Mutex<bool>,
-    context: Mutex<Option<ExportDragContext>>,
+    inner: Mutex<ExportDragInner>,
 }
 
 pub fn normalize_path_key(path_str: &str) -> String {
@@ -89,64 +95,29 @@ fn register_path_keys(keys: &mut HashSet<String>, path: &Path) {
     }
 }
 
-impl ExportDragState {
-    pub fn register_export(&self, paths: &[PathBuf], context: Option<ExportDragContext>) {
-        let mut keys = self.suppressed_keys.lock();
-        keys.clear();
-        for path in paths {
-            register_path_keys(&mut keys, path);
-        }
-        *self.export_in_progress.lock() = true;
-        *self.suppress_until.lock() = None;
-        *self.context.lock() = context;
-    }
-
-    pub fn finish_export(&self) {
-        *self.export_in_progress.lock() = false;
-        *self.context.lock() = None;
-        *self.suppress_until.lock() = Some(Instant::now() + EXPORT_DROP_SUPPRESS_FOR);
-    }
-
-    #[allow(dead_code)]
-    pub fn has_track_context(&self) -> bool {
-        self.context.lock().is_some()
-    }
-
-    pub fn export_in_progress(&self) -> bool {
-        *self.export_in_progress.lock()
-    }
-
-    fn should_suppress_import_ui(&self, paths: &[String]) -> bool {
-        if self.export_in_progress() {
-            return true;
-        }
-        self.all_paths_suppressed(paths)
-    }
-
-    fn purge_expired(&self) {
-        let until = *self.suppress_until.lock();
-        if let Some(deadline) = until {
+impl ExportDragInner {
+    fn purge_expired(&mut self) {
+        if let Some(deadline) = self.suppress_until {
             if Instant::now() >= deadline {
-                self.suppressed_keys.lock().clear();
-                *self.suppress_until.lock() = None;
+                self.suppressed_keys.clear();
+                self.suppress_until = None;
             }
         }
     }
 
-    fn is_suppressed_key(&self, key: &str) -> bool {
+    fn is_suppressed_key(&mut self, key: &str) -> bool {
         self.purge_expired();
-        let keys = self.suppressed_keys.lock();
-        if !keys.contains(key) {
+        if !self.suppressed_keys.contains(key) {
             return false;
         }
-        match *self.suppress_until.lock() {
-            None => true,
+        match self.suppress_until {
+            None => true, // export still in progress (until set only after finish)
             Some(deadline) => Instant::now() < deadline,
         }
     }
 
-    pub fn is_suppressed_path(&self, path: &str) -> bool {
-        if self.export_in_progress() {
+    fn is_suppressed_path(&mut self, path: &str) -> bool {
+        if self.export_in_progress {
             return true;
         }
         let path = Path::new(path);
@@ -160,16 +131,41 @@ impl ExportDragState {
             .and_then(|name| name.to_str())
             .is_some_and(|name| self.is_suppressed_key(&name.to_lowercase()))
     }
+}
 
-    pub fn filter_drop_paths(&self, paths: Vec<String>) -> Vec<String> {
-        paths
-            .into_iter()
-            .filter(|path| !self.is_suppressed_path(path))
-            .collect()
+impl ExportDragState {
+    pub fn register_export(&self, paths: &[PathBuf], context: Option<ExportDragContext>) {
+        let mut g = self.inner.lock();
+        g.suppressed_keys.clear();
+        for path in paths {
+            register_path_keys(&mut g.suppressed_keys, path);
+        }
+        g.export_in_progress = true;
+        g.suppress_until = None;
+        g.context = context;
     }
 
-    pub fn all_paths_suppressed(&self, paths: &[String]) -> bool {
-        !paths.is_empty() && paths.iter().all(|path| self.is_suppressed_path(path))
+    pub fn finish_export(&self) {
+        let mut g = self.inner.lock();
+        g.export_in_progress = false;
+        g.context = None;
+        g.suppress_until = Some(Instant::now() + EXPORT_DROP_SUPPRESS_FOR);
+    }
+
+    fn should_suppress_import_ui(&self, paths: &[String]) -> bool {
+        let mut g = self.inner.lock();
+        if g.export_in_progress {
+            return true;
+        }
+        !paths.is_empty() && paths.iter().all(|path| g.is_suppressed_path(path))
+    }
+
+    pub fn filter_drop_paths(&self, paths: Vec<String>) -> Vec<String> {
+        let mut g = self.inner.lock();
+        paths
+            .into_iter()
+            .filter(|path| !g.is_suppressed_path(path))
+            .collect()
     }
 }
 
@@ -184,14 +180,6 @@ pub struct DroppedTracksPayload {
     /// Whether Ctrl was held at drop time (import-into-playlist mode).
     #[serde(default)]
     pub ctrl: bool,
-}
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct LibraryScanProgress {
-    current: usize,
-    total: usize,
-    label: String,
 }
 
 /// Hover state while dragging files over the window (physical pixel coords).
@@ -236,33 +224,20 @@ fn emit_drop_result(window: &Window, position: [f64; 2], paths: Vec<String>, ctr
     }
 
     let source_paths = paths.clone();
-    let last_emitted = std::sync::Mutex::new(0usize);
-    let payload = match library::scan_paths_with_progress(&paths, &|current, total, path| {
-        let step = (total / 200).max(1);
-        if current > 0 && current < total && current % step != 0 {
-            return;
-        }
-        let Ok(mut last) = last_emitted.lock() else {
-            return;
-        };
-        if current > 0 && current < *last {
-            return;
-        }
-        *last = current;
-        let label = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("Scanning music...")
-            .to_string();
-        let _ = window.emit(
-            "library:scan-progress",
-            LibraryScanProgress {
-                current,
-                total,
-                label,
-            },
-        );
-    }) {
+    let progress = {
+        let window = window.clone();
+        library::make_throttled_scan_progress(move |current, total, label| {
+            let _ = window.emit(
+                "library:scan-progress",
+                library::LibraryScanProgress {
+                    current,
+                    total,
+                    label: label.to_string(),
+                },
+            );
+        })
+    };
+    let payload = match library::scan_paths_with_progress(&paths, &progress) {
         Ok(files) if files.is_empty() => DroppedTracksPayload {
             files,
             position,

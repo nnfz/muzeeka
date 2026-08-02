@@ -10,10 +10,49 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 use walkdir::WalkDir;
 
 use crate::cue;
 use crate::metadata;
+
+/// Payload for `library:scan-progress` (commands + native drop import).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryScanProgress {
+    pub current: usize,
+    pub total: usize,
+    pub label: String,
+}
+
+/// Throttled progress callback (~200 updates max per scan). Shared by
+/// `library_scan`, `library_scan_paths`, and drop-handler import.
+pub fn make_throttled_scan_progress<F>(
+    emit: F,
+) -> impl Fn(usize, usize, &Path) + Send + Sync + 'static
+where
+    F: Fn(usize, usize, &str) + Send + Sync + 'static,
+{
+    let last_emitted = Mutex::new(0usize);
+    move |current, total, path| {
+        let step = (total / 200).max(1);
+        if current > 0 && current < total && current % step != 0 {
+            return;
+        }
+        let Ok(mut last) = last_emitted.lock() else {
+            return;
+        };
+        if current > 0 && current < *last {
+            return;
+        }
+        *last = current;
+        let label = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("Scanning music...");
+        emit(current, total, label);
+    }
+}
 
 /// Supported audio file extensions (lowercase).
 const AUDIO_EXTENSIONS: &[&str] = &[
