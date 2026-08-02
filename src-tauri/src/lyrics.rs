@@ -43,8 +43,18 @@ pub fn init_lyrics_cache(app_data_dir: PathBuf) {
     let _ = LYRICS_CACHE_DIR.set(lyrics);
 }
 
+/// Soft misses: not found / rate limit / temporary upstream failure.
+/// 401/403 are *not* soft — those are auth/config problems and must be visible.
 fn is_soft_http_status(code: u16) -> bool {
-    matches!(code, 401 | 404 | 429 | 502 | 503 | 504)
+    matches!(code, 404 | 429 | 502 | 503 | 504)
+}
+
+fn log_auth_http_status(code: u16) {
+    if matches!(code, 401 | 403) {
+        eprintln!(
+            "[lyrics] HTTP {code} from provider — unauthorized/forbidden (check API access); treating as no lyrics"
+        );
+    }
 }
 
 pub(crate) fn http_get_json<T: serde::de::DeserializeOwned>(url: &str) -> Result<Option<T>, String> {
@@ -55,11 +65,20 @@ pub(crate) fn http_get_json<T: serde::de::DeserializeOwned>(url: &str) -> Result
     {
         Ok(response) => response,
         Err(ureq::Error::StatusCode(code)) if is_soft_http_status(code) => return Ok(None),
+        Err(ureq::Error::StatusCode(code)) if matches!(code, 401 | 403) => {
+            log_auth_http_status(code);
+            return Ok(None);
+        }
         Err(error) => return Err(format!("Lyrics request failed: {error}")),
     };
 
     let status = response.status();
-    if is_soft_http_status(status.as_u16()) {
+    let code = status.as_u16();
+    if is_soft_http_status(code) {
+        return Ok(None);
+    }
+    if matches!(code, 401 | 403) {
+        log_auth_http_status(code);
         return Ok(None);
     }
 
@@ -176,11 +195,12 @@ pub(crate) fn field_matches(query: &str, candidate: &str) -> bool {
         return true;
     }
 
-    // Containment for minor suffixes/prefixes, require meaningful length.
+    // Containment for minor suffixes/prefixes. Require a longer shorter-side so
+    // short titles like "Home" do not match "Home Alone" via substring.
     let q_chars = q.chars().count();
     let c_chars = c.chars().count();
     let shorter = q_chars.min(c_chars);
-    if shorter >= 4 && (q.contains(&c) || c.contains(&q)) {
+    if shorter >= 8 && (q.contains(&c) || c.contains(&q)) {
         return true;
     }
 
@@ -196,10 +216,14 @@ pub(crate) fn field_matches(query: &str, candidate: &str) -> bool {
     }
 
     // Require strong overlap so unrelated short tokens cannot match.
+    // Coverage alone is not enough when either side is a single short token
+    // ("Home" ⊂ "Home Alone" would otherwise pass with coverage 1.0).
     let union = qt.union(&ct).count().max(1);
     let jaccard = inter as f64 / union as f64;
-    let coverage = inter as f64 / qt.len().min(ct.len()).max(1) as f64;
-    jaccard >= 0.75 || coverage >= 0.9
+    let min_tokens = qt.len().min(ct.len()).max(1);
+    let coverage = inter as f64 / min_tokens as f64;
+    let coverage_ok = coverage >= 0.9 && min_tokens >= 2;
+    jaccard >= 0.75 || coverage_ok
 }
 
 /// Reject provider hits that don't match the requested track identity.
@@ -572,6 +596,13 @@ mod tests {
             "Hotline Bling",
             "Hotline Bling (Radio Edit)"
         ));
+    }
+
+    #[test]
+    fn field_matches_rejects_short_title_containment() {
+        // "Home" must not match "Home Alone" via substring / single-token coverage.
+        assert!(!field_matches("Home", "Home Alone"));
+        assert!(!field_matches("Home Alone", "Home"));
     }
 
     #[test]

@@ -8,20 +8,17 @@ struct LrcLine {
 
 fn parse_lrc_timestamp(raw: &str) -> Option<u32> {
     let raw = raw.trim();
-    let (hours, rest) = if let Some((h, rest)) = raw.split_once(':') {
-        if rest.contains(':') {
-            (h.parse::<u32>().ok()?, rest)
-        } else {
-            (0, raw)
+    // `mm:ss[.xxx]` or `hh:mm:ss[.xxx]` — branch on colon count, not nested split_once.
+    let parts: Vec<&str> = raw.split(':').collect();
+    let (hours, minutes, seconds_part): (u32, u32, &str) = match parts.as_slice() {
+        [minutes, seconds_part] => (0, minutes.parse().ok()?, seconds_part),
+        [hours, minutes, seconds_part] => {
+            (hours.parse().ok()?, minutes.parse().ok()?, seconds_part)
         }
-    } else {
-        return None;
+        _ => return None,
     };
 
-    let (minutes, seconds_part) = rest.rsplit_once(':').unwrap_or(("0", rest));
-    let minutes: u32 = minutes.parse().ok()?;
     let seconds_part = seconds_part.trim();
-
     let (seconds, millis) = if let Some((secs, frac)) = seconds_part.split_once('.') {
         let secs: u32 = secs.parse().ok()?;
         let frac = frac.chars().take(3).collect::<String>();

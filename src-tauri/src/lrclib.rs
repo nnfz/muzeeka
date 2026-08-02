@@ -32,19 +32,8 @@ fn synced_lyrics_to_ttml(synced: &str, duration_secs: u32) -> Option<String> {
     lrc_to_ttml(synced, song_duration_ms)
 }
 
-fn duration_candidates(duration_secs: u32) -> Vec<u32> {
-    let mut candidates = vec![duration_secs];
-    for delta in [1u32, 2] {
-        if duration_secs > delta {
-            candidates.push(duration_secs - delta);
-        }
-        candidates.push(duration_secs.saturating_add(delta));
-    }
-    candidates.sort_unstable();
-    candidates.dedup();
-    candidates
-}
-
+/// Single exact `/get` — no ±1/±2 duration fan-out (that was up to 5 sequential HTTP calls).
+/// Duration fuzziness is handled in `/search` via local matching.
 fn try_lrclib_get(title: &str, artist: &str, duration_secs: u32) -> Result<Option<String>, String> {
     let url = format!(
         "{LRCLIB_GET}?track_name={}&artist_name={}&duration={duration_secs}",
@@ -76,16 +65,6 @@ fn try_lrclib_get(title: &str, artist: &str, duration_secs: u32) -> Result<Optio
         .unwrap_or(duration_secs);
 
     Ok(synced_lyrics_to_ttml(&synced, resolved_duration))
-}
-
-fn fetch_lrclib_get(title: &str, artist: &str, duration_secs: u32) -> Result<Option<String>, String> {
-    for duration in duration_candidates(duration_secs) {
-        if let Some(ttml) = try_lrclib_get(title, artist, duration)? {
-            return Ok(Some(ttml));
-        }
-    }
-
-    Ok(None)
 }
 
 fn fetch_lrclib_search(
@@ -166,8 +145,9 @@ pub fn fetch_lrclib_ttml(
         return Ok(None);
     }
 
+    // At most two HTTP calls: one exact /get (when duration known), then one /search.
     if duration_secs > 0 {
-        if let Some(ttml) = fetch_lrclib_get(title, artist, duration_secs)? {
+        if let Some(ttml) = try_lrclib_get(title, artist, duration_secs)? {
             return Ok(Some(ttml));
         }
     }
@@ -177,17 +157,8 @@ pub fn fetch_lrclib_ttml(
 
 #[cfg(test)]
 mod tests {
-    use super::{duration_candidates, fetch_lrclib_ttml};
+    use super::fetch_lrclib_ttml;
     use crate::lyrics::track_identity_matches;
-
-    #[test]
-    fn duration_candidates_include_tolerance() {
-        let candidates = duration_candidates(267);
-        assert!(candidates.contains(&267));
-        assert!(candidates.contains(&266));
-        assert!(candidates.contains(&268));
-        assert!(candidates.len() <= 5);
-    }
 
     #[test]
     fn identity_requires_title_and_artist() {
