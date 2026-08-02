@@ -152,6 +152,11 @@ impl ExportDragState {
         g.suppress_until = Some(Instant::now() + EXPORT_DROP_SUPPRESS_FOR);
     }
 
+    #[allow(dead_code)] // reserved for playlist-aware drop targets
+    pub fn has_track_context(&self) -> bool {
+        self.inner.lock().context.is_some()
+    }
+
     fn should_suppress_import_ui(&self, paths: &[String]) -> bool {
         let mut g = self.inner.lock();
         if g.export_in_progress {
