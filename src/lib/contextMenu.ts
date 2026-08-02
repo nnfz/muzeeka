@@ -4,7 +4,7 @@ export interface ContextMenuItem {
   danger?: boolean;
   disabled?: boolean;
   closeOnSelect?: boolean;
-  icon?: 'rename' | 'delete' | 'heart' | 'folder' | 'playlist' | 'image';
+  icon?: 'rename' | 'delete' | 'heart' | 'folder' | 'playlist' | 'image' | 'file' | 'import';
   onSelect: () => void;
 }
 
@@ -18,7 +18,8 @@ export interface ContextMenuSize {
   height: number;
 }
 
-const DEFAULT_MENU_SIZE: ContextMenuSize = { width: 168, height: 80 };
+/** Rough estimate used only until ContextMenu measures itself and clamps. */
+const DEFAULT_MENU_SIZE: ContextMenuSize = { width: 200, height: 160 };
 
 export function getContextMenuPosition(
   event: MouseEvent,

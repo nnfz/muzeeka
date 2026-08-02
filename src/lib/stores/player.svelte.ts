@@ -1929,6 +1929,69 @@ async function addDroppedPaths(paths: string[], playlistId?: string | null) {
   }
 }
 
+function m3uPlaylistName(path: string): string {
+  const base = pathBasename(path);
+  return base.replace(/\.m3u8?$/i, '').trim() || nextPlaylistName();
+}
+
+/**
+ * Import each .m3u/.m3u8 as its own playlist (named after the file stem).
+ * Track order follows the playlist file.
+ */
+async function importM3uPlaylists(
+  paths: string[],
+): Promise<CreatePlaylistsFromDropResult> {
+  const normalizedPaths = paths.map((path) => path.trim()).filter(Boolean);
+  if (normalizedPaths.length === 0) {
+    return { playlists: 0, tracks: 0, names: [] };
+  }
+
+  let playlistCount = 0;
+  let trackCount = 0;
+  const names: string[] = [];
+  let lastId: string | null = null;
+
+  try {
+    setImportProgress({
+      active: true,
+      current: 0,
+      total: normalizedPaths.length,
+      label: 'Importing M3U...',
+    });
+    await yieldToUI();
+
+    for (let i = 0; i < normalizedPaths.length; i++) {
+      const path = normalizedPaths[i];
+      setImportProgress({
+        active: true,
+        current: i + 1,
+        total: normalizedPaths.length,
+        label: pathBasename(path),
+      });
+      await yieldToUI();
+
+      const files: MusicFile[] = await invoke('library_scan_paths', { paths: [path] });
+      if (files.length === 0) continue;
+
+      const name = m3uPlaylistName(path);
+      const id = ensurePlaylist(name, { select: true });
+      trackCount += mergeTracksIntoPlaylist(id, files);
+      playlistCount += 1;
+      names.push(name);
+      lastId = id;
+    }
+
+    if (lastId) {
+      activePlaylistId = lastId;
+    }
+  } catch (e) {
+    console.error('Failed to import M3U playlist:', e);
+  }
+
+  resetImportProgress();
+  return { playlists: playlistCount, tracks: trackCount, names };
+}
+
 // --- Player Actions ---
 
 async function init() {
@@ -3060,6 +3123,7 @@ export function createPlayerStore() {
     addScannedTracks,
     createPlaylistsFromDroppedPaths,
     createPlaylistsFromScannedTracks,
+    importM3uPlaylists,
     clearAll,
 
     // Player actions

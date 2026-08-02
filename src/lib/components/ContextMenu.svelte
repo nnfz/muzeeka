@@ -11,6 +11,34 @@
 
   let { open, x, y, items, onclose }: Props = $props();
 
+  const VIEWPORT_PAD = 8;
+
+  /** Keep the menu inside the viewport using its real measured size. */
+  function clampToViewport(
+    node: HTMLElement,
+    params: { x: number; y: number; itemCount: number },
+  ) {
+    function apply(next: { x: number; y: number }) {
+      const { width, height } = node.getBoundingClientRect();
+      const maxX = Math.max(VIEWPORT_PAD, window.innerWidth - width - VIEWPORT_PAD);
+      const maxY = Math.max(VIEWPORT_PAD, window.innerHeight - height - VIEWPORT_PAD);
+      const left = Math.min(Math.max(VIEWPORT_PAD, next.x), maxX);
+      const top = Math.min(Math.max(VIEWPORT_PAD, next.y), maxY);
+      node.style.left = `${left}px`;
+      node.style.top = `${top}px`;
+    }
+
+    apply(params);
+
+    return {
+      update(next: { x: number; y: number; itemCount: number }) {
+        // itemCount is only for reactivity when the menu grows/shrinks
+        void next.itemCount;
+        apply(next);
+      },
+    };
+  }
+
   function handleSelect(item: ContextMenuItem) {
     if (item.disabled) return;
     item.onSelect();
@@ -28,6 +56,7 @@
     class="context-menu"
     style:left="{x}px"
     style:top="{y}px"
+    use:clampToViewport={{ x, y, itemCount: items.length }}
     role="menu"
     tabindex="-1"
     onclick={(e) => e.stopPropagation()}
@@ -79,6 +108,17 @@
                 <rect x="3" y="3" width="18" height="18" rx="2" />
                 <circle cx="8.5" cy="8.5" r="1.5" />
                 <path d="m21 15-5-5L5 21" />
+              </svg>
+            {:else if item.icon === 'file'}
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z" />
+                <polyline points="14 2 14 8 20 8" />
+              </svg>
+            {:else if item.icon === 'import'}
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 3v12" />
+                <path d="m8 11 4 4 4-4" />
+                <path d="M4 19h16" />
               </svg>
             {/if}
           </span>

@@ -14,6 +14,7 @@ use std::sync::Mutex;
 use walkdir::WalkDir;
 
 use crate::cue;
+use crate::m3u;
 use crate::metadata;
 
 /// Payload for `library:scan-progress` (commands + native drop import).
@@ -468,6 +469,28 @@ fn scan_paths_impl(
                 let key = path_key(&file.path);
                 if seen.insert(key) {
                     results.push(file);
+                }
+            }
+            if let Some(report) = progress {
+                report(input_index + 1, paths.len(), &path);
+            }
+            continue;
+        }
+
+        if m3u::is_m3u_path(&path) {
+            // Expand entries, but never follow nested .m3u (avoids cycles).
+            let nested: Vec<String> = m3u::expand_m3u_paths(&path)
+                .into_iter()
+                .filter(|p| !m3u::is_m3u_path(p))
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect();
+            if !nested.is_empty() {
+                let nested_files = scan_paths_impl(&nested, None)?;
+                for file in nested_files {
+                    let key = path_key(&file.path);
+                    if seen.insert(key) {
+                        results.push(file);
+                    }
                 }
             }
             if let Some(report) = progress {

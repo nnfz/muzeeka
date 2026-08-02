@@ -8,6 +8,7 @@
   import { resolvePlaylistCoverTrack } from "$lib/playlistCover";
   import {
     getPlayerStore,
+    isEditablePlaylist,
     type Playlist,
     VIRTUAL_ALL_ID,
     VIRTUAL_LIKED_ID,
@@ -22,6 +23,23 @@
   const DEFAULT_WIDTH = 220;
   const MIN_WIDTH = 200;
   const MAX_WIDTH = 300;
+
+  const AUDIO_DIALOG_EXTENSIONS = [
+    "mp3",
+    "flac",
+    "ogg",
+    "wav",
+    "aac",
+    "m4a",
+    "wma",
+    "opus",
+    "ape",
+    "mod",
+    "s3m",
+    "xm",
+    "it",
+    "cue",
+  ];
 
   function maxWidth(): number {
     return Math.min(MAX_WIDTH, Math.floor(window.innerWidth * 0.55));
@@ -46,6 +64,7 @@
   let contextMenu = $state<{ playlist: Playlist; x: number; y: number } | null>(
     null,
   );
+  let addMenu = $state<{ x: number; y: number } | null>(null);
 
   let playlistMenuItems = $derived.by((): ContextMenuItem[] => {
     const target = contextMenu?.playlist;
@@ -88,6 +107,50 @@
     return items;
   });
 
+  let addMenuItems = $derived.by((): ContextMenuItem[] => {
+    if (!addMenu) return [];
+
+    const canAddToCurrent = isEditablePlaylist(player.activePlaylistId);
+
+    return [
+      {
+        id: "add-files-to-current",
+        label: "Add files to current playlist",
+        icon: "file",
+        disabled: !canAddToCurrent,
+        onSelect: () => void addFilesToCurrentPlaylist(),
+      },
+      {
+        id: "add-folder-to-current",
+        label: "Add folder to current playlist",
+        icon: "folder",
+        disabled: !canAddToCurrent,
+        onSelect: () => void addFolderToCurrentPlaylist(),
+      },
+      {
+        id: "add-folder-as-playlist",
+        label: "Add folder as playlist",
+        icon: "playlist",
+        onSelect: () => void addFolderAsPlaylist(),
+      },
+      {
+        id: "add-m3u",
+        label: "Add M3U playlist",
+        icon: "import",
+        onSelect: () => void addM3uPlaylists(),
+      },
+    ];
+  });
+
+  function normalizeOpenPaths(selected: string | string[] | null): string[] {
+    if (!selected) return [];
+    if (Array.isArray(selected)) {
+      return selected.map((p) => p.trim()).filter(Boolean);
+    }
+    const path = selected.trim();
+    return path ? [path] : [];
+  }
+
   function persist() {
     localStorage.setItem(STORAGE_WIDTH_KEY, String(sidebarWidth));
   }
@@ -125,9 +188,20 @@
     contextMenu = null;
   }
 
+  function closeAddMenu() {
+    addMenu = null;
+  }
+
   function openPlaylistContextMenu(e: MouseEvent, playlist: Playlist) {
+    closeAddMenu();
     const position = openContextMenuFromEvent(e);
     contextMenu = { playlist, ...position };
+  }
+
+  function openAddMenu(e: MouseEvent) {
+    closeContextMenu();
+    const position = openContextMenuFromEvent(e, { width: 260, height: 160 });
+    addMenu = position;
   }
 
   async function pickPlaylistCover(playlist: Playlist) {
@@ -142,6 +216,64 @@
     });
     if (!selected || typeof selected !== "string") return;
     await player.setPlaylistCover(playlist.id, selected);
+  }
+
+  async function addFilesToCurrentPlaylist() {
+    if (!isEditablePlaylist(player.activePlaylistId)) return;
+
+    const paths = normalizeOpenPaths(
+      await open({
+        multiple: true,
+        title: "Add files to playlist",
+        filters: [
+          { name: "Audio files", extensions: AUDIO_DIALOG_EXTENSIONS },
+          { name: "All files", extensions: ["*"] },
+        ],
+      }),
+    );
+    if (paths.length === 0) return;
+    await player.addDroppedPaths(paths, player.activePlaylistId);
+  }
+
+  async function addFolderToCurrentPlaylist() {
+    if (!isEditablePlaylist(player.activePlaylistId)) return;
+
+    const paths = normalizeOpenPaths(
+      await open({
+        multiple: true,
+        directory: true,
+        title: "Add folder to playlist",
+      }),
+    );
+    if (paths.length === 0) return;
+    await player.addDroppedPaths(paths, player.activePlaylistId);
+  }
+
+  async function addFolderAsPlaylist() {
+    const paths = normalizeOpenPaths(
+      await open({
+        multiple: true,
+        directory: true,
+        title: "Add folder as playlist",
+      }),
+    );
+    if (paths.length === 0) return;
+    await player.createPlaylistsFromDroppedPaths(paths);
+  }
+
+  async function addM3uPlaylists() {
+    const paths = normalizeOpenPaths(
+      await open({
+        multiple: true,
+        title: "Import M3U playlist",
+        filters: [
+          { name: "M3U playlists", extensions: ["m3u", "m3u8"] },
+          { name: "All files", extensions: ["*"] },
+        ],
+      }),
+    );
+    if (paths.length === 0) return;
+    await player.importM3uPlaylists(paths);
   }
 
   function playPlaylist(playlistId: string, firstTrackPath?: string | null) {
@@ -234,6 +366,7 @@
 
     e.preventDefault();
     closeContextMenu();
+    closeAddMenu();
     startRename(playlist);
   }
 </script>
@@ -254,8 +387,9 @@
     <button
       class="icon-btn"
       onclick={() => player.createPlaylist()}
+      oncontextmenu={openAddMenu}
       aria-label="New playlist"
-      title="New playlist"
+      title="New playlist — right-click to import"
     >
       <svg
         width="16"
@@ -490,6 +624,14 @@
   y={contextMenu?.y ?? 0}
   items={playlistMenuItems}
   onclose={closeContextMenu}
+/>
+
+<ContextMenu
+  open={addMenu !== null}
+  x={addMenu?.x ?? 0}
+  y={addMenu?.y ?? 0}
+  items={addMenuItems}
+  onclose={closeAddMenu}
 />
 
 <style>

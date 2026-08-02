@@ -15,6 +15,7 @@ mod musicbrainz;
 
 mod equalizer;
 mod library;
+mod m3u;
 mod lrc;
 mod lrclib;
 mod lyrics;
