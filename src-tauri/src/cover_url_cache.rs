@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use parking_lot::Mutex;
@@ -17,10 +17,16 @@ struct CoverUrlCache {
     entries: HashMap<String, String>,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct DiskFormat {
     #[serde(default)]
     entries: HashMap<String, String>,
+}
+
+/// Serialize view — avoids cloning the map just to write JSON.
+#[derive(Serialize)]
+struct DiskFormatRef<'a> {
+    entries: &'a HashMap<String, String>,
 }
 
 /// Initialize the on-disk cache under the app data directory.
@@ -45,12 +51,18 @@ pub fn set(key: &str, url: &str) {
     let Some(cache) = CACHE.get() else {
         return;
     };
-    let mut guard = cache.lock();
-    if guard.entries.get(key).map(String::as_str) == Some(url) {
-        return;
-    }
-    guard.entries.insert(key.to_string(), url.to_string());
-    if let Err(error) = save(&guard.path, &guard.entries) {
+
+    // Mutate under the lock, then release before disk I/O so get() isn't blocked on fsync.
+    let (path, entries) = {
+        let mut guard = cache.lock();
+        if guard.entries.get(key).map(String::as_str) == Some(url) {
+            return;
+        }
+        guard.entries.insert(key.to_string(), url.to_string());
+        (guard.path.clone(), guard.entries.clone())
+    };
+
+    if let Err(error) = save(&path, &entries) {
         eprintln!("Discord cover URL cache save failed: {error}");
     }
 }
@@ -59,7 +71,7 @@ fn is_http_url(url: &str) -> bool {
     url.starts_with("https://") || url.starts_with("http://")
 }
 
-fn load(path: &PathBuf) -> HashMap<String, String> {
+fn load(path: &Path) -> HashMap<String, String> {
     let Ok(raw) = fs::read_to_string(path) else {
         return HashMap::new();
     };
@@ -76,15 +88,13 @@ fn load(path: &PathBuf) -> HashMap<String, String> {
     }
 }
 
-fn save(path: &PathBuf, entries: &HashMap<String, String>) -> Result<(), String> {
+fn save(path: &Path, entries: &HashMap<String, String>) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create cover URL cache dir: {e}"))?;
     }
 
-    let payload = DiskFormat {
-        entries: entries.clone(),
-    };
+    let payload = DiskFormatRef { entries };
     let bytes = serde_json::to_vec_pretty(&payload)
         .map_err(|e| format!("Failed to serialize cover URL cache: {e}"))?;
 
