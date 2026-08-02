@@ -135,6 +135,56 @@ pub fn strip_ytdlp_id_suffix(value: &str) -> String {
     trimmed[..open].trim().to_string()
 }
 
+/// Case-insensitive char-by-char prefix strip. Returns the remainder of `haystack`.
+fn strip_prefix_ignore_case<'a>(haystack: &'a str, needle: &str) -> Option<&'a str> {
+    let mut end_byte = 0usize;
+    let mut h = haystack.char_indices();
+    let mut n = needle.chars();
+    loop {
+        match (h.next(), n.next()) {
+            (Some((i, hc)), Some(nc)) => {
+                if hc.to_lowercase().ne(nc.to_lowercase()) {
+                    return None;
+                }
+                end_byte = i + hc.len_utf8();
+            }
+            (_, Some(_)) => return None,
+            (Some(_), None) | (None, None) => return Some(&haystack[end_byte..]),
+        }
+    }
+}
+
+/// If `title` starts with `artist` + dash separator (` - `, em/en dash, …),
+/// return only the song part. Otherwise `None`.
+///
+/// Examples:
+/// - `"Rick Astley - Never Gonna Give You Up"` + `"Rick Astley"` → `"Never Gonna Give You Up"`
+/// - `"artist — song"` + `"Artist"` → `"song"`
+pub fn strip_redundant_artist_prefix(title: &str, artist: &str) -> Option<String> {
+    let title = title.trim();
+    let artist = artist.trim();
+    if title.is_empty() || artist.is_empty() {
+        return None;
+    }
+
+    // Common "Artist - Title" separators (space + dash-like + space).
+    const SEPS: &[&str] = &[" - ", " — ", " – ", " − ", " | "];
+
+    for sep in SEPS {
+        let mut prefix = String::with_capacity(artist.len() + sep.len());
+        prefix.push_str(artist);
+        prefix.push_str(sep);
+        if let Some(rest) = strip_prefix_ignore_case(title, &prefix) {
+            let rest = rest.trim();
+            if !rest.is_empty() {
+                return Some(rest.to_string());
+            }
+        }
+    }
+
+    None
+}
+
 fn non_empty(value: Option<String>) -> Option<String> {
     value.filter(|s| !s.is_empty())
 }
@@ -1342,12 +1392,16 @@ pub fn write_track_tags(
     title: Option<&str>,
     artist: Option<&str>,
 ) -> Result<(), String> {
-    let title = title
-        .map(strip_ytdlp_id_suffix)
-        .filter(|s| !s.is_empty());
     let artist = artist
         .map(clean_tag_value)
         .filter(|s| !s.is_empty());
+    let title = title
+        .map(strip_ytdlp_id_suffix)
+        .filter(|s| !s.is_empty())
+        .map(|t| match artist.as_deref() {
+            Some(a) => strip_redundant_artist_prefix(&t, a).unwrap_or(t),
+            None => t,
+        });
 
     if title.is_none() && artist.is_none() {
         return Ok(());
@@ -1542,6 +1596,42 @@ mod tests {
             "авиасейлс - на морозе"
         );
         assert_eq!(strip_ytdlp_id_suffix("plain title"), "plain title");
+    }
+
+    #[test]
+    fn strip_redundant_artist_prefix_removes_artist_dash_prefix() {
+        assert_eq!(
+            strip_redundant_artist_prefix(
+                "Rick Astley - Never Gonna Give You Up",
+                "Rick Astley"
+            )
+            .as_deref(),
+            Some("Never Gonna Give You Up")
+        );
+        // case-insensitive artist match
+        assert_eq!(
+            strip_redundant_artist_prefix("artist — Song Name", "Artist").as_deref(),
+            Some("Song Name")
+        );
+        // Cyrillic
+        assert_eq!(
+            strip_redundant_artist_prefix("авиасейлс - на морозе", "авиасейлс").as_deref(),
+            Some("на морозе")
+        );
+        // no false positive when only artist appears without separator song
+        assert_eq!(
+            strip_redundant_artist_prefix("Rick Astley Live", "Rick Astley"),
+            None
+        );
+        // artist must match full prefix (not partial "The" in "The The")
+        assert_eq!(
+            strip_redundant_artist_prefix("The The - This Is The Day", "The"),
+            None
+        );
+        assert_eq!(
+            strip_redundant_artist_prefix("The The - This Is The Day", "The The").as_deref(),
+            Some("This Is The Day")
+        );
     }
 
     #[test]

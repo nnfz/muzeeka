@@ -293,6 +293,14 @@ fn run_ytdlp(app: &AppHandle, args: &[&str]) -> Result<std::process::Output, Str
     Ok(output)
 }
 
+fn clean_probe_title(title: String, uploader: Option<&str>) -> String {
+    let title = metadata::strip_ytdlp_id_suffix(&title);
+    match uploader {
+        Some(artist) => metadata::strip_redundant_artist_prefix(&title, artist).unwrap_or(title),
+        None => title,
+    }
+}
+
 fn parse_probe_json(raw: &str) -> Result<YtdlpProbeResult, String> {
     let entry: YtdlpJsonEntry = serde_json::from_str(raw)
         .map_err(|e| format!("Failed to parse yt-dlp response: {}", e))?;
@@ -304,7 +312,7 @@ fn parse_probe_json(raw: &str) -> Result<YtdlpProbeResult, String> {
             .filter(|t| !t.trim().is_empty())
             .or_else(|| entries.first().and_then(|e| e.title.clone()))
             .unwrap_or_else(|| "Playlist".to_string());
-
+        // Playlist titles usually aren't "Artist - …"; leave as-is.
         return Ok(YtdlpProbeResult {
             title,
             uploader: entry.uploader,
@@ -315,9 +323,15 @@ fn parse_probe_json(raw: &str) -> Result<YtdlpProbeResult, String> {
         });
     }
 
+    let uploader = entry.uploader;
+    let title = clean_probe_title(
+        entry.title.unwrap_or_else(|| "Unknown".to_string()),
+        uploader.as_deref(),
+    );
+
     Ok(YtdlpProbeResult {
-        title: entry.title.unwrap_or_else(|| "Unknown".to_string()),
-        uploader: entry.uploader,
+        title,
+        uploader,
         duration_secs: entry.duration,
         thumbnail: entry.thumbnail,
         is_playlist: false,
@@ -1022,12 +1036,16 @@ fn apply_metadata_to_file(
     artist: Option<String>,
 ) {
     let path = Path::new(&file.path);
-    let title = title
-        .map(|value| metadata::strip_ytdlp_id_suffix(&value))
-        .filter(|value| !value.is_empty());
     let artist = artist
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
+    let title = title
+        .map(|value| metadata::strip_ytdlp_id_suffix(&value))
+        .filter(|value| !value.is_empty())
+        .map(|t| match artist.as_deref() {
+            Some(a) => metadata::strip_redundant_artist_prefix(&t, a).unwrap_or(t),
+            None => t,
+        });
 
     if artist.is_some() || title.is_some() {
         if let Err(err) = metadata::write_track_tags(path, title.as_deref(), artist.as_deref()) {
@@ -1073,6 +1091,11 @@ fn enrich_downloaded_file(file: &mut MusicFile) {
                 artist = Some(parsed_artist);
                 title = Some(parsed_title);
             }
+        }
+    } else if let (Some(ref a), Some(ref t)) = (&artist, &title) {
+        // Uploader/channel already set artist, but title is still "Artist - Song".
+        if let Some(stripped) = metadata::strip_redundant_artist_prefix(t, a) {
+            title = Some(stripped);
         }
     }
 
