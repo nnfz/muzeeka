@@ -7,6 +7,9 @@ use tauri::{Manager, Window};
 use crate::drop_handler::{ExportDragContext, ExportDragState};
 use crate::metadata;
 
+/// Built-in drag-ghost fallback (compiled into the binary once).
+static APP_ICON_PNG: &[u8] = include_bytes!("../icons/32x32.png");
+
 fn is_image_path(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
@@ -55,10 +58,6 @@ fn image_path_to_png_bytes(path: &Path) -> Option<Vec<u8>> {
     Some(buf)
 }
 
-fn app_icon_png() -> Vec<u8> {
-    include_bytes!("../icons/32x32.png").to_vec()
-}
-
 /// Build the OS drag preview: prefer track cover (any format we can decode),
 /// then embedded art from the audio file, then app icon.
 fn drag_preview_image(icon_path: Option<&str>, audio_file: &Path) -> drag::Image {
@@ -93,12 +92,26 @@ fn drag_preview_image(icon_path: Option<&str>, audio_file: &Path) -> drag::Image
         }
     }
 
-    drag::Image::Raw(app_icon_png())
+    drag::Image::Raw(APP_ICON_PNG.to_vec())
+}
+
+/// Ensures `finish_export` runs on every exit path after `register_export`.
+struct FinishExportGuard<'a> {
+    state: &'a ExportDragState,
+}
+
+impl Drop for FinishExportGuard<'_> {
+    fn drop(&mut self) {
+        self.state.finish_export();
+    }
 }
 
 /// Start a native OS drag with local file paths (e.g. drag to Telegram or Explorer).
+///
+/// `drag::start_drag` blocks until the OS drag ends — run it on the blocking pool
+/// so a long drag does not pin a Tauri command worker.
 #[tauri::command]
-pub fn start_file_drag(
+pub async fn start_file_drag(
     window: Window,
     paths: Vec<String>,
     icon_path: Option<String>,
@@ -115,28 +128,33 @@ pub fn start_file_drag(
         return Err("File not found".into());
     }
 
-    let export_state = window.state::<ExportDragState>();
-    let context = track_paths
-        .filter(|tracks| !tracks.is_empty())
-        .map(|track_paths| ExportDragContext {
-            track_paths,
-            source_playlist_id,
-            is_copy: is_copy.unwrap_or(false),
-        });
-    export_state.register_export(&files, context);
+    tauri::async_runtime::spawn_blocking(move || {
+        let export_state = window.state::<ExportDragState>();
+        let context = track_paths
+            .filter(|tracks| !tracks.is_empty())
+            .map(|track_paths| ExportDragContext {
+                track_paths,
+                source_playlist_id,
+                is_copy: is_copy.unwrap_or(false),
+            });
+        export_state.register_export(&files, context);
+        // Always clear suppress state — even if preview/start_drag fails later.
+        let _finish = FinishExportGuard {
+            state: &export_state,
+        };
 
-    let item = drag::DragItem::Files(files.clone());
-    let image = drag_preview_image(icon_path.as_deref(), &files[0]);
+        let item = drag::DragItem::Files(files.clone());
+        let image = drag_preview_image(icon_path.as_deref(), &files[0]);
 
-    // start_drag blocks until the OS drag ends; export paths stay suppressed until finish_export.
-    let drag_result = drag::start_drag(
-        &window,
-        item,
-        image,
-        |_result, _pos| {},
-        drag::Options::default(),
-    );
-
-    export_state.finish_export();
-    drag_result.map_err(|e| e.to_string())
+        drag::start_drag(
+            &window,
+            item,
+            image,
+            |_result, _pos| {},
+            drag::Options::default(),
+        )
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("Drag task failed: {e}"))?
 }
