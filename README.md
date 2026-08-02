@@ -145,7 +145,7 @@ Muzeeka depends on a number of great projects and libraries:
 - [image](https://crates.io/crates/image) - image decoding and processing
 - [rusqlite](https://crates.io/crates/rusqlite) - SQLite access
 - [axum](https://crates.io/crates/axum) - backend HTTP server components
-
+- [Unison](https://unison.boidu.dev) - Lyrics from Unison
 ## Legal & Third-Party Notices
 
 Muzeeka integrates several powerful third-party libraries and CLI tools to handle media playback and extraction. These tools are governed by their own respective licenses:
