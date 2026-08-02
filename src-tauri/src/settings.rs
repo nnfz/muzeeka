@@ -120,17 +120,85 @@ fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir.join("settings.json"))
 }
 
+fn settings_bak_path(primary: &std::path::Path) -> PathBuf {
+    primary.with_extension("json.bak")
+}
+
+/// Clamp fields that can be hand-edited or come from older app versions.
+fn normalize_settings(mut settings: AppSettings) -> AppSettings {
+    settings.equalizer = settings.equalizer.clamp();
+    settings.playback_rate = settings.playback_rate.clamp(0.25, 2.0);
+    settings.remote_port = crate::remote_server::sanitize_port(settings.remote_port);
+    for preset in &mut settings.custom_presets {
+        preset.preamp_db = preset.preamp_db.clamp(-15.0, 15.0);
+        for gain in &mut preset.bands_db {
+            *gain = gain.clamp(-20.0, 20.0);
+        }
+    }
+    settings
+}
+
+fn parse_settings_file(path: &std::path::Path) -> Result<AppSettings, String> {
+    let raw = fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+    serde_json::from_str(&raw)
+        .map_err(|e| format!("Failed to parse {}: {}", path.display(), e))
+}
+
 pub fn load_settings(app: &AppHandle) -> Result<AppSettings, String> {
     let path = settings_path(app)?;
+    let bak_path = settings_bak_path(&path);
 
     if !path.exists() {
+        // Primary missing — still try backup (e.g. crash mid-replace left only .bak).
+        if bak_path.is_file() {
+            match parse_settings_file(&bak_path) {
+                Ok(settings) => {
+                    eprintln!(
+                        "[settings] settings.json missing; restored from {}",
+                        bak_path.display()
+                    );
+                    let settings = normalize_settings(settings);
+                    // Heal primary so the next launch does not depend on .bak alone.
+                    let _ = save_settings(app, &settings);
+                    return Ok(settings);
+                }
+                Err(error) => {
+                    eprintln!("[settings] backup also unreadable: {error}");
+                }
+            }
+        }
         return Ok(AppSettings::default());
     }
 
-    let raw = fs::read_to_string(&path)
-        .map_err(|e| format!("Failed to read settings file: {}", e))?;
-
-    serde_json::from_str(&raw).map_err(|e| format!("Failed to parse settings file: {}", e))
+    match parse_settings_file(&path) {
+        Ok(settings) => Ok(normalize_settings(settings)),
+        Err(primary_error) => {
+            if bak_path.is_file() {
+                match parse_settings_file(&bak_path) {
+                    Ok(settings) => {
+                        eprintln!(
+                            "[settings] {primary_error}; restored from {}",
+                            bak_path.display()
+                        );
+                        let settings = normalize_settings(settings);
+                        let _ = save_settings(app, &settings);
+                        return Ok(settings);
+                    }
+                    Err(bak_error) => {
+                        eprintln!(
+                            "[settings] primary and backup both failed ({primary_error}; {bak_error}); using defaults"
+                        );
+                    }
+                }
+            } else {
+                eprintln!(
+                    "[settings] {primary_error}; no .bak available, using defaults"
+                );
+            }
+            Ok(AppSettings::default())
+        }
+    }
 }
 
 fn write_file_atomic(path: &PathBuf, contents: &[u8]) -> Result<(), String> {
