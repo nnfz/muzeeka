@@ -155,13 +155,17 @@ fn is_cue_extension(ext: &str) -> bool {
     ext.eq_ignore_ascii_case("cue")
 }
 
-fn is_covered_audio(path: &Path, covered: &[String]) -> bool {
+/// Pre-normalized path keys for O(1) CUE-covered audio checks.
+fn covered_audio_keys(covered: &[String]) -> HashSet<String> {
+    covered.iter().map(|entry| path_key(entry)).collect()
+}
+
+fn is_covered_audio(path: &Path, covered_keys: &HashSet<String>) -> bool {
     let canonical = fs::canonicalize(path)
         .unwrap_or_else(|_| path.to_path_buf())
         .to_string_lossy()
         .to_string();
-
-    covered.iter().any(|entry| path_key(entry) == path_key(&canonical))
+    covered_keys.contains(&path_key(&canonical))
 }
 
 fn is_directory(path: &Path) -> bool {
@@ -329,14 +333,14 @@ fn build_files_from_paths(
     progress: Option<ScanProgressCallback<'_>>,
 ) -> Vec<MusicFile> {
     let cue_paths = if skip_cue { vec![] } else { collect_cue_paths(&paths) };
-    let covered = cue::covered_audio_paths(&cue_paths);
+    let covered_keys = covered_audio_keys(&cue::covered_audio_paths(&cue_paths));
     let audio_paths: Vec<&PathBuf> = paths
         .iter()
         .filter(|path| {
             let Some(ext) = path.extension().and_then(|value| value.to_str()) else {
                 return false;
             };
-            is_audio_extension(ext) && !is_covered_audio(path, &covered)
+            is_audio_extension(ext) && !is_covered_audio(path, &covered_keys)
         })
         .collect();
     let total = audio_paths.len() + cue_paths.len();
@@ -384,6 +388,10 @@ fn collect_from_directory(
     progress: Option<ScanProgressCallback<'_>>,
 ) {
     let paths = collect_paths_from_directory(root);
+    // Fast path scan: no ID3 / no covers / skip CUE expand here.
+    // Tags + covers are filled later via `library_fetch_metadata` (lazy UI).
+    // `skip_cue=true` keeps folder walks cheap; explicit .cue drops still expand
+    // in `scan_paths_impl`.
     for file in build_files_from_paths(paths, false, false, true, progress) {
         let key = path_key(&file.path);
         if seen.insert(key) {
@@ -590,7 +598,28 @@ mod tests {
         let files = scan_paths(&[base.to_string_lossy().to_string()]).expect("scan paths");
         assert_eq!(files.len(), 1);
         assert!(files[0].file_name.ends_with("track.mp3"));
-        assert!(files[0].title.is_some());
+        // Directory scan is path-only; titles come from `fetch_metadata` later.
+        assert!(files[0].title.is_none());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn fetch_metadata_fills_title_from_filename_fallback() {
+        let base = std::env::temp_dir().join(format!("muzeeka-meta-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).expect("create meta dir");
+        let track = base.join("My Cool Track.mp3");
+        write_test_file(&track, &[1, 2, 3]);
+
+        let path = track.to_string_lossy().to_string();
+        let files = fetch_metadata(&[path.clone()]).expect("fetch metadata");
+        assert_eq!(files.len(), 1);
+        assert!(
+            files[0].title.as_deref() == Some("My Cool Track"),
+            "expected filename stem title, got {:?}",
+            files[0].title
+        );
 
         let _ = fs::remove_dir_all(&base);
     }
