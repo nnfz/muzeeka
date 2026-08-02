@@ -6,9 +6,11 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::thread;
+use std::time::Duration;
 use regex::Regex;
+use ureq::Agent;
 
 use rayon::prelude::*;
 
@@ -19,6 +21,32 @@ use tauri::path::BaseDirectory;
 use crate::library::{self, MusicFile};
 use crate::metadata;
 use crate::process_util;
+
+static SPOTIFY_NEXT_DATA_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?s)<script id="__NEXT_DATA__" type="application/json">(.*?)</script>"#)
+        .expect("spotify next-data regex")
+});
+static SPOTIFY_OG_DESC_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)<meta\s+property=["']og:description["']\s+content=["'](.*?)["']"#)
+        .expect("spotify og:description regex")
+});
+
+const YTDLP_HTTP_TIMEOUT: Duration = Duration::from_secs(20);
+static YTDLP_HTTP_AGENT: OnceLock<Agent> = OnceLock::new();
+
+fn http_agent() -> &'static Agent {
+    YTDLP_HTTP_AGENT.get_or_init(|| {
+        let config = Agent::config_builder()
+            .timeout_global(Some(YTDLP_HTTP_TIMEOUT))
+            .build();
+        config.into()
+    })
+}
+
+/// Normalize user paste: trim only. Do **not** strip `?…` — YouTube needs `?v=…`.
+fn normalize_media_url(url: &str) -> &str {
+    url.trim()
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct YtdlpProbeResult {
@@ -298,7 +326,8 @@ fn parse_probe_json(raw: &str) -> Result<YtdlpProbeResult, String> {
 }
 
 fn http_get_text(url: &str, accept: &str) -> Result<String, String> {
-    let mut response = ureq::get(url)
+    let mut response = http_agent()
+        .get(url)
         .header(
             "User-Agent",
             "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
@@ -365,9 +394,7 @@ fn extract_spotify_playlist_queries(url: &str) -> (Vec<String>, Option<String>) 
         Err(_) => return (queries, first_cover),
     };
 
-    let re = Regex::new(r#"(?s)<script id="__NEXT_DATA__" type="application/json">(.*?)</script>"#).unwrap();
-    
-    if let Some(caps) = re.captures(&html) {
+    if let Some(caps) = SPOTIFY_NEXT_DATA_RE.captures(&html) {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&caps[1]) {
             if let Some(track_list) = json
                 .get("props")
@@ -442,8 +469,7 @@ fn probe_spotify(url: &str) -> Result<YtdlpProbeResult, String> {
         }
     } else {
         let html = http_get_text(url, "text/html").unwrap_or_default();
-        let re_desc = Regex::new(r#"(?i)<meta\s+property=["']og:description["']\s+content=["'](.*?)["']"#).unwrap();
-        if let Some(caps) = re_desc.captures(&html) {
+        if let Some(caps) = SPOTIFY_OG_DESC_RE.captures(&html) {
             let desc = caps[1].trim();
             let without_prefix = if let Some(idx) = desc.find("Spotify. ") {
                 &desc[idx + 9..]
@@ -468,8 +494,9 @@ fn probe_spotify(url: &str) -> Result<YtdlpProbeResult, String> {
 }
 
 pub fn probe(app: &AppHandle, url: &str) -> Result<YtdlpProbeResult, String> {
-    let trimmed = url.trim().split('?').next().unwrap_or(url.trim());
-    
+    // Keep query string: youtube.com/watch?v=ID must not become /watch.
+    let trimmed = normalize_media_url(url);
+
     if !is_supported_url(trimmed) {
         return Err("URL is not recognized as a supported media link".to_string());
     }
@@ -650,7 +677,7 @@ pub fn download(
     output_dir: Option<&str>,
     allow_playlist: bool,
 ) -> Result<YtdlpDownloadResult, String> {
-    let trimmed = url.trim().split('?').next().unwrap_or(url.trim());
+    let trimmed = normalize_media_url(url);
     if !is_supported_url(trimmed) {
         return Err("URL is not recognized as a supported media link".to_string());
     }
