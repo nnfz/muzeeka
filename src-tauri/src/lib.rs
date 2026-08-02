@@ -34,11 +34,12 @@ mod ytdlp;
 use discord_rpc::DiscordPresence;
 use drop_handler::{handle_window_event, DropState, ExportDragState};
 
+use parking_lot::Mutex;
 use player::Player;
 use remote_control::RemoteController;
 use remote_server::RemoteServer;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::path::BaseDirectory;
 use tauri::{Emitter, LogicalPosition, LogicalSize, Manager, WindowEvent};
@@ -194,14 +195,13 @@ pub fn run() {
             if window.label() == "main" {
                 match event {
                     WindowEvent::Resized(_) | WindowEvent::Moved(_) => {
-                        if let Ok(mut last_save) = last_window_state_save_for_event.lock() {
-                            if last_save.elapsed() >= Duration::from_millis(700) {
-                                let app = window.app_handle();
-                                if let Some(webview_window) = app.get_webview_window(window.label()) {
-                                    save_window_state(&app, &webview_window);
-                                }
-                                *last_save = Instant::now();
+                        let mut last_save = last_window_state_save_for_event.lock();
+                        if last_save.elapsed() >= Duration::from_millis(700) {
+                            let app = window.app_handle();
+                            if let Some(webview_window) = app.get_webview_window(window.label()) {
+                                save_window_state(&app, &webview_window);
                             }
+                            *last_save = Instant::now();
                         }
                     }
                     // Reliable path for exclusive-fullscreen games (JS focus can miss).
@@ -258,11 +258,15 @@ pub fn run() {
             }
             metadata::set_ffmpeg_bin(ffmpeg);
 
+            // One settings load for window geometry, EQ, Discord, and remote server.
+            let app_settings = settings::load_settings(&app.handle()).ok();
+
             if let Some(window) = app.get_webview_window("main") {
-                if let Ok(app_settings) = settings::load_settings(&app.handle()) {
-                    if let Some(window_state) = app_settings.window_state.as_ref() {
-                        apply_window_state(&window, window_state);
-                    }
+                if let Some(window_state) = app_settings
+                    .as_ref()
+                    .and_then(|s| s.window_state.as_ref())
+                {
+                    apply_window_state(&window, window_state);
                 }
                 let _ = window.eval(
                     "document.addEventListener('contextmenu',e=>e.preventDefault(),{capture:true});",
@@ -279,8 +283,8 @@ pub fn run() {
 
             // Apply saved equalizer settings as early as possible (before any playback)
             // so the first seconds of audio are processed by DSP.
-            if let Ok(app_settings) = settings::load_settings(&app.handle()) {
-                let _ = player.set_equalizer(app_settings.equalizer);
+            if let Some(ref app_settings) = app_settings {
+                let _ = player.set_equalizer(app_settings.equalizer.clone());
                 discord_presence.configure(app_settings.discord_rpc_enabled);
             }
 
@@ -295,12 +299,10 @@ pub fn run() {
             app.manage(remote_controller.clone());
             taskbar_handler::setup(app.handle(), remote_controller.clone());
 
-            let (remote_enabled, remote_port) =
-                if let Ok(app_settings) = settings::load_settings(&app.handle()) {
-                    (app_settings.remote_enabled, app_settings.remote_port)
-                } else {
-                    (true, remote_server::DEFAULT_REMOTE_PORT)
-                };
+            let (remote_enabled, remote_port) = app_settings
+                .as_ref()
+                .map(|s| (s.remote_enabled, s.remote_port))
+                .unwrap_or((true, remote_server::DEFAULT_REMOTE_PORT));
             let remote_http =
                 RemoteServer::new(remote_controller, remote_enabled, remote_port);
             app.manage(remote_http);
@@ -312,7 +314,9 @@ pub fn run() {
 
             Ok(())
         })
+        // Command modules: commands/{player,library,lyrics,settings,ytdlp,vk}.rs
         .invoke_handler(tauri::generate_handler![
+            // Player
             commands::player_init,
             commands::player_play,
             commands::player_prepare_next,
@@ -328,10 +332,12 @@ pub fn run() {
             commands::player_get_equalizer_status,
             commands::player_set_equalizer,
             commands::load_addon,
+            // Settings / remote / input
             commands::settings_load,
             commands::settings_save,
             commands::remote_status,
             commands::input_is_ctrl_held,
+            // Library + playlists + covers
             commands::library_scan,
             commands::library_scan_paths,
             commands::library_fetch_metadata,
@@ -339,10 +345,6 @@ pub fn run() {
             commands::library_resolve_full_cover,
             commands::library_cover_data_url,
             commands::library_rebuild_covers,
-            commands::lyrics_fetch,
-            commands::lyrics_import_ttml,
-            commands::lyrics_clear,
-            commands::lyrics_refetch,
             commands::playlists_load,
             commands::playlists_list_meta,
             commands::library_state_save,
@@ -362,6 +364,12 @@ pub fn run() {
             commands::playlist_cache_cover,
             commands::playlist_cache_cover_url,
             commands::playlist_remove_cover,
+            // Lyrics
+            commands::lyrics_fetch,
+            commands::lyrics_import_ttml,
+            commands::lyrics_clear,
+            commands::lyrics_refetch,
+            // yt-dlp
             commands::ytdlp_is_url,
             commands::ytdlp_available,
             commands::ytdlp_ffmpeg_available,
@@ -369,9 +377,11 @@ pub fn run() {
             commands::ytdlp_download,
             commands::ytdlp_cancel,
             commands::ytdlp_default_download_dir,
+            // VK
             commands::vk_auth_status,
             commands::vk_login,
             commands::vk_logout,
+            // Native drag
             file_drag::start_file_drag,
             drag_float::drag_float_show,
             drag_float::drag_float_update,
