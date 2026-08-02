@@ -426,6 +426,16 @@ pub unsafe extern "system" fn eq_dsp_callback(
         return;
     }
 
+    // First call runs on BASS's mixer/update thread — register it as audio-critical
+    // so process BELOW_NORMAL (unfocused window) does not starve the callback.
+    {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static DSP_THREAD_REGISTERED: AtomicBool = AtomicBool::new(false);
+        if !DSP_THREAD_REGISTERED.swap(true, Ordering::Relaxed) {
+            crate::process_util::register_audio_thread();
+        }
+    }
+
     let ctx = &*(user as *const EqDspContext);
     let use_float = ctx.dsp_float_forced.load(Ordering::Acquire)
         || ctx.bytes_per_sample.load(Ordering::Acquire) >= 4;

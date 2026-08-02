@@ -2433,6 +2433,8 @@ impl Player {
 
     pub fn mark_bass_thread(&self) {
         *self.bass_thread.write() = Some(thread::current().id());
+        // Keep this thread above BELOW_NORMAL process priority when unfocused.
+        crate::process_util::register_audio_thread();
     }
 
     /// Poll playback on the main thread and emit position / track-ended events.
