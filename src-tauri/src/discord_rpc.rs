@@ -14,20 +14,25 @@ use parking_lot::Mutex;
 
 use crate::cue;
 use crate::library::MusicFile;
-use crate::metadata::{self, TrackMetadata};
 use crate::imgbb;
+use crate::metadata::{self, TrackMetadata};
 use crate::musicbrainz;
 use crate::player::{PlaybackState, PlayerStateSnapshot};
 
 /// Discord Application ID — https://discord.com/developers/applications
 pub const DISCORD_CLIENT_ID: &str = "1525094033666473995";
 
-/// Last resolved tags for the active track — avoids re-parsing ID3 on every RPC sync.
-static META_CACHE: Mutex<Option<(String, TrackMetadata)>> = Mutex::new(None);
+/// Small MRU cache of parsed track tags — Discord can fire on play/pause/seek/gapless.
+/// A few slots cover current + next/prev without re-parsing large APIC frames.
+const META_CACHE_CAP: usize = 4;
+
+/// Path → metadata, most-recently-used at the end.
+static META_CACHE: Mutex<Vec<(String, TrackMetadata)>> = Mutex::new(Vec::new());
 
 #[derive(Clone)]
 pub struct DiscordPresence {
     inner: Arc<Mutex<PresenceInner>>,
+    /// Bumped on every cover lookup / clear so stale network work discards results.
     lookup_generation: Arc<AtomicU64>,
 }
 
@@ -70,12 +75,22 @@ impl DiscordPresence {
         }
     }
 
+    /// Invalidate in-flight cover lookups (track change, stop, disable, shutdown).
+    fn bump_lookup_generation(&self) -> u64 {
+        self.lookup_generation.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    fn lookup_is_current(generation: u64, gen: &AtomicU64) -> bool {
+        generation == gen.load(Ordering::SeqCst)
+    }
+
     pub fn configure(&self, enabled: bool) {
         let mut inner = self.inner.lock();
         let changed = inner.enabled != enabled;
         inner.enabled = enabled;
 
         if !enabled {
+            self.bump_lookup_generation();
             let _ = Self::clear_activity(&mut inner);
             return;
         }
@@ -95,12 +110,14 @@ impl DiscordPresence {
         }
 
         let Some(track_path) = snapshot.current_file.as_ref() else {
+            self.bump_lookup_generation();
             let _ = Self::clear_activity(&mut inner);
             inner.last_sync_key = None;
             return;
         };
 
         if snapshot.state == PlaybackState::Stopped && !snapshot.is_playing && !snapshot.is_paused {
+            self.bump_lookup_generation();
             let _ = Self::clear_activity(&mut inner);
             inner.last_sync_key = None;
             return;
@@ -162,6 +179,7 @@ impl DiscordPresence {
     }
 
     pub fn shutdown(&self) {
+        self.bump_lookup_generation();
         let mut inner = self.inner.lock();
         let _ = Self::clear_activity(&mut inner);
         Self::reset_connection(&mut inner);
@@ -176,14 +194,30 @@ impl DiscordPresence {
         album: Option<String>,
         base_payload: ActivityPayload,
     ) {
-        let generation = self.lookup_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let generation = self.bump_lookup_generation();
+        let gen = Arc::clone(&self.lookup_generation);
         let inner = self.inner.clone();
         thread::spawn(move || {
+            // Cheap bail-out if the user already skipped ahead before we start network I/O.
+            if !Self::lookup_is_current(generation, &gen) {
+                return;
+            }
+
             let cover_url = resolve_cover_url(&track_path, &artist, &title, album.as_deref());
+
+            // Drop result if a newer track (or clear/shutdown) won the race.
+            if !Self::lookup_is_current(generation, &gen) {
+                return;
+            }
+
             let Some(cover_url) = cover_url else {
                 return;
             };
+
             let mut guard = inner.lock();
+            if !Self::lookup_is_current(generation, &gen) {
+                return;
+            }
             if !guard.enabled {
                 return;
             }
@@ -205,8 +239,6 @@ impl DiscordPresence {
                 Ok(()) => guard.last_sync_key = Some(sync_key),
                 Err(error) => eprintln!("Discord RPC cover update failed: {error}"),
             }
-
-            let _ = generation;
         });
     }
 
@@ -361,6 +393,7 @@ fn resolve_cover_url(
     local_cover_path(track_path).and_then(|path| imgbb::upload_image(&path))
 }
 
+/// Cover from the real audio file (CUE virtual paths point at the image, not the track file).
 fn local_cover_from_audio(track_path: &str, track: &MusicFile) -> Option<String> {
     if let Some(audio_path) = track.audio_path.as_deref() {
         let audio = Path::new(audio_path);
@@ -400,16 +433,24 @@ fn metadata_for_path(track_path: &str) -> TrackMetadata {
     // Discord updates can fire on play/pause/seek/gapless; re-reading ID3 + decoding
     // embedded art each time made some tracks (large APIC) stutter for free.
     {
-        let cache = META_CACHE.lock();
-        if let Some((cached_path, meta)) = cache.as_ref() {
-            if cached_path == track_path {
-                return meta.clone();
-            }
+        let mut cache = META_CACHE.lock();
+        if let Some(pos) = cache.iter().position(|(path, _)| path == track_path) {
+            let entry = cache.remove(pos);
+            let meta = entry.1.clone();
+            cache.push(entry); // MRU at the end
+            return meta;
         }
     }
 
     let meta = metadata_for_path_uncached(track_path);
-    *META_CACHE.lock() = Some((track_path.to_string(), meta.clone()));
+    {
+        let mut cache = META_CACHE.lock();
+        cache.retain(|(path, _)| path != track_path);
+        if cache.len() >= META_CACHE_CAP {
+            cache.remove(0); // drop LRU
+        }
+        cache.push((track_path.to_string(), meta.clone()));
+    }
     meta
 }
 

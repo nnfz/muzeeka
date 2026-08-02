@@ -2,12 +2,67 @@
 
 use cue_rw::{CUEFile, CUETrack, CUETimeStamp};
 use num_rational::Rational32;
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use std::time::SystemTime;
 
 use crate::library::MusicFile;
 use crate::metadata;
+
+// ── Short-lived path caches (mtime-invalidated) ───────────────────────────────
+// repair_track / resolve_playback hit the same album CUE once per track; cache
+// companion lookup + full expand so a 15-track multi-file album pays once.
+
+struct CompanionCacheEntry {
+    parent_mtime: Option<SystemTime>,
+    cue: Option<PathBuf>,
+}
+
+struct ExpandCacheEntry {
+    cue_mtime: Option<SystemTime>,
+    resolve_covers: bool,
+    tracks: Vec<MusicFile>,
+}
+
+fn companion_cache() -> &'static Mutex<HashMap<String, CompanionCacheEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, CompanionCacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn expand_cache() -> &'static Mutex<HashMap<String, ExpandCacheEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, ExpandCacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn path_mtime(path: &Path) -> Option<SystemTime> {
+    fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+fn path_cache_key(path: &Path) -> String {
+    path.to_string_lossy().to_lowercase()
+}
+
+/// Files only, sorted — one `read_dir` reused by resolve / companion lookups.
+fn list_files_in_dir(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let is_file = entry.file_type().map(|t| t.is_file()).unwrap_or(false);
+            if is_file {
+                files.push(entry.path());
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+fn canonicalize_or(path: PathBuf) -> PathBuf {
+    fs::canonicalize(&path).unwrap_or(path)
+}
 
 pub const CUE_PATH_MARKER: &str = "#cue:";
 
@@ -46,6 +101,31 @@ pub fn parse_virtual_cue_path(path: &str) -> Option<(String, u32)> {
 /// - `album.flac.cue` beside `album.flac` (Exact Audio Copy and similar)
 /// - multi-file rips: any `*.cue` in the same folder that references this audio
 pub fn companion_cue_for_audio(audio_path: &Path) -> Option<PathBuf> {
+    let parent = audio_path.parent()?;
+    let key = path_cache_key(audio_path);
+    let parent_mtime = path_mtime(parent);
+
+    {
+        let cache = companion_cache().lock();
+        if let Some(entry) = cache.get(&key) {
+            if entry.parent_mtime == parent_mtime {
+                return entry.cue.clone();
+            }
+        }
+    }
+
+    let cue = companion_cue_for_audio_uncached(audio_path, parent);
+    companion_cache().lock().insert(
+        key,
+        CompanionCacheEntry {
+            parent_mtime,
+            cue: cue.clone(),
+        },
+    );
+    cue
+}
+
+fn companion_cue_for_audio_uncached(audio_path: &Path, parent: &Path) -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::with_capacity(2);
     if let Some(stem) = audio_path.file_stem() {
         candidates.push(audio_path.with_file_name(format!("{}.cue", stem.to_string_lossy())));
@@ -60,7 +140,8 @@ pub fn companion_cue_for_audio(audio_path: &Path) -> Option<PathBuf> {
         }
     }
 
-    let parent = audio_path.parent()?;
+    // One directory listing for case-insensitive name match + multi-file FILE scan.
+    let listing = list_files_in_dir(parent);
 
     // Case-insensitive match on Windows (FAT/NTFS folder listings can differ in case).
     #[cfg(windows)]
@@ -70,15 +151,13 @@ pub fn companion_cue_for_audio(audio_path: &Path) -> Option<PathBuf> {
             .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase()))
             .collect();
         if !targets.is_empty() {
-            if let Ok(entries) = fs::read_dir(parent) {
-                for entry in entries.flatten() {
-                    let name = entry.file_name().to_string_lossy().to_lowercase();
-                    if targets.iter().any(|t| t == &name) {
-                        let path = entry.path();
-                        if path.is_file() {
-                            return Some(path);
-                        }
-                    }
+            for path in &listing {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_lowercase())
+                    .unwrap_or_default();
+                if targets.iter().any(|t| t == &name) {
+                    return Some(path.clone());
                 }
             }
         }
@@ -93,37 +172,38 @@ pub fn companion_cue_for_audio(audio_path: &Path) -> Option<PathBuf> {
         .map(|n| n.to_string_lossy().to_lowercase())
         .unwrap_or_default();
 
-    if let Ok(entries) = fs::read_dir(parent) {
-        let mut cue_paths: Vec<PathBuf> = entries
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| {
-                p.extension()
-                    .and_then(|e| e.to_str())
-                    .is_some_and(|e| e.eq_ignore_ascii_case("cue"))
-            })
-            .collect();
-        cue_paths.sort();
-        for cue_path in cue_paths {
-            if let Some((cue, _)) = parse_cue_file(&cue_path) {
-                for file_name in &cue.files {
-                    let fname = file_name.to_lowercase();
-                    let fstem = Path::new(file_name)
-                        .file_stem()
-                        .map(|s| s.to_string_lossy().to_lowercase())
-                        .unwrap_or_default();
-                    if fname == audio_name
-                        || fstem == audio_stem
-                        || fname.starts_with(&audio_stem)
-                        || audio_name.starts_with(&fstem)
-                    {
+    let mut cue_paths: Vec<PathBuf> = listing
+        .iter()
+        .filter(|p| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("cue"))
+        })
+        .cloned()
+        .collect();
+    cue_paths.sort();
+
+    for cue_path in cue_paths {
+        if let Some((cue, _)) = parse_cue_file(&cue_path) {
+            for file_name in &cue.files {
+                let fname = file_name.to_lowercase();
+                let fstem = Path::new(file_name)
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_lowercase())
+                    .unwrap_or_default();
+                if fname == audio_name
+                    || fstem == audio_stem
+                    || fname.starts_with(&audio_stem)
+                    || audio_name.starts_with(&fstem)
+                {
+                    return Some(cue_path);
+                }
+                // Resolved path match (ALAC → m4a) — reuse folder listing.
+                if let Some(resolved) =
+                    resolve_audio_file_with_listing(parent, file_name, &listing)
+                {
+                    if same_path_key(&resolved, audio_path) {
                         return Some(cue_path);
-                    }
-                    // Resolved path match (ALAC → m4a).
-                    if let Some(resolved) = resolve_audio_file(parent, file_name) {
-                        if same_path_key(&resolved, audio_path) {
-                            return Some(cue_path);
-                        }
                     }
                 }
             }
@@ -146,9 +226,35 @@ fn same_path_key(a: &Path, b: &Path) -> bool {
 
 fn expanded_track_for_audio(audio_path: &str, track_no: u32) -> Option<MusicFile> {
     let cue_path = companion_cue_for_audio(Path::new(audio_path))?;
-    expand_cue_file(&cue_path)
+    expand_cue_file_cached(&cue_path, true)
         .into_iter()
         .nth(track_no.saturating_sub(1) as usize)
+}
+
+/// Expand with mtime cache — shared by repair_track / resolve_playback per album CUE.
+fn expand_cue_file_cached(cue_path: &Path, resolve_covers: bool) -> Vec<MusicFile> {
+    let key = path_cache_key(cue_path);
+    let cue_mtime = path_mtime(cue_path);
+
+    {
+        let cache = expand_cache().lock();
+        if let Some(entry) = cache.get(&key) {
+            if entry.cue_mtime == cue_mtime && entry.resolve_covers == resolve_covers {
+                return entry.tracks.clone();
+            }
+        }
+    }
+
+    let tracks = expand_cue_file_impl(cue_path, resolve_covers);
+    expand_cache().lock().insert(
+        key,
+        ExpandCacheEntry {
+            cue_mtime,
+            resolve_covers,
+            tracks: tracks.clone(),
+        },
+    );
+    tracks
 }
 
 /// Fill missing CUE metadata on a playlist track loaded from disk.
@@ -485,7 +591,11 @@ fn normalize_eac_multifile_cue(content: &str) -> String {
 
 fn parse_cue_file(cue_path: &Path) -> Option<(CUEFile, PathBuf)> {
     let raw = read_cue_text(cue_path)?;
-    let content = raw.strip_prefix('\u{feff}').unwrap_or(raw.as_str());
+    parse_cue_content(&raw, cue_path)
+}
+
+fn parse_cue_content(raw: &str, cue_path: &Path) -> Option<(CUEFile, PathBuf)> {
+    let content = raw.strip_prefix('\u{feff}').unwrap_or(raw);
     let normalized = normalize_eac_multifile_cue(content);
     let cue: CUEFile = normalized.as_str().try_into().ok()?;
     let cue_dir = cue_path.parent()?.to_path_buf();
@@ -497,26 +607,22 @@ const AUDIO_EXT_FALLBACKS: &[&str] = &[
     "m4a", "mp4", "alac", "flac", "wav", "aiff", "aif", "ape", "wv", "opus", "ogg", "mp3", "wma",
 ];
 
-fn resolve_audio_file(cue_dir: &Path, file_name: &str) -> Option<PathBuf> {
+fn resolve_audio_file_with_listing(
+    cue_dir: &Path,
+    file_name: &str,
+    listing: &[PathBuf],
+) -> Option<PathBuf> {
+    if let Some(path) = resolve_audio_file_direct(cue_dir, file_name) {
+        return Some(path);
+    }
+    resolve_audio_file_from_listing(file_name, listing)
+}
+
+/// Exact path + extension substitution (no `read_dir`).
+fn resolve_audio_file_direct(cue_dir: &Path, file_name: &str) -> Option<PathBuf> {
     let candidate = cue_dir.join(file_name);
     if candidate.is_file() {
-        return fs::canonicalize(&candidate)
-            .ok()
-            .or(Some(candidate));
-    }
-
-    // Case-insensitive exact name (Windows).
-    #[cfg(windows)]
-    {
-        let target = file_name.to_lowercase();
-        if let Ok(entries) = fs::read_dir(cue_dir) {
-            for entry in entries.flatten() {
-                if entry.file_name().to_string_lossy().to_lowercase() == target {
-                    let path = entry.path();
-                    return fs::canonicalize(&path).ok().or(Some(path));
-                }
-            }
-        }
+        return Some(canonicalize_or(candidate));
     }
 
     // Same stem, different extension (EAC often writes FILE "...ALAC" ALAC while
@@ -525,36 +631,53 @@ fn resolve_audio_file(cue_dir: &Path, file_name: &str) -> Option<PathBuf> {
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| file_name.to_string());
-    let stem_lower = stem.to_lowercase();
 
     for ext in AUDIO_EXT_FALLBACKS {
         let alt = cue_dir.join(format!("{stem}.{ext}"));
         if alt.is_file() {
-            return fs::canonicalize(&alt).ok().or(Some(alt));
+            return Some(canonicalize_or(alt));
         }
     }
 
-    // Case-insensitive stem match against directory listing.
-    if let Ok(entries) = fs::read_dir(cue_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            let Some(entry_stem) = path.file_stem().map(|s| s.to_string_lossy().to_lowercase()) else {
-                continue;
-            };
-            if entry_stem != stem_lower {
-                continue;
-            }
-            let ext = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("")
-                .to_lowercase();
-            if AUDIO_EXT_FALLBACKS.iter().any(|a| *a == ext) || !ext.is_empty() {
-                return fs::canonicalize(&path).ok().or(Some(path));
-            }
+    None
+}
+
+/// Case-insensitive / prefix heuristics against a pre-read folder listing.
+fn resolve_audio_file_from_listing(file_name: &str, listing: &[PathBuf]) -> Option<PathBuf> {
+    let target = file_name.to_lowercase();
+    let stem = Path::new(file_name)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| file_name.to_string());
+    let stem_lower = stem.to_lowercase();
+
+    // Case-insensitive exact name.
+    for path in listing {
+        if path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_lowercase())
+            .as_deref()
+            == Some(target.as_str())
+        {
+            return Some(canonicalize_or(path.clone()));
+        }
+    }
+
+    // Case-insensitive stem match.
+    for path in listing {
+        let Some(entry_stem) = path.file_stem().map(|s| s.to_string_lossy().to_lowercase()) else {
+            continue;
+        };
+        if entry_stem != stem_lower {
+            continue;
+        }
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        if AUDIO_EXT_FALLBACKS.iter().any(|a| *a == ext) || !ext.is_empty() {
+            return Some(canonicalize_or(path.clone()));
         }
     }
 
@@ -563,29 +686,26 @@ fn resolve_audio_file(cue_dir: &Path, file_name: &str) -> Option<PathBuf> {
         if !num.is_empty() {
             let prefix = format!("{num}.");
             let prefix_lower = prefix.to_lowercase();
-            if let Ok(entries) = fs::read_dir(cue_dir) {
-                let mut matches: Vec<PathBuf> = entries
-                    .flatten()
-                    .map(|e| e.path())
-                    .filter(|p| p.is_file())
-                    .filter(|p| {
-                        p.file_name()
-                            .map(|n| n.to_string_lossy().to_lowercase().starts_with(&prefix_lower))
-                            .unwrap_or(false)
-                    })
-                    .filter(|p| {
-                        let ext = p
-                            .extension()
-                            .and_then(|e| e.to_str())
-                            .unwrap_or("")
-                            .to_lowercase();
-                        AUDIO_EXT_FALLBACKS.iter().any(|a| *a == ext)
-                    })
-                    .collect();
-                matches.sort();
-                if let Some(path) = matches.into_iter().next() {
-                    return fs::canonicalize(&path).ok().or(Some(path));
-                }
+            let mut matches: Vec<PathBuf> = listing
+                .iter()
+                .filter(|p| {
+                    p.file_name()
+                        .map(|n| n.to_string_lossy().to_lowercase().starts_with(&prefix_lower))
+                        .unwrap_or(false)
+                })
+                .filter(|p| {
+                    let ext = p
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("")
+                        .to_lowercase();
+                    AUDIO_EXT_FALLBACKS.iter().any(|a| *a == ext)
+                })
+                .cloned()
+                .collect();
+            matches.sort();
+            if let Some(path) = matches.into_iter().next() {
+                return Some(canonicalize_or(path));
             }
         }
     }
@@ -659,13 +779,13 @@ fn extract_multifile_index00_ends(content: &str) -> Vec<Option<f64>> {
 ///   `cue_start`/`cue_end` from INDEX so duration/gapless match the sheet (INDEX 00),
 ///   not the full container length of the m4a/ALAC file.
 pub fn expand_cue_file(cue_path: &Path) -> Vec<MusicFile> {
-    expand_cue_file_impl(cue_path, true)
+    expand_cue_file_cached(cue_path, true)
 }
 
 /// Import variant: preserve all CUE identity/timing while deferring expensive
 /// embedded-cover extraction until a track becomes visible.
 pub fn expand_cue_file_fast(cue_path: &Path) -> Vec<MusicFile> {
-    expand_cue_file_impl(cue_path, false)
+    expand_cue_file_cached(cue_path, false)
 }
 
 fn expand_cue_file_impl(cue_path: &Path, resolve_covers: bool) -> Vec<MusicFile> {
@@ -676,7 +796,8 @@ fn expand_cue_file_impl(cue_path: &Path, resolve_covers: bool) -> Vec<MusicFile>
     let content = raw.strip_prefix('\u{feff}').unwrap_or(raw.as_str());
     let index00_ends = extract_multifile_index00_ends(content);
 
-    let (cue, cue_dir) = match parse_cue_file(cue_path) {
+    // Parse from already-loaded text — avoid a second disk read + normalize pass.
+    let (cue, cue_dir) = match parse_cue_content(content, cue_path) {
         Some(value) => value,
         None => return Vec::new(),
     };
@@ -701,8 +822,12 @@ fn expand_cue_file_impl(cue_path: &Path, resolve_covers: bool) -> Vec<MusicFile>
         }
     }
 
+    // One folder listing for all track FILE resolutions in this sheet.
+    let listing = list_files_in_dir(&cue_dir);
+
     let mut result = Vec::with_capacity(track_refs.len());
     let mut metadata_by_audio = HashMap::<String, metadata::TrackMetadata>::new();
+    let mut size_by_audio = HashMap::<String, u64>::new();
 
     for (index, (file_id, track)) in track_refs.iter().enumerate() {
         let file_name = match cue.files.get(*file_id) {
@@ -710,10 +835,11 @@ fn expand_cue_file_impl(cue_path: &Path, resolve_covers: bool) -> Vec<MusicFile>
             None => continue,
         };
 
-        let audio_path = match resolve_audio_file(&cue_dir, file_name) {
-            Some(path) => path,
-            None => continue,
-        };
+        let audio_path =
+            match resolve_audio_file_with_listing(&cue_dir, file_name, &listing) {
+                Some(path) => path,
+                None => continue,
+            };
 
         let start = match track_index_start(track) {
             Some(value) => value,
@@ -738,6 +864,9 @@ fn expand_cue_file_impl(cue_path: &Path, resolve_covers: bool) -> Vec<MusicFile>
                 }
             })
             .clone();
+        let size = *size_by_audio
+            .entry(audio_path_str.clone())
+            .or_insert_with(|| fs::metadata(&audio_path).map(|meta| meta.len()).unwrap_or(0));
         let ext = audio_path
             .extension()
             .and_then(|value| value.to_str())
@@ -799,7 +928,7 @@ fn expand_cue_file_impl(cue_path: &Path, resolve_covers: bool) -> Vec<MusicFile>
             path,
             file_name: display_name,
             extension: ext,
-            size: fs::metadata(&audio_path).map(|meta| meta.len()).unwrap_or(0),
+            size,
             title,
             artist,
             album: album.clone(),
@@ -828,8 +957,11 @@ pub fn covered_audio_paths(cue_paths: &[PathBuf]) -> Vec<String> {
             None => continue,
         };
 
+        let listing = list_files_in_dir(&cue_dir);
         for file_name in &cue.files {
-            if let Some(audio) = resolve_audio_file(&cue_dir, file_name) {
+            if let Some(audio) =
+                resolve_audio_file_with_listing(&cue_dir, file_name, &listing)
+            {
                 covered.push(audio.to_string_lossy().to_string());
             }
         }
