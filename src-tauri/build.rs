@@ -20,7 +20,6 @@ const BASS_DOWNLOADS: &[(&str, &str)] = &[
 
 const TOOL_DOWNLOADS: &[(&str, &str)] = &[
     ("yt-dlp.exe", "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"),
-    ("spotdl.exe", "github_win32:spotDL/spotify-downloader"),
 ];
 
 const FFMPEG_URL: &str = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip";
@@ -143,7 +142,7 @@ fn ensure_native_assets(manifest_dir: &Path) -> Result<(), String> {
         }
     }
 
-    let tool_targets = ["yt-dlp.exe", "spotdl.exe", "ffmpeg.exe", "ffprobe.exe", "ffplay.exe"];
+    let tool_targets = ["yt-dlp.exe", "ffmpeg.exe", "ffprobe.exe", "ffplay.exe"];
     let ffmpeg_ready = tool_targets.iter().all(|name| bin_dir.join(name).is_file());
     if !ffmpeg_ready {
         let temp_dir = env::temp_dir().join("muzeeka-tools");

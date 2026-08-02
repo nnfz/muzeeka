@@ -34,7 +34,7 @@ Muzeeka is a desktop audio player focused on local library playback, playlist ma
 - Equalizer with custom presets
 - Synchronized lyrics (LRC/TTML) + fullscreen lyrics view
 - Search, drag-and-drop, context menus
-- Download audio via yt-dlp, spotDL and VK
+- Download audio via yt-dlp and from VK
 - Discord Rich Presence
 - Built-in remote control over local network
 - Playback speed control with optional pitch correction
@@ -124,7 +124,6 @@ Muzeeka depends on a number of great projects and libraries:
 - [BASS](https://www.un4seen.com/) - the core audio playback engine
 - [FFmpeg](https://ffmpeg.org/) - multimedia processing and conversion
 - [yt-dlp](https://github.com/yt-dlp/yt-dlp) - media extraction capabilities
-- [spotDL](https://github.com/spotDL/spotify-downloader) - track integration and downloading
 - [Tauri](https://tauri.app/) - the desktop application framework
 - [SvelteKit](https://svelte.dev/docs/kit) - application framework for the UI
 - [Svelte](https://svelte.dev/) - reactive component framework
@@ -153,7 +152,6 @@ Muzeeka integrates several powerful third-party libraries and CLI tools to handl
 - **[BASS Audio Library](https://www.un4seen.com/)**: Audio playback is powered by the BASS library. BASS is a product of Un4seen Developments Ltd. It is free for non-commercial use. If you intend to distribute or use Muzeeka commercially, you must obtain a separate commercial license from Un4seen Developments.
 - **[FFmpeg](https://ffmpeg.org/)**: This software uses the code of FFmpeg to handle audio processing, licensed under the LGPLv2.1 / GPLv3. FFmpeg is a trademark of Fabrice Bellard, originator of the FFmpeg project.
 - **[yt-dlp](https://github.com/yt-dlp/yt-dlp)**: Used for media extraction. Released into the public domain (Unlicense).
-- **[spotDL](https://github.com/spotDL/spotify-downloader)**: Utilized for Spotify track capabilities. Licensed under the MIT License.
 
 ## License
 

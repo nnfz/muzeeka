@@ -108,13 +108,34 @@ impl LibraryDatabase {
         connection
             .busy_timeout(Duration::from_secs(5))
             .map_err(db_error)?;
+
+        // Per-connection PRAGMAs (NOT stored in the .db file). External tools that
+        // open library.db will still report foreign_keys=0 — only this connection matters.
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .map_err(db_error)?;
+        connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .map_err(db_error)?;
+        connection
+            .pragma_update(None, "synchronous", "NORMAL")
+            .map_err(db_error)?;
+        connection
+            .pragma_update(None, "temp_store", "MEMORY")
+            .map_err(db_error)?;
+
+        let fk_on: i64 = connection
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .map_err(db_error)?;
+        if fk_on == 0 {
+            return Err(
+                "SQLite foreign_keys stayed OFF — CASCADE deletes would leave orphans".into(),
+            );
+        }
+
         connection
             .execute_batch(
-                "PRAGMA foreign_keys = ON;
-                 PRAGMA journal_mode = WAL;
-                 PRAGMA synchronous = NORMAL;
-                 PRAGMA temp_store = MEMORY;
-                 CREATE TABLE IF NOT EXISTS schema_info (
+                "CREATE TABLE IF NOT EXISTS schema_info (
                      version INTEGER NOT NULL
                  );
                  CREATE TABLE IF NOT EXISTS tracks (
@@ -158,6 +179,9 @@ impl LibraryDatabase {
                  );
                  CREATE INDEX IF NOT EXISTS playlist_tracks_order
                      ON playlist_tracks(playlist_id, position);
+                 -- Reverse lookups + efficient ON DELETE CASCADE from tracks(id).
+                 CREATE INDEX IF NOT EXISTS playlist_tracks_track
+                     ON playlist_tracks(track_id);
                  CREATE TABLE IF NOT EXISTS liked_tracks (
                      track_id INTEGER PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE,
                      position INTEGER NOT NULL
@@ -187,6 +211,17 @@ impl LibraryDatabase {
             "ALTER TABLE app_state ADD COLUMN was_playing INTEGER NOT NULL DEFAULT 0",
             [],
         );
+
+        // If foreign_keys was ever off historically, orphan membership rows can linger.
+        connection
+            .execute_batch(
+                "DELETE FROM playlist_tracks
+                   WHERE track_id NOT IN (SELECT id FROM tracks)
+                      OR playlist_id NOT IN (SELECT id FROM playlists);
+                 DELETE FROM liked_tracks
+                   WHERE track_id NOT IN (SELECT id FROM tracks);",
+            )
+            .map_err(db_error)?;
 
         let version = connection
             .query_row("SELECT version FROM schema_info LIMIT 1", [], |row| {
@@ -442,6 +477,50 @@ impl LibraryDatabase {
             .map_err(db_error)?;
         drop(connection);
         self.changed();
+        Ok(())
+    }
+
+    /// Cover paths stored for a track path (list thumb + fullscreen full).
+    pub fn get_track_covers(
+        &self,
+        path: &str,
+    ) -> Result<Option<(Option<String>, Option<String>)>, String> {
+        let connection = self.inner.connection.lock();
+        connection
+            .query_row(
+                "SELECT cover_path, cover_path_full FROM tracks WHERE path_key = ?1",
+                params![path_key(path)],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(db_error)
+    }
+
+    /// Persist cover paths for an existing track row (no-op if the path is not in the library).
+    pub fn set_track_covers(
+        &self,
+        path: &str,
+        cover_path: Option<&str>,
+        cover_path_full: Option<&str>,
+    ) -> Result<(), String> {
+        if cover_path.is_none() && cover_path_full.is_none() {
+            return Ok(());
+        }
+        let connection = self.inner.connection.lock();
+        connection
+            .execute(
+                "UPDATE tracks SET
+                    cover_path = CASE WHEN ?2 IS NOT NULL THEN ?2 ELSE cover_path END,
+                    cover_path_full = CASE WHEN ?3 IS NOT NULL THEN ?3 ELSE cover_path_full END
+                 WHERE path_key = ?1",
+                params![path_key(path), cover_path, cover_path_full],
+            )
+            .map_err(db_error)?;
         Ok(())
     }
 
@@ -939,6 +1018,16 @@ mod tests {
 
     fn database() -> LibraryDatabase {
         LibraryDatabase::from_connection(Connection::open_in_memory().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn foreign_keys_enforced_on_open() {
+        let db = database();
+        let connection = db.inner.connection.lock();
+        let fk_on: i64 = connection
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(fk_on, 1, "foreign_keys must be ON for CASCADE");
     }
 
     #[test]

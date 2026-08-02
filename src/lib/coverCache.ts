@@ -41,23 +41,27 @@ function isCoverCachePath(path: string): boolean {
 
 /**
  * Prefer full-res cover for fullscreen / large UI.
- * Content-addressed cache stores pairs: c-…-thumb.webp + c-…-full.webp —
- * if only thumb is known, map to full so we don't flash the tiny image first.
+ * Content-addressed cache stores pairs: c-…-thumb.webp + c-…-full.jpg|webp.
+ * Never treat a *-thumb.* path as full (that upscales 96px in fullscreen).
  */
 export function preferFullCoverPath(
   thumb: string | null | undefined,
   full: string | null | undefined,
 ): string | null {
   const fullPath = full?.trim();
-  if (fullPath) return fullPath;
+  if (fullPath && !/-thumb\./i.test(fullPath)) return fullPath;
 
   const thumbPath = thumb?.trim();
   if (!thumbPath) return null;
 
+  // Map list thumb → full siblings. Prefer lossy JPEG (new), then legacy WebP.
+  if (/-thumb\.webp$/i.test(thumbPath)) {
+    return thumbPath.replace(/-thumb\.webp$/i, '-full.jpg');
+  }
   if (/-thumb\./i.test(thumbPath)) {
     return thumbPath.replace(/-thumb\./i, '-full.');
   }
-  return thumbPath;
+  return null;
 }
 
 export function getCoverSrc(coverPath: string | null | undefined): string | null {

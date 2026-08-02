@@ -2,12 +2,13 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread;
+use regex::Regex;
 
 use rayon::prelude::*;
 
@@ -63,13 +64,18 @@ struct YtdlpJsonEntry {
     entries: Option<Vec<YtdlpJsonEntry>>,
 }
 
+#[derive(Debug, Deserialize)]
+struct SpotifyOEmbed {
+    title: Option<String>,
+    thumbnail_url: Option<String>,
+}
+
 static DOWNLOAD_CANCELLED: AtomicBool = AtomicBool::new(false);
 static ACTIVE_CHILD: Mutex<Option<Child>> = Mutex::new(None);
 
 pub fn cancel_download() {
     DOWNLOAD_CANCELLED.store(true, Ordering::SeqCst);
     crate::vk_audio::cancel();
-    crate::spotdl::cancel();
     if let Ok(mut guard) = ACTIVE_CHILD.lock() {
         if let Some(mut child) = guard.take() {
             let _ = child.kill();
@@ -151,7 +157,11 @@ pub fn ffmpeg_available(app: &AppHandle) -> bool {
 }
 
 fn build_ytdlp_args(app: &AppHandle, args: &[&str]) -> Vec<String> {
-    let mut out = Vec::with_capacity(args.len() + 2);
+    let mut out = Vec::with_capacity(args.len() + 4);
+    
+    out.push("--encoding".to_string());
+    out.push("utf-8".to_string());
+    
     if let Some(dir) = resolve_ffmpeg_location(app) {
         out.push("--ffmpeg-location".to_string());
         out.push(dir.to_string_lossy().to_string());
@@ -224,13 +234,35 @@ fn run_ytdlp(app: &AppHandle, args: &[&str]) -> Result<std::process::Output, Str
 
     let full_args = build_ytdlp_args(app, args);
 
+    log_ytdlp(
+        Some(app),
+        &format!("run: {} {}", binary.display(), full_args.join(" ")),
+    );
+
     let mut cmd = Command::new(&binary);
     cmd.args(&full_args)
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("PYTHONUTF8", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+        
     process_util::hide_console(&mut cmd);
-    cmd.output()
-        .map_err(|e| format!("Failed to run yt-dlp: {}", e))
+    let output = cmd
+        .output()
+        .map_err(|e| format!("Failed to run yt-dlp: {}", e))?;
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for line in stderr.lines() {
+        log_ytdlp(Some(app), line);
+    }
+    if !output.status.success() {
+        log_ytdlp(
+            Some(app),
+            &format!("exit status: {}", output.status),
+        );
+    }
+
+    Ok(output)
 }
 
 fn parse_probe_json(raw: &str) -> Result<YtdlpProbeResult, String> {
@@ -239,7 +271,6 @@ fn parse_probe_json(raw: &str) -> Result<YtdlpProbeResult, String> {
 
     if let Some(entries) = entry.entries {
         let count = entries.len() as u32;
-        // Prefer the playlist/album title from the root entry, not the first track.
         let title = entry
             .title
             .filter(|t| !t.trim().is_empty())
@@ -266,13 +297,188 @@ fn parse_probe_json(raw: &str) -> Result<YtdlpProbeResult, String> {
     })
 }
 
+fn http_get_text(url: &str, accept: &str) -> Result<String, String> {
+    let mut response = ureq::get(url)
+        .header(
+            "User-Agent",
+            "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+        )
+        .header("Accept", accept)
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .call()
+        .map_err(|e| format!("Request failed: {}", e))?;
+
+    response
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| format!("Failed to read response: {}", e))
+}
+
+fn is_playlist_like(url: &str) -> bool {
+    let lower = url.to_lowercase();
+    lower.contains("/playlist/") || lower.contains("/album/") || lower.contains("/artist/")
+}
+
+fn unescape_html(s: &str) -> String {
+    s.replace("&amp;", "&")
+    .replace("&#39;", "'")
+    .replace("&quot;", "\"")
+}
+
+fn parse_jsonld_track(item: &serde_json::Value) -> Option<String> {
+    let title = item.get("name").and_then(|n| n.as_str()).unwrap_or("");
+    let mut artist_name = String::new();
+
+    if let Some(by_artist) = item.get("byArtist") {
+        if let Some(arr) = by_artist.as_array() {
+            let names: Vec<&str> = arr.iter().filter_map(|a| a.get("name").and_then(|n| n.as_str())).collect();
+            artist_name = names.join(", ");
+        } else if let Some(obj) = by_artist.as_object() {
+            artist_name = obj.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+        }
+    }
+
+    if !title.is_empty() {
+        let clean_title = unescape_html(title);
+        let clean_artist = unescape_html(&artist_name);
+
+        if clean_artist.is_empty() {
+            Some(format!("ytsearch1:{} audio", clean_title))
+        } else {
+            Some(format!("ytsearch1:{} {} audio", clean_artist, clean_title))
+        }
+    } else {
+        None
+    }
+}
+
+fn extract_spotify_playlist_queries(url: &str) -> (Vec<String>, Option<String>) {
+    let mut queries = Vec::new();
+    let mut first_cover = None;
+    
+    let embed_url = url
+        .replace("open.spotify.com/playlist/", "open.spotify.com/embed/playlist/")
+        .replace("open.spotify.com/album/", "open.spotify.com/embed/album/");
+        
+    let html = match http_get_text(&embed_url, "text/html") {
+        Ok(h) => h,
+        Err(_) => return (queries, first_cover),
+    };
+
+    let re = Regex::new(r#"(?s)<script id="__NEXT_DATA__" type="application/json">(.*?)</script>"#).unwrap();
+    
+    if let Some(caps) = re.captures(&html) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&caps[1]) {
+            if let Some(track_list) = json
+                .get("props")
+                .and_then(|p| p.get("pageProps"))
+                .and_then(|p| p.get("state"))
+                .and_then(|p| p.get("data"))
+                .and_then(|p| p.get("entity"))
+                .and_then(|p| p.get("trackList"))
+                .and_then(|p| p.as_array())
+            {
+                for track in track_list {
+                    let title = track.get("title").and_then(|t| t.as_str()).unwrap_or("");
+                    let subtitle = track.get("subtitle").and_then(|s| s.as_str()).unwrap_or("");
+                    
+                    if first_cover.is_none() {
+                        if let Some(cover_url) = track
+                            .get("coverArt")
+                            .and_then(|c| c.get("sources"))
+                            .and_then(|s| s.as_array())
+                            .and_then(|arr| arr.first())
+                            .and_then(|src| src.get("url"))
+                            .and_then(|u| u.as_str())
+                        {
+                            first_cover = Some(cover_url.to_string());
+                        }
+                    }
+                    
+                    if !title.is_empty() {
+                        let clean_title = unescape_html(title);
+                        let clean_artist = unescape_html(subtitle);
+                        
+                        let query = if clean_artist.is_empty() {
+                            format!("ytsearch1:{} \"Topic\"", clean_title)
+                        } else {
+                            format!("ytsearch1:{} {} \"Topic\"", clean_artist, clean_title)
+                        };
+                        queries.push(query);
+                    }
+                }
+            }
+        }
+    }
+    (queries, first_cover)
+}
+
+fn probe_spotify(url: &str) -> Result<YtdlpProbeResult, String> {
+    let is_playlist = is_playlist_like(url);
+
+    let oembed = format!(
+        "https://open.spotify.com/oembed?url={}",
+        urlencoding::encode(url)
+    );
+    let oembed_raw = http_get_text(&oembed, "application/json").unwrap_or_default();
+    let data: Option<SpotifyOEmbed> = serde_json::from_str(&oembed_raw).ok();
+
+    let title = data.as_ref()
+        .and_then(|d| d.title.clone())
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or_else(|| "Unknown".to_string());
+
+    let mut thumbnail = data.and_then(|d| d.thumbnail_url);
+    let mut artist = None;
+    let mut entry_count = None;
+
+    if is_playlist {
+        let (queries, first_track_cover) = extract_spotify_playlist_queries(url);
+        if !queries.is_empty() {
+            entry_count = Some(queries.len() as u32);
+        }
+        if thumbnail.is_none() {
+            thumbnail = first_track_cover;
+        }
+    } else {
+        let html = http_get_text(url, "text/html").unwrap_or_default();
+        let re_desc = Regex::new(r#"(?i)<meta\s+property=["']og:description["']\s+content=["'](.*?)["']"#).unwrap();
+        if let Some(caps) = re_desc.captures(&html) {
+            let desc = caps[1].trim();
+            let without_prefix = if let Some(idx) = desc.find("Spotify. ") {
+                &desc[idx + 9..]
+            } else {
+                desc
+            };
+            let final_artist = without_prefix.split('·').next().unwrap_or(without_prefix).trim();
+            if !final_artist.is_empty() && final_artist.to_lowercase() != "song" {
+                artist = Some(unescape_html(final_artist));
+            }
+        }
+    }
+
+    Ok(YtdlpProbeResult {
+        title: unescape_html(&title),
+        uploader: artist,
+        duration_secs: None,
+        thumbnail,
+        is_playlist,
+        entry_count,
+    })
+}
+
 pub fn probe(app: &AppHandle, url: &str) -> Result<YtdlpProbeResult, String> {
-    let trimmed = url.trim();
+    let trimmed = url.trim().split('?').next().unwrap_or(url.trim());
+    
     if !is_supported_url(trimmed) {
         return Err("URL is not recognized as a supported media link".to_string());
     }
 
-    // VK audio is handled asynchronously in commands (needs WebView session).
+    let lower_url = trimmed.to_lowercase();
+    if lower_url.contains("spotify.com") || lower_url.contains("spoti.fi") {
+        return probe_spotify(trimmed);
+    }
+
 
     let output = run_ytdlp(
         app,
@@ -297,6 +503,42 @@ fn emit_progress(app: &AppHandle, url: &str, status: &str, percent: Option<f32>)
             url: url.to_string(),
         },
     );
+}
+
+/// Dump a yt-dlp line to the process stderr (cargo/tauri terminal) and, when
+/// an AppHandle is available, forward it to the webview as `ytdlp:log` so it
+/// also shows up in DevTools.
+fn log_ytdlp(app: Option<&AppHandle>, line: &str) {
+    let cleaned = strip_ansi(line);
+    let cleaned = cleaned.trim_end_matches(['\r', '\n']);
+    if cleaned.is_empty() {
+        return;
+    }
+
+    let _ = writeln!(std::io::stderr(), "[yt-dlp] {cleaned}");
+    let _ = std::io::stderr().flush();
+
+    if let Some(app) = app {
+        let _ = app.emit("ytdlp:log", cleaned.to_string());
+    }
+}
+
+fn log_ytdlp_banner(app: Option<&AppHandle>, title: &str) {
+    log_ytdlp(app, &format!("========== {title} =========="));
+}
+
+/// True for machine progress / redraw noise we still print live, but skip when
+/// re-dumping a failure summary.
+fn is_progress_noise(line: &str) -> bool {
+    let line = strip_ansi(line);
+    let line = line.trim();
+    if line.is_empty() {
+        return true;
+    }
+    if line.starts_with("muzeeka-progress:") {
+        return true;
+    }
+    parse_progress_line(line).is_some()
 }
 
 fn normalize_path_key(path: &Path) -> String {
@@ -408,20 +650,55 @@ pub fn download(
     output_dir: Option<&str>,
     allow_playlist: bool,
 ) -> Result<YtdlpDownloadResult, String> {
-    let trimmed = url.trim();
+    let trimmed = url.trim().split('?').next().unwrap_or(url.trim());
     if !is_supported_url(trimmed) {
         return Err("URL is not recognized as a supported media link".to_string());
     }
 
-    // VK audio is handled asynchronously in commands (needs WebView session).
-
     DOWNLOAD_CANCELLED.store(false, Ordering::SeqCst);
+
+    let lower_url = trimmed.to_lowercase();
+    let is_spotify = lower_url.contains("spotify.com") || lower_url.contains("spoti.fi");
+
+    let mut batch_file_path = None;
+
+    let target_query = if is_spotify {
+        emit_progress(app, trimmed, "Fetching Spotify metadata…", Some(5.0));
+        
+        let is_playlist = is_playlist_like(trimmed);
+        
+        if is_playlist {
+            // Просто передаем ссылку, парсер сам сходит на embed-страницу и вытащит треки
+            let (queries, _) = extract_spotify_playlist_queries(trimmed);
+            
+            if queries.is_empty() {
+                return Err("Плейлист пуст или скрыт. Поддерживаются только открытые плейлисты.".to_string());
+            }
+
+            let temp_name = format!("muzeeka_spotify_{}.txt", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
+            let temp_path = std::env::temp_dir().join(temp_name);
+
+            let mut file_content = String::from("\u{FEFF}");
+            file_content.push_str(&queries.join("\n"));
+            
+            fs::write(&temp_path, file_content).map_err(|e| format!("Failed to write batch file: {}", e))?;
+            batch_file_path = Some(temp_path);
+            
+            String::new()
+        } else {
+            let meta = probe_spotify(trimmed)?;
+            let artist = meta.uploader.unwrap_or_else(|| "Unknown Artist".to_string());
+            format!("ytsearch1:{} {} \"Topic\"", artist, meta.title)
+        }
+    } else {
+        trimmed.to_string()
+    };
 
     let dir = resolve_download_dir(app, output_dir)?;
     let dir_str = dir.to_string_lossy().to_string();
     let before_snapshot = snapshot_mp3_dir(&dir);
 
-    let output_template = format!("{}/%(title)s.%(ext)s", dir_str);
+    let output_template = format!("{}/%(artist,uploader)s - %(title)s.%(ext)s", dir_str);
 
     let binary = ytdlp_binary_path(app);
     if !binary.is_file() {
@@ -432,17 +709,14 @@ pub fn download(
         ));
     }
 
-    emit_progress(app, trimmed, "Starting download…", Some(0.0));
+    emit_progress(app, trimmed, "Starting download…", Some(10.0));
 
     let mut cmd_args = build_ytdlp_args(app, &[]);
     cmd_args.extend([
+        // "--ignore-errors".to_string(),
         "--newline".to_string(),
-        "--no-warnings".to_string(),
-        // Force progress on stderr even when not a TTY (piped on Windows).
+        // Keep warnings/errors visible in the console (do not silence yt-dlp).
         "--progress".to_string(),
-        "--console-title".to_string(),
-        // Machine-readable percent for reliable UI updates.
-        // `_percent_str` is widely available (e.g. " 45.3%"); we parse the number.
         "--progress-template".to_string(),
         "download:muzeeka-progress:%(progress._percent_str)s".to_string(),
         "-x".to_string(),
@@ -451,22 +725,52 @@ pub fn download(
         "--audio-quality".to_string(),
         "0".to_string(),
         "--embed-thumbnail".to_string(),
+        "--convert-thumbnails".to_string(),
+        "jpg".to_string(),
+        "--ppa".to_string(),
+        "ThumbnailsConvertor+ffmpeg_o:-vf crop=ih:ih".to_string(),
+        "--ppa".to_string(),
+        "EmbedThumbnail+ffmpeg_o:-id3v2_version 3".to_string(),
+        "--ppa".to_string(),
+        "Metadata+ffmpeg_o:-id3v2_version 3".to_string(),
         "--embed-metadata".to_string(),
         "--parse-metadata".to_string(),
         "%(artist,album_artist,uploader,channel,creator)s:%(artist)s".to_string(),
-        "--write-info-json".to_string(),
         "-o".to_string(),
         output_template,
         "--print".to_string(),
         "after_move:filepath".to_string(),
     ]);
-    if !allow_playlist {
+    
+    if !allow_playlist && batch_file_path.is_none() {
         cmd_args.push("--no-playlist".to_string());
     }
-    cmd_args.push(trimmed.to_string());
+    
+    if let Some(batch_path) = &batch_file_path {
+        cmd_args.push("--batch-file".to_string());
+        cmd_args.push(batch_path.to_string_lossy().to_string());
+    } else {
+        cmd_args.push(target_query);
+    }
+
+    log_ytdlp_banner(Some(app), "yt-dlp download start");
+    log_ytdlp(
+        Some(app),
+        &format!("binary: {}", binary.display()),
+    );
+    log_ytdlp(
+        Some(app),
+        &format!("args: {}", cmd_args.join(" ")),
+    );
+    log_ytdlp(
+        Some(app),
+        &format!("output dir: {}", dir_str),
+    );
 
     let mut cmd = Command::new(&binary);
     cmd.args(&cmd_args)
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("PYTHONUTF8", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     process_util::hide_console(&mut cmd);
@@ -481,8 +785,12 @@ pub fn download(
         *guard = Some(child);
     }
 
+    // Collect every stderr line so we can re-dump non-progress diagnostics on failure.
+    let collected_stderr: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
     let app_stderr = app.clone();
     let url_stderr = trimmed.to_string();
+    let collected_for_stderr = Arc::clone(&collected_stderr);
     let stderr_handle = stderr.map(|stderr| {
         std::thread::spawn(move || {
             let reader = BufReader::new(stderr);
@@ -492,15 +800,17 @@ pub fn download(
                 if DOWNLOAD_CANCELLED.load(Ordering::SeqCst) {
                     break;
                 }
-                // yt-dlp may pack multiple CR-separated updates in one "line"
                 for part in line.split(['\r', '\n']) {
                     let part = part.trim();
                     if part.is_empty() {
                         continue;
                     }
+                    log_ytdlp(Some(&app_stderr), part);
+                    if let Ok(mut buf) = collected_for_stderr.lock() {
+                        buf.push(part.to_string());
+                    }
                     if let Some(pct) = parse_progress_line(part) {
                         saw_download = true;
-                        // Throttle spam: emit on 0.5% steps (or first/last)
                         if (pct - last_emitted).abs() >= 0.5 || pct >= 99.5 || last_emitted < 0.0 {
                             last_emitted = pct;
                             emit_progress(
@@ -534,11 +844,16 @@ pub fn download(
         })
     });
 
+    let app_stdout = app.clone();
     let stdout_handle = stdout.map(|stdout| {
         thread::spawn(move || {
             let mut paths = Vec::new();
             let reader = BufReader::new(stdout);
             for line in reader.lines().map_while(Result::ok) {
+                let raw = line.trim();
+                if !raw.is_empty() {
+                    log_ytdlp(Some(&app_stdout), &format!("stdout: {raw}"));
+                }
                 let path = sanitize_printed_path(&line);
                 if !path.is_empty() && Path::new(&path).is_file() {
                     paths.push(path);
@@ -564,11 +879,39 @@ pub fn download(
             .map_err(|e| format!("yt-dlp process error: {}", e))?
     };
 
+    log_ytdlp(Some(app), &format!("exit status: {status}"));
+
     if DOWNLOAD_CANCELLED.load(Ordering::SeqCst) {
+        log_ytdlp_banner(Some(app), "yt-dlp cancelled");
         return Err("Download cancelled".to_string());
     }
 
+    let dump_stderr_summary = |app: &AppHandle, reason: &str| {
+        log_ytdlp_banner(Some(app), reason);
+        let lines = collected_stderr
+            .lock()
+            .map(|v| v.clone())
+            .unwrap_or_default();
+        let interesting: Vec<&String> = lines
+            .iter()
+            .filter(|l| !is_progress_noise(l))
+            .collect();
+        if interesting.is_empty() {
+            log_ytdlp(Some(app), "(no yt-dlp stderr lines captured)");
+        } else {
+            log_ytdlp(
+                Some(app),
+                &format!("--- yt-dlp stderr ({} lines, progress filtered) ---", interesting.len()),
+            );
+            for line in interesting {
+                log_ytdlp(Some(app), line);
+            }
+        }
+        log_ytdlp_banner(Some(app), "end yt-dlp dump");
+    };
+
     if !status.success() {
+        dump_stderr_summary(app, "yt-dlp download FAILED");
         return Err("yt-dlp download failed".to_string());
     }
 
@@ -578,17 +921,21 @@ pub fn download(
         .map_err(|_| "Failed to read yt-dlp output".to_string())?
         .unwrap_or_default();
 
-    // Trust yt-dlp's printed paths when available (covers re-downloads/overwrites).
     downloaded_paths.retain(|path| Path::new(path).is_file());
 
-    // Fallback: only files created during this download, never the whole folder.
     if downloaded_paths.is_empty() {
         downloaded_paths = collect_new_mp3_files(&dir, &before_snapshot);
     }
 
     if downloaded_paths.is_empty() {
+        dump_stderr_summary(app, "yt-dlp finished but NO audio files found");
         return Err("Download finished but no audio files were found".to_string());
     }
+
+    log_ytdlp(
+        Some(app),
+        &format!("ok: {} file(s) downloaded", downloaded_paths.len()),
+    );
 
     emit_progress(app, trimmed, "Processing files…", Some(100.0));
 
@@ -596,6 +943,9 @@ pub fn download(
     enrich_downloaded_metadata(&mut files);
 
     emit_progress(app, trimmed, "Done", Some(100.0));
+    if let Some(batch_path) = batch_file_path {
+        let _ = fs::remove_file(batch_path);
+    }
     Ok(YtdlpDownloadResult { files })
 }
 
@@ -705,4 +1055,3 @@ fn enrich_downloaded_file(file: &mut MusicFile) {
 fn enrich_downloaded_metadata(files: &mut [MusicFile]) {
     files.par_iter_mut().for_each(enrich_downloaded_file);
 }
-

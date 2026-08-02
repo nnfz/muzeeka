@@ -349,38 +349,103 @@ pub async fn library_fetch_metadata(paths: Vec<String>) -> Result<Vec<library::M
         .map_err(|e| format!("Metadata task failed: {e}"))?
 }
 
+fn cover_audio_path(path: &str) -> String {
+    if crate::cue::is_cue_track_path(path) {
+        if let Some((audio, _)) = crate::cue::parse_virtual_cue_path(path) {
+            return audio;
+        }
+    }
+    path.to_string()
+}
+
+fn cover_file_ok(path: &str) -> bool {
+    !path.is_empty() && std::path::Path::new(path).is_file()
+}
+
+/// Prefer SQLite cover paths; extract from the audio file only on miss / stale / missing full.
+fn resolve_covers_via_db(
+    database: &LibraryDatabase,
+    track_path: &str,
+    need_full: bool,
+) -> (Option<String>, Option<String>) {
+    let audio = cover_audio_path(track_path);
+    let keys = if audio == track_path {
+        vec![track_path.to_string()]
+    } else {
+        vec![track_path.to_string(), audio.clone()]
+    };
+
+    let mut thumb: Option<String> = None;
+    let mut full: Option<String> = None;
+    for key in &keys {
+        if let Ok(Some((db_thumb, db_full))) = database.get_track_covers(key) {
+            if thumb.is_none() {
+                thumb = db_thumb.filter(|p| cover_file_ok(p));
+            }
+            if full.is_none() {
+                full = db_full
+                    .filter(|p| cover_file_ok(p) && !crate::metadata::is_thumb_cache_path(p));
+            }
+        }
+    }
+
+    let have_what_we_need = thumb.is_some() && (!need_full || full.is_some());
+    if have_what_we_need {
+        return (thumb, full);
+    }
+
+    // Miss / wiped covers dir / thumb-only when fullscreen asked for full.
+    let extract_path = std::path::Path::new(&audio);
+    if !extract_path.is_file() {
+        return (thumb, full);
+    }
+    let covers = crate::metadata::extract_covers_for_file(extract_path);
+    let new_thumb = covers.thumb.or(thumb);
+    let new_full = covers
+        .full
+        .filter(|p| !crate::metadata::is_thumb_cache_path(p))
+        .or(full);
+
+    if new_thumb.is_some() || new_full.is_some() {
+        for key in &keys {
+            let _ = database.set_track_covers(
+                key,
+                new_thumb.as_deref(),
+                new_full.as_deref(),
+            );
+        }
+    }
+    (new_thumb, new_full)
+}
+
 /// Resolve the small cover used by virtualized lists and the transport bar.
 #[tauri::command]
-pub async fn library_resolve_cover(path: String) -> Result<Option<String>, String> {
+pub async fn library_resolve_cover(
+    database: State<'_, LibraryDatabase>,
+    path: String,
+) -> Result<Option<String>, String> {
+    let database = database.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        use std::path::Path;
-        if crate::cue::is_cue_track_path(&path) {
-            if let Some((audio, _)) = crate::cue::parse_virtual_cue_path(&path) {
-                return crate::metadata::resolve_list_cover(Path::new(&audio));
-            }
-            return None;
-        }
-        crate::metadata::resolve_list_cover(Path::new(&path))
+        let (thumb, full) = resolve_covers_via_db(&database, &path, false);
+        Ok(thumb.or(full))
     })
     .await
-    .map_err(|e| format!("Cover resolve task failed: {e}"))
+    .map_err(|e| format!("Cover resolve task failed: {e}"))?
 }
 
 /// Resolve a full-resolution cover path for a track (creates cache if needed).
 #[tauri::command]
-pub async fn library_resolve_full_cover(path: String) -> Result<Option<String>, String> {
+pub async fn library_resolve_full_cover(
+    database: State<'_, LibraryDatabase>,
+    path: String,
+) -> Result<Option<String>, String> {
+    let database = database.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        use std::path::Path;
-        if crate::cue::is_cue_track_path(&path) {
-            if let Some((audio, _)) = crate::cue::parse_virtual_cue_path(&path) {
-                return crate::metadata::resolve_full_cover(Path::new(&audio));
-            }
-            return None;
-        }
-        crate::metadata::resolve_full_cover(Path::new(&path))
+        let (_thumb, full) = resolve_covers_via_db(&database, &path, true);
+        Ok(full)
     })
     .await
-    .map_err(|e| format!("Cover resolve task failed: {e}"))
+    .map_err(|e| format!("Cover resolve task failed: {e}"))?
 }
 
 /// Return a data URL for a cover image file (works for library paths outside asset scope).
@@ -738,11 +803,6 @@ pub async fn ytdlp_probe(app: AppHandle, url: String) -> Result<YtdlpProbeResult
     if crate::vk_audio::is_vk_audio_url(&url) {
         return crate::vk_audio::probe_async(app, url).await;
     }
-    if crate::spotdl::is_spotify_url(&url) {
-        return tauri::async_runtime::spawn_blocking(move || crate::spotdl::probe(&app, &url))
-            .await
-            .map_err(|_| "Probe task failed".to_string())?;
-    }
     tauri::async_runtime::spawn_blocking(move || ytdlp::probe(&app, &url))
         .await
         .map_err(|_| "Probe task failed".to_string())?
@@ -764,18 +824,6 @@ pub async fn ytdlp_download(
             allow_playlist.unwrap_or(false),
         )
         .await;
-    }
-    if crate::spotdl::is_spotify_url(&url) {
-        return tauri::async_runtime::spawn_blocking(move || {
-            crate::spotdl::download(
-                &app,
-                &url,
-                output_dir.as_deref(),
-                allow_playlist.unwrap_or(false),
-            )
-        })
-        .await
-        .map_err(|_| "Download task failed".to_string())?;
     }
     tauri::async_runtime::spawn_blocking(move || {
         ytdlp::download(

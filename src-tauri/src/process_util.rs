@@ -4,7 +4,7 @@
 use std::process::Command;
 
 /// Prevent a console window when launching console-subsystem tools
-/// (yt-dlp, ffmpeg, spotDL, …) from the GUI process.
+/// (yt-dlp, ffmpeg, …) from the GUI process.
 pub fn hide_console(cmd: &mut Command) {
     #[cfg(windows)]
     {

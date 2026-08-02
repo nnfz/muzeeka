@@ -524,8 +524,13 @@
       const src = immediate ?? (await resolveCoverSrc(path));
       if (cancelled || !src) return;
       if (untrack(() => player.currentFile) !== file) return;
+      // Only swap after decode succeeds — missing/legacy full paths must not
+      // clobber the thumb in Kawarp or leave a broken asset protocol URL.
+      const ok = await warmImageSrc(src);
+      if (cancelled || !ok) return;
+      if (untrack(() => player.currentFile) !== file) return;
       bgCoverSrc = src;
-      await setArtSrcWhenReady(src, file);
+      setArtSrc(src, file);
     };
 
     // 1) Instant stand-in (thumb is ~96px WebP, usually already decoded in the list).

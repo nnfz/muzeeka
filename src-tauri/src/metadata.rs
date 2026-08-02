@@ -10,14 +10,13 @@ use lofty::probe::Probe;
 use lofty::read_from_path;
 use lofty::tag::{Accessor, Tag, TagType};
 use serde::Serialize;
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
 use std::fs;
-use std::hash::{Hash, Hasher};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
+use id3::TagLike;
 
 static COVER_CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();
 static PLAYLIST_COVER_DIR: OnceLock<PathBuf> = OnceLock::new();
@@ -36,9 +35,13 @@ const THUMB_SIZE: u32 = 96;
 /// Fullscreen cover — capped so retina UI stays sharp without multi‑MB assets.
 /// (Old unlimited lossless dumps hit 10–15MB and felt like “cover never loads”.)
 const FULL_SIZE: u32 = 720;
-/// If an existing `*-full.webp` is larger, re-encode at FULL_SIZE on next access.
-/// 720px lossless WebP of photos is typically 100–500KB; 15MB dumps are the bug.
+/// Soft size budget for full covers. Lossless 720 WebP of detailed art often
+/// lands at 900KB–1MB; we used to *delete* those and fall back to 96px thumbs
+/// in fullscreen. Full covers are now lossy JPEG so they stay under this.
 const MAX_FULL_CACHE_BYTES: u64 = 800 * 1024;
+/// Prefer ffmpeg downscale for huge embeds (e.g. 4500² / 7MB APIC) so we never
+/// hold an 80MB+ RGBA buffer on the cover-resolve path (UI freeze while audio plays).
+const HUGE_COVER_BYTES: usize = 512 * 1024;
 
 #[derive(Debug, Clone, Default)]
 pub struct TrackMetadata {
@@ -53,10 +56,11 @@ pub struct TrackMetadata {
     pub cover_path_full: Option<String>,
 }
 
+/// Content-addressed cover pair written under the covers/ cache directory.
 #[derive(Debug, Clone, Default)]
-struct CoverPaths {
-    thumb: Option<String>,
-    full: Option<String>,
+pub struct CoverPaths {
+    pub thumb: Option<String>,
+    pub full: Option<String>,
 }
 
 /// Initialize the on-disk cover art cache under the app data directory.
@@ -68,6 +72,28 @@ pub fn init_cover_cache(app_data_dir: PathBuf) {
     let playlist_covers = app_data_dir.join("playlist_covers");
     let _ = fs::create_dir_all(&playlist_covers);
     let _ = PLAYLIST_COVER_DIR.set(playlist_covers);
+
+    // Legacy: per-track `t-*.ref` pointers. Track→cover mapping lives in SQLite now.
+    purge_legacy_track_refs();
+}
+
+/// Delete obsolete `t-{hash}-*.ref` sidecars (path→content_id). Safe to call repeatedly.
+fn purge_legacy_track_refs() {
+    let Some(dir) = COVER_CACHE_DIR.get() else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.starts_with("t-") && name.ends_with(".ref") {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Register the ffmpeg binary used for animated GIF → WebP conversion.
@@ -114,13 +140,6 @@ fn filename_stem(path: &Path, fallback: &str) -> String {
         .unwrap_or_else(|| clean_tag_value(fallback))
 }
 
-fn cache_key(path: &Path) -> String {
-    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let mut hasher = DefaultHasher::new();
-    canonical.to_string_lossy().hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
-}
-
 pub(crate) fn mime_from_path(path: &Path) -> &'static str {
     match path
         .extension()
@@ -135,13 +154,6 @@ pub(crate) fn mime_from_path(path: &Path) -> &'static str {
         Some("tif") | Some("tiff") => "image/tiff",
         _ => "image/jpeg",
     }
-}
-
-fn is_cover_cache_path(path: &str) -> bool {
-    let Some(cache_dir) = COVER_CACHE_DIR.get() else {
-        return false;
-    };
-    Path::new(path).starts_with(cache_dir)
 }
 
 fn guess_mime(data: &[u8]) -> String {
@@ -229,83 +241,42 @@ fn content_thumb_path(content_id: &str) -> Option<PathBuf> {
     Some(cache_dir.join(format!("c-{content_id}-thumb.webp")))
 }
 
+/// Preferred on-disk path for newly written full covers (lossy JPEG).
 fn content_full_path(content_id: &str) -> Option<PathBuf> {
     let cache_dir = COVER_CACHE_DIR.get()?;
-    Some(cache_dir.join(format!("c-{content_id}-full.webp")))
+    Some(cache_dir.join(format!("c-{content_id}-full.jpg")))
 }
 
-/// Tiny per-track pointer so we can resolve covers without re-parsing tags
-/// when the audio file hasn't changed.
-fn track_cover_ref_path(audio_path: &Path, suffix: &str) -> Option<PathBuf> {
-    let cache_dir = COVER_CACHE_DIR.get()?;
-    Some(cache_dir.join(format!(
-        "t-{}-{suffix}.ref",
-        cache_key(audio_path)
-    )))
-}
-
-fn write_track_cover_ref(audio_path: &Path, suffix: &str, content_id: &str) {
-    let Some(ref_path) = track_cover_ref_path(audio_path, suffix) else {
-        return;
+/// Full cover candidates: new JPEG first, then legacy lossless WebP.
+fn content_full_candidates(content_id: &str) -> Vec<PathBuf> {
+    let Some(cache_dir) = COVER_CACHE_DIR.get() else {
+        return Vec::new();
     };
-    if let Some(parent) = ref_path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let _ = fs::write(&ref_path, content_id.as_bytes());
+    vec![
+        cache_dir.join(format!("c-{content_id}-full.jpg")),
+        cache_dir.join(format!("c-{content_id}-full.jpeg")),
+        cache_dir.join(format!("c-{content_id}-full.webp")),
+    ]
 }
 
-fn read_track_cover_ref(audio_path: &Path, suffix: &str) -> Option<String> {
-    let ref_path = track_cover_ref_path(audio_path, suffix)?;
-    if !ref_path.is_file() {
-        return None;
-    }
-
-    // Invalidate if the audio file is newer than the pointer (tags changed).
-    let audio_mtime = fs::metadata(audio_path).and_then(|m| m.modified()).ok();
-    let ref_mtime = fs::metadata(&ref_path).and_then(|m| m.modified()).ok();
-    if let (Some(audio_t), Some(ref_t)) = (audio_mtime, ref_mtime) {
-        if audio_t > ref_t {
-            return None;
-        }
-    }
-
-    let id = fs::read_to_string(&ref_path).ok()?;
-    let id = id.trim();
-    if id.is_empty() || !id.chars().all(|c| c.is_ascii_hexdigit()) {
-        return None;
-    }
-    Some(id.to_string())
+fn find_ok_full(content_id: &str) -> Option<PathBuf> {
+    content_full_candidates(content_id)
+        .into_iter()
+        .find(|p| full_cache_is_ok(p))
 }
 
-fn paths_for_content_id(content_id: &str) -> Option<CoverPaths> {
-    let thumb = content_thumb_path(content_id)?;
-    if !thumb.is_file() {
-        return None;
-    }
-    let full_path = content_full_path(content_id)?;
+fn find_any_full(content_id: &str) -> Option<PathBuf> {
+    content_full_candidates(content_id)
+        .into_iter()
+        .find(|p| p.is_file() && fs::metadata(p).map(|m| m.len() > 0).unwrap_or(false))
+}
 
-    // Shrink legacy multi‑MB fulls in place (decode cache file — no MP3 re-parse).
-    if full_path.is_file() && !full_cache_is_ok(&full_path) {
-        if let Ok(img) = image::open(&full_path) {
-            let _ = write_resized_webp(&img, &full_path, FULL_SIZE);
-        }
-        // If still bad / unreadable, fall through to thumb-only and let extract rewrite later.
-        if !full_cache_is_ok(&full_path) {
-            let _ = fs::remove_file(&full_path);
+fn remove_other_fulls(content_id: &str, keep: &Path) {
+    for path in content_full_candidates(content_id) {
+        if path != keep && path.is_file() {
+            let _ = fs::remove_file(path);
         }
     }
-
-    let full = if full_cache_is_ok(&full_path) {
-        full_path
-    } else if full_path.is_file() {
-        full_path
-    } else {
-        thumb.clone()
-    };
-    Some(CoverPaths {
-        thumb: Some(thumb.to_string_lossy().to_string()),
-        full: Some(full.to_string_lossy().to_string()),
-    })
 }
 
 fn full_cache_is_ok(path: &Path) -> bool {
@@ -315,7 +286,7 @@ fn full_cache_is_ok(path: &Path) -> bool {
     }
 }
 
-/// Ensure content-addressed full + thumb WebP exist for this image payload.
+/// Ensure content-addressed full + thumb exist for this image payload.
 /// Full is always max FULL_SIZE (never dump multi‑MB originals).
 fn ensure_content_cover_files(data: &[u8], _mime: &str) -> Option<(String, CoverPaths)> {
     if data.is_empty() {
@@ -323,13 +294,13 @@ fn ensure_content_cover_files(data: &[u8], _mime: &str) -> Option<(String, Cover
     }
     let content_id = cover_content_id(data);
     let thumb_path = content_thumb_path(&content_id)?;
-    let full_path = content_full_path(&content_id)?;
 
     let thumb_ok = thumb_path.is_file();
-    let full_ok = full_cache_is_ok(&full_path);
+    let full_ok = find_ok_full(&content_id).is_some();
 
     // Shared by every track with this APIC — only when both are usable.
     if thumb_ok && full_ok {
+        let full_path = find_ok_full(&content_id)?;
         return Some((
             content_id,
             CoverPaths {
@@ -339,24 +310,31 @@ fn ensure_content_cover_files(data: &[u8], _mime: &str) -> Option<(String, Cover
         ));
     }
 
-    // Decode once when we need to (re)write anything.
-    let image = if !full_ok || !thumb_ok {
-        decode_image_bytes(data)?
-    } else {
-        // unreachable, both ok handled above
-        return None;
-    };
-
     if !full_ok {
-        // Always resize — never write raw embedded WebP/JPEG (were 5–15MB).
-        if !write_resized_webp(&image, &full_path, FULL_SIZE) {
-            return None;
+        // Prefer recompressing an existing oversized 720 full (legacy lossless WebP)
+        // over re-decoding a multi‑MB APIC from the audio file.
+        let recompressed = find_any_full(&content_id)
+            .and_then(|oversized| image::open(oversized).ok())
+            .and_then(|img| write_full_cover_image(&img, &content_id))
+            .is_some();
+        if !recompressed {
+            // Huge embeds (4500² FLAC pictures): ffmpeg scale avoids multi‑second RGBA freezes.
+            // Don't abort the whole cover set if full encode fails — thumb alone still works.
+            let _ = write_full_cover_from_bytes(data, &content_id);
         }
     }
 
     if !thumb_path.is_file() {
-        if !write_thumbnail_from_image(&image, &thumb_path) {
-            return None;
+        // Prefer cheap path: scale from the full we just wrote when present.
+        let wrote_thumb = find_any_full(&content_id)
+            .and_then(|full| image::open(full).ok())
+            .map(|img| write_thumbnail_from_image(&img, &thumb_path))
+            .unwrap_or(false);
+        if !wrote_thumb {
+            let image = decode_image_bytes(data)?;
+            if !write_thumbnail_from_image(&image, &thumb_path) {
+                return None;
+            }
         }
     }
 
@@ -364,23 +342,127 @@ fn ensure_content_cover_files(data: &[u8], _mime: &str) -> Option<(String, Cover
         return None;
     }
 
-    let full = if full_path.is_file() {
-        full_path.to_string_lossy().to_string()
-    } else {
-        thumb_path.to_string_lossy().to_string()
-    };
+    let full = find_ok_full(&content_id)
+        .or_else(|| find_any_full(&content_id))
+        .map(|p| p.to_string_lossy().to_string());
 
     Some((
         content_id,
         CoverPaths {
             thumb: Some(thumb_path.to_string_lossy().to_string()),
-            full: Some(full),
+            full,
         },
     ))
 }
 
 fn decode_image_bytes(data: &[u8]) -> Option<image::DynamicImage> {
     image::load_from_memory(data).ok()
+}
+
+/// Build a ≤FULL_SIZE full cover under the size budget (lossy JPEG).
+fn write_full_cover_from_bytes(data: &[u8], content_id: &str) -> Option<PathBuf> {
+    // Fast path for multi‑MB APIC / cover.jpg: ffmpeg resizes without a full RGBA buffer.
+    if data.len() >= HUGE_COVER_BYTES {
+        if let Some(ffmpeg) = ffmpeg_bin() {
+            if let Some(dest) = content_full_path(content_id) {
+                if encode_full_cover_ffmpeg(data, &dest, ffmpeg) && full_cache_is_ok(&dest) {
+                    remove_other_fulls(content_id, &dest);
+                    return Some(dest);
+                }
+            }
+        }
+    }
+
+    let image = decode_image_bytes(data)?;
+    write_full_cover_image(&image, content_id)
+}
+
+fn write_full_cover_image(image: &image::DynamicImage, content_id: &str) -> Option<PathBuf> {
+    let dest = content_full_path(content_id)?;
+    if let Some(parent) = dest.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    let (width, height) = image.dimensions();
+    let resized = if width <= FULL_SIZE && height <= FULL_SIZE {
+        image.clone()
+    } else {
+        image.resize(FULL_SIZE, FULL_SIZE, FilterType::Triangle)
+    };
+
+    // Quality ladder until we fit the soft budget (detailed 720 art as lossless WebP did not).
+    for quality in [88_u8, 78, 68, 55] {
+        if write_jpeg(&resized, &dest, quality) && full_cache_is_ok(&dest) {
+            remove_other_fulls(content_id, &dest);
+            return Some(dest);
+        }
+    }
+
+    // Keep whatever we produced rather than leaving fullscreen on a 96px thumb.
+    if dest.is_file() && fs::metadata(&dest).map(|m| m.len() > 0).unwrap_or(false) {
+        remove_other_fulls(content_id, &dest);
+        return Some(dest);
+    }
+    None
+}
+
+fn write_jpeg(image: &image::DynamicImage, dest: &Path, quality: u8) -> bool {
+    use image::codecs::jpeg::JpegEncoder;
+    use std::io::BufWriter;
+
+    if let Some(parent) = dest.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    let rgb = image.to_rgb8();
+    let Ok(file) = fs::File::create(dest) else {
+        return false;
+    };
+    let mut encoder = JpegEncoder::new_with_quality(BufWriter::new(file), quality);
+    encoder
+        .encode(
+            rgb.as_raw(),
+            rgb.width(),
+            rgb.height(),
+            image::ExtendedColorType::Rgb8,
+        )
+        .is_ok()
+}
+
+fn encode_full_cover_ffmpeg(data: &[u8], dest: &Path, ffmpeg: &Path) -> bool {
+    if let Some(parent) = dest.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    let tmp_in = dest.with_extension("src-tmp");
+    if fs::write(&tmp_in, data).is_err() {
+        return false;
+    }
+
+    // Even dimensions help some JPEG encoders; scale longer side ≤ FULL_SIZE.
+    let vf = format!(
+        "scale='min({FULL_SIZE},iw)':'min({FULL_SIZE},ih)':force_original_aspect_ratio=decrease"
+    );
+
+    let mut cmd = Command::new(ffmpeg);
+    configure_ffmpeg_command(&mut cmd);
+    let ok = cmd
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+        ])
+        .arg(&tmp_in)
+        .args(["-vf", &vf, "-frames:v", "1", "-q:v", "3"])
+        .arg(dest)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    let _ = fs::remove_file(&tmp_in);
+    ok && dest.is_file()
 }
 
 #[allow(dead_code)]
@@ -838,15 +920,18 @@ pub fn rebuild_cover_cache(
         }
     }
 
-    // Count shared content images after rebuild.
+    // Count shared content images after rebuild (JPEG fulls + legacy WebP).
     if let Some(dir) = COVER_CACHE_DIR.get() {
         if let Ok(entries) = fs::read_dir(dir) {
             stats.unique_images = entries
                 .flatten()
                 .filter(|e| {
-                    e.file_name()
-                        .to_str()
-                        .is_some_and(|n| n.starts_with("c-") && n.ends_with("-full.webp"))
+                    e.file_name().to_str().is_some_and(|n| {
+                        n.starts_with("c-")
+                            && (n.ends_with("-full.jpg")
+                                || n.ends_with("-full.jpeg")
+                                || n.ends_with("-full.webp"))
+                    })
                 })
                 .count() as u32;
         }
@@ -954,41 +1039,21 @@ pub fn fresh_cover_paths_for_track(track_path: &str) -> (Option<String>, Option<
     (meta.cover_path, meta.cover_path_full)
 }
 
-fn cache_cover_bytes(audio_path: &Path, data: &[u8], mime: &str, suffix: &str) -> CoverPaths {
-    // Content-addressed: identical embedded art (same album) → one pair of WebP files.
-    let Some((content_id, paths)) = ensure_content_cover_files(data, mime) else {
-        return CoverPaths::default();
-    };
-    write_track_cover_ref(audio_path, suffix, &content_id);
-    paths
+fn cache_cover_bytes(data: &[u8], mime: &str) -> CoverPaths {
+    // Content-addressed: identical APIC/cover bytes (same album) → one image pair.
+    // Track→path mapping is stored in SQLite (`tracks.cover_path*`), not sidecar .ref files.
+    ensure_content_cover_files(data, mime)
+        .map(|(_, paths)| paths)
+        .unwrap_or_default()
 }
 
-fn cache_cover_file(audio_path: &Path, source: &Path) -> CoverPaths {
-    // Fast path via track ref if still valid and source hasn't changed.
-    if let Some(content_id) = read_track_cover_ref(audio_path, "nearby") {
-        let source_mtime = fs::metadata(source).and_then(|m| m.modified()).ok();
-        let ref_path = track_cover_ref_path(audio_path, "nearby");
-        let ref_mtime = ref_path
-            .as_ref()
-            .and_then(|p| fs::metadata(p).and_then(|m| m.modified()).ok());
-        let source_fresh = match (source_mtime, ref_mtime) {
-            (Some(src), Some(r)) => src <= r,
-            _ => true,
-        };
-        if source_fresh {
-            if let Some(paths) = paths_for_content_id(&content_id) {
-                return paths;
-            }
-        }
-    }
-
+fn cache_cover_file(source: &Path) -> CoverPaths {
     let Ok(data) = fs::read(source) else {
         return CoverPaths::default();
     };
     let mime = mime_from_path(source);
-    cache_cover_bytes(audio_path, &data, mime, "nearby")
+    cache_cover_bytes(&data, mime)
 }
-
 
 fn extract_embedded_cover(tagged_file: &TaggedFile, path: &Path) -> CoverPaths {
     // For MP3/AIFF files, lofty mis-applies unsynchronisation decoding on the
@@ -1005,7 +1070,7 @@ fn extract_embedded_cover(tagged_file: &TaggedFile, path: &Path) -> CoverPaths {
             if data.len() < 256 {
                 continue;
             }
-            let paths = cache_cover_bytes(path, data, &mime, "embedded");
+            let paths = cache_cover_bytes(data, &mime);
             if paths.thumb.is_some() || paths.full.is_some() {
                 return paths;
             }
@@ -1016,7 +1081,6 @@ fn extract_embedded_cover(tagged_file: &TaggedFile, path: &Path) -> CoverPaths {
 }
 
 /// Extract cover art from an MP3/ID3 file using the `id3` crate as a fallback.
-
 fn extract_embedded_cover_id3(path: &Path) -> Option<CoverPaths> {
     // Only attempt for files that could carry ID3 tags.
     let ext = path
@@ -1026,11 +1090,6 @@ fn extract_embedded_cover_id3(path: &Path) -> Option<CoverPaths> {
     match ext.as_deref() {
         Some("mp3") | Some("aiff") | Some("aif") => {}
         _ => return None,
-    }
-
-    // Cached cover from a previous read — skip re-parsing ID3 + re-decoding JPEG.
-    if let Some(paths) = existing_embedded_cover_cache(path) {
-        return Some(paths);
     }
 
     let tag = id3::Tag::read_from_path(path).ok()?;
@@ -1049,7 +1108,7 @@ fn extract_embedded_cover_id3(path: &Path) -> Option<CoverPaths> {
         pic.mime_type.clone()
     };
 
-    let paths = cache_cover_bytes(path, &pic.data, &mime, "embedded");
+    let paths = cache_cover_bytes(&pic.data, &mime);
     if paths.thumb.is_some() || paths.full.is_some() {
         Some(paths)
     } else {
@@ -1057,18 +1116,12 @@ fn extract_embedded_cover_id3(path: &Path) -> Option<CoverPaths> {
     }
 }
 
-fn existing_embedded_cover_cache(path: &Path) -> Option<CoverPaths> {
-    // Track pointer → shared content file (no ID3 re-parse, no re-encode).
-    let content_id = read_track_cover_ref(path, "embedded")?;
-    paths_for_content_id(&content_id)
-}
-
 fn extract_nearby_cover(path: &Path) -> CoverPaths {
     let source = match find_nearby_cover(path) {
         Some(source) => source,
         None => return CoverPaths::default(),
     };
-    cache_cover_file(path, &source)
+    cache_cover_file(&source)
 }
 
 fn resolve_cover_paths(path: &Path, tagged_file: Option<&TaggedFile>) -> CoverPaths {
@@ -1089,45 +1142,43 @@ fn resolve_cover_paths(path: &Path, tagged_file: Option<&TaggedFile>) -> CoverPa
     extract_nearby_cover(path)
 }
 
-/// Resolve the small list/transport cover, creating the cache only when the UI
-/// actually asks for this track.
-pub fn resolve_list_cover(path: &Path) -> Option<String> {
-    if let Some(paths) = existing_embedded_cover_cache(path) {
-        return paths.thumb.or(paths.full);
-    }
+/// True when `path` is a list thumb, not a fullscreen full.
+pub fn is_thumb_cache_path(path: &str) -> bool {
+    path.to_ascii_lowercase().contains("-thumb.")
+}
 
-    let tagged_file = read_from_path(path).ok();
-    let paths = match tagged_file.as_ref() {
-        Some(tagged_file) => resolve_cover_paths(path, Some(tagged_file)),
-        None => resolve_cover_paths(path, None),
-    };
+/// Extract / cache covers from an audio file (no DB). Prefer DB lookup at the command layer.
+pub fn resolve_list_cover(path: &Path) -> Option<String> {
+    let paths = extract_covers_for_file(path);
     paths.thumb.or(paths.full)
 }
 
-/// Resolve a full-resolution cover path for an audio file (creates cache if needed).
+/// Extract / cache full cover from an audio file (no DB). Prefer DB lookup at the command layer.
 pub fn resolve_full_cover(path: &Path) -> Option<String> {
-    if let Some(paths) = existing_embedded_cover_cache(path) {
-        return paths.full.or(paths.thumb);
-    }
+    let paths = extract_covers_for_file(path);
+    paths
+        .full
+        .filter(|p| !is_thumb_cache_path(p))
+}
 
+/// Read tags if needed and write content-addressed cover files. Returns thumb + full paths.
+pub fn extract_covers_for_file(path: &Path) -> CoverPaths {
     let tagged_file = read_from_path(path).ok();
-    let paths = match tagged_file.as_ref() {
+    match tagged_file.as_ref() {
         Some(tagged_file) => resolve_cover_paths(path, Some(tagged_file)),
         None => resolve_cover_paths(path, None),
-    };
-
-    if let Some(ref full) = paths.full {
-        if is_cover_cache_path(full) {
-            return paths.full;
-        }
     }
-
-    paths.thumb.or(paths.full)
 }
 
 /// Read a cover image from disk and return a data URL (for paths outside the asset scope).
 pub fn cover_data_url(path: &Path) -> Result<Option<String>, String> {
     if !path.is_file() {
+        return Ok(None);
+    }
+
+    // Never base64 multi‑MB raw cover.jpg into the WebView (freezes the UI).
+    let meta = fs::metadata(path).map_err(|e| format!("Failed to stat cover: {e}"))?;
+    if meta.len() > MAX_FULL_CACHE_BYTES * 2 {
         return Ok(None);
     }
 
@@ -1210,7 +1261,6 @@ fn read_metadata_impl(path: &Path, file_name: &str, resolve_covers: bool) -> Tra
     meta
 }
 
-/// Write title and/or artist into the file's primary tag (creates ID3v2 for MP3 when missing).
 pub fn write_track_tags(
     path: &Path,
     title: Option<&str>,
@@ -1224,6 +1274,15 @@ pub fn write_track_tags(
         .filter(|s| !s.is_empty());
 
     if title.is_none() && artist.is_none() {
+        return Ok(());
+    }
+
+    let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
+    if ext.as_deref() == Some("mp3") {
+        let mut tag = id3::Tag::read_from_path(path).unwrap_or_else(|_| id3::Tag::new());
+        if let Some(t) = title { tag.set_title(t); }
+        if let Some(a) = artist { tag.set_artist(a); }
+        tag.write_to_path(path, id3::Version::Id3v23).map_err(|e| format!("id3 save error: {}", e))?;
         return Ok(());
     }
 
@@ -1291,19 +1350,16 @@ fn mime_from_image_bytes(data: &[u8], hint: Option<&str>) -> MimeType {
     MimeType::Jpeg
 }
 
-/// Embed cover art into the file's primary tag (ID3 APIC / similar).
 pub fn write_track_cover(path: &Path, data: &[u8], mime_hint: Option<&str>) -> Result<(), String> {
     if data.is_empty() {
         return Err("Empty cover image".to_string());
     }
 
-    // Re-encode exotic formats (webp) to JPEG so more players accept the tag.
     let (bytes, mime) = match mime_from_image_bytes(data, mime_hint) {
         MimeType::Jpeg | MimeType::Png | MimeType::Gif | MimeType::Bmp | MimeType::Tiff => {
             (data.to_vec(), mime_from_image_bytes(data, mime_hint))
         }
         other => {
-            // Try decode → jpeg
             match image::load_from_memory(data) {
                 Ok(img) => {
                     let mut out = Vec::new();
@@ -1318,6 +1374,31 @@ pub fn write_track_cover(path: &Path, data: &[u8], mime_hint: Option<&str>) -> R
             }
         }
     };
+
+    let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
+    if ext.as_deref() == Some("mp3") {
+        let mut tag = id3::Tag::read_from_path(path).unwrap_or_else(|_| id3::Tag::new());
+        tag.remove_picture_by_type(id3::frame::PictureType::CoverFront);
+        
+        let mime_str = match mime {
+            MimeType::Png => "image/png",
+            MimeType::Gif => "image/gif",
+            MimeType::Bmp => "image/bmp",
+            MimeType::Tiff => "image/tiff",
+            MimeType::Jpeg => "image/jpeg",
+            MimeType::Unknown(ref s) => s.as_str(),
+            _ => "image/jpeg",
+        }.to_string();
+
+        tag.add_frame(id3::frame::Picture {
+            mime_type: mime_str,
+            picture_type: id3::frame::PictureType::CoverFront,
+            description: String::new(),
+            data: bytes,
+        });
+        tag.write_to_path(path, id3::Version::Id3v23).map_err(|e| format!("id3 save cover error: {}", e))?;
+        return Ok(());
+    }
 
     let mut tagged_file = read_from_path(path)
         .map_err(|e| format!("Failed to read audio file for cover: {}", e))?;

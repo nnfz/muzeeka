@@ -139,6 +139,7 @@ let ytdlpReady = $state<boolean | null>(null);
 let ffmpegReady = $state<boolean | null>(null);
 
 let unlistenProgress: UnlistenFn | null = null;
+let unlistenLog: UnlistenFn | null = null;
 
 async function ensureProgressListener() {
   if (unlistenProgress) return;
@@ -149,6 +150,27 @@ async function ensureProgressListener() {
       // Monotonic while downloading so the bar never jumps backwards.
       downloadPercent =
         downloadPercent == null ? next : Math.max(downloadPercent, next);
+    }
+  });
+}
+
+/** Pipe yt-dlp stderr/stdout into the browser console (DevTools), not the UI. */
+async function ensureLogListener() {
+  if (unlistenLog) return;
+  unlistenLog = await listen<string>('ytdlp:log', (event) => {
+    const line = event.payload ?? '';
+    const lower = line.toLowerCase();
+    if (
+      lower.includes('error') ||
+      lower.includes('failed') ||
+      lower.includes('traceback') ||
+      lower.includes('no audio files')
+    ) {
+      console.error('[yt-dlp]', line);
+    } else if (lower.includes('warning') || lower.includes('warn')) {
+      console.warn('[yt-dlp]', line);
+    } else {
+      console.log('[yt-dlp]', line);
     }
   });
 }
@@ -245,6 +267,7 @@ export async function openDownloadWindow(initialUrl = '') {
 export function createDownloadStore() {
   void checkAvailability();
   void ensureProgressListener();
+  void ensureLogListener();
 
   return {
     get url() { return url; },
@@ -350,7 +373,6 @@ export function createDownloadStore() {
           files: result.files,
           playlistId: downloadPlaylistId ?? null,
           namedPlaylist,
-          // Probe thumbnail → playlist cover (VK / Spotify / SoundCloud / YouTube)
           coverUrl:
             namedPlaylist && probe?.thumbnail?.trim()
               ? probe.thumbnail.trim()
@@ -361,7 +383,10 @@ export function createDownloadStore() {
         progress = { status: 'Done', percent: 100, url: normalized };
         return result.files.length;
       } catch (e) {
-        error = typeof e === 'string' ? e : String(e);
+        const message = typeof e === 'string' ? e : String(e);
+        // Keep the short UI message; full yt-dlp dump goes via ytdlp:log / terminal.
+        console.error('[yt-dlp] download failed:', message);
+        error = message;
         progress = null;
         downloadPercent = null;
         return 0;
