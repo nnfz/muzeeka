@@ -280,6 +280,11 @@ impl LibraryDatabase {
                      play_count INTEGER NOT NULL DEFAULT 0,
                      first_played_unix INTEGER,
                      last_played_unix INTEGER
+                 );
+                 -- App-only per-track prefs (not written into file tags).
+                 CREATE TABLE IF NOT EXISTS track_prefs (
+                     path_key TEXT PRIMARY KEY,
+                     playback_rate REAL
                  );",
             )
             .map_err(db_error)?;
@@ -410,6 +415,61 @@ impl LibraryDatabase {
             .optional()
             .map_err(db_error)?;
         Ok(stats.unwrap_or_default())
+    }
+
+    /// Per-track playback rate override. `None` → use global Settings rate.
+    pub fn get_track_playback_rate(&self, track_path: &str) -> Result<Option<f32>, String> {
+        let key = path_key(track_path.trim());
+        if key.is_empty() {
+            return Ok(None);
+        }
+        let connection = self.inner.connection.lock();
+        let rate: Option<f64> = connection
+            .query_row(
+                "SELECT playback_rate FROM track_prefs WHERE path_key = ?1",
+                [&key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_error)?;
+        Ok(rate.and_then(|r| {
+            if r.is_finite() && r > 0.0 {
+                Some((r as f32).clamp(0.25, 2.0))
+            } else {
+                None
+            }
+        }))
+    }
+
+    /// Set or clear per-track playback rate. `None` removes the override.
+    pub fn set_track_playback_rate(
+        &self,
+        track_path: &str,
+        rate: Option<f32>,
+    ) -> Result<(), String> {
+        let key = path_key(track_path.trim());
+        if key.is_empty() {
+            return Err("Empty track path".into());
+        }
+        let connection = self.inner.connection.lock();
+        match rate {
+            Some(r) if r.is_finite() => {
+                let clamped = r.clamp(0.25, 2.0);
+                connection
+                    .execute(
+                        "INSERT INTO track_prefs(path_key, playback_rate) VALUES (?1, ?2)
+                         ON CONFLICT(path_key) DO UPDATE SET playback_rate = excluded.playback_rate",
+                        params![key, clamped as f64],
+                    )
+                    .map_err(db_error)?;
+            }
+            _ => {
+                connection
+                    .execute("DELETE FROM track_prefs WHERE path_key = ?1", [&key])
+                    .map_err(db_error)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn load(&self) -> Result<PlaylistsData, String> {

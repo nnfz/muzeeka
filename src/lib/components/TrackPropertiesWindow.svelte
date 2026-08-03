@@ -27,11 +27,18 @@
     preferFullCoverPath,
   } from "$lib/coverCache";
   import { COVER_PLACEHOLDER_SRC } from "$lib/coverPlaceholder";
+  import {
+    applyEffectivePlaybackRate,
+    clampPlaybackRate,
+    getCachedGlobalPlaybackRate,
+    getTrackPlaybackRate,
+    setTrackPlaybackRate,
+  } from "$lib/trackPrefs";
 
   /** This webview is bound to one track window label for life. */
   const windowLabel = getCurrentWindow().label;
 
-  type Section = "metadata" | "details" | "lyrics";
+  type Section = "metadata" | "details" | "lyrics" | "muzeeka";
 
   interface TagTableRow {
     id: string;
@@ -67,7 +74,10 @@
     { id: "metadata", label: "Metadata" },
     { id: "details", label: "Details" },
     { id: "lyrics", label: "Lyrics" },
+    { id: "muzeeka", label: "Muzeeka" },
   ];
+
+  const RATE_PRESETS = [0.75, 0.85, 1.0, 1.25, 1.5] as const;
 
   let activeSection = $state<Section>("metadata");
 
@@ -76,6 +86,13 @@
   /** Path the current `rows` belong to — prevents lyrics lookup using previous track tags. */
   let rowsForPath = $state<string | null>(null);
   let tech = $state<AudioTechInfo | null>(null);
+
+  // Muzeeka tab — app-only per-track prefs
+  let trackRateOverride = $state<number | null>(null);
+  let trackRateDraft = $state(1.0);
+  let trackRateBusy = $state(false);
+  let trackRateError = $state<string | null>(null);
+  let trackRateSuccess = $state<string | null>(null);
 
   let coverBusy = $state(false);
   let coverFailed = $state(false);
@@ -225,6 +242,69 @@
     }
   }
 
+  function rateFillPct(rate: number): number {
+    return Math.max(0, Math.min(100, ((rate - 0.25) / (2 - 0.25)) * 100));
+  }
+
+  async function loadTrackPrefs(t: MusicFile, gen = loadGen) {
+    trackRateError = null;
+    trackRateSuccess = null;
+    try {
+      const override = await getTrackPlaybackRate(t.path);
+      if (!stillCurrent(t, gen)) return;
+      trackRateOverride = override;
+      trackRateDraft = override ?? getCachedGlobalPlaybackRate();
+    } catch (e) {
+      if (!stillCurrent(t, gen)) return;
+      trackRateOverride = null;
+      trackRateDraft = getCachedGlobalPlaybackRate();
+      trackRateError = typeof e === "string" ? e : String(e);
+    }
+  }
+
+  async function commitTrackRate(rate: number | null) {
+    if (!track || trackRateBusy) return;
+    trackRateBusy = true;
+    trackRateError = null;
+    trackRateSuccess = null;
+    try {
+      await setTrackPlaybackRate(track.path, rate);
+      trackRateOverride = rate;
+      trackRateDraft = rate ?? getCachedGlobalPlaybackRate();
+      trackRateSuccess =
+        rate == null
+          ? "Using global speed from Settings"
+          : `Track speed set to ${rate.toFixed(2)}×`;
+      // Live-apply if this track is what the player would use next/now.
+      void applyEffectivePlaybackRate(track.path);
+    } catch (e) {
+      trackRateError = typeof e === "string" ? e : String(e);
+    } finally {
+      trackRateBusy = false;
+    }
+  }
+
+  function onTrackRateInput(e: Event) {
+    const v = clampPlaybackRate(
+      Number((e.currentTarget as HTMLInputElement).value),
+    );
+    trackRateDraft = v;
+    trackRateSuccess = null;
+  }
+
+  function onTrackRateCommit() {
+    void commitTrackRate(clampPlaybackRate(trackRateDraft));
+  }
+
+  function onTrackRatePreset(r: number) {
+    trackRateDraft = r;
+    void commitTrackRate(r);
+  }
+
+  function onTrackRateReset() {
+    void commitTrackRate(null);
+  }
+
   function loadTrack(next: MusicFile) {
     // Each window is one track — ignore foreign payloads.
     if (track && !sameTrackPath(track.path, next.path)) {
@@ -245,8 +325,13 @@
     lyricsDirty = false;
     lyricsError = null;
     lyricsSuccess = null;
+    trackRateOverride = null;
+    trackRateDraft = getCachedGlobalPlaybackRate();
+    trackRateError = null;
+    trackRateSuccess = null;
 
     void loadTechFor(next, gen);
+    void loadTrackPrefs(next, gen);
     // Library snapshot lyrics key (parallel) + tags for metadata table.
     void loadLyricsFor(next, gen);
     void (async () => {
@@ -839,6 +924,9 @@
               if (section.id === "details" && track) {
                 void loadTechFor(track);
               }
+              if (section.id === "muzeeka" && track) {
+                void loadTrackPrefs(track);
+              }
             }}
           >
             <span class="nav-icon" aria-hidden="true">
@@ -900,9 +988,27 @@
                     stroke="none"
                   />
                 </svg>
+              {:else if section.id === "muzeeka"}
+                <svg
+                  width="16"
+                  height="16"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.75"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                >
+                  <path
+                    d="M12 3v10.55A4 4 0 1 0 14 17V7h4V3h-6Z"
+                  />
+                </svg>
               {/if}
             </span>
             <span class="nav-label">{section.label}</span>
+            {#if section.id === "muzeeka" && trackRateOverride != null}
+              <span class="nav-badge">{trackRateOverride.toFixed(2)}×</span>
+            {/if}
           </button>
         {/each}
       </div>
@@ -1220,6 +1326,112 @@
                 Unsaved lyrics changes
               {:else if lyricsLoading}
                 Loading…
+              {/if}
+            </div>
+            <div class="props-actions">
+              <button
+                type="button"
+                class="action-btn"
+                onclick={() => void closeWindow()}
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      {:else if activeSection === "muzeeka"}
+        <div class="props-section props-section-fill">
+          <div class="section-head">
+            <div>
+              <h2 class="section-title">Muzeeka</h2>
+              <p class="section-desc">
+                App-only extras for this track — stored in Muzeeka, never written
+                into the audio file.
+              </p>
+            </div>
+          </div>
+
+          <div class="props-card muzeeka-card">
+            <div class="muzeeka-feature">
+              <div class="muzeeka-feature-head">
+                <div>
+                  <div class="card-label">Playback speed</div>
+                  <div class="card-value">
+                    {#if trackRateOverride != null}
+                      Custom for this track
+                    {:else}
+                      Using global speed from Settings ({getCachedGlobalPlaybackRate().toFixed(2)}×)
+                    {/if}
+                  </div>
+                </div>
+                <div class="rate-display">
+                  <span class="rate-value-big">{trackRateDraft.toFixed(2)}×</span>
+                </div>
+              </div>
+
+              <div class="rate-slider-row">
+                <input
+                  type="range"
+                  class="rate-slider"
+                  min="0.25"
+                  max="2"
+                  step="0.01"
+                  value={trackRateDraft}
+                  style={`--fill: ${rateFillPct(trackRateDraft)}%`}
+                  disabled={!track || trackRateBusy}
+                  oninput={onTrackRateInput}
+                  onchange={onTrackRateCommit}
+                  onpointerup={onTrackRateCommit}
+                />
+                <div class="rate-bounds">
+                  <span>0.25×</span>
+                  <span>2.00×</span>
+                </div>
+              </div>
+
+              <div class="rate-presets">
+                {#each RATE_PRESETS as r}
+                  <button
+                    type="button"
+                    class="preset-btn"
+                    class:active={trackRateOverride != null &&
+                      Math.abs(trackRateDraft - r) < 0.01}
+                    disabled={!track || trackRateBusy}
+                    onclick={() => onTrackRatePreset(r)}
+                  >
+                    {r.toFixed(r === 1 ? 1 : 2)}×
+                  </button>
+                {/each}
+                <button
+                  type="button"
+                  class="preset-btn"
+                  disabled={!track ||
+                    trackRateBusy ||
+                    trackRateOverride == null}
+                  onclick={() => onTrackRateReset()}
+                  title="Clear override — use Settings global speed"
+                >
+                  Reset
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div class="props-actions-bar">
+            <div
+              class="props-status"
+              class:error={!!trackRateError}
+              class:success={!!trackRateSuccess && !trackRateError}
+              class:muted={trackRateOverride != null &&
+                !trackRateError &&
+                !trackRateSuccess}
+            >
+              {#if trackRateError}
+                {trackRateError}
+              {:else if trackRateSuccess}
+                {trackRateSuccess}
+              {:else if trackRateOverride != null}
+                Override active for this track
               {/if}
             </div>
             <div class="props-actions">

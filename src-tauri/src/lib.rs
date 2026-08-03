@@ -366,6 +366,8 @@ pub fn run() {
             commands::library_reorder,
             commands::library_remove_tracks,
             commands::library_clear_all,
+            commands::track_prefs_get_playback_rate,
+            commands::track_prefs_set_playback_rate,
             commands::library_set_liked,
             commands::library_reorder_liked,
             commands::playlist_cache_cover,

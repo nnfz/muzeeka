@@ -8,6 +8,10 @@ import {
   notifyTrackPropertiesCloseAll,
   notifyTrackPropertiesPathsRemoved,
 } from '$lib/stores/trackProperties.svelte';
+import {
+  applyEffectivePlaybackRate,
+  setCachedGlobalPlaybackRate,
+} from '$lib/trackPrefs';
 import { reorderItemsAtBoundary } from '$lib/trackOrder';
 import { setImportProgress, resetImportProgress } from '$lib/stores/importProgress.svelte';
 import {
@@ -2030,10 +2034,13 @@ async function init() {
     // Restore persisted playback rate from settings (so rate survives app restart)
     try {
       const s = await invoke<{ playback_rate?: number }>('settings_load');
-      if (typeof s?.playback_rate === 'number' && s.playback_rate > 0 && s.playback_rate !== 1) {
+      if (typeof s?.playback_rate === 'number' && s.playback_rate > 0) {
         const r = Math.max(0.25, Math.min(2, s.playback_rate));
         playbackRate = r;
-        await invoke('player_set_playback_rate', { rate: r }).catch(() => {});
+        setCachedGlobalPlaybackRate(r);
+        if (r !== 1) {
+          await invoke('player_set_playback_rate', { rate: r }).catch(() => {});
+        }
       }
     } catch {}
 
@@ -2476,6 +2483,10 @@ async function play(filePath: string) {
     if (requestId !== playRequestId) return;
 
     try {
+      // Set rate before open so the new stream inherits the right tempo/FREQ.
+      await applyEffectivePlaybackRate(currentFile ?? filePath);
+      if (requestId !== playRequestId) return;
+
       await invoke('player_play', {
         ...playOptionsForTrack(resolvedTrack, currentFile ?? filePath),
         queue: queueToSend,
@@ -2889,6 +2900,8 @@ function setupListeners() {
     scheduleSave();
     lastGaplessChangeAt = Date.now();
     void prepareGaplessNext(currentFile ?? path);
+    // Apply per-track speed (or restore global) when gapless advances.
+    void applyEffectivePlaybackRate(currentFile ?? path);
     syncWindowTitle();
   });
 

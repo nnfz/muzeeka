@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { getContext, setContext } from 'svelte';
+import { setCachedGlobalPlaybackRate } from '$lib/trackPrefs';
 
 export const BAND_COUNT = 17;
 
@@ -146,6 +147,7 @@ async function applyEqualizer(settings: EqualizerSettings) {
 async function applyPlaybackRate(rate: number, opts?: { immediate?: boolean }) {
   const clamped = Math.max(0.25, Math.min(2, rate));
   playbackRate = clamped;
+  setCachedGlobalPlaybackRate(clamped);
 
   const send = async (value: number) => {
     const seq = ++rateApplySeq;
@@ -220,6 +222,7 @@ export function createSettingsStore(
       } else {
         playbackRate = 1.0;
       }
+      setCachedGlobalPlaybackRate(playbackRate);
       pitchEnabled = data.pitch_enabled !== false;
       if (typeof data.download_folder === 'string' && data.download_folder.trim()) {
         downloadFolder = data.download_folder.trim();

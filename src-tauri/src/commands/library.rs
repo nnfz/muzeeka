@@ -832,6 +832,25 @@ pub fn library_remove_tracks(
     database.remove_library_tracks(&paths)
 }
 
+/// Per-track playback rate override (`None` = use global Settings rate).
+#[tauri::command]
+pub fn track_prefs_get_playback_rate(
+    database: State<'_, LibraryDatabase>,
+    path: String,
+) -> Result<Option<f32>, String> {
+    database.get_track_playback_rate(&path)
+}
+
+/// Set or clear per-track playback rate. Pass `null` to remove the override.
+#[tauri::command]
+pub fn track_prefs_set_playback_rate(
+    database: State<'_, LibraryDatabase>,
+    path: String,
+    rate: Option<f32>,
+) -> Result<(), String> {
+    database.set_track_playback_rate(&path, rate)
+}
+
 #[tauri::command]
 pub fn library_set_liked(
     database: State<'_, LibraryDatabase>,
