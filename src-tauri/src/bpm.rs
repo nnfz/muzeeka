@@ -1,149 +1,338 @@
 //! Energy-envelope BPM detection via BASS decode streams.
 //!
-//! Runs on the player's BASS thread (same device as playback). Keeps analysis
-//! short so the UI does not freeze.
+//! Pipeline:
+//! 1. Open a decode stream (float mono → float stereo → 16-bit)
+//! 2. Pull mono PCM from several windows across the file
+//! 3. Per window: energy envelope → onset → autocorrelation + IOI histogram
+//! 4. Vote across windows, refine lag, fold tempo octave, snap for tags
+//!
+//! Runs on the player's BASS thread. Results are cached by path + mtime + size.
+
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::OnceLock;
+use std::time::SystemTime;
+
+use parking_lot::Mutex;
 
 use crate::bass::{self, BassLibrary};
 use crate::player::Player;
 
+// ── Range / hop ──────────────────────────────────────────────────────────────
 const MIN_BPM: f32 = 70.0;
 const MAX_BPM: f32 = 180.0;
-/// Seconds of audio to analyze (middle of the track when possible).
-const ANALYZE_SECS: f64 = 45.0;
-/// Skip this many seconds from the start (intros / silence).
-const SKIP_SECS: f64 = 12.0;
-/// Energy hop size in mono samples (~5.8 ms at 44.1 kHz) — finer BPM lag grid.
+/// Energy hop in mono samples (~5.8 ms @ 44.1 kHz).
 const HOP: usize = 256;
+/// Common song-tempo band used for outlier rescue.
+const SWEET_BPM_LO: f32 = 95.0;
+const SWEET_BPM_HI: f32 = 150.0;
 
-/// Detect BPM for an on-disk audio file.
+// ── Multi-window layout ──────────────────────────────────────────────────────
+/// Length of each analysis window (seconds).
+const WINDOW_SECS: f64 = 18.0;
+/// Relative start positions in the track (0 = start, 1 = end).
+const WINDOW_FRACS: [f64; 3] = [0.12, 0.42, 0.70];
+/// Skip absolute intro even on short files.
+const MIN_START_SKIP_SECS: f64 = 4.0;
+
+// ── Onset / peak thresholds ──────────────────────────────────────────────────
+const ONSET_PEAK_THRESH: f32 = 0.12;
+const CORR_PEAK_REL: f32 = 0.35;
+const WEAK_SCORE_MIN: f32 = 0.05;
+const WEAK_CORR_MIN: f32 = 0.002;
+
+// ── Candidate scoring weights ────────────────────────────────────────────────
+const W_CORR: f32 = 0.55;
+const W_HIST: f32 = 0.20;
+const W_TWO_BEAT: f32 = 0.25;
+const DOUBLE_TEMPO_HALF_RATIO: f32 = 0.9;
+const DOUBLE_TEMPO_PENALTY: f32 = 0.75;
+const BAR_BONUS_SCALE: f32 = 0.20;
+const OCTAVE_DOWN_RATIO: f32 = 0.70;
+const SWEET_ALT_CORR_RATIO: f32 = 0.45;
+const SWEET_ALT_BEST_RATIO: f32 = 0.40;
+/// Only consider /2 when result is this high *and* half lands in a musical band.
+const HIGH_BPM_CUTOFF: f32 = 168.0;
+const HIGH_BPM_HALF_MIN: f32 = 95.0;
+const HIGH_BPM_HALF_RATIO: f32 = 0.65;
+
+// ── Tempo prior (Gaussian around ~118 BPM) ───────────────────────────────────
+const PRIOR_CENTER: f32 = 118.0;
+const PRIOR_SIGMA: f32 = 28.0;
+const PRIOR_FLOOR: f32 = 0.30;
+const PRIOR_SCALE: f32 = 0.70;
+
+// ── Snap ─────────────────────────────────────────────────────────────────────
+const SNAP_INT_TOL: f32 = 0.4;
+
+// ── Vote ─────────────────────────────────────────────────────────────────────
+/// Candidates within this many BPM count as the same vote bin.
+const VOTE_CLUSTER_BPM: f32 = 1.25;
+
+// ── Cache ────────────────────────────────────────────────────────────────────
+struct CacheKey {
+    path: String,
+    modified: SystemTime,
+    size: u64,
+}
+
+struct CacheEntry {
+    key: CacheKey,
+    bpm: f32,
+}
+
+fn bpm_cache() -> &'static Mutex<HashMap<String, CacheEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, CacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn file_cache_key(path: &str) -> Option<CacheKey> {
+    let meta = std::fs::metadata(path).ok()?;
+    let modified = meta.modified().ok()?;
+    Some(CacheKey {
+        path: path.to_string(),
+        modified,
+        size: meta.len(),
+    })
+}
+
+fn cache_get(path: &str) -> Option<f32> {
+    let key = file_cache_key(path)?;
+    let guard = bpm_cache().lock();
+    let entry = guard.get(path)?;
+    if entry.key.modified == key.modified && entry.key.size == key.size {
+        Some(entry.bpm)
+    } else {
+        None
+    }
+}
+
+fn cache_put(path: &str, bpm: f32) {
+    let Some(key) = file_cache_key(path) else {
+        return;
+    };
+    bpm_cache().lock().insert(
+        path.to_string(),
+        CacheEntry {
+            key,
+            bpm,
+        },
+    );
+}
+
+// ── Public API ───────────────────────────────────────────────────────────────
+
+/// Detect BPM for an on-disk audio file (cached by path + mtime + size).
 pub fn detect_bpm_for_path(player: &Player, path: &str) -> Result<f32, String> {
     let path = path.trim().to_string();
     if path.is_empty() {
         return Err("Empty audio path".into());
     }
-    if !std::path::Path::new(&path).is_file() {
+    if !Path::new(&path).is_file() {
         return Err(format!("File not found: {path}"));
     }
 
-    // Ensure BASS is up (setup already does this; safe to call again).
-    player.init()?;
+    if let Some(cached) = cache_get(&path) {
+        eprintln!("[bpm] cache hit for {path}: {cached}");
+        return Ok(cached);
+    }
 
-    player.with_bass(move |bass| detect_bpm_with_bass(bass, &path))
+    player.init()?;
+    let path_for_bass = path.clone();
+    let bpm = player.with_bass(move |bass| detect_bpm_with_bass(bass, &path_for_bass))?;
+    cache_put(&path, bpm);
+    Ok(bpm)
 }
 
-fn open_decode(bass: &BassLibrary, path: &str) -> Result<u32, String> {
-    // Prefer float mono for analysis; fall back if the codec rejects MONO.
-    let attempts = [
-        bass::BASS_STREAM_DECODE | bass::BASS_SAMPLE_FLOAT | bass::BASS_SAMPLE_MONO,
-        bass::BASS_STREAM_DECODE | bass::BASS_SAMPLE_FLOAT,
-        bass::BASS_STREAM_DECODE, // 16-bit stereo → convert below
+// ── Decode / multi-window pull ───────────────────────────────────────────────
+
+fn open_decode(bass: &BassLibrary, path: &str) -> Result<(u32, &'static str), String> {
+    let attempts: [(u32, &str); 3] = [
+        (
+            bass::BASS_STREAM_DECODE | bass::BASS_SAMPLE_FLOAT | bass::BASS_SAMPLE_MONO,
+            "float+mono",
+        ),
+        (
+            bass::BASS_STREAM_DECODE | bass::BASS_SAMPLE_FLOAT,
+            "float",
+        ),
+        (bass::BASS_STREAM_DECODE, "default-16bit"),
     ];
     let mut last_err = String::from("Failed to open decode stream");
-    for flags in attempts {
+    for (flags, label) in attempts {
         match bass.stream_create_file(path, flags) {
-            Ok(h) if h != 0 => return Ok(h),
-            Ok(_) => last_err = bass.last_error_string(),
-            Err(e) => last_err = e,
+            Ok(h) if h != 0 => {
+                eprintln!("[bpm] open_decode ok ({label}) for {path}");
+                return Ok((h, label));
+            }
+            Ok(_) => last_err = format!("{label}: {}", bass.last_error_string()),
+            Err(e) => last_err = format!("{label}: {e}"),
         }
     }
     Err(last_err)
 }
 
-fn detect_bpm_with_bass(bass: &BassLibrary, path: &str) -> Result<f32, String> {
-    let handle = open_decode(bass, path)?;
+struct DecodeInfo {
+    sample_rate: u32,
+    chans: usize,
+    is_float: bool,
+    total_secs: f64,
+}
 
-    let result = (|| {
-        let info = bass.channel_get_info(handle)?;
-        let sample_rate = if info.freq > 0 { info.freq } else { 44100 };
-        let chans = info.chans.max(1) as usize;
-        let is_float = (info.flags & bass::BASS_SAMPLE_FLOAT) != 0;
-
-        // Jump past intro when the file is long enough.
-        let total_secs = {
-            let len = bass.channel_get_length(handle, bass::BASS_POS_BYTE);
-            if len == 0 || len == u64::MAX {
-                0.0
-            } else {
-                bass.channel_bytes2seconds(handle, len).max(0.0)
-            }
-        };
-        if total_secs > SKIP_SECS + ANALYZE_SECS + 5.0 {
-            let pos = bass.channel_seconds2bytes(handle, SKIP_SECS);
-            let _ = bass.channel_set_position(handle, pos, bass::BASS_POS_BYTE);
+fn decode_info(bass: &BassLibrary, handle: u32) -> Result<DecodeInfo, String> {
+    let info = bass.channel_get_info(handle)?;
+    let sample_rate = if info.freq > 0 { info.freq } else { 44100 };
+    let chans = info.chans.max(1) as usize;
+    let is_float = (info.flags & bass::BASS_SAMPLE_FLOAT) != 0;
+    let total_secs = {
+        let len = bass.channel_get_length(handle, bass::BASS_POS_BYTE);
+        if len == 0 || len == u64::MAX {
+            0.0
+        } else {
+            bass.channel_bytes2seconds(handle, len).max(0.0)
         }
+    };
+    Ok(DecodeInfo {
+        sample_rate,
+        chans,
+        is_float,
+        total_secs,
+    })
+}
 
-        let max_mono = ((ANALYZE_SECS * sample_rate as f64) as usize).max(sample_rate as usize);
-        let mut mono: Vec<f32> = Vec::with_capacity(max_mono);
-        let mut float_chunk = vec![0f32; 8192 * chans];
-        let mut i16_chunk = vec![0i16; 8192 * chans];
+/// Pull up to `max_mono` mono samples from the current stream position.
+fn pull_mono(
+    bass: &BassLibrary,
+    handle: u32,
+    info: &DecodeInfo,
+    max_mono: usize,
+) -> Result<Vec<f32>, String> {
+    let mut mono = Vec::with_capacity(max_mono);
+    let mut float_chunk = vec![0f32; 8192 * info.chans];
+    let mut i16_chunk = vec![0i16; 8192 * info.chans];
 
-        let mut pulls = 0u32;
-        let mut last_pull = 0usize;
-        while mono.len() < max_mono && pulls < 50_000 {
-            pulls += 1;
-            let frames = if is_float {
-                let n = bass.channel_get_data_f32(handle, &mut float_chunk)?;
-                if n == 0 {
-                    break;
-                }
-                last_pull = n;
-                let frames = n / chans;
-                let need = (max_mono - mono.len()).min(frames);
-                for i in 0..need {
-                    if chans == 1 {
-                        mono.push(float_chunk[i]);
-                    } else {
-                        let mut s = 0.0f32;
-                        for c in 0..chans {
-                            s += float_chunk[i * chans + c];
-                        }
-                        mono.push(s / chans as f32);
-                    }
-                }
-                frames
-            } else {
-                let n = bass.channel_get_data_i16(handle, &mut i16_chunk)?;
-                if n == 0 {
-                    break;
-                }
-                last_pull = n;
-                let frames = n / chans;
-                let need = (max_mono - mono.len()).min(frames);
-                for i in 0..need {
-                    if chans == 1 {
-                        mono.push(i16_chunk[i] as f32 / 32768.0);
-                    } else {
-                        let mut s = 0.0f32;
-                        for c in 0..chans {
-                            s += i16_chunk[i * chans + c] as f32 / 32768.0;
-                        }
-                        mono.push(s / chans as f32);
-                    }
-                }
-                frames
-            };
-            if frames == 0 {
+    // Bound iterations by remaining samples (not a magic fixed pull count).
+    let chunk_frames = 8192usize;
+    let max_pulls = (max_mono / chunk_frames).saturating_add(8).max(8);
+
+    for _ in 0..max_pulls {
+        if mono.len() >= max_mono {
+            break;
+        }
+        let frames = if info.is_float {
+            let n = bass.channel_get_data_f32(handle, &mut float_chunk)?;
+            if n == 0 {
                 break;
             }
+            let frames = n / info.chans;
+            let need = (max_mono - mono.len()).min(frames);
+            for i in 0..need {
+                if info.chans == 1 {
+                    mono.push(float_chunk[i]);
+                } else {
+                    let mut acc = 0.0f32;
+                    for c in 0..info.chans {
+                        acc += float_chunk[i * info.chans + c];
+                    }
+                    mono.push(acc / info.chans as f32);
+                }
+            }
+            frames
+        } else {
+            let n = bass.channel_get_data_i16(handle, &mut i16_chunk)?;
+            if n == 0 {
+                break;
+            }
+            let frames = n / info.chans;
+            let need = (max_mono - mono.len()).min(frames);
+            for i in 0..need {
+                if info.chans == 1 {
+                    mono.push(i16_chunk[i] as f32 / 32768.0);
+                } else {
+                    let mut acc = 0.0f32;
+                    for c in 0..info.chans {
+                        acc += i16_chunk[i * info.chans + c] as f32;
+                    }
+                    mono.push((acc / info.chans as f32) / 32768.0);
+                }
+            }
+            frames
+        };
+        if frames == 0 {
+            break;
         }
+    }
+    Ok(mono)
+}
 
-        if mono.len() < (sample_rate as usize / 2) {
-            return Err(format!(
-                "Not enough audio to detect BPM (got {} samples, last pull {}, rate {} Hz, chans {}, float={})",
-                mono.len(),
-                last_pull,
-                sample_rate,
-                chans,
-                is_float
-            ));
-        }
-
-        estimate_bpm(&mono, sample_rate).ok_or_else(|| {
-            "Could not detect a stable BPM — try tapping instead".to_string()
+fn window_starts_secs(total_secs: f64) -> Vec<f64> {
+    if total_secs <= WINDOW_SECS + MIN_START_SKIP_SECS {
+        // Short file — single window from the start (tiny skip if possible).
+        let start = if total_secs > WINDOW_SECS + 1.0 {
+            MIN_START_SKIP_SECS.min(total_secs * 0.05)
+        } else {
+            0.0
+        };
+        return vec![start];
+    }
+    WINDOW_FRACS
+        .iter()
+        .map(|f| {
+            let raw = total_secs * f;
+            let max_start = (total_secs - WINDOW_SECS).max(0.0);
+            raw.clamp(MIN_START_SKIP_SECS, max_start)
         })
+        .collect()
+}
+
+fn detect_bpm_with_bass(bass: &BassLibrary, path: &str) -> Result<f32, String> {
+    let (handle, _mode) = open_decode(bass, path)?;
+
+    let result = (|| {
+        let info = decode_info(bass, handle)?;
+        let max_mono = ((WINDOW_SECS * info.sample_rate as f64) as usize).max(info.sample_rate as usize / 2);
+        let starts = window_starts_secs(info.total_secs);
+
+        let mut estimates: Vec<f32> = Vec::with_capacity(starts.len());
+        for (i, start) in starts.iter().enumerate() {
+            let pos = bass.channel_seconds2bytes(handle, *start);
+            if let Err(e) = bass.channel_set_position(handle, pos, bass::BASS_POS_BYTE) {
+                eprintln!("[bpm] seek window {i} @{start:.1}s failed: {e}");
+                continue;
+            }
+            let mono = pull_mono(bass, handle, &info, max_mono)?;
+            if mono.len() < info.sample_rate as usize / 2 {
+                eprintln!(
+                    "[bpm] window {i} too short ({} samples @ {} Hz)",
+                    mono.len(),
+                    info.sample_rate
+                );
+                continue;
+            }
+            match estimate_bpm(&mono, info.sample_rate) {
+                Some(bpm) => {
+                    eprintln!("[bpm] window {i} @{start:.1}s → {bpm}");
+                    estimates.push(bpm);
+                }
+                None => eprintln!("[bpm] window {i} @{start:.1}s → no estimate"),
+            }
+        }
+
+        if estimates.is_empty() {
+            return Err(
+                "Could not detect a stable BPM — try tapping instead".to_string(),
+            );
+        }
+
+        let bpm = vote_bpm(&estimates).ok_or_else(|| {
+            "Could not detect a stable BPM — try tapping instead".to_string()
+        })?;
+        Ok(bpm)
     })();
 
-    let _ = bass.channel_free(handle);
+    if let Err(e) = bass.channel_free(handle) {
+        eprintln!("[bpm] channel_free failed for {path}: {e}");
+    }
     match &result {
         Ok(bpm) => eprintln!("[bpm] detect ok for {path}: {bpm}"),
         Err(e) => eprintln!("[bpm] detect failed for {path}: {e}"),
@@ -151,47 +340,104 @@ fn detect_bpm_with_bass(bass: &BassLibrary, path: &str) -> Result<f32, String> {
     result
 }
 
-/// Parabolic peak interpolation: given y[i-1], y[i], y[i+1], return fractional
-/// offset in [-0.5, 0.5] from index i (0 when flat / degenerate).
-fn parabolic_offset(ym1: f32, y0: f32, yp1: f32) -> f32 {
-    let denom = 2.0 * (2.0 * y0 - yp1 - ym1);
-    if denom.abs() < 1e-12 {
-        return 0.0;
+/// Cluster window estimates and pick the strongest bin (median of that bin).
+fn vote_bpm(estimates: &[f32]) -> Option<f32> {
+    if estimates.is_empty() {
+        return None;
     }
-    ((yp1 - ym1) / denom).clamp(-0.5, 0.5)
+    if estimates.len() == 1 {
+        return Some(estimates[0]);
+    }
+
+    // Greedy clustering by proximity.
+    let mut used = vec![false; estimates.len()];
+    let mut best_cluster: Vec<f32> = Vec::new();
+
+    for i in 0..estimates.len() {
+        if used[i] {
+            continue;
+        }
+        let mut cluster = vec![estimates[i]];
+        used[i] = true;
+        for j in (i + 1)..estimates.len() {
+            if used[j] {
+                continue;
+            }
+            if (estimates[j] - estimates[i]).abs() <= VOTE_CLUSTER_BPM {
+                cluster.push(estimates[j]);
+                used[j] = true;
+            }
+        }
+        // Also merge members within tolerance of cluster mean (second pass).
+        let mean = cluster.iter().sum::<f32>() / cluster.len() as f32;
+        for j in 0..estimates.len() {
+            if used[j] {
+                continue;
+            }
+            if (estimates[j] - mean).abs() <= VOTE_CLUSTER_BPM {
+                cluster.push(estimates[j]);
+                used[j] = true;
+            }
+        }
+        if cluster.len() > best_cluster.len()
+            || (cluster.len() == best_cluster.len()
+                && cluster_spread(&cluster) < cluster_spread(&best_cluster))
+        {
+            best_cluster = cluster;
+        }
+    }
+
+    if best_cluster.is_empty() {
+        return None;
+    }
+    best_cluster.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = best_cluster[best_cluster.len() / 2];
+    Some(snap_bpm(mid))
 }
 
-/// Prefer whole BPM when close (tags are almost always integers); else 0.5 step.
-fn snap_bpm(bpm: f32) -> f32 {
-    let nearest_int = bpm.round();
-    if (bpm - nearest_int).abs() <= 0.4 {
-        return nearest_int.clamp(MIN_BPM, MAX_BPM);
+fn cluster_spread(c: &[f32]) -> f32 {
+    if c.is_empty() {
+        return f32::MAX;
     }
-    let half = (bpm * 2.0).round() / 2.0;
-    half.clamp(MIN_BPM, MAX_BPM)
+    let min = c.iter().cloned().fold(f32::INFINITY, f32::min);
+    let max = c.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    max - min
 }
 
-fn fold_bpm_range(mut bpm: f32) -> Option<f32> {
-    while bpm < MIN_BPM {
-        bpm *= 2.0;
-    }
-    while bpm > MAX_BPM {
-        bpm *= 0.5;
-    }
-    if (MIN_BPM..=MAX_BPM).contains(&bpm) {
-        Some(bpm)
-    } else {
-        None
-    }
-}
+// ── Core analysis (per window) ───────────────────────────────────────────────
 
-/// Envelope → autocorrelation + IOI histogram BPM estimate.
+/// Envelope → autocorrelation + IOI histogram BPM estimate for one mono window.
 pub fn estimate_bpm(mono: &[f32], sample_rate: u32) -> Option<f32> {
     if mono.len() < sample_rate as usize / 2 || sample_rate < 8000 {
         return None;
     }
 
-    // RMS energy per hop.
+    let onset = compute_onset_envelope(mono)?;
+    let hop_rate = sample_rate as f32 / HOP as f32;
+    let min_lag = ((hop_rate * 60.0 / MAX_BPM).floor() as usize).max(2);
+    let max_lag = ((hop_rate * 60.0 / MIN_BPM).ceil() as usize).min(onset.len() / 2);
+    if max_lag <= min_lag + 2 {
+        return None;
+    }
+
+    let (corr_scores, best_corr) = compute_autocorrelation(&onset, min_lag, max_lag)?;
+    let hist_sm = compute_ioi_histogram(&onset, min_lag, max_lag);
+    let hist_peak = hist_sm.iter().cloned().fold(0.0f32, f32::max).max(1e-9);
+
+    let mut lag = score_candidates(
+        hop_rate,
+        min_lag,
+        max_lag,
+        &corr_scores,
+        best_corr,
+        &hist_sm,
+        hist_peak,
+    )?;
+    lag = walk_octave_down(lag, hop_rate, max_lag, &corr_scores);
+    refine_and_fold(lag, hop_rate, min_lag, max_lag, &corr_scores, &hist_sm, hist_peak, best_corr)
+}
+
+fn compute_energy_envelope(mono: &[f32]) -> Option<Vec<f32>> {
     let mut energy = Vec::with_capacity(mono.len() / HOP + 1);
     let mut i = 0;
     while i + HOP <= mono.len() {
@@ -203,10 +449,14 @@ pub fn estimate_bpm(mono: &[f32], sample_rate: u32) -> Option<f32> {
         i += HOP;
     }
     if energy.len() < 64 {
-        return None;
+        None
+    } else {
+        Some(energy)
     }
+}
 
-    // Onset strength = positive energy diff, lightly smoothed.
+fn compute_onset_envelope(mono: &[f32]) -> Option<Vec<f32>> {
+    let energy = compute_energy_envelope(mono)?;
     let mut onset = vec![0.0f32; energy.len()];
     for i in 1..energy.len() {
         let d = energy[i] - energy[i - 1];
@@ -219,7 +469,6 @@ pub fn estimate_bpm(mono: &[f32], sample_rate: u32) -> Option<f32> {
         }
         onset = sm;
     }
-
     let peak = onset.iter().cloned().fold(0.0f32, f32::max);
     if peak < 1e-9 {
         return None;
@@ -227,15 +476,14 @@ pub fn estimate_bpm(mono: &[f32], sample_rate: u32) -> Option<f32> {
     for v in &mut onset {
         *v /= peak;
     }
+    Some(onset)
+}
 
-    let hop_rate = sample_rate as f32 / HOP as f32;
-    let min_lag = ((hop_rate * 60.0 / MAX_BPM).floor() as usize).max(2);
-    let max_lag = ((hop_rate * 60.0 / MIN_BPM).ceil() as usize).min(onset.len() / 2);
-    if max_lag <= min_lag + 2 {
-        return None;
-    }
-
-    // --- Autocorrelation (raw; no 2× bonus — that boosted double-tempo false peaks) ---
+fn compute_autocorrelation(
+    onset: &[f32],
+    min_lag: usize,
+    max_lag: usize,
+) -> Option<(Vec<f32>, f32)> {
     let mut corr_scores = vec![0.0f32; max_lag + 1];
     let mut best_corr = f32::NEG_INFINITY;
     for lag in min_lag..=max_lag {
@@ -251,14 +499,16 @@ pub fn estimate_bpm(mono: &[f32], sample_rate: u32) -> Option<f32> {
         }
     }
     if best_corr < 1e-9 {
-        return None;
+        None
+    } else {
+        Some((corr_scores, best_corr))
     }
+}
 
-    // --- Peak-picking IOI histogram ---
-    let thresh = 0.12f32;
+fn compute_ioi_histogram(onset: &[f32], min_lag: usize, max_lag: usize) -> Vec<f32> {
     let mut peaks: Vec<usize> = Vec::new();
     for i in 2..onset.len().saturating_sub(2) {
-        if onset[i] >= thresh
+        if onset[i] >= ONSET_PEAK_THRESH
             && onset[i] >= onset[i - 1]
             && onset[i] >= onset[i + 1]
             && onset[i] >= onset[i - 2]
@@ -290,19 +540,27 @@ pub fn estimate_bpm(mono: &[f32], sample_rate: u32) -> Option<f32> {
         }
         hist_sm[i] = s / c;
     }
-    let hist_peak = hist_sm.iter().cloned().fold(0.0f32, f32::max).max(1e-9);
+    hist_sm
+}
 
-    // Local peaks in the autocorrelation (not just global max — global often = double-tempo).
+fn score_candidates(
+    hop_rate: f32,
+    min_lag: usize,
+    max_lag: usize,
+    corr_scores: &[f32],
+    best_corr: f32,
+    hist_sm: &[f32],
+    hist_peak: f32,
+) -> Option<usize> {
     let mut lag_peaks: Vec<usize> = Vec::new();
     for lag in (min_lag + 1)..max_lag {
         if corr_scores[lag] >= corr_scores[lag - 1]
             && corr_scores[lag] >= corr_scores[lag + 1]
-            && corr_scores[lag] > best_corr * 0.35
+            && corr_scores[lag] > best_corr * CORR_PEAK_REL
         {
             lag_peaks.push(lag);
         }
     }
-    // Always consider global max too.
     let global_max_lag = (min_lag..=max_lag)
         .max_by(|a, b| {
             corr_scores[*a]
@@ -314,9 +572,6 @@ pub fn estimate_bpm(mono: &[f32], sample_rate: u32) -> Option<f32> {
         lag_peaks.push(global_max_lag);
     }
 
-    // Score each peak lag as a *musical* tempo candidate.
-    // Prefer the period where BOTH the beat lag and 2×lag (two-beat) are strong,
-    // and apply a mild prior around ~120 so 179 loses to 90/124 when ambiguous.
     let mut best_score = f32::NEG_INFINITY;
     let mut chosen_lag = global_max_lag;
     for &lag in &lag_peaks {
@@ -328,8 +583,6 @@ pub fn estimate_bpm(mono: &[f32], sample_rate: u32) -> Option<f32> {
         } else {
             0.0
         };
-        // Half-lag = double tempo. If half is *stronger*, this lag is likely the true beat
-        // (we are at the slower period). If half is weak, lag may already be correct.
         let lag_half = lag / 2;
         let half = if lag_half >= min_lag && lag % 2 == 0 {
             corr_scores[lag_half] / best_corr
@@ -339,13 +592,13 @@ pub fn estimate_bpm(mono: &[f32], sample_rate: u32) -> Option<f32> {
 
         let bpm = 60.0 * hop_rate / lag as f32;
         let prior = tempo_prior(bpm);
-
-        // Penalize being the double-tempo of a strong half-period.
-        let double_penalty = if half > corr_n * 0.9 { 0.75 } else { 1.0 };
-        // Reward having a solid two-beat correlation (true meters usually do).
-        let bar_bonus = 1.0 + 0.2 * two_beat;
-
-        let score = (corr_n * 0.55 + hist_n * 0.20 + two_beat * 0.25)
+        let double_penalty = if half > corr_n * DOUBLE_TEMPO_HALF_RATIO {
+            DOUBLE_TEMPO_PENALTY
+        } else {
+            1.0
+        };
+        let bar_bonus = 1.0 + BAR_BONUS_SCALE * two_beat;
+        let score = (corr_n * W_CORR + hist_n * W_HIST + two_beat * W_TWO_BEAT)
             * prior
             * double_penalty
             * bar_bonus;
@@ -356,57 +609,78 @@ pub fn estimate_bpm(mono: &[f32], sample_rate: u32) -> Option<f32> {
         }
     }
 
-    if best_score < 0.05 && best_corr < 0.002 {
-        return None;
+    if best_score < WEAK_SCORE_MIN && best_corr < WEAK_CORR_MIN {
+        None
+    } else {
+        Some(chosen_lag)
     }
+}
 
-    // Walk toward slower tempi while 2×lag stays competitive (8th-notes → quarter).
-    let mut lag_i = chosen_lag;
+fn walk_octave_down(
+    mut lag: usize,
+    hop_rate: f32,
+    max_lag: usize,
+    corr_scores: &[f32],
+) -> usize {
+    // Only step to a slower period when that tempo stays musically plausible.
+    // Pure click trains have strong corr at 2×lag (→ half BPM); without a floor
+    // this collapses 160 → 80.
     loop {
-        let lag2 = lag_i * 2;
+        let lag2 = lag * 2;
         if lag2 > max_lag {
             break;
         }
-        let c1 = corr_scores[lag_i];
+        let slower_bpm = 60.0 * hop_rate / lag2 as f32;
+        if slower_bpm < SWEET_BPM_LO {
+            break;
+        }
+        let c1 = corr_scores[lag];
         let c2 = corr_scores[lag2];
-        if c2 >= c1 * 0.70 {
-            lag_i = lag2;
+        if c2 >= c1 * OCTAVE_DOWN_RATIO {
+            lag = lag2;
             continue;
         }
         break;
     }
+    lag
+}
 
-    // Sub-lag refine via parabola.
-    let refined_lag = {
-        let ym1 = if lag_i > min_lag {
-            corr_scores[lag_i - 1]
-        } else {
-            corr_scores[lag_i]
-        };
-        let y0 = corr_scores[lag_i];
-        let yp1 = if lag_i < max_lag {
-            corr_scores[lag_i + 1]
-        } else {
-            corr_scores[lag_i]
-        };
-        let frac = parabolic_offset(ym1, y0, yp1);
-        (lag_i as f32 + frac).max(min_lag as f32)
+fn refine_and_fold(
+    lag_i: usize,
+    hop_rate: f32,
+    min_lag: usize,
+    max_lag: usize,
+    corr_scores: &[f32],
+    hist_sm: &[f32],
+    hist_peak: f32,
+    best_corr: f32,
+) -> Option<f32> {
+    let ym1 = if lag_i > min_lag {
+        corr_scores[lag_i - 1]
+    } else {
+        corr_scores[lag_i]
     };
+    let y0 = corr_scores[lag_i];
+    let yp1 = if lag_i < max_lag {
+        corr_scores[lag_i + 1]
+    } else {
+        corr_scores[lag_i]
+    };
+    let frac = parabolic_offset(ym1, y0, yp1);
+    let refined_lag = (lag_i as f32 + frac).max(min_lag as f32);
 
     let mut bpm = fold_bpm_range(60.0 * hop_rate / refined_lag)?;
     bpm = snap_bpm(bpm);
 
-    // Edge BPMs (near 70 or 180) are usually octave errors. Prefer the best
-    // peak inside the common song range when it is not much weaker.
-    if !(95.0..=150.0).contains(&bpm) {
+    if !(SWEET_BPM_LO..=SWEET_BPM_HI).contains(&bpm) {
         if let Some(alt) = best_bpm_in_range(
-            95.0,
-            150.0,
+            SWEET_BPM_LO,
+            SWEET_BPM_HI,
             hop_rate,
             min_lag,
             max_lag,
-            &corr_scores,
-            &hist_sm,
+            corr_scores,
+            hist_sm,
             hist_peak,
             best_corr,
         ) {
@@ -414,23 +688,23 @@ pub fn estimate_bpm(mono: &[f32], sample_rate: u32) -> Option<f32> {
             let lag_alt = bpm_to_lag(alt, hop_rate, min_lag, max_lag);
             let c_cur = corr_scores.get(lag_cur).copied().unwrap_or(0.0);
             let c_alt = corr_scores.get(lag_alt).copied().unwrap_or(0.0);
-            // Switch if the common-range peak is at least ~half as strong.
-            if c_alt >= c_cur * 0.45 || c_alt >= best_corr * 0.40 {
+            if c_alt >= c_cur * SWEET_ALT_CORR_RATIO || c_alt >= best_corr * SWEET_ALT_BEST_RATIO {
                 bpm = snap_bpm(alt);
             }
         }
     }
 
-    // Final octave nudge for remaining high outliers (179 → 89.5 is still wrong,
-    // but 160+ almost always wants /2 when half is in-range and not dead).
-    if bpm > 155.0 {
+    if bpm > HIGH_BPM_CUTOFF {
         if let Some(half) = fold_bpm_range(bpm * 0.5) {
-            let lag_h = bpm_to_lag(half, hop_rate, min_lag, max_lag);
-            let lag_b = bpm_to_lag(bpm, hop_rate, min_lag, max_lag);
-            let c_h = corr_scores.get(lag_h).copied().unwrap_or(0.0);
-            let c_b = corr_scores.get(lag_b).copied().unwrap_or(0.0);
-            if c_h >= c_b * 0.50 {
-                bpm = snap_bpm(half);
+            // Avoid collapsing real 160–167 tracks to 80–83.
+            if half >= HIGH_BPM_HALF_MIN {
+                let lag_h = bpm_to_lag(half, hop_rate, min_lag, max_lag);
+                let lag_b = bpm_to_lag(bpm, hop_rate, min_lag, max_lag);
+                let c_h = corr_scores.get(lag_h).copied().unwrap_or(0.0);
+                let c_b = corr_scores.get(lag_b).copied().unwrap_or(0.0);
+                if c_h >= c_b * HIGH_BPM_HALF_RATIO {
+                    bpm = snap_bpm(half);
+                }
             }
         }
     }
@@ -438,12 +712,44 @@ pub fn estimate_bpm(mono: &[f32], sample_rate: u32) -> Option<f32> {
     Some(bpm)
 }
 
+// ── Small helpers ────────────────────────────────────────────────────────────
+
+fn parabolic_offset(ym1: f32, y0: f32, yp1: f32) -> f32 {
+    let denom = 2.0 * (2.0 * y0 - yp1 - ym1);
+    if denom.abs() < 1e-12 {
+        return 0.0;
+    }
+    ((yp1 - ym1) / denom).clamp(-0.5, 0.5)
+}
+
+fn snap_bpm(bpm: f32) -> f32 {
+    let nearest_int = bpm.round();
+    if (bpm - nearest_int).abs() <= SNAP_INT_TOL {
+        return nearest_int.clamp(MIN_BPM, MAX_BPM);
+    }
+    let half = (bpm * 2.0).round() / 2.0;
+    half.clamp(MIN_BPM, MAX_BPM)
+}
+
+fn fold_bpm_range(mut bpm: f32) -> Option<f32> {
+    while bpm < MIN_BPM {
+        bpm *= 2.0;
+    }
+    while bpm > MAX_BPM {
+        bpm *= 0.5;
+    }
+    if (MIN_BPM..=MAX_BPM).contains(&bpm) {
+        Some(bpm)
+    } else {
+        None
+    }
+}
+
 fn bpm_to_lag(bpm: f32, hop_rate: f32, min_lag: usize, max_lag: usize) -> usize {
     let lag = (60.0 * hop_rate / bpm).round() as usize;
     lag.clamp(min_lag, max_lag)
 }
 
-/// Best BPM inside [lo, hi] by combined corr/hist score (parabolically refined).
 fn best_bpm_in_range(
     lo: f32,
     hi: f32,
@@ -455,7 +761,7 @@ fn best_bpm_in_range(
     hist_peak: f32,
     best_corr: f32,
 ) -> Option<f32> {
-    let lag_lo = bpm_to_lag(hi, hop_rate, min_lag, max_lag); // higher BPM → shorter lag
+    let lag_lo = bpm_to_lag(hi, hop_rate, min_lag, max_lag);
     let lag_hi = bpm_to_lag(lo, hop_rate, min_lag, max_lag);
     if lag_hi <= lag_lo + 1 {
         return None;
@@ -488,14 +794,13 @@ fn best_bpm_in_range(
     fold_bpm_range(60.0 * hop_rate / refined)
 }
 
-/// Mild prior: common song tempos cluster near 100–130. Far outliers (e.g. 179)
-/// need a clearly stronger correlation to win.
 fn tempo_prior(bpm: f32) -> f32 {
-    let z = (bpm - 118.0) / 28.0;
+    let z = (bpm - PRIOR_CENTER) / PRIOR_SIGMA;
     let g = (-0.5 * z * z).exp();
-    // Keep a floor so rare slow/fast tracks still work.
-    0.30 + 0.70 * g
+    PRIOR_FLOOR + PRIOR_SCALE * g
 }
+
+// ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -532,10 +837,39 @@ mod tests {
         let sr = 44100u32;
         let mono = synth_clicks(sr, 124.0, 25.0);
         let est = estimate_bpm(&mono, sr).expect("bpm");
+        assert!((est - 124.0).abs() < 1.0, "expected ~124, got {est}");
+    }
+
+    #[test]
+    fn prefers_160_over_80_for_fast_clicks() {
+        // Strong 160 BPM click train — should not collapse to 80.
+        let sr = 44100u32;
+        let mono = synth_clicks(sr, 160.0, 25.0);
+        let est = estimate_bpm(&mono, sr).expect("bpm");
         assert!(
-            (est - 124.0).abs() < 1.0,
-            "expected ~124, got {est} (was rounding to 122.5)"
+            (est - 160.0).abs() < 3.0,
+            "expected ~160 (not half), got {est}"
         );
+    }
+
+    #[test]
+    fn silence_returns_none() {
+        let sr = 44100u32;
+        let mono = vec![0.0f32; sr as usize * 5];
+        assert!(estimate_bpm(&mono, sr).is_none());
+    }
+
+    #[test]
+    fn short_buffer_returns_none() {
+        let sr = 44100u32;
+        let mono = vec![0.1f32; 1000];
+        assert!(estimate_bpm(&mono, sr).is_none());
+    }
+
+    #[test]
+    fn low_sample_rate_returns_none() {
+        let mono = synth_clicks(4000, 120.0, 10.0);
+        assert!(estimate_bpm(&mono, 4000).is_none());
     }
 
     #[test]
@@ -543,7 +877,25 @@ mod tests {
         assert_eq!(snap_bpm(123.8), 124.0);
         assert_eq!(snap_bpm(123.9), 124.0);
         assert_eq!(snap_bpm(122.2), 122.0);
-        // Far from integer → half-step grid
         assert_eq!(snap_bpm(122.6), 122.5);
+    }
+
+    #[test]
+    fn vote_picks_majority_cluster() {
+        let v = vote_bpm(&[122.5, 124.0, 124.0, 179.0]).unwrap();
+        assert!((v - 124.0).abs() < 1.0, "vote got {v}");
+    }
+
+    #[test]
+    fn window_starts_short_file() {
+        let w = window_starts_secs(20.0);
+        assert_eq!(w.len(), 1);
+    }
+
+    #[test]
+    fn window_starts_long_file() {
+        let w = window_starts_secs(200.0);
+        assert_eq!(w.len(), 3);
+        assert!(w[0] < w[1] && w[1] < w[2]);
     }
 }
