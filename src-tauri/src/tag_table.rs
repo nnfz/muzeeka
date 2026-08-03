@@ -301,6 +301,49 @@ pub fn write_tag_table(path: &Path, rows: &[TagTableRow]) -> Result<(), String> 
     Ok(())
 }
 
+/// Write BPM into file tags (`Bpm` + `IntegerBpm` for max format compatibility).
+/// Does not touch other fields.
+pub fn write_bpm(path: &Path, bpm: f32) -> Result<(), String> {
+    if !bpm.is_finite() || bpm <= 0.0 {
+        return Err("Invalid BPM".into());
+    }
+    let bpm = bpm.clamp(1.0, 999.0);
+    let int_bpm = bpm.round().clamp(1.0, 999.0) as u32;
+    // Prefer a clean integer string when close; keep one decimal otherwise.
+    let text = if (bpm - int_bpm as f32).abs() < 0.05 {
+        format!("{int_bpm}")
+    } else {
+        format!("{bpm:.1}")
+    };
+
+    let mut tagged = open_tagged(path)?;
+    let tag = primary_or_insert(&mut tagged)?;
+    tag.insert_text(ItemKey::Bpm, text.clone());
+    tag.insert_text(ItemKey::IntegerBpm, int_bpm.to_string());
+    tagged
+        .save_to_path(path, WriteOptions::default())
+        .map_err(|e| format!("Failed to save BPM tags: {e}"))?;
+    Ok(())
+}
+
+/// Read BPM from tags (`Bpm` preferred, then `IntegerBpm`).
+pub fn read_bpm(path: &Path) -> Option<f32> {
+    let tagged = open_tagged_text_only(path).ok()?;
+    let tag = tagged.primary_tag().or_else(|| tagged.first_tag())?;
+    let parse = |s: &str| -> Option<f32> {
+        let t = s.trim().replace(',', ".");
+        let v: f32 = t.parse().ok()?;
+        if v.is_finite() && v > 0.0 && v < 1000.0 {
+            Some(v)
+        } else {
+            None
+        }
+    };
+    tag.get_string(ItemKey::Bpm)
+        .and_then(parse)
+        .or_else(|| tag.get_string(ItemKey::IntegerBpm).and_then(parse))
+}
+
 /// Pull common library fields out of a saved table for SQLite / UI.
 pub fn track_fields_from_table(rows: &[TagTableRow]) -> TrackFieldsFromTable {
     let get = |id: &str| -> Option<String> {

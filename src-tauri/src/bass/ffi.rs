@@ -58,6 +58,8 @@ pub struct BassLibrary {
     bass_channel_is_active: unsafe extern "system" fn(handle: DWORD) -> DWORD,
     #[allow(dead_code)] // used by channel_get_level
     bass_channel_get_level: unsafe extern "system" fn(handle: DWORD) -> DWORD,
+    bass_channel_get_data:
+        unsafe extern "system" fn(handle: DWORD, buffer: *mut std::ffi::c_void, length: DWORD) -> DWORD,
 
     // ── Config / DSP ──────────────────────────────────────────────────────────
     bass_set_config: unsafe extern "system" fn(option: DWORD, value: f32) -> BOOL,
@@ -209,6 +211,7 @@ impl BassLibrary {
                 bass_channel_get_info: load_fn!(lib, b"BASS_ChannelGetInfo\0"),
                 bass_channel_is_active: load_fn!(lib, b"BASS_ChannelIsActive\0"),
                 bass_channel_get_level: load_fn!(lib, b"BASS_ChannelGetLevel\0"),
+                bass_channel_get_data: load_fn!(lib, b"BASS_ChannelGetData\0"),
                 bass_set_config: load_fn!(lib, b"BASS_SetConfig\0"),
                 bass_channel_set_dsp: load_fn!(lib, b"BASS_ChannelSetDSP\0"),
                 bass_channel_set_dsp_ex: load_fn!(lib, b"BASS_ChannelSetDSPEx\0"),
@@ -419,6 +422,69 @@ impl BassLibrary {
     #[allow(dead_code)] // public BASS API surface; not yet used by player
     pub fn channel_get_level(&self, handle: DWORD) -> DWORD {
         unsafe { (self.bass_channel_get_level)(handle) }
+    }
+
+    /// Soft EOF / empty for decode-channel `ChannelGetData` pulls.
+    fn channel_get_data_is_eof(&self, got: DWORD) -> bool {
+        if got != DWORD::MAX {
+            return got == 0;
+        }
+        let code = self.last_error();
+        matches!(code, BassError::Ended | BassError::Ok | BassError::Decode)
+            || code.code() == 0
+    }
+
+    /// Pull float PCM from a decode stream. `buffer` length is in **samples**.
+    /// Returns samples written (0 at EOF).
+    pub fn channel_get_data_f32(&self, handle: DWORD, buffer: &mut [f32]) -> Result<usize, String> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        let want_bytes = (buffer.len() * std::mem::size_of::<f32>()) as DWORD;
+        let length = want_bytes | BASS_DATA_FLOAT;
+        let got = unsafe {
+            (self.bass_channel_get_data)(
+                handle,
+                buffer.as_mut_ptr() as *mut std::ffi::c_void,
+                length,
+            )
+        };
+        if self.channel_get_data_is_eof(got) {
+            return Ok(0);
+        }
+        if got == DWORD::MAX {
+            return Err(format!(
+                "BASS_ChannelGetData(float) failed: {}",
+                self.last_error_string()
+            ));
+        }
+        Ok((got as usize) / std::mem::size_of::<f32>())
+    }
+
+    /// Pull 16-bit PCM from a decode stream. `buffer` length is in **samples**.
+    /// Returns samples written (0 at EOF).
+    pub fn channel_get_data_i16(&self, handle: DWORD, buffer: &mut [i16]) -> Result<usize, String> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        let want_bytes = (buffer.len() * std::mem::size_of::<i16>()) as DWORD;
+        let got = unsafe {
+            (self.bass_channel_get_data)(
+                handle,
+                buffer.as_mut_ptr() as *mut std::ffi::c_void,
+                want_bytes,
+            )
+        };
+        if self.channel_get_data_is_eof(got) {
+            return Ok(0);
+        }
+        if got == DWORD::MAX {
+            return Err(format!(
+                "BASS_ChannelGetData(i16) failed: {}",
+                self.last_error_string()
+            ));
+        }
+        Ok((got as usize) / std::mem::size_of::<i16>())
     }
 
     pub fn set_config(&self, option: DWORD, value: f32) -> Result<(), String> {

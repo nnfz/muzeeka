@@ -460,6 +460,21 @@ impl Player {
         self.run_on_bass_thread(|inner| Self::init_inner(inner))
     }
 
+    /// Run a closure with the live `BassLibrary` on the BASS thread (for analysis etc.).
+    pub fn with_bass<F, T>(&self, f: F) -> Result<T, String>
+    where
+        F: FnOnce(&BassLibrary) -> Result<T, String> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.run_on_bass_thread(move |inner| {
+            let bass = inner
+                .bass
+                .as_ref()
+                .ok_or_else(|| "BASS is not initialized".to_string())?;
+            f(bass)
+        })
+    }
+
     fn init_inner(inner: &mut PlayerInner) -> Result<(), String> {
         if inner.bass.is_some() {
             return Ok(());

@@ -248,6 +248,12 @@ pub const BASS_STREAM_AUTOFREE: DWORD = 0x40000;
 pub const BASS_STREAM_DECODE: DWORD = 0x200000;
 pub const BASS_UNICODE: DWORD = 0x80000000;
 pub const BASS_SAMPLE_FLOAT: DWORD = 256;
+/// Downmix to mono when creating a stream (good for analysis).
+pub const BASS_SAMPLE_MONO: DWORD = 2;
+
+// ── ChannelGetData flags ─────────────────────────────────────────────────────
+/// Request floating-point PCM (OR with byte length).
+pub const BASS_DATA_FLOAT: DWORD = 0x4000_0000;
 
 // ── Position mode ─────────────────────────────────────────────────────────────
 pub const BASS_POS_BYTE: DWORD = 0;

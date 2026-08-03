@@ -94,6 +94,18 @@
   let trackRateError = $state<string | null>(null);
   let trackRateSuccess = $state<string | null>(null);
 
+  // BPM (written into file tags)
+  let bpmValue = $state<number | null>(null);
+  let bpmDraft = $state("");
+  let bpmBusy = $state(false);
+  let bpmDetecting = $state(false);
+  let bpmError = $state<string | null>(null);
+  let bpmSuccess = $state<string | null>(null);
+  let bpmTapTimes = $state<number[]>([]);
+  let bpmTapEstimate = $state<number | null>(null);
+  let bpmTapFlash = $state(false);
+  let bpmTapResetTimer: ReturnType<typeof setTimeout> | null = null;
+
   let coverBusy = $state(false);
   let coverFailed = $state(false);
   let tableLoading = $state(false);
@@ -246,9 +258,100 @@
     return Math.max(0, Math.min(100, ((rate - 0.25) / (2 - 0.25)) * 100));
   }
 
+  function formatBpm(n: number | null | undefined): string {
+    if (n == null || !Number.isFinite(n) || n <= 0) return "—";
+    return Number.isInteger(n) ? String(n) : n.toFixed(1);
+  }
+
+  function parseBpmInput(raw: string): number | null {
+    const t = raw.trim().replace(",", ".");
+    if (!t) return null;
+    const n = Number(t);
+    if (!Number.isFinite(n) || n < 1 || n >= 1000) return null;
+    return Math.round(n * 10) / 10;
+  }
+
+  function clearBpmTapTimer() {
+    if (bpmTapResetTimer) {
+      clearTimeout(bpmTapResetTimer);
+      bpmTapResetTimer = null;
+    }
+  }
+
+  function scheduleBpmTapReset() {
+    clearBpmTapTimer();
+    // Idle for 2.5s → start a new tap series.
+    bpmTapResetTimer = setTimeout(() => {
+      bpmTapTimes = [];
+      bpmTapEstimate = null;
+      bpmTapResetTimer = null;
+    }, 2500);
+  }
+
+  function recomputeTapBpm(times: number[]) {
+    if (times.length < 2) {
+      bpmTapEstimate = null;
+      return;
+    }
+    const intervals: number[] = [];
+    for (let i = 1; i < times.length; i++) {
+      const d = times[i] - times[i - 1];
+      // Ignore absurd intervals (slower than 30 BPM / faster than 300 BPM).
+      if (d >= 200 && d <= 2000) intervals.push(d);
+    }
+    if (intervals.length === 0) {
+      bpmTapEstimate = null;
+      return;
+    }
+    // Median interval is robust to one late tap.
+    const sorted = [...intervals].sort((a, b) => a - b);
+    const mid = sorted[Math.floor(sorted.length / 2)];
+    const bpm = 60000 / mid;
+    bpmTapEstimate = Math.round(bpm * 10) / 10;
+    bpmDraft = formatBpm(bpmTapEstimate).replace("—", "");
+  }
+
+  function handleBpmTap() {
+    const now = performance.now();
+    const times = [...bpmTapTimes, now].slice(-12);
+    bpmTapTimes = times;
+    recomputeTapBpm(times);
+    scheduleBpmTapReset();
+    bpmTapFlash = true;
+    setTimeout(() => {
+      bpmTapFlash = false;
+    }, 80);
+    bpmError = null;
+    bpmSuccess = null;
+  }
+
+  async function loadBpmFromFile(t: MusicFile, gen = loadGen) {
+    try {
+      const bpm = await invoke<number | null>("library_get_bpm", {
+        path: t.path,
+        audioPath: t.audio_path ?? null,
+      });
+      if (!stillCurrent(t, gen)) return;
+      bpmValue = bpm;
+      bpmDraft = bpm != null ? formatBpm(bpm).replace("—", "") : "";
+    } catch {
+      if (!stillCurrent(t, gen)) return;
+      // Fall back to tag table if present.
+      const fromRows =
+        parseBpmInput(rowValue("Bpm")) ?? parseBpmInput(rowValue("IntegerBpm"));
+      bpmValue = fromRows;
+      bpmDraft = fromRows != null ? formatBpm(fromRows).replace("—", "") : "";
+    }
+  }
+
   async function loadTrackPrefs(t: MusicFile, gen = loadGen) {
     trackRateError = null;
     trackRateSuccess = null;
+    bpmError = null;
+    bpmSuccess = null;
+    bpmTapTimes = [];
+    bpmTapEstimate = null;
+    clearBpmTapTimer();
     try {
       const override = await getTrackPlaybackRate(t.path);
       if (!stillCurrent(t, gen)) return;
@@ -260,6 +363,83 @@
       trackRateDraft = getCachedGlobalPlaybackRate();
       trackRateError = typeof e === "string" ? e : String(e);
     }
+    await loadBpmFromFile(t, gen);
+  }
+
+  async function handleDetectBpm() {
+    if (!track || bpmDetecting || bpmBusy) return;
+    const t = track;
+    const gen = loadGen;
+    bpmDetecting = true;
+    bpmError = null;
+    bpmSuccess = null;
+    try {
+      // Ensure shared player/BASS is up (main already does this; cheap no-op).
+      try {
+        await invoke("player_init");
+      } catch {
+        /* ignore — detect will error with a clearer message if BASS is dead */
+      }
+      const bpm = await invoke<number>("library_detect_bpm", {
+        path: t.path,
+        audioPath: t.audio_path ?? null,
+      });
+      if (!stillCurrent(t, gen)) return;
+      const rounded = Math.round(bpm * 10) / 10;
+      bpmDraft = formatBpm(rounded).replace("—", "");
+      bpmTapEstimate = rounded;
+      bpmSuccess = `Detected ${formatBpm(rounded)} BPM — press Write to save tags`;
+    } catch (e) {
+      if (!stillCurrent(t, gen)) return;
+      const msg = typeof e === "string" ? e : String(e);
+      bpmError = msg.replace(/^Error:\s*/i, "");
+      console.error("[bpm] detect failed", e);
+    } finally {
+      if (gen === loadGen) bpmDetecting = false;
+    }
+  }
+
+  async function handleWriteBpm() {
+    if (!track || bpmBusy) return;
+    const bpm = parseBpmInput(bpmDraft);
+    if (bpm == null) {
+      bpmError = "Enter a BPM between 1 and 999";
+      return;
+    }
+    bpmBusy = true;
+    bpmError = null;
+    bpmSuccess = null;
+    try {
+      const updated = await invoke<MusicFile>("library_set_track_bpm", {
+        path: track.path,
+        audioPath: track.audio_path ?? null,
+        bpm,
+        snapshot: track,
+      });
+      if (!stillCurrent(track, loadGen)) return;
+      track = {
+        ...updated,
+        cover_path: updated.cover_path ?? track.cover_path,
+        cover_path_full: updated.cover_path_full ?? track.cover_path_full,
+      };
+      bpmValue = bpm;
+      bpmDraft = formatBpm(bpm).replace("—", "");
+      bpmSuccess = isCue
+        ? `BPM ${formatBpm(bpm)} written to audio image tags`
+        : `BPM ${formatBpm(bpm)} written to file tags`;
+      // Refresh metadata table so BPM rows appear.
+      await loadTagTable(track);
+    } catch (e) {
+      bpmError = typeof e === "string" ? e : String(e);
+    } finally {
+      bpmBusy = false;
+    }
+  }
+
+  function handleBpmDraftInput(e: Event) {
+    bpmDraft = (e.currentTarget as HTMLInputElement).value;
+    bpmError = null;
+    bpmSuccess = null;
   }
 
   async function commitTrackRate(rate: number | null) {
@@ -329,6 +509,13 @@
     trackRateDraft = getCachedGlobalPlaybackRate();
     trackRateError = null;
     trackRateSuccess = null;
+    bpmValue = null;
+    bpmDraft = "";
+    bpmError = null;
+    bpmSuccess = null;
+    bpmTapTimes = [];
+    bpmTapEstimate = null;
+    clearBpmTapTimer();
 
     void loadTechFor(next, gen);
     void loadTrackPrefs(next, gen);
@@ -1345,8 +1532,8 @@
             <div>
               <h2 class="section-title">Muzeeka</h2>
               <p class="section-desc">
-                App-only extras for this track — stored in Muzeeka, never written
-                into the audio file.
+                App extras for this track. Speed stays in Muzeeka only; BPM is
+                written into the file tags.
               </p>
             </div>
           </div>
@@ -1358,7 +1545,7 @@
                   <div class="card-label">Playback speed</div>
                   <div class="card-value">
                     {#if trackRateOverride != null}
-                      Custom for this track
+                      Custom for this track (app-only)
                     {:else}
                       Using global speed from Settings ({getCachedGlobalPlaybackRate().toFixed(2)}×)
                     {/if}
@@ -1415,23 +1602,106 @@
                 </button>
               </div>
             </div>
+
+            <div class="muzeeka-divider"></div>
+
+            <div class="muzeeka-feature">
+              <div class="muzeeka-feature-head">
+                <div>
+                  <div class="card-label">BPM</div>
+                  <div class="card-value">
+                    {#if bpmValue != null}
+                      In file tags: {formatBpm(bpmValue)}
+                    {:else}
+                      No BPM in tags yet — tap, detect, or type, then Write
+                    {/if}
+                  </div>
+                </div>
+                <div class="rate-display">
+                  <span class="rate-value-big bpm-value">
+                    {#if bpmTapEstimate != null}
+                      {formatBpm(bpmTapEstimate)}
+                    {:else if parseBpmInput(bpmDraft) != null}
+                      {formatBpm(parseBpmInput(bpmDraft))}
+                    {:else}
+                      —
+                    {/if}
+                  </span>
+                </div>
+              </div>
+
+              <div class="bpm-toolbar">
+                <input
+                  class="props-input bpm-input"
+                  type="text"
+                  inputmode="decimal"
+                  placeholder="BPM"
+                  value={bpmDraft}
+                  disabled={!track || bpmBusy || bpmDetecting}
+                  oninput={handleBpmDraftInput}
+                  onkeydown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      void handleWriteBpm();
+                    }
+                  }}
+                />
+                <button
+                  type="button"
+                  class="action-btn bpm-btn"
+                  class:flash={bpmTapFlash}
+                  disabled={!track || bpmBusy || bpmDetecting}
+                  onclick={handleBpmTap}
+                  title="Tap along with the beat (fills BPM field)"
+                >
+                  Tap{#if bpmTapTimes.length > 0}&nbsp;·&nbsp;{bpmTapTimes.length}{/if}
+                </button>
+                <button
+                  type="button"
+                  class="action-btn bpm-btn"
+                  disabled={!track || bpmBusy || bpmDetecting}
+                  onclick={() => void handleDetectBpm()}
+                >
+                  {bpmDetecting ? "Detecting…" : "Auto detect"}
+                </button>
+                <button
+                  type="button"
+                  class="action-btn action-btn-primary bpm-btn"
+                  disabled={!track ||
+                    bpmBusy ||
+                    bpmDetecting ||
+                    parseBpmInput(bpmDraft) == null}
+                  onclick={() => void handleWriteBpm()}
+                >
+                  {bpmBusy ? "Writing…" : "Write"}
+                </button>
+              </div>
+            </div>
           </div>
 
           <div class="props-actions-bar">
             <div
               class="props-status"
-              class:error={!!trackRateError}
-              class:success={!!trackRateSuccess && !trackRateError}
-              class:muted={trackRateOverride != null &&
+              class:error={!!trackRateError || !!bpmError}
+              class:success={(!!trackRateSuccess || !!bpmSuccess) &&
                 !trackRateError &&
-                !trackRateSuccess}
+                !bpmError}
+              class:muted={(trackRateOverride != null || bpmValue != null) &&
+                !trackRateError &&
+                !bpmError &&
+                !trackRateSuccess &&
+                !bpmSuccess}
             >
               {#if trackRateError}
                 {trackRateError}
+              {:else if bpmError}
+                {bpmError}
+              {:else if bpmSuccess}
+                {bpmSuccess}
               {:else if trackRateSuccess}
                 {trackRateSuccess}
               {:else if trackRateOverride != null}
-                Override active for this track
+                Speed override active
               {/if}
             </div>
             <div class="props-actions">

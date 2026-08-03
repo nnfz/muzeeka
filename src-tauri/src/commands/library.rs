@@ -851,6 +851,118 @@ pub fn track_prefs_set_playback_rate(
     database.set_track_playback_rate(&path, rate)
 }
 
+/// Detect BPM by analyzing the audio stream (BASS decode + energy autocorrelation).
+#[tauri::command]
+pub async fn library_detect_bpm(
+    player: State<'_, Player>,
+    path: String,
+    audio_path: Option<String>,
+) -> Result<f32, String> {
+    let write_path = tag_write_path(path.trim(), audio_path.as_deref())?;
+    let path_str = write_path.to_string_lossy().into_owned();
+    // Clone the managed Player handle (same process-wide BASS device).
+    let player = player.inner().clone();
+    // Heavy decode must not sit on the async runtime; BASS work is then
+    // hopped onto the audio/main thread inside `detect_bpm_for_path`.
+    match tauri::async_runtime::spawn_blocking(move || {
+        crate::bpm::detect_bpm_for_path(&player, &path_str)
+    })
+    .await
+    {
+        Ok(Ok(bpm)) => Ok(bpm),
+        Ok(Err(e)) => {
+            eprintln!("[library_detect_bpm] {e}");
+            Err(e)
+        }
+        Err(e) => Err(format!("BPM detect task failed: {e}")),
+    }
+}
+
+/// Read BPM currently stored in the file tags (if any).
+#[tauri::command]
+pub async fn library_get_bpm(
+    path: String,
+    audio_path: Option<String>,
+) -> Result<Option<f32>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let write_path = tag_write_path(path.trim(), audio_path.as_deref())?;
+        Ok(crate::tag_table::read_bpm(&write_path))
+    })
+    .await
+    .map_err(|e| format!("BPM read task failed: {e}"))?
+}
+
+/// Write BPM into the audio file tags (`Bpm` + `IntegerBpm`).
+#[tauri::command]
+pub async fn library_set_track_bpm(
+    app: AppHandle,
+    database: State<'_, LibraryDatabase>,
+    path: String,
+    audio_path: Option<String>,
+    bpm: f32,
+    snapshot: Option<library::MusicFile>,
+) -> Result<library::MusicFile, String> {
+    if !bpm.is_finite() || bpm <= 0.0 || bpm >= 1000.0 {
+        return Err("BPM must be between 1 and 999".into());
+    }
+    let database = database.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let track_path = path.trim().to_string();
+        if track_path.is_empty() {
+            return Err("Empty track path".to_string());
+        }
+        let write_path = tag_write_path(&track_path, audio_path.as_deref())?;
+        crate::tag_table::write_bpm(&write_path, bpm)?;
+
+        // Re-read library row (covers/duration stay intact).
+        let is_cue = crate::cue::is_cue_track_path(&track_path);
+        let track = if is_cue {
+            let mut snap = snapshot.unwrap_or(library::MusicFile {
+                path: track_path.clone(),
+                file_name: track_path
+                    .rsplit(['\\', '/'])
+                    .next()
+                    .unwrap_or(&track_path)
+                    .to_string(),
+                extension: write_path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase(),
+                size: 0,
+                title: None,
+                artist: None,
+                album: None,
+                duration_secs: None,
+                year: None,
+                track_number: None,
+                genre: None,
+                cover_path: None,
+                cover_path_full: None,
+                audio_path: None,
+                cue_start_secs: None,
+                cue_end_secs: None,
+            });
+            snap.path = track_path;
+            snap.audio_path = Some(write_path.to_string_lossy().into_owned());
+            snap
+        } else {
+            let mut files = library::fetch_metadata(&[track_path.clone()])?;
+            files
+                .pop()
+                .ok_or_else(|| format!("Could not re-read track: {track_path}"))?
+        };
+
+        database.upsert_tracks(&[track.clone()])?;
+        if let Err(e) = app.emit("track:metadata-updated", &track) {
+            eprintln!("[library_set_track_bpm] emit failed: {e}");
+        }
+        Ok(track)
+    })
+    .await
+    .map_err(|e| format!("BPM write task failed: {e}"))?
+}
+
 #[tauri::command]
 pub fn library_set_liked(
     database: State<'_, LibraryDatabase>,
