@@ -758,6 +758,15 @@ pub fn playlist_set_cover_path(
 }
 
 #[tauri::command]
+pub fn playlist_set_mix_mode(
+    database: State<'_, LibraryDatabase>,
+    id: String,
+    mix_mode: bool,
+) -> Result<(), String> {
+    database.set_playlist_mix_mode(&id, mix_mode)
+}
+
+#[tauri::command]
 pub async fn library_tracks_upsert(
     database: State<'_, LibraryDatabase>,
     tracks: Vec<library::MusicFile>,
@@ -849,6 +858,35 @@ pub fn track_prefs_set_playback_rate(
     rate: Option<f32>,
 ) -> Result<(), String> {
     database.set_track_playback_rate(&path, rate)
+}
+
+/// Waveform peaks for the Mix transition editor (top/bottom track strips).
+#[tauri::command]
+pub async fn library_get_waveform(
+    player: State<'_, Player>,
+    cache: State<'_, crate::waveform::WaveformCache>,
+    path: String,
+    audio_path: Option<String>,
+    bins: Option<usize>,
+    cue_start_secs: Option<f64>,
+    cue_end_secs: Option<f64>,
+) -> Result<crate::waveform::WaveformPeaks, String> {
+    let write_path = tag_write_path(path.trim(), audio_path.as_deref())?;
+    let path_str = write_path.to_string_lossy().into_owned();
+    let player = player.inner().clone();
+    let cache = cache.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::waveform::peaks_for_path(
+            &player,
+            &cache,
+            &path_str,
+            bins,
+            cue_start_secs,
+            cue_end_secs,
+        )
+    })
+    .await
+    .map_err(|e| format!("Waveform task failed: {e}"))?
 }
 
 /// Detect BPM by analyzing the audio stream (BASS decode + energy autocorrelation).

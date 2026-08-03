@@ -8,11 +8,13 @@
   import SettingsWindow from '$lib/components/SettingsWindow.svelte';
   import DownloadWindow from '$lib/components/DownloadWindow.svelte';
   import TrackPropertiesWindow from '$lib/components/TrackPropertiesWindow.svelte';
+  import MixTransitionWindow from '$lib/components/MixTransitionWindow.svelte';
   import DragFloatWindow from '$lib/components/DragFloatWindow.svelte';
   import SearchBar from '$lib/components/SearchBar.svelte';
   import ImportProgressBar from '$lib/components/ImportProgressBar.svelte';
   import { precreateDownloadWindow } from '$lib/stores/download.svelte';
   import { isTrackPropertiesWindowLabel } from '$lib/stores/trackProperties.svelte';
+  import { isMixTransitionWindowLabel } from '$lib/stores/mixTransition.svelte';
   import { invoke } from '@tauri-apps/api/core';
   import { getPlayerStore } from '$lib/stores/player.svelte';
   import { createSettingsStore, setSettingsStore } from '$lib/stores/settings.svelte';
@@ -24,9 +26,14 @@
   const isSettingsWindow = currentWin.label === 'settings';
   const isDownloadWindow = currentWin.label === 'download';
   const isTrackPropertiesWindow = isTrackPropertiesWindowLabel(currentWin.label);
+  const isMixTransitionWindow = isMixTransitionWindowLabel(currentWin.label);
   const isDragFloatWindow = currentWin.label === 'drag-float';
   const isSecondaryWindow =
-    isSettingsWindow || isDownloadWindow || isTrackPropertiesWindow || isDragFloatWindow;
+    isSettingsWindow ||
+    isDownloadWindow ||
+    isTrackPropertiesWindow ||
+    isMixTransitionWindow ||
+    isDragFloatWindow;
 
   let player = $state<ReturnType<typeof getPlayerStore> | null>(null);
   let ensurePlayerReady: () => Promise<void>;
@@ -47,7 +54,8 @@
         // Player may already be initialized by main window
       }
     };
-  } else if (isDownloadWindow || isTrackPropertiesWindow) {
+  } else if (isDownloadWindow || isTrackPropertiesWindow || isMixTransitionWindow) {
+    // Mix transition still calls player_init itself for BASS decode waveforms.
     ensurePlayerReady = async () => {};
   } else {
     player = getPlayerStore();
@@ -332,6 +340,8 @@
   <DownloadWindow />
 {:else if isTrackPropertiesWindow}
   <TrackPropertiesWindow />
+{:else if isMixTransitionWindow}
+  <MixTransitionWindow />
 {:else}
   <div class="app-layout">
     <ImportProgressBar />

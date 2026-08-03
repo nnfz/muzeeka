@@ -72,6 +72,12 @@
 
     const items: ContextMenuItem[] = [
       {
+        id: "mix-mode",
+        label: target.mix_mode ? "Disable Mix mode" : "Enable Mix mode",
+        icon: "mix",
+        onSelect: () => player.setPlaylistMixMode(target.id, !target.mix_mode),
+      },
+      {
         id: "cover",
         label: "Set cover image",
         icon: "image",
@@ -529,6 +535,7 @@
             class:active={isActive}
             class:playing={isPlayingFrom}
             class:has-current={hasCurrentStopped}
+            class:mix-mode={!!playlist.mix_mode}
             class:drop-target={(trackDrag.isDraggingTracks &&
               trackDrag.copyTargetPlaylistId === playlist.id) ||
               (externalDrop.active &&
@@ -596,6 +603,11 @@
                   </span>
                 {/if}
                 <span class="playlist-count">
+                  {#if playlist.mix_mode}
+                    <span class="mix-badge" title="Mix mode" aria-label="Mix mode"
+                      >Mix</span
+                    >
+                  {/if}
                   {playlist.tracks.length} track{playlist.tracks.length !== 1
                     ? "s"
                     : ""}

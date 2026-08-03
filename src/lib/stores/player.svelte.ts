@@ -106,6 +106,8 @@ export interface Playlist {
   name: string;
   tracks: MusicFile[];
   cover_path?: string | null;
+  /** DJ/mix mode — track list shows transition slots between songs. */
+  mix_mode?: boolean;
 }
 
 type RepeatMode = 'off' | 'all' | 'one';
@@ -1293,6 +1295,7 @@ function ensurePlaylist(name: string, options?: { select?: boolean }): string {
     id: crypto.randomUUID(),
     name: trimmed,
     tracks: [],
+    mix_mode: false,
   };
   // Append via functional read of current state so a concurrent import that
   // already inserted another playlist is not wiped by a stale spread.
@@ -1424,6 +1427,16 @@ function removeTrack(path: string, playlistId?: string | null) {
   }
 
   scheduleSave();
+}
+
+function setPlaylistMixMode(id: string, mixMode: boolean) {
+  const playlist = playlistById.get(id);
+  if (!playlist) return;
+  if (!!playlist.mix_mode === mixMode) return;
+  playlists = playlists.map((p) =>
+    p.id === id ? { ...p, mix_mode: mixMode } : p,
+  );
+  persistMutation('playlist_set_mix_mode', { id, mixMode });
 }
 
 async function setPlaylistCover(id: string, sourcePath: string) {
@@ -3156,6 +3169,7 @@ export function createPlayerStore() {
     deletePlaylist,
     renamePlaylist,
     setPlaylistCover,
+    setPlaylistMixMode,
     clearPlaylistCover,
     removeTrack,
     setPlaylistTrackOrder,

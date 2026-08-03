@@ -215,10 +215,26 @@
 }
 
 .playlist-count {
-  display: block;
+  display: flex;
+  align-items: center;
+  gap: 6px;
   font-size: 10px;
   line-height: 1;
   color: var(--text-muted);
+}
+
+.mix-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 5px;
+  border-radius: var(--radius-full);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
 }
 
 .playlist-row.drop-target {

@@ -1,0 +1,278 @@
+.mix-win {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  width: 100vw;
+  background: var(--bg-deep, #0a0a0f);
+  color: var(--text-primary, #f0f0f5);
+  overflow: hidden;
+  color-scheme: dark;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.mix-header {
+  flex-shrink: 0;
+}
+
+.mix-win-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  padding-left: 4px;
+  flex-shrink: 0;
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mix-zoom-chip {
+  flex-shrink: 0;
+  margin-right: 6px;
+  padding: 3px 8px;
+  border-radius: var(--radius-full, 999px);
+  font-size: 10px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.03em;
+  color: var(--text-secondary, #cbcbcb);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+.mix-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 0 var(--margin, 10px) 8px;
+}
+
+.mix-track-panel {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px 12px;
+  border-radius: var(--radius-sm, 10px);
+  background: rgba(17, 17, 24, 0.45);
+  border: 1px solid var(--border-subtle, rgba(255, 255, 255, 0.06));
+}
+
+.mix-track-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+  flex-shrink: 0;
+}
+
+.mix-track-meta-left,
+.mix-track-meta-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.mix-track-meta-right {
+  justify-content: flex-end;
+}
+
+.mix-track-role {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-muted, #8a8a98);
+  flex-shrink: 0;
+}
+
+.mix-bpm-badge {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 3px;
+  padding: 2px 7px;
+  border-radius: var(--radius-full, 999px);
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--accent, #7c5cff);
+  background: color-mix(in srgb, var(--accent, #7c5cff) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent, #7c5cff) 28%, transparent);
+  flex-shrink: 0;
+}
+
+.mix-bpm-unit {
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  opacity: 0.7;
+}
+
+.mix-time-hint {
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted, #8a8a98);
+  flex-shrink: 0;
+}
+
+.mix-reset-btn {
+  flex-shrink: 0;
+  height: 22px;
+  padding: 0 8px;
+  border-radius: var(--radius-mini, 6px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-secondary, #cbcbcb);
+  font-family: var(--font-family);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition:
+    color var(--transition-fast, 150ms ease),
+    background var(--transition-fast, 150ms ease),
+    border-color var(--transition-fast, 150ms ease);
+}
+
+.mix-reset-btn:hover {
+  color: var(--accent, #7c5cff);
+  border-color: color-mix(in srgb, var(--accent, #7c5cff) 40%, transparent);
+  background: color-mix(in srgb, var(--accent, #7c5cff) 10%, transparent);
+}
+
+.mix-track-name {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  text-align: right;
+}
+
+.mix-wave-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 96px;
+  border-radius: var(--radius-mini, 6px);
+  background:
+    linear-gradient(
+      180deg,
+      rgba(255, 255, 255, 0.03),
+      rgba(255, 255, 255, 0.01)
+    );
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  overflow: hidden;
+  cursor: grab;
+  touch-action: none;
+}
+
+.mix-wave-wrap.is-dragging {
+  cursor: grabbing;
+}
+
+.mix-wave-wrap.is-snapped {
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--accent, #7c5cff) 45%, transparent),
+    inset 0 0 24px color-mix(in srgb, var(--accent, #7c5cff) 12%, transparent);
+}
+
+.mix-wave-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.mix-wave-status {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-muted, #8a8a98);
+  pointer-events: none;
+  background: rgba(10, 10, 15, 0.35);
+}
+
+.mix-wave-status.error {
+  color: #fca5a5;
+}
+
+.mix-wave-hint {
+  position: absolute;
+  right: 8px;
+  bottom: 6px;
+  font-size: 10px;
+  color: var(--text-muted, #8a8a98);
+  opacity: 0.7;
+  pointer-events: none;
+}
+
+.mix-wave-refining {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  display: flex;
+  align-items: center;
+  pointer-events: none;
+  opacity: 0.85;
+}
+
+.mix-wave-refining .mix-wave-spinner {
+  width: 12px;
+  height: 12px;
+}
+
+.mix-wave-spinner {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2px solid color-mix(in srgb, var(--accent, #7c5cff) 30%, transparent);
+  border-top-color: var(--accent, #7c5cff);
+  animation: mix-spin 0.7s linear infinite;
+}
+
+.mix-help {
+  flex-shrink: 0;
+  margin: 0;
+  padding: 0 2px 2px;
+  font-size: 10px;
+  color: var(--text-muted, #8a8a98);
+  text-align: center;
+}
+
+.mix-help kbd {
+  display: inline-block;
+  padding: 0 4px;
+  border-radius: 3px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.05);
+  font-family: var(--font-family);
+  font-size: 9px;
+  font-weight: 600;
+  line-height: 1.5;
+}
+
+@keyframes mix-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mix-wave-spinner {
+    animation: none;
+    border-top-color: color-mix(in srgb, var(--accent, #7c5cff) 30%, transparent);
+  }
+}

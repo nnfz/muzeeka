@@ -23,6 +23,7 @@ mod lyrics;
 mod unison;
 mod metadata;
 mod tag_table;
+mod waveform;
 mod player;
 mod path_store;
 mod playlists;
@@ -191,6 +192,7 @@ pub fn run() {
         .manage(DropState::default())
         .manage(ExportDragState::default())
         .manage(player.clone())
+        .manage(waveform::WaveformCache::default())
         .manage(discord_presence.clone())
         .on_window_event(move |window, event| {
             handle_window_event(window, event);
@@ -360,6 +362,7 @@ pub fn run() {
             commands::playlist_delete,
             commands::playlist_rename,
             commands::playlist_set_cover_path,
+            commands::playlist_set_mix_mode,
             commands::library_tracks_upsert,
             commands::playlist_add_tracks,
             commands::playlist_remove_tracks,
@@ -372,6 +375,7 @@ pub fn run() {
             commands::library_detect_bpm,
             commands::library_get_bpm,
             commands::library_set_track_bpm,
+            commands::library_get_waveform,
             commands::library_set_liked,
             commands::library_reorder_liked,
             commands::playlist_cache_cover,

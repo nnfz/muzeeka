@@ -25,6 +25,7 @@
     openContextMenuFromEvent,
     type ContextMenuItem,
   } from "$lib/contextMenu";
+  import { invoke } from "@tauri-apps/api/core";
   import { open } from "@tauri-apps/plugin-dialog";
   import { revealItemInDir } from "@tauri-apps/plugin-opener";
   import { audioPathsForDrag, startFileDrag } from "$lib/fileDrag";
@@ -36,8 +37,9 @@
   import TrackCover from "./TrackCover.svelte";
   import LikeButton from "./LikeButton.svelte";
   import { openTrackPropertiesWindow } from "$lib/stores/trackProperties.svelte";
+  import { openMixTransitionWindow } from "$lib/stores/mixTransition.svelte";
 
-  type ColumnId = "index" | "title" | "album" | "duration";
+  type ColumnId = "index" | "title" | "album" | "bpm" | "duration";
   type SortDirection = "asc" | "desc";
 
   interface ListedTrack {
@@ -52,9 +54,17 @@
     titleShare: number;
   }
 
-  const COLUMN_ORDER: ColumnId[] = ["index", "title", "album", "duration"];
+  const COLUMN_ORDER: ColumnId[] = [
+    "index",
+    "title",
+    "album",
+    "bpm",
+    "duration",
+  ];
   const COL_GAP = 6;
   const FIXED_INDEX_WIDTH = 28;
+  /** Fixed BPM column width (only shown in Mix mode). */
+  const FIXED_BPM_WIDTH = 48;
   const DEFAULT_LAYOUT: ColumnLayout = {
     index: FIXED_INDEX_WIDTH,
     duration: 64,
@@ -64,6 +74,7 @@
     index: 22,
     title: 140,
     album: 80,
+    bpm: 40,
     duration: 52,
   };
   const STORAGE_COLUMN_LAYOUT_KEY = "muzeeka:track-table:column-layout";
@@ -87,6 +98,8 @@
   let resizingPair = $state<{ left: ColumnId; right: ColumnId } | null>(null);
 
   const ROW_HEIGHT = 52;
+  /** Height of the Mix-mode transition strip between two tracks. */
+  const MIX_STRIP_HEIGHT = 28;
   /** Visual gap opened between rows while reordering (px). */
   const DROP_GAP_PX = 44;
   /** Matches `.track-list-rows` vertical padding — used for drop-index math. */
@@ -103,6 +116,7 @@
       value === "index" ||
       value === "title" ||
       value === "album" ||
+      value === "bpm" ||
       value === "duration"
     );
   }
@@ -245,6 +259,18 @@
   let dragFloatSample = { x: 0, y: 0, t: 0 };
 
   let canReorder = $derived(supportsPlaylistReorder(player.activePlaylistId));
+
+  /** Real playlists only — Mix mode lives on user playlists, not All/Liked. */
+  let mixMode = $derived(
+    !!player.activePlaylistId &&
+      isEditablePlaylist(player.activePlaylistId) &&
+      !!player.activePlaylist?.mix_mode,
+  );
+
+  /** Unit height for virtualization / drop-index when mix strips are present. */
+  let listUnitHeight = $derived(
+    mixMode ? ROW_HEIGHT + MIX_STRIP_HEIGHT : ROW_HEIGHT,
+  );
 
   /** True while reordering inside the list (not copy-to-playlist / file export). */
   let reorderGapActive = $derived(
@@ -422,9 +448,89 @@
     }));
   });
 
-  let visibleColumns = $derived(
-    isNarrow ? COLUMN_ORDER.filter((id) => id !== "album") : COLUMN_ORDER,
-  );
+  let visibleColumns = $derived.by((): ColumnId[] => {
+    let cols = COLUMN_ORDER;
+    // BPM is Mix-mode only — appear as soon as the playlist enters mix mode.
+    if (!mixMode) cols = cols.filter((id) => id !== "bpm");
+    if (isNarrow) cols = cols.filter((id) => id !== "album");
+    return cols;
+  });
+
+  /** path → BPM from tags (`null` = no tag / failed). Missing key = not loaded yet. */
+  let bpmByPath = $state<Map<string, number | null>>(new Map());
+  const bpmInflight = new Set<string>();
+
+  function formatBpm(value: number | null | undefined): string {
+    if (value == null || !Number.isFinite(value) || value <= 0) return "—";
+    const rounded = Math.round(value * 10) / 10;
+    return Number.isInteger(rounded)
+      ? String(rounded)
+      : rounded.toFixed(1);
+  }
+
+  function bpmOf(path: string): number | null {
+    return bpmByPath.get(path) ?? null;
+  }
+
+  async function loadBpmsForTracks(tracks: MusicFile[]) {
+    const pending = tracks.filter(
+      (t) => t.path && !bpmByPath.has(t.path) && !bpmInflight.has(t.path),
+    );
+    if (pending.length === 0) return;
+
+    for (const t of pending) bpmInflight.add(t.path);
+
+    const results: { path: string; bpm: number | null }[] = [];
+    const queue = [...pending];
+    const workers = Math.min(4, queue.length);
+
+    async function worker() {
+      while (queue.length > 0) {
+        const track = queue.shift();
+        if (!track) return;
+        try {
+          const bpm = await invoke<number | null>("library_get_bpm", {
+            path: track.path,
+            audioPath: track.audio_path ?? null,
+          });
+          results.push({
+            path: track.path,
+            bpm:
+              typeof bpm === "number" && Number.isFinite(bpm) && bpm > 0
+                ? bpm
+                : null,
+          });
+        } catch {
+          results.push({ path: track.path, bpm: null });
+        } finally {
+          bpmInflight.delete(track.path);
+        }
+      }
+    }
+
+    await Promise.all(Array.from({ length: workers }, () => worker()));
+    if (results.length === 0) return;
+
+    const next = new Map(bpmByPath);
+    for (const { path, bpm } of results) next.set(path, bpm);
+    bpmByPath = next;
+  }
+
+  // Prefetch BPM tags for the open mix playlist (visible + overscan is enough via displayedTracks).
+  $effect(() => {
+    if (!mixMode) return;
+    const tracks = displayedTracks.map((item) => item.track);
+    void loadBpmsForTracks(tracks);
+  });
+
+  // Drop BPM sort when leaving Mix mode (column disappears).
+  $effect(() => {
+    if (!mixMode && sortColumn === "bpm") {
+      sortColumn = null;
+      sortDirection = "asc";
+      persistSort();
+    }
+  });
 
   function availableWidth(columns: ColumnId[]): number {
     const gaps = (columns.length - 1) * COL_GAP;
@@ -433,7 +539,7 @@
 
   function minMiddleWidth(columns: ColumnId[]): number {
     return columns
-      .filter((id) => id !== "index" && id !== "duration")
+      .filter((id) => id !== "index" && id !== "duration" && id !== "bpm")
       .reduce((sum, id) => sum + MIN_COLUMN_WIDTHS[id], 0);
   }
 
@@ -445,16 +551,17 @@
     const middleMin = minMiddleWidth(columns);
 
     const index = FIXED_INDEX_WIDTH;
+    const bpm = columns.includes("bpm") ? FIXED_BPM_WIDTH : 0;
     let duration = layout.duration;
 
-    const maxDuration = available - index - middleMin;
+    const maxDur = available - index - bpm - middleMin;
     duration = clamp(
       duration,
       MIN_COLUMN_WIDTHS.duration,
-      Math.max(MIN_COLUMN_WIDTHS.duration, maxDuration),
+      Math.max(MIN_COLUMN_WIDTHS.duration, maxDur),
     );
 
-    const middle = available - index - duration;
+    const middle = available - index - bpm - duration;
 
     let title = middle;
     let album = 0;
@@ -476,7 +583,7 @@
       }
     }
 
-    return { index, title, album, duration };
+    return { index, title, album, bpm, duration };
   }
 
   let effectiveWidths = $derived(
@@ -519,27 +626,50 @@
 
   const HEADER_HEIGHT = 36;
 
+  /**
+   * Y offset of track `index` in the virtual list.
+   * In mix mode each prior track occupies ROW + STRIP (strip sits under the track).
+   */
+  function trackOffset(index: number, unit: number): number {
+    if (index <= 0) return 0;
+    return index * unit;
+  }
+
+  function contentHeight(total: number, unit: number, mix: boolean): number {
+    if (total <= 0) return 0;
+    if (!mix) return total * ROW_HEIGHT;
+    // Last track has no transition strip under it.
+    return (total - 1) * unit + ROW_HEIGHT;
+  }
+
   let visibleRange = $derived.by(() => {
     const total = displayedTracks.length;
     if (total === 0) return { start: 0, end: 0, top: 0, bottom: 0 };
 
+    const unit = listUnitHeight;
+    const mix = mixMode;
     const scrollWithinRows = Math.max(0, rowsScrollTop - HEADER_HEIGHT);
     const start = Math.max(
       0,
-      Math.floor(scrollWithinRows / ROW_HEIGHT) - VIRTUAL_OVERSCAN,
+      Math.floor(scrollWithinRows / unit) - VIRTUAL_OVERSCAN,
     );
     const visibleCount =
-      Math.ceil(rowsViewportHeight / ROW_HEIGHT) + VIRTUAL_OVERSCAN * 2;
+      Math.ceil(rowsViewportHeight / unit) + VIRTUAL_OVERSCAN * 2;
     const end = Math.min(
       total,
       start + Math.max(visibleCount, VIRTUAL_OVERSCAN * 2),
     );
+    const top = trackOffset(start, unit);
+    const totalH = contentHeight(total, unit, mix);
+    // When `end` reaches the last track, content ends mid-unit (no final strip).
+    const endOffset =
+      end >= total ? totalH : trackOffset(end, unit);
 
     return {
       start,
       end,
-      top: start * ROW_HEIGHT,
-      bottom: Math.max(0, (total - end) * ROW_HEIGHT),
+      top,
+      bottom: Math.max(0, totalH - endOffset),
     };
   });
 
@@ -609,6 +739,8 @@
             sensitivity: "base",
           },
         );
+      case "bpm":
+        return (bpmOf(a.track.path) ?? -1) - (bpmOf(b.track.path) ?? -1);
       case "duration":
         return (a.track.duration_secs ?? -1) - (b.track.duration_secs ?? -1);
     }
@@ -628,7 +760,7 @@
   }
 
   function startColumnResize(left: ColumnId, right: ColumnId, e: PointerEvent) {
-    if (left === "index") return;
+    if (left === "index" || left === "bpm") return;
     e.preventDefault();
     e.stopPropagation();
     resizingPair = { left, right };
@@ -638,12 +770,14 @@
     const available = availableWidth(columns);
     const middleMin = minMiddleWidth(columns);
     const startLayout = { ...columnLayout };
+    const bpmWidth = columns.includes("bpm") ? FIXED_BPM_WIDTH : 0;
 
     function onMove(moveEvent: PointerEvent) {
       const delta = moveEvent.clientX - startX;
 
       if (left === "title" && right === "album") {
-        const middle = available - startLayout.index - startLayout.duration;
+        const middle =
+          available - startLayout.index - startLayout.duration - bpmWidth;
         const startTitle = middle * startLayout.titleShare;
         const nextTitle = clamp(
           startTitle + delta,
@@ -658,7 +792,8 @@
       }
 
       if (right === "duration") {
-        const maxDuration = available - startLayout.index - middleMin;
+        const maxDuration =
+          available - startLayout.index - bpmWidth - middleMin;
         columnLayout = {
           ...startLayout,
           duration: clamp(
@@ -1097,8 +1232,9 @@
 
     const yInContent =
       clientY - rect.top + el.scrollTop - LIST_PAD_Y;
-    // Map Y onto insert slots [0 .. n] at row midpoints (stable coordinates).
-    const raw = yInContent / ROW_HEIGHT;
+    // Map Y onto insert slots [0 .. n] at unit midpoints (stable coordinates).
+    // In mix mode each unit is track + transition strip (last has no strip; round is fine).
+    const raw = yInContent / listUnitHeight;
     return Math.max(
       0,
       Math.min(displayedTracks.length, Math.round(raw)),
@@ -1123,9 +1259,10 @@
     const rect = el.getBoundingClientRect();
     const yInContent = clientY - rect.top + el.scrollTop - LIST_PAD_Y;
     // Boundary between prev and next slots (in content px).
-    // Slot k is centered at k * ROW_HEIGHT; boundary between k and k+1 at (k+0.5)*H.
+    // Slot k is centered at k * unit; boundary between k and k+1 at (k+0.5)*unit.
+    const unit = listUnitHeight;
     const low = Math.min(prev, next);
-    const boundary = (low + 0.5) * ROW_HEIGHT;
+    const boundary = (low + 0.5) * unit;
     const dist = yInContent - boundary;
 
     // Must push past boundary by hysteresis before flipping.
@@ -1410,9 +1547,25 @@
         return "Title";
       case "album":
         return "Album";
+      case "bpm":
+        return "BPM";
       case "duration":
         return "Duration";
     }
+  }
+
+  function onMixTransitionClick(e: MouseEvent, fromIndex: number) {
+    e.preventDefault();
+    e.stopPropagation();
+    const from = displayedTracks[fromIndex];
+    const to = displayedTracks[fromIndex + 1];
+    if (!from || !to || !player.activePlaylistId) return;
+    void openMixTransitionWindow(
+      from.track,
+      to.track,
+      player.activePlaylistId,
+      fromIndex,
+    );
   }
 </script>
 
@@ -1448,6 +1601,7 @@
               class:col-index={column === "index"}
               class:col-title={column === "title"}
               class:col-album={column === "album"}
+              class:col-bpm={column === "bpm"}
               class:col-duration={column === "duration"}
             >
               <button
@@ -1498,7 +1652,10 @@
                 {/if}
               </button>
 
-              {#if i < visibleColumns.length - 1 && column !== "index" && column !== "album"}
+              {#if i < visibleColumns.length - 1 &&
+                column !== "index" &&
+                column !== "album" &&
+                column !== "bpm"}
                 {@const rightColumn = visibleColumns[i + 1]}
                 <button
                   type="button"
@@ -1523,6 +1680,7 @@
         >
           <div
             class="track-list-rows"
+            class:mix-mode={mixMode}
             class:drop-at-end={reorderDropIndex === displayedTracks.length &&
               displayedTracks.length > 0}
             style={reorderGapActive
@@ -1544,8 +1702,14 @@
                 reorderDropIndex != null && i >= reorderDropIndex
                   ? DROP_GAP_PX
                   : 0}
+              {@const stripGapShift =
+                reorderDropIndex != null && i + 1 >= reorderDropIndex
+                  ? DROP_GAP_PX
+                  : 0}
               {@const isGapEdge =
                 reorderDropIndex != null && i === reorderDropIndex}
+              {@const showMixTransition =
+                mixMode && i < displayedTracks.length - 1}
               <button
                 class="track-row"
                 class:active={isActive}
@@ -1608,6 +1772,10 @@
                     </span>
                   {:else if column === "album"}
                     <span class="col-album">{track.album ?? "—"}</span>
+                  {:else if column === "bpm"}
+                    <span class="col-bpm"
+                      >{formatBpm(bpmByPath.get(track.path))}</span
+                    >
                   {:else}
                     <span class="col-duration">
                       <span
@@ -1625,6 +1793,39 @@
                   {/if}
                 {/each}
               </button>
+              {#if showMixTransition}
+                <div
+                  class="mix-transition"
+                  style="transform: translate3d(0, {stripGapShift}px, 0)"
+                >
+                  <div class="mix-transition-line" aria-hidden="true"></div>
+                  <button
+                    type="button"
+                    class="mix-transition-btn"
+                    title="Edit transition"
+                    aria-label={`Transition after ${trackDisplayTitle(track)}`}
+                    onclick={(e) => onMixTransitionClick(e, i)}
+                    onpointerdown={(e) => e.stopPropagation()}
+                  >
+                    <svg
+                      width="12"
+                      height="12"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="2"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      aria-hidden="true"
+                    >
+                      <path d="M4 12c2-4 4-4 6 0s4 4 6 0 4-4 6 0" />
+                      <path d="M4 17c2-4 4-4 6 0s4 4 6 0 4-4 6 0" />
+                    </svg>
+                    <span>Transition</span>
+                  </button>
+                  <div class="mix-transition-line" aria-hidden="true"></div>
+                </div>
+              {/if}
             {/each}
             <div
               style="height: {visibleRange.bottom}px"

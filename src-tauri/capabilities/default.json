@@ -8,6 +8,7 @@
     "download",
     "track-properties",
     "track-properties-*",
+    "mix-transition",
     "vk-login",
     "vk-session",
     "drag-float"

@@ -26,6 +26,9 @@ pub struct SavedPlaylist {
     pub name: String,
     pub tracks: Vec<MusicFile>,
     pub cover_path: Option<String>,
+    /// DJ/mix mode: track list shows transition slots between songs.
+    #[serde(default)]
+    pub mix_mode: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -186,6 +189,11 @@ impl LibraryDatabase {
         );
         let _ = connection.execute(
             "ALTER TABLE app_state ADD COLUMN was_playing INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        // Mix mode flag on playlists (DJ transitions UI).
+        let _ = connection.execute(
+            "ALTER TABLE playlists ADD COLUMN mix_mode INTEGER NOT NULL DEFAULT 0",
             [],
         );
 
@@ -490,14 +498,18 @@ impl LibraryDatabase {
 
         let playlist_headers = {
             let mut statement = connection
-                .prepare("SELECT id, name, cover_path FROM playlists ORDER BY position, id")
+                .prepare(
+                    "SELECT id, name, cover_path, COALESCE(mix_mode, 0)
+                       FROM playlists ORDER BY position, id",
+                )
                 .map_err(db_error)?;
             let rows = statement
                 .query_map([], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
-                        row.get(2)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, i64>(3)? != 0,
                     ))
                 })
                 .map_err(db_error)?;
@@ -505,7 +517,7 @@ impl LibraryDatabase {
         };
 
         let mut playlists = Vec::with_capacity(playlist_headers.len());
-        for (id, name, cover_path) in playlist_headers {
+        for (id, name, cover_path, mix_mode) in playlist_headers {
             let tracks = query_tracks(
                 &connection,
                 &format!(
@@ -523,6 +535,7 @@ impl LibraryDatabase {
                 name,
                 tracks,
                 cover_path,
+                mix_mode,
             });
         }
 
@@ -755,6 +768,19 @@ impl LibraryDatabase {
             .execute(
                 "UPDATE playlists SET cover_path = ?2 WHERE id = ?1",
                 params![id, cover_path],
+            )
+            .map_err(db_error)?;
+        drop(connection);
+        self.changed();
+        Ok(())
+    }
+
+    pub fn set_playlist_mix_mode(&self, id: &str, mix_mode: bool) -> Result<(), String> {
+        let connection = self.inner.connection.lock();
+        connection
+            .execute(
+                "UPDATE playlists SET mix_mode = ?2 WHERE id = ?1",
+                params![id, mix_mode as i64],
             )
             .map_err(db_error)?;
         drop(connection);
