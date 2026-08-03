@@ -1315,6 +1315,198 @@ pub fn cover_data_url(path: &Path) -> Result<Option<String>, String> {
     )))
 }
 
+/// Technical audio + file details for Properties → Details (foobar-style).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct AudioTechInfo {
+    /// Audio bitrate in kbps when known.
+    pub bitrate_kbps: Option<u32>,
+    /// Sample rate in Hz.
+    pub sample_rate_hz: Option<u32>,
+    pub channels: Option<u8>,
+    pub bit_depth: Option<u8>,
+    /// Duration from stream properties (fractional seconds).
+    pub duration_secs: Option<f64>,
+    /// Approximate total samples (`duration * sample_rate`).
+    pub total_samples: Option<u64>,
+    /// Display codec name (e.g. "FLAC", "MP3").
+    pub codec: Option<String>,
+    /// "lossless" / "lossy" when known.
+    pub encoding: Option<String>,
+    /// Encoder / vendor string (foobar "Tool").
+    pub tool: Option<String>,
+    /// FLAC STREAMINFO audio MD5 (hex uppercase), when present.
+    pub audio_md5: Option<String>,
+    /// Whether an embedded cuesheet was detected.
+    pub embedded_cuesheet: Option<bool>,
+    /// On-disk file size in bytes (resolved audio path).
+    pub file_size: Option<u64>,
+    /// Last modified time as Unix seconds.
+    pub modified_unix: Option<i64>,
+    /// Created time as Unix seconds (when the OS reports it).
+    pub created_unix: Option<i64>,
+    /// File name component of the resolved audio path.
+    pub file_name: Option<String>,
+    /// Parent folder path of the resolved audio path.
+    pub folder_name: Option<String>,
+    /// Full resolved audio path on disk.
+    pub file_path: Option<String>,
+    /// Times this track was started (library DB).
+    pub play_count: Option<u32>,
+    /// First play start as Unix seconds.
+    pub first_played_unix: Option<i64>,
+    /// Last play start as Unix seconds.
+    pub last_played_unix: Option<i64>,
+}
+
+fn system_time_unix(t: std::time::SystemTime) -> Option<i64> {
+    match t.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => Some(d.as_secs() as i64),
+        Err(e) => Some(-(e.duration().as_secs() as i64)),
+    }
+}
+
+fn file_type_codec(ft: lofty::file::FileType) -> (&'static str, &'static str) {
+    use lofty::file::FileType;
+    match ft {
+        FileType::Flac => ("FLAC", "lossless"),
+        FileType::Wav => ("WAV", "lossless"),
+        FileType::Aiff => ("AIFF", "lossless"),
+        FileType::Ape => ("Monkey's Audio", "lossless"),
+        FileType::WavPack => ("WavPack", "lossless"),
+        FileType::Mpeg => ("MP3", "lossy"),
+        FileType::Aac => ("AAC", "lossy"),
+        FileType::Mp4 => ("MP4", "lossy"),
+        FileType::Opus => ("Opus", "lossy"),
+        FileType::Vorbis => ("Vorbis", "lossy"),
+        FileType::Speex => ("Speex", "lossy"),
+        FileType::Mpc => ("Musepack", "lossy"),
+        FileType::Custom(_) | _ => ("Unknown", "unknown"),
+    }
+}
+
+fn fill_fs_fields(path: &Path, info: &mut AudioTechInfo) {
+    info.file_path = Some(path.to_string_lossy().to_string());
+    info.file_name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string());
+    info.folder_name = path
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .filter(|s| !s.is_empty());
+
+    if let Ok(meta) = fs::metadata(path) {
+        info.file_size = Some(meta.len());
+        if let Ok(m) = meta.modified() {
+            info.modified_unix = system_time_unix(m);
+        }
+        if let Ok(c) = meta.created() {
+            info.created_unix = system_time_unix(c);
+        }
+    }
+}
+
+/// Probe stream + filesystem details for the Properties window (no cover art).
+pub fn read_audio_tech_info(path: &Path) -> AudioTechInfo {
+    let mut info = AudioTechInfo::default();
+    fill_fs_fields(path, &mut info);
+
+    let tagged = Probe::open(path).and_then(|probe| {
+        probe
+            .options(ParseOptions::new().read_cover_art(false))
+            .read()
+    });
+    let Ok(tagged_file) = tagged else {
+        return info;
+    };
+
+    let (codec, encoding) = file_type_codec(tagged_file.file_type());
+    // Prefer extension-based codec label for MP4/M4A when extension is clearer.
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_uppercase());
+    info.codec = Some(match (codec, ext.as_deref()) {
+        ("MP4", Some("M4A")) => "ALAC/AAC".to_string(),
+        ("MP4", Some(e)) => e.to_string(),
+        ("MP3", Some("MP2")) => "MP2".to_string(),
+        _ => codec.to_string(),
+    });
+    info.encoding = Some(encoding.to_string());
+
+    let props = tagged_file.properties();
+    let bitrate = props
+        .audio_bitrate()
+        .filter(|&b| b > 0)
+        .or_else(|| props.overall_bitrate().filter(|&b| b > 0));
+    info.bitrate_kbps = bitrate;
+    info.sample_rate_hz = props.sample_rate().filter(|&r| r > 0);
+    info.channels = props.channels().filter(|&c| c > 0);
+    info.bit_depth = props.bit_depth().filter(|&d| d > 0);
+
+    let duration = props.duration();
+    if !duration.is_zero() {
+        let secs = duration.as_secs_f64();
+        info.duration_secs = Some(secs);
+        if let Some(rate) = info.sample_rate_hz {
+            let samples = (secs * f64::from(rate)).round();
+            if samples.is_finite() && samples > 0.0 {
+                info.total_samples = Some(samples as u64);
+            }
+        }
+    }
+
+    // Tool = encoder software / vendor (mapped into EncoderSoftware for Vorbis/FLAC).
+    let tag = tagged_file
+        .primary_tag()
+        .or_else(|| tagged_file.first_tag());
+    if let Some(tag) = tag {
+        use lofty::tag::ItemKey;
+        let tool = tag
+            .get_string(ItemKey::EncoderSoftware)
+            .or_else(|| tag.get_string(ItemKey::EncodedBy))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        info.tool = tool;
+
+        // Best-effort embedded cuesheet detection from freeform / comment-ish text.
+        let has_cue = tag.items().any(|item| {
+            let key = format!("{:?}", item.key()).to_ascii_uppercase();
+            if key.contains("CUESHEET") || key.contains("CUE_SHEET") {
+                return true;
+            }
+            match item.value() {
+                lofty::tag::ItemValue::Text(s) | lofty::tag::ItemValue::Locator(s) => {
+                    let u = s.to_ascii_uppercase();
+                    u.contains("FILE \"") && u.contains("TRACK ") && u.contains("INDEX ")
+                }
+                _ => false,
+            }
+        });
+        info.embedded_cuesheet = Some(has_cue);
+    } else {
+        info.embedded_cuesheet = Some(false);
+    }
+
+    // FLAC STREAMINFO MD5 — needs concrete FlacFile properties.
+    if matches!(tagged_file.file_type(), lofty::file::FileType::Flac) {
+        if let Ok(mut file) = fs::File::open(path) {
+            use lofty::file::AudioFile as _;
+            if let Ok(flac) = lofty::flac::FlacFile::read_from(
+                &mut file,
+                ParseOptions::new().read_cover_art(false),
+            ) {
+                let sig = flac.properties().signature();
+                if sig != 0 {
+                    info.audio_md5 = Some(format!("{sig:032X}"));
+                }
+            }
+        }
+    }
+
+    info
+}
+
 /// Read tags and audio properties from a file. Falls back to the filename when tags are missing.
 pub fn read_metadata(path: &Path, file_name: &str) -> TrackMetadata {
     read_metadata_impl(path, file_name, true)
@@ -1387,27 +1579,224 @@ fn read_metadata_impl(path: &Path, file_name: &str, resolve_covers: bool) -> Tra
     meta
 }
 
-pub fn write_track_tags(
-    path: &Path,
-    title: Option<&str>,
-    artist: Option<&str>,
-) -> Result<(), String> {
+/// Editable tags written into the audio file (and later mirrored in SQLite).
+/// Empty strings clear the corresponding text field; `None` for year/track clears them.
+#[derive(Debug, Clone, Default)]
+pub struct TrackTags {
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub year: Option<u32>,
+    pub track_number: Option<u32>,
+    pub genre: Option<String>,
+}
+
+fn normalize_title_artist(title: Option<String>, artist: Option<String>) -> (Option<String>, Option<String>) {
     let artist = artist
-        .map(clean_tag_value)
+        .map(|s| clean_tag_value(&s))
         .filter(|s| !s.is_empty());
     let title = title
-        .map(strip_ytdlp_id_suffix)
+        .map(|s| strip_ytdlp_id_suffix(&s))
+        .map(|s| clean_tag_value(&s))
         .filter(|s| !s.is_empty())
         .map(|t| match artist.as_deref() {
             Some(a) => strip_redundant_artist_prefix(&t, a).unwrap_or(t),
             None => t,
         });
+    (title, artist)
+}
+
+/// Partial tag write used by downloaders (title/artist only; other frames preserved).
+pub fn write_track_tags(
+    path: &Path,
+    title: Option<&str>,
+    artist: Option<&str>,
+) -> Result<(), String> {
+    let (title, artist) = normalize_title_artist(
+        title.map(|s| s.to_string()),
+        artist.map(|s| s.to_string()),
+    );
 
     if title.is_none() && artist.is_none() {
         return Ok(());
     }
 
-    let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
+    apply_tag_patch(path, |tag| {
+        if let Some(t) = title.as_deref() {
+            tag.set_title(t);
+        }
+        if let Some(a) = artist.as_deref() {
+            tag.set_artist(a);
+        }
+    })
+}
+
+/// Full metadata write for the Properties editor — sets or clears every standard field.
+pub fn write_track_metadata(path: &Path, tags: &TrackTags) -> Result<(), String> {
+    let (title, artist) = normalize_title_artist(tags.title.clone(), tags.artist.clone());
+    let album = tags
+        .album
+        .as_ref()
+        .map(|s| clean_tag_value(s))
+        .filter(|s| !s.is_empty());
+    let genre = tags
+        .genre
+        .as_ref()
+        .map(|s| clean_tag_value(s))
+        .filter(|s| !s.is_empty());
+    let year = tags.year.filter(|&y| y > 0 && y <= 9999);
+    let track_number = tags.track_number.filter(|&n| n > 0);
+
+    // Explicit empty title/artist/album/genre from the editor means clear.
+    let clear_title = tags.title.as_ref().is_some_and(|s| clean_tag_value(s).is_empty());
+    let clear_artist = tags.artist.as_ref().is_some_and(|s| clean_tag_value(s).is_empty());
+    let clear_album = tags.album.as_ref().is_some_and(|s| clean_tag_value(s).is_empty());
+    let clear_genre = tags.genre.as_ref().is_some_and(|s| clean_tag_value(s).is_empty());
+    let clear_year = tags.year.is_none() || tags.year == Some(0);
+    let clear_track = tags.track_number.is_none() || tags.track_number == Some(0);
+
+    apply_tag_patch(path, |tag| {
+        match (&title, clear_title) {
+            (Some(t), _) => tag.set_title(t.as_str()),
+            (None, true) => tag.remove_title(),
+            _ => {}
+        }
+        match (&artist, clear_artist) {
+            (Some(a), _) => tag.set_artist(a.as_str()),
+            (None, true) => tag.remove_artist(),
+            _ => {}
+        }
+        match (&album, clear_album) {
+            (Some(a), _) => tag.set_album(a.as_str()),
+            (None, true) => tag.remove_album(),
+            _ => {}
+        }
+        match (&genre, clear_genre) {
+            (Some(g), _) => tag.set_genre(g.as_str()),
+            (None, true) => tag.remove_genre(),
+            _ => {}
+        }
+        if let Some(y) = year {
+            tag.set_year(y);
+        } else if clear_year {
+            tag.remove_year();
+        }
+        if let Some(n) = track_number {
+            tag.set_track(n);
+        } else if clear_track {
+            tag.remove_track();
+        }
+    })
+}
+
+/// Unified tag mutator for MP3 (id3 crate) and other formats (lofty).
+trait AudioTagPatch {
+    fn set_title(&mut self, value: &str);
+    fn remove_title(&mut self);
+    fn set_artist(&mut self, value: &str);
+    fn remove_artist(&mut self);
+    fn set_album(&mut self, value: &str);
+    fn remove_album(&mut self);
+    fn set_genre(&mut self, value: &str);
+    fn remove_genre(&mut self);
+    fn set_year(&mut self, year: u32);
+    fn remove_year(&mut self);
+    fn set_track(&mut self, track: u32);
+    fn remove_track(&mut self);
+}
+
+impl AudioTagPatch for id3::Tag {
+    fn set_title(&mut self, value: &str) {
+        TagLike::set_title(self, value);
+    }
+    fn remove_title(&mut self) {
+        TagLike::remove_title(self);
+    }
+    fn set_artist(&mut self, value: &str) {
+        TagLike::set_artist(self, value);
+    }
+    fn remove_artist(&mut self) {
+        TagLike::remove_artist(self);
+    }
+    fn set_album(&mut self, value: &str) {
+        TagLike::set_album(self, value);
+    }
+    fn remove_album(&mut self) {
+        TagLike::remove_album(self);
+    }
+    fn set_genre(&mut self, value: &str) {
+        TagLike::set_genre(self, value);
+    }
+    fn remove_genre(&mut self) {
+        TagLike::remove_genre(self);
+    }
+    fn set_year(&mut self, year: u32) {
+        TagLike::set_year(self, year as i32);
+    }
+    fn remove_year(&mut self) {
+        TagLike::remove_year(self);
+    }
+    fn set_track(&mut self, track: u32) {
+        TagLike::set_track(self, track);
+    }
+    fn remove_track(&mut self) {
+        TagLike::remove_track(self);
+    }
+}
+
+struct LoftyTagPatch<'a>(&'a mut Tag);
+
+impl AudioTagPatch for LoftyTagPatch<'_> {
+    fn set_title(&mut self, value: &str) {
+        self.0.set_title(value.to_string());
+    }
+    fn remove_title(&mut self) {
+        self.0.remove_title();
+    }
+    fn set_artist(&mut self, value: &str) {
+        self.0.set_artist(value.to_string());
+    }
+    fn remove_artist(&mut self) {
+        self.0.remove_artist();
+    }
+    fn set_album(&mut self, value: &str) {
+        self.0.set_album(value.to_string());
+    }
+    fn remove_album(&mut self) {
+        self.0.remove_album();
+    }
+    fn set_genre(&mut self, value: &str) {
+        self.0.set_genre(value.to_string());
+    }
+    fn remove_genre(&mut self) {
+        self.0.remove_genre();
+    }
+    fn set_year(&mut self, year: u32) {
+        let y = year.min(u16::MAX as u32) as u16;
+        self.0.set_date(lofty::tag::items::Timestamp {
+            year: y,
+            ..Default::default()
+        });
+    }
+    fn remove_year(&mut self) {
+        self.0.remove_date();
+    }
+    fn set_track(&mut self, track: u32) {
+        self.0.set_track(track);
+    }
+    fn remove_track(&mut self) {
+        self.0.remove_track();
+    }
+}
+
+fn apply_tag_patch<F>(path: &Path, mut patch: F) -> Result<(), String>
+where
+    F: FnMut(&mut dyn AudioTagPatch),
+{
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
     if ext.as_deref() == Some("mp3") {
         let mut tag = match id3::Tag::read_from_path(path) {
             Ok(tag) => tag,
@@ -1419,14 +1808,14 @@ pub fn write_track_tags(
                 id3::Tag::new()
             }
         };
-        if let Some(t) = title { tag.set_title(t); }
-        if let Some(a) = artist { tag.set_artist(a); }
-        tag.write_to_path(path, id3::Version::Id3v23).map_err(|e| format!("id3 save error: {}", e))?;
+        patch(&mut tag);
+        tag.write_to_path(path, id3::Version::Id3v23)
+            .map_err(|e| format!("id3 save error: {e}"))?;
         return Ok(());
     }
 
     let mut tagged_file = read_from_path(path)
-        .map_err(|e| format!("Failed to read audio file for tagging: {}", e))?;
+        .map_err(|e| format!("Failed to read audio file for tagging: {e}"))?;
 
     if tagged_file.primary_tag_mut().is_none() {
         let tag_type = tagged_file
@@ -1441,16 +1830,14 @@ pub fn write_track_tags(
         .primary_tag_mut()
         .ok_or_else(|| "No writable tag slot".to_string())?;
 
-    if let Some(title) = title {
-        tag.set_title(title);
-    }
-    if let Some(artist) = artist {
-        tag.set_artist(artist);
+    {
+        let mut wrapper = LoftyTagPatch(tag);
+        patch(&mut wrapper);
     }
 
     tagged_file
         .save_to_path(path, WriteOptions::default())
-        .map_err(|e| format!("Failed to save tags: {}", e))?;
+        .map_err(|e| format!("Failed to save tags: {e}"))?;
 
     Ok(())
 }
@@ -1489,32 +1876,47 @@ fn mime_from_image_bytes(data: &[u8], hint: Option<&str>) -> MimeType {
     MimeType::Jpeg
 }
 
-pub fn write_track_cover(path: &Path, data: &[u8], mime_hint: Option<&str>) -> Result<(), String> {
+fn mime_to_id3_str(mime: &MimeType) -> String {
+    match mime {
+        MimeType::Png => "image/png".to_string(),
+        MimeType::Gif => "image/gif".to_string(),
+        MimeType::Bmp => "image/bmp".to_string(),
+        MimeType::Tiff => "image/tiff".to_string(),
+        MimeType::Jpeg => "image/jpeg".to_string(),
+        MimeType::Unknown(s) => s.clone(),
+        _ => "image/jpeg".to_string(),
+    }
+}
+
+fn prepare_cover_bytes(data: &[u8], mime_hint: Option<&str>) -> Result<(Vec<u8>, MimeType), String> {
     if data.is_empty() {
         return Err("Empty cover image".to_string());
     }
-
-    let (bytes, mime) = match mime_from_image_bytes(data, mime_hint) {
+    match mime_from_image_bytes(data, mime_hint) {
         MimeType::Jpeg | MimeType::Png | MimeType::Gif | MimeType::Bmp | MimeType::Tiff => {
-            (data.to_vec(), mime_from_image_bytes(data, mime_hint))
+            Ok((data.to_vec(), mime_from_image_bytes(data, mime_hint)))
         }
-        other => {
-            match image::load_from_memory(data) {
-                Ok(img) => {
-                    let mut out = Vec::new();
-                    let rgb = img.to_rgb8();
-                    let mut cursor = std::io::Cursor::new(&mut out);
-                    image::DynamicImage::ImageRgb8(rgb)
-                        .write_to(&mut cursor, ImageFormat::Jpeg)
-                        .map_err(|e| format!("Failed to re-encode cover: {e}"))?;
-                    (out, MimeType::Jpeg)
-                }
-                Err(_) => (data.to_vec(), other),
+        other => match image::load_from_memory(data) {
+            Ok(img) => {
+                let mut out = Vec::new();
+                let rgb = img.to_rgb8();
+                let mut cursor = std::io::Cursor::new(&mut out);
+                image::DynamicImage::ImageRgb8(rgb)
+                    .write_to(&mut cursor, ImageFormat::Jpeg)
+                    .map_err(|e| format!("Failed to re-encode cover: {e}"))?;
+                Ok((out, MimeType::Jpeg))
             }
-        }
-    };
+            Err(_) => Ok((data.to_vec(), other)),
+        },
+    }
+}
 
-    let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
+fn write_cover_into_file(path: &Path, bytes: &[u8], mime: &MimeType) -> Result<(), String> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+
     if ext.as_deref() == Some("mp3") {
         let mut tag = match id3::Tag::read_from_path(path) {
             Ok(tag) => tag,
@@ -1526,30 +1928,23 @@ pub fn write_track_cover(path: &Path, data: &[u8], mime_hint: Option<&str>) -> R
                 id3::Tag::new()
             }
         };
-        tag.remove_picture_by_type(id3::frame::PictureType::CoverFront);
-        
-        let mime_str = match mime {
-            MimeType::Png => "image/png",
-            MimeType::Gif => "image/gif",
-            MimeType::Bmp => "image/bmp",
-            MimeType::Tiff => "image/tiff",
-            MimeType::Jpeg => "image/jpeg",
-            MimeType::Unknown(ref s) => s.as_str(),
-            _ => "image/jpeg",
-        }.to_string();
-
+        // Clear every APIC so old "Other"/back covers don't hide the new front cover.
+        tag.remove_all_pictures();
         tag.add_frame(id3::frame::Picture {
-            mime_type: mime_str,
+            mime_type: mime_to_id3_str(mime),
             picture_type: id3::frame::PictureType::CoverFront,
             description: String::new(),
-            data: bytes,
+            data: bytes.to_vec(),
         });
-        tag.write_to_path(path, id3::Version::Id3v23).map_err(|e| format!("id3 save cover error: {}", e))?;
+        tag.write_to_path(path, id3::Version::Id3v23)
+            .map_err(|e| format!("id3 save cover error: {e}"))?;
         return Ok(());
     }
 
-    let mut tagged_file = read_from_path(path)
-        .map_err(|e| format!("Failed to read audio file for cover: {}", e))?;
+    // Always re-read with cover art enabled so we don't strip existing pictures
+    // when only swapping the front cover.
+    let mut tagged_file =
+        read_from_path(path).map_err(|e| format!("Failed to read audio file for cover: {e}"))?;
 
     if tagged_file.primary_tag_mut().is_none() {
         let tag_type = tagged_file
@@ -1565,17 +1960,116 @@ pub fn write_track_cover(path: &Path, data: &[u8], mime_hint: Option<&str>) -> R
         .ok_or_else(|| "No writable tag slot".to_string())?;
 
     tag.remove_picture_type(PictureType::CoverFront);
+    // Also drop generic "Other" if it was the only cover many tools wrote.
+    tag.remove_picture_type(PictureType::Other);
 
-    let picture = Picture::unchecked(bytes)
+    let picture = Picture::unchecked(bytes.to_vec())
         .pic_type(PictureType::CoverFront)
-        .mime_type(mime)
+        .mime_type(mime.clone())
         .build();
     tag.push_picture(picture);
 
     tagged_file
         .save_to_path(path, WriteOptions::default())
-        .map_err(|e| format!("Failed to save cover tag: {}", e))?;
+        .map_err(|e| format!("Failed to save cover tag: {e}"))?;
+    Ok(())
+}
 
+fn file_has_embedded_cover(path: &Path) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    if ext.as_deref() == Some("mp3") {
+        if let Ok(tag) = id3::Tag::read_from_path(path) {
+            return tag.pictures().next().is_some();
+        }
+    }
+    if let Ok(tagged) = read_from_path(path) {
+        if let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) {
+            return !tag.pictures().is_empty();
+        }
+    }
+    false
+}
+
+fn replace_audio_file(tmp: &Path, dest: &Path) -> Result<(), String> {
+    // Prefer rename-over; on Windows this often fails if dest exists / is open.
+    if fs::rename(tmp, dest).is_ok() {
+        return Ok(());
+    }
+    // Fallback: remove dest then rename (still fails if the file is locked by BASS).
+    match fs::remove_file(dest) {
+        Ok(()) => fs::rename(tmp, dest).map_err(|e| {
+            format!(
+                "Failed to move tagged file into place ({}). Stop playback and try again.",
+                e
+            )
+        }),
+        Err(e) => Err(format!(
+            "Cannot replace audio file ({}). If the track is playing, stop it and try again.",
+            e
+        )),
+    }
+}
+
+/// Embed cover art into the audio file (APIC / FLAC picture / MP4 covr, etc.).
+///
+/// Writes via a temp copy + replace so a failed mid-write doesn't corrupt the
+/// original, and surfaces a clear error when the file is locked by playback.
+pub fn write_track_cover(path: &Path, data: &[u8], mime_hint: Option<&str>) -> Result<(), String> {
+    let (bytes, mime) = prepare_cover_bytes(data, mime_hint)?;
+
+    // 1) Try in-place first (works when the OS allows shared write).
+    match write_cover_into_file(path, &bytes, &mime) {
+        Ok(()) => {
+            if file_has_embedded_cover(path) {
+                return Ok(());
+            }
+            eprintln!(
+                "[metadata] cover write reported ok but re-read found no picture: {}",
+                path.display()
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "[metadata] in-place cover write failed for {}: {e} — trying temp copy",
+                path.display()
+            );
+        }
+    }
+
+    // 2) Temp-copy → tag → replace (avoids partial writes; may still fail if locked).
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("audio");
+    let tmp = path.with_file_name(format!(".{file_name}.muzeeka-cover.tmp"));
+    if tmp.exists() {
+        let _ = fs::remove_file(&tmp);
+    }
+    fs::copy(path, &tmp).map_err(|e| format!("Failed to copy audio for cover write: {e}"))?;
+
+    if let Err(e) = write_cover_into_file(&tmp, &bytes, &mime) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if !file_has_embedded_cover(&tmp) {
+        let _ = fs::remove_file(&tmp);
+        return Err(
+            "Cover was not embedded (this format may not support picture tags)".to_string(),
+        );
+    }
+
+    if let Err(e) = replace_audio_file(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    let _ = fs::remove_file(&tmp);
+
+    if !file_has_embedded_cover(path) {
+        return Err("Cover write finished but the file still has no embedded picture".to_string());
+    }
     Ok(())
 }
 

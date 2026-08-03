@@ -411,6 +411,49 @@ fn fetch_uncached(
     Ok(None)
 }
 
+/// Wrap plain (unsynced) lyrics into a minimal TTML document the player can parse.
+fn plain_text_to_ttml(text: &str) -> String {
+    let mut body = String::new();
+    for line in text.lines() {
+        let escaped = line
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;");
+        // Each line as its own paragraph so the fullscreen view still breaks by line.
+        body.push_str(&format!(
+            r#"      <p begin="0.0s" end="36000.0s">{escaped}</p>
+"#
+        ));
+    }
+    if body.trim().is_empty() {
+        body.push_str(r#"      <p begin="0.0s" end="36000.0s"></p>
+"#);
+    }
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<tt xmlns="http://www.w3.org/ns/ttml">
+  <body>
+    <div>
+{body}    </div>
+  </body>
+</tt>
+"#
+    )
+}
+
+/// Normalize editor input: keep TTML as-is, wrap plain text into unsynced TTML.
+pub fn normalize_lyrics_content(content: &str) -> Result<String, String> {
+    let content = content.trim();
+    if content.is_empty() {
+        return Err("Lyrics text is empty".to_string());
+    }
+    let lower = content.to_ascii_lowercase();
+    if lower.contains("<tt") || lower.contains("<transcript") {
+        return Ok(content.to_string());
+    }
+    Ok(plain_text_to_ttml(content))
+}
+
 /// Import a local TTML (or plain TTML string) into the on-disk lyrics cache
 /// under the same key used by network fetch (title/artist/album/duration).
 pub fn import_lyrics_ttml(
@@ -426,19 +469,11 @@ pub fn import_lyrics_ttml(
         return Err("Track has no title or artist for lyrics cache key".to_string());
     }
 
-    let ttml = ttml.trim();
-    if ttml.is_empty() {
-        return Err("TTML file is empty".to_string());
-    }
-    // Basic sanity — accept TTML or Apple-style timed text roots.
-    let lower = ttml.to_ascii_lowercase();
-    if !lower.contains("<tt") && !lower.contains("<transcript") {
-        return Err("File does not look like TTML lyrics".to_string());
-    }
+    let ttml = normalize_lyrics_content(ttml)?;
 
     let album = album.map(str::trim).filter(|value| !value.is_empty());
     let key = cache_key(title, artist, album, duration_secs);
-    write_cached_hit(&key, ttml)
+    write_cached_hit(&key, &ttml)
 }
 
 /// Remove cached lyrics for a track and mark it as user-cleared so network

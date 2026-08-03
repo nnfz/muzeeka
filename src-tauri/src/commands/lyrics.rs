@@ -53,6 +53,35 @@ pub async fn lyrics_import_ttml(
     Ok(())
 }
 
+/// Save lyrics text (TTML or plain) into the cache for a track.
+#[tauri::command]
+pub async fn lyrics_save_text(
+    app: AppHandle,
+    title: String,
+    artist: String,
+    album: Option<String>,
+    duration_secs: Option<u32>,
+    content: String,
+    track_path: Option<String>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::lyrics::import_lyrics_ttml(
+            &title,
+            &artist,
+            album.as_deref(),
+            duration_secs,
+            &content,
+        )
+    })
+    .await
+    .map_err(|error| format!("Lyrics save task failed: {error}"))??;
+
+    if let Err(e) = app.emit("lyrics:imported", track_path.unwrap_or_default()) {
+        eprintln!("[lyrics_save_text] emit failed: {e}");
+    }
+    Ok(())
+}
+
 /// Remove cached lyrics for a track (and stop auto-refetch until re-import).
 #[tauri::command]
 pub async fn lyrics_clear(

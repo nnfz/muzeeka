@@ -7,10 +7,12 @@
   import WindowControls from '$lib/components/WindowControls.svelte';
   import SettingsWindow from '$lib/components/SettingsWindow.svelte';
   import DownloadWindow from '$lib/components/DownloadWindow.svelte';
+  import TrackPropertiesWindow from '$lib/components/TrackPropertiesWindow.svelte';
   import DragFloatWindow from '$lib/components/DragFloatWindow.svelte';
   import SearchBar from '$lib/components/SearchBar.svelte';
   import ImportProgressBar from '$lib/components/ImportProgressBar.svelte';
   import { precreateDownloadWindow } from '$lib/stores/download.svelte';
+  import { precreateTrackPropertiesWindow } from '$lib/stores/trackProperties.svelte';
   import { invoke } from '@tauri-apps/api/core';
   import { getPlayerStore } from '$lib/stores/player.svelte';
   import { createSettingsStore, setSettingsStore } from '$lib/stores/settings.svelte';
@@ -20,9 +22,10 @@
   const currentWin = getCurrentWindow();
   const isSettingsWindow = currentWin.label === 'settings';
   const isDownloadWindow = currentWin.label === 'download';
+  const isTrackPropertiesWindow = currentWin.label === 'track-properties';
   const isDragFloatWindow = currentWin.label === 'drag-float';
   const isSecondaryWindow =
-    isSettingsWindow || isDownloadWindow || isDragFloatWindow;
+    isSettingsWindow || isDownloadWindow || isTrackPropertiesWindow || isDragFloatWindow;
 
   let player = $state<ReturnType<typeof getPlayerStore> | null>(null);
   let ensurePlayerReady: () => Promise<void>;
@@ -43,7 +46,7 @@
         // Player may already be initialized by main window
       }
     };
-  } else if (isDownloadWindow) {
+  } else if (isDownloadWindow || isTrackPropertiesWindow) {
     ensurePlayerReady = async () => {};
   } else {
     player = getPlayerStore();
@@ -100,6 +103,7 @@
 
     queueMicrotask(precreateSettingsWindow);
     precreateDownloadWindow();
+    precreateTrackPropertiesWindow();
   }
 
   async function openSettingsWindow() {
@@ -313,6 +317,8 @@
   <SettingsWindow />
 {:else if isDownloadWindow}
   <DownloadWindow />
+{:else if isTrackPropertiesWindow}
+  <TrackPropertiesWindow />
 {:else}
   <div class="app-layout">
     <ImportProgressBar />

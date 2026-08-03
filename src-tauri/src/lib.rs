@@ -21,6 +21,7 @@ mod lrclib;
 mod lyrics;
 mod unison;
 mod metadata;
+mod tag_table;
 mod player;
 mod path_store;
 mod playlists;
@@ -342,6 +343,11 @@ pub fn run() {
             commands::library_scan,
             commands::library_scan_paths,
             commands::library_fetch_metadata,
+            commands::library_update_track_metadata,
+            commands::library_audio_tech_info,
+            commands::library_get_tag_table,
+            commands::library_set_tag_table,
+            commands::library_set_track_cover,
             commands::library_resolve_cover,
             commands::library_resolve_full_cover,
             commands::library_cover_data_url,
@@ -368,6 +374,7 @@ pub fn run() {
             // Lyrics
             commands::lyrics_fetch,
             commands::lyrics_import_ttml,
+            commands::lyrics_save_text,
             commands::lyrics_clear,
             commands::lyrics_refetch,
             // yt-dlp

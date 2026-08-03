@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::bass::{self, BassLibrary};
 use crate::cue::{self, PlaybackTarget};
@@ -755,6 +755,7 @@ impl Player {
     ) -> Result<(), String> {
         let _ops = self.ops.lock();
         let track_path = track_path.to_string();
+        let track_path_for_stats = track_path.clone();
         let audio_path = audio_path.map(str::to_string);
         self.run_on_bass_thread(move |inner| {
             // Install the queue/index only — do NOT preload the next track yet.
@@ -778,7 +779,26 @@ impl Player {
                 .current_track_start_time
                 .saturating_add(MANUAL_SEGMENT_SUPPRESS_MS);
             Ok(())
-        })
+        })?;
+        // Count after BASS open succeeds (manual play / remote / next-prev).
+        self.record_play_stat(&track_path_for_stats);
+        Ok(())
+    }
+
+    /// Persist foobar-style play count for `track_path` (best-effort).
+    fn record_play_stat(&self, track_path: &str) {
+        let path = track_path.trim();
+        if path.is_empty() {
+            return;
+        }
+        let Some(app) = self.app.read().clone() else {
+            return;
+        };
+        if let Some(db) = app.try_state::<crate::playlists::LibraryDatabase>() {
+            if let Err(e) = db.record_play(path) {
+                eprintln!("[playback_stats] record_play failed: {e}");
+            }
+        }
     }
 
     fn refresh_pending_next(inner: &mut PlayerInner) {
@@ -2612,6 +2632,8 @@ impl Player {
         };
 
         if let Some(path) = advanced_path {
+            // Gapless auto-advance is a new play start for the next track.
+            player_for_main.record_play_stat(&path);
             let mut was = was_for_main.lock().unwrap_or_else(|e| e.into_inner());
             *was = true;
             let snapshot = player_for_main.get_state();
@@ -2700,6 +2722,7 @@ impl Player {
                     .flatten();
 
                 if let Some(path) = recovered {
+                    player_for_main.record_play_stat(&path);
                     *was = true;
                     let snapshot = player_for_main.get_state();
                     let _ = app_emit.emit(

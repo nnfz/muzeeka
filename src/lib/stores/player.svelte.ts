@@ -4,6 +4,10 @@ import { setupTaskbar } from '$lib/taskbar';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
+import {
+  notifyTrackPropertiesCloseAll,
+  notifyTrackPropertiesPathsRemoved,
+} from '$lib/stores/trackProperties.svelte';
 import { reorderItemsAtBoundary } from '$lib/trackOrder';
 import { setImportProgress, resetImportProgress } from '$lib/stores/importProgress.svelte';
 import {
@@ -1354,6 +1358,7 @@ function deletePlaylist(id: string) {
       libraryTracks = libraryTracks.filter((t) => !orphanKeys.has(pathKey(t.path)));
       allPaths = allPaths.filter((p) => !orphanKeys.has(pathKey(p)));
       persistMutation('library_remove_tracks', { paths: orphanPaths });
+      notifyTrackPropertiesPathsRemoved(orphanPaths);
 
       if (currentFile && orphanKeys.has(pathKey(currentFile))) {
         void stop();
@@ -1397,6 +1402,7 @@ function removeTrack(path: string, playlistId?: string | null) {
     p.id === targetId ? { ...p, tracks: p.tracks.filter((track) => track.path !== path) } : p
   );
   persistMutation('playlist_remove_tracks', { playlistId: targetId, paths: [path] });
+  notifyTrackPropertiesPathsRemoved([path]);
 
   if (currentFile === path) {
     void stop();
@@ -1550,6 +1556,7 @@ function removeTracksFromPlaylist(paths: string[], playlistId: string) {
       : p
   );
   persistMutation('playlist_remove_tracks', { playlistId, paths });
+  notifyTrackPropertiesPathsRemoved(paths);
 
   if (currentFile && pathSet.has(currentFile)) {
     void stop();
@@ -2967,10 +2974,30 @@ function setupListeners() {
     isPaused = false;
     position = 0;
     syncWindowTitle();
+    notifyTrackPropertiesCloseAll();
   });
 
   listen('covers:rebuilt', () => {
     void refreshCoversAfterRebuild();
+  });
+
+  listen<MusicFile>('track:metadata-updated', (event) => {
+    const updated = event.payload;
+    if (!updated?.path) return;
+    // Serde omits None optionals — force-clear so the editor can wipe tags.
+    const normalized: MusicFile = {
+      ...updated,
+      title: updated.title ?? null,
+      artist: updated.artist ?? null,
+      album: updated.album ?? null,
+      genre: updated.genre ?? null,
+      year: updated.year ?? null,
+      track_number: updated.track_number ?? null,
+    };
+    mergeMetadataIntoPlaylists([normalized]);
+    if (currentFile && pathKey(currentFile) === pathKey(updated.path)) {
+      syncWindowTitle();
+    }
   });
 
   listen<{

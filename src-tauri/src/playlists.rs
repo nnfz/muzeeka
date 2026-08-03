@@ -83,6 +83,14 @@ pub struct PlaylistsData {
     pub was_playing: bool,
 }
 
+/// Foobar-style per-track play statistics.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PlaybackStats {
+    pub play_count: u32,
+    pub first_played_unix: Option<i64>,
+    pub last_played_unix: Option<i64>,
+}
+
 struct DatabaseInner {
     connection: Mutex<Connection>,
     revision: AtomicU64,
@@ -264,7 +272,15 @@ impl LibraryDatabase {
                      track_id INTEGER PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE,
                      position INTEGER NOT NULL
                  );
-                 CREATE INDEX IF NOT EXISTS liked_tracks_order ON liked_tracks(position);",
+                 CREATE INDEX IF NOT EXISTS liked_tracks_order ON liked_tracks(position);
+                 -- Foobar-style play counts; keyed by absolute path_key (incl. #cue:N).
+                 -- Not FK-linked to tracks so stats survive remove/re-import.
+                 CREATE TABLE IF NOT EXISTS playback_stats (
+                     path_key TEXT PRIMARY KEY,
+                     play_count INTEGER NOT NULL DEFAULT 0,
+                     first_played_unix INTEGER,
+                     last_played_unix INTEGER
+                 );",
             )
             .map_err(db_error)?;
 
@@ -328,6 +344,72 @@ impl LibraryDatabase {
 
     fn changed(&self) {
         self.inner.revision.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Record a play start for the given track path (absolute, may include `#cue:N`).
+    /// Safe to call from any thread; does not bump library revision (stats are separate).
+    pub fn record_play(&self, track_path: &str) -> Result<PlaybackStats, String> {
+        let key = path_key(track_path.trim());
+        if key.is_empty() {
+            return Err("Empty track path".into());
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        let connection = self.inner.connection.lock();
+        connection
+            .execute(
+                "INSERT INTO playback_stats(path_key, play_count, first_played_unix, last_played_unix)
+                 VALUES (?1, 1, ?2, ?2)
+                 ON CONFLICT(path_key) DO UPDATE SET
+                     play_count = play_count + 1,
+                     first_played_unix = COALESCE(first_played_unix, excluded.first_played_unix),
+                     last_played_unix = excluded.last_played_unix",
+                params![key, now],
+            )
+            .map_err(db_error)?;
+
+        connection
+            .query_row(
+                "SELECT play_count, first_played_unix, last_played_unix
+                   FROM playback_stats WHERE path_key = ?1",
+                [&key],
+                |row| {
+                    Ok(PlaybackStats {
+                        play_count: row.get::<_, i64>(0)?.max(0) as u32,
+                        first_played_unix: row.get(1)?,
+                        last_played_unix: row.get(2)?,
+                    })
+                },
+            )
+            .map_err(db_error)
+    }
+
+    /// Look up play stats for a track path. Missing row → zeros / None.
+    pub fn get_playback_stats(&self, track_path: &str) -> Result<PlaybackStats, String> {
+        let key = path_key(track_path.trim());
+        if key.is_empty() {
+            return Ok(PlaybackStats::default());
+        }
+        let connection = self.inner.connection.lock();
+        let stats = connection
+            .query_row(
+                "SELECT play_count, first_played_unix, last_played_unix
+                   FROM playback_stats WHERE path_key = ?1",
+                [&key],
+                |row| {
+                    Ok(PlaybackStats {
+                        play_count: row.get::<_, i64>(0)?.max(0) as u32,
+                        first_played_unix: row.get(1)?,
+                        last_played_unix: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(db_error)?;
+        Ok(stats.unwrap_or_default())
     }
 
     pub fn load(&self) -> Result<PlaylistsData, String> {

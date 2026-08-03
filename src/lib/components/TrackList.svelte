@@ -27,7 +27,6 @@
   } from "$lib/contextMenu";
   import { open } from "@tauri-apps/plugin-dialog";
   import { revealItemInDir } from "@tauri-apps/plugin-opener";
-  import { invoke } from "@tauri-apps/api/core";
   import { audioPathsForDrag, startFileDrag } from "$lib/fileDrag";
   import { exportAudioPathForTrack } from "$lib/trackPaths";
   import { reorderItemsAtBoundary } from "$lib/trackOrder";
@@ -36,6 +35,7 @@
   import { dragFloatHide } from "$lib/dragFloat";
   import TrackCover from "./TrackCover.svelte";
   import LikeButton from "./LikeButton.svelte";
+  import { openTrackPropertiesWindow } from "$lib/stores/trackProperties.svelte";
 
   type ColumnId = "index" | "title" | "album" | "duration";
   type SortDirection = "asc" | "desc";
@@ -346,22 +346,13 @@
       onSelect: () => revealTracksOnDisk(affectedTracks),
     });
 
-    // Lyrics actions — single track only (lyrics cache key is per-title/artist).
+    // Properties — single track only.
     if (!multi) {
       items.push({
-        id: "import-ttml",
-        label: "Импорт TTML",
-        onSelect: () => void importTtmlForTrack(target.track),
-      });
-      items.push({
-        id: "refetch-lyrics",
-        label: "Найти текст",
-        onSelect: () => void refetchLyricsForTrack(target.track),
-      });
-      items.push({
-        id: "clear-lyrics",
-        label: "Убрать текст",
-        onSelect: () => void clearLyricsForTrack(target.track),
+        id: "properties",
+        label: "Properties",
+        icon: "properties",
+        onSelect: () => void openTrackPropertiesWindow(target.track),
       });
     }
 
@@ -716,87 +707,6 @@
       dragToast = null;
       dragToastTimer = null;
     }, ms);
-  }
-
-  async function importTtmlForTrack(track: MusicFile) {
-    const selected = await open({
-      multiple: false,
-      filters: [
-        { name: "TTML lyrics", extensions: ["ttml", "xml"] },
-        { name: "All files", extensions: ["*"] },
-      ],
-    });
-    const path = typeof selected === "string" ? selected : null;
-    if (!path) return;
-
-    try {
-      await invoke("lyrics_import_ttml", {
-        title: trackDisplayTitle(track),
-        artist: trackDisplayArtist(track),
-        album: track.album ?? null,
-        durationSecs:
-          track.duration_secs != null && track.duration_secs > 0
-            ? Math.round(track.duration_secs)
-            : null,
-        path,
-        trackPath: track.path,
-      });
-      showDragToast("TTML импортирован");
-    } catch (e) {
-      console.error("Failed to import TTML:", e);
-      showDragToast(
-        e instanceof Error ? e.message : "Не удалось импортировать TTML",
-        3200,
-      );
-    }
-  }
-
-  async function clearLyricsForTrack(track: MusicFile) {
-    try {
-      await invoke("lyrics_clear", {
-        title: trackDisplayTitle(track),
-        artist: trackDisplayArtist(track),
-        album: track.album ?? null,
-        durationSecs:
-          track.duration_secs != null && track.duration_secs > 0
-            ? Math.round(track.duration_secs)
-            : null,
-        trackPath: track.path,
-      });
-      showDragToast("Текст убран");
-    } catch (e) {
-      console.error("Failed to clear lyrics:", e);
-      showDragToast(
-        e instanceof Error ? e.message : "Не удалось убрать текст",
-        3200,
-      );
-    }
-  }
-
-  async function refetchLyricsForTrack(track: MusicFile) {
-    showDragToast("Ищем текст…", 8000);
-    try {
-      const found = await invoke<boolean>("lyrics_refetch", {
-        title: trackDisplayTitle(track),
-        artist: trackDisplayArtist(track),
-        album: track.album ?? null,
-        durationSecs:
-          track.duration_secs != null && track.duration_secs > 0
-            ? Math.round(track.duration_secs)
-            : null,
-        trackPath: track.path,
-      });
-      showDragToast(
-        found ? "Текст найден" : "Текст не найден",
-        found ? 2400 : 3200,
-      );
-    } catch (e) {
-      console.error("Failed to refetch lyrics:", e);
-      showDragToast(
-        e instanceof Error ? e.message : "Не удалось найти текст",
-        3200,
-      );
-    }
   }
 
   function closeContextMenu() {

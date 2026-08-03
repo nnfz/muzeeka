@@ -4,7 +4,7 @@ export interface ContextMenuItem {
   danger?: boolean;
   disabled?: boolean;
   closeOnSelect?: boolean;
-  icon?: 'rename' | 'delete' | 'heart' | 'folder' | 'playlist' | 'image' | 'file' | 'import';
+  icon?: 'rename' | 'delete' | 'heart' | 'folder' | 'playlist' | 'image' | 'file' | 'import' | 'properties';
   onSelect: () => void;
 }
 

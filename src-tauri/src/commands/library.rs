@@ -74,6 +74,472 @@ pub async fn library_fetch_metadata(paths: Vec<String>) -> Result<Vec<library::M
         .map_err(|e| format!("Metadata task failed: {e}"))?
 }
 
+/// Payload for the track Properties editor.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct TrackMetadataUpdate {
+    pub path: String,
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub year: Option<u32>,
+    pub track_number: Option<u32>,
+    pub genre: Option<String>,
+    /// Snapshot fields preserved for CUE / DB-only updates when we cannot re-read the file.
+    #[serde(default)]
+    pub file_name: Option<String>,
+    #[serde(default)]
+    pub extension: Option<String>,
+    #[serde(default)]
+    pub size: Option<u64>,
+    #[serde(default)]
+    pub duration_secs: Option<f64>,
+    #[serde(default)]
+    pub cover_path: Option<String>,
+    #[serde(default)]
+    pub cover_path_full: Option<String>,
+    #[serde(default)]
+    pub audio_path: Option<String>,
+    #[serde(default)]
+    pub cue_start_secs: Option<f64>,
+    #[serde(default)]
+    pub cue_end_secs: Option<f64>,
+}
+
+/// Result of writing tags + updating the library row.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TrackMetadataUpdateResult {
+    pub track: library::MusicFile,
+    /// True when tags were written into the on-disk audio file (plain file or CUE image).
+    pub wrote_to_file: bool,
+}
+
+/// Resolve the real audio file that should receive embedded tags.
+/// CUE virtual paths (`image.flac#cue:3`) map to the container audio image.
+fn tag_write_path(track_path: &str, audio_path_hint: Option<&str>) -> Result<std::path::PathBuf, String> {
+    if crate::cue::is_cue_track_path(track_path) {
+        let audio = audio_path_hint
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .or_else(|| {
+                crate::cue::parse_virtual_cue_path(track_path).map(|(audio, _)| audio)
+            })
+            .ok_or_else(|| format!("Could not resolve CUE audio file for: {track_path}"))?;
+        let p = std::path::PathBuf::from(&audio);
+        if !p.is_file() {
+            return Err(format!("CUE audio file not found: {audio}"));
+        }
+        return Ok(p);
+    }
+
+    let p = std::path::PathBuf::from(track_path);
+    if !p.is_file() {
+        return Err(format!("File not found: {track_path}"));
+    }
+    Ok(p)
+}
+
+/// Probe bitrate / sample rate for the Properties window (CUE → audio image).
+#[tauri::command]
+pub async fn library_audio_tech_info(
+    database: State<'_, LibraryDatabase>,
+    path: String,
+    audio_path: Option<String>,
+) -> Result<crate::metadata::AudioTechInfo, String> {
+    let track_path = path.clone();
+    let database = database.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let write_path = tag_write_path(path.trim(), audio_path.as_deref())?;
+        let mut info = crate::metadata::read_audio_tech_info(&write_path);
+        // Play stats are keyed by the playlist/virtual track path (incl. #cue:N).
+        if let Ok(stats) = database.get_playback_stats(track_path.trim()) {
+            info.play_count = Some(stats.play_count);
+            info.first_played_unix = stats.first_played_unix;
+            info.last_played_unix = stats.last_played_unix;
+        }
+        Ok(info)
+    })
+    .await
+    .map_err(|e| format!("Audio tech probe failed: {e}"))?
+}
+
+/// Foobar-style full tag dump for the Properties → Metadata table.
+#[tauri::command]
+pub async fn library_get_tag_table(
+    path: String,
+    audio_path: Option<String>,
+) -> Result<Vec<crate::tag_table::TagTableRow>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let write_path = tag_write_path(path.trim(), audio_path.as_deref())?;
+        crate::tag_table::read_tag_table(&write_path)
+    })
+    .await
+    .map_err(|e| format!("Tag table read failed: {e}"))?
+}
+
+/// Write the full tag table back to the audio file and refresh library fields.
+#[tauri::command]
+pub async fn library_set_tag_table(
+    app: AppHandle,
+    database: State<'_, LibraryDatabase>,
+    path: String,
+    audio_path: Option<String>,
+    rows: Vec<crate::tag_table::TagTableRow>,
+    snapshot: Option<library::MusicFile>,
+) -> Result<library::MusicFile, String> {
+    let database = database.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let track_path = path.trim().to_string();
+        if track_path.is_empty() {
+            return Err("Empty track path".to_string());
+        }
+        let write_path = tag_write_path(&track_path, audio_path.as_deref())?;
+        crate::tag_table::write_tag_table(&write_path, &rows)?;
+
+        let fields = crate::tag_table::track_fields_from_table(&rows);
+        let is_cue = crate::cue::is_cue_track_path(&track_path);
+
+        let track = if is_cue {
+            let snap = snapshot.unwrap_or(library::MusicFile {
+                path: track_path.clone(),
+                file_name: track_path
+                    .rsplit(['\\', '/'])
+                    .next()
+                    .unwrap_or(&track_path)
+                    .to_string(),
+                extension: write_path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase(),
+                size: 0,
+                title: None,
+                artist: None,
+                album: None,
+                duration_secs: None,
+                year: None,
+                track_number: None,
+                genre: None,
+                cover_path: None,
+                cover_path_full: None,
+                audio_path: None,
+                cue_start_secs: None,
+                cue_end_secs: None,
+            });
+            let covers = crate::metadata::extract_covers_for_file(&write_path);
+            library::MusicFile {
+                path: track_path,
+                file_name: snap.file_name,
+                extension: snap.extension,
+                size: if snap.size > 0 {
+                    snap.size
+                } else {
+                    std::fs::metadata(&write_path)
+                        .map(|m| m.len())
+                        .unwrap_or(0)
+                },
+                title: fields.title.or(snap.title),
+                artist: fields.artist.or(snap.artist),
+                album: fields.album.or(snap.album),
+                duration_secs: snap.duration_secs,
+                year: fields.year.or(snap.year),
+                track_number: fields.track_number.or(snap.track_number),
+                genre: fields.genre.or(snap.genre),
+                cover_path: covers.thumb.or(snap.cover_path),
+                cover_path_full: covers.full.or(snap.cover_path_full),
+                audio_path: Some(write_path.to_string_lossy().into_owned()),
+                cue_start_secs: snap.cue_start_secs,
+                cue_end_secs: snap.cue_end_secs,
+            }
+        } else {
+            let mut files = library::fetch_metadata(&[track_path.clone()])?;
+            let mut file = files
+                .pop()
+                .ok_or_else(|| format!("Could not re-read track: {track_path}"))?;
+            // Prefer table values for the core columns we just wrote.
+            file.title = fields.title.or(file.title.take());
+            file.artist = fields.artist.or(file.artist.take());
+            file.album = fields.album;
+            file.genre = fields.genre;
+            file.year = fields.year;
+            file.track_number = fields.track_number;
+            file
+        };
+
+        database.upsert_tracks(&[track.clone()])?;
+        if let Err(e) = app.emit("track:metadata-updated", &track) {
+            eprintln!("[library_set_tag_table] emit failed: {e}");
+        }
+        Ok(track)
+    })
+    .await
+    .map_err(|e| format!("Tag table write failed: {e}"))?
+}
+
+/// Embed a new cover image into the audio file, refresh cover cache, upsert library.
+/// `snapshot` preserves CUE segment fields / current tags when re-read is partial.
+#[tauri::command]
+pub async fn library_set_track_cover(
+    app: AppHandle,
+    database: State<'_, LibraryDatabase>,
+    path: String,
+    image_path: String,
+    snapshot: Option<library::MusicFile>,
+) -> Result<library::MusicFile, String> {
+    let database = database.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let track_path = path.trim().to_string();
+        if track_path.is_empty() {
+            return Err("Empty track path".to_string());
+        }
+        let image = std::path::PathBuf::from(image_path.trim());
+        if !image.is_file() {
+            return Err(format!("Image not found: {}", image.display()));
+        }
+        let bytes = std::fs::read(&image).map_err(|e| format!("Failed to read image: {e}"))?;
+        if bytes.is_empty() {
+            return Err("Image file is empty".to_string());
+        }
+        let mime_hint = image
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| match e.to_ascii_lowercase().as_str() {
+                "png" => "image/png",
+                "gif" => "image/gif",
+                "webp" => "image/webp",
+                "bmp" => "image/bmp",
+                "tif" | "tiff" => "image/tiff",
+                _ => "image/jpeg",
+            });
+
+        let audio_hint = snapshot
+            .as_ref()
+            .and_then(|t| t.audio_path.as_deref());
+        let write_path = tag_write_path(&track_path, audio_hint)?;
+        eprintln!(
+            "[library_set_track_cover] embedding {} bytes into {}",
+            bytes.len(),
+            write_path.display()
+        );
+        crate::metadata::write_track_cover(&write_path, &bytes, mime_hint)?;
+
+        // Rebuild content-addressed cover cache from the freshly tagged file.
+        let covers = crate::metadata::extract_covers_for_file(&write_path);
+        if covers.thumb.is_none() && covers.full.is_none() {
+            eprintln!(
+                "[library_set_track_cover] warning: wrote cover but extract found none for {}",
+                write_path.display()
+            );
+        }
+
+        let is_cue = crate::cue::is_cue_track_path(&track_path);
+        let track = if is_cue {
+            let snap = snapshot.unwrap_or(library::MusicFile {
+                path: track_path.clone(),
+                file_name: track_path
+                    .rsplit(['\\', '/'])
+                    .next()
+                    .unwrap_or(&track_path)
+                    .to_string(),
+                extension: write_path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase(),
+                size: 0,
+                title: None,
+                artist: None,
+                album: None,
+                duration_secs: None,
+                year: None,
+                track_number: None,
+                genre: None,
+                cover_path: None,
+                cover_path_full: None,
+                audio_path: None,
+                cue_start_secs: None,
+                cue_end_secs: None,
+            });
+            let audio = write_path.to_string_lossy().into_owned();
+            let file_size = if snap.size > 0 {
+                snap.size
+            } else {
+                std::fs::metadata(&write_path)
+                    .map(|m| m.len())
+                    .unwrap_or(0)
+            };
+            library::MusicFile {
+                path: track_path,
+                file_name: snap.file_name,
+                extension: if snap.extension.is_empty() {
+                    write_path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("")
+                        .to_ascii_lowercase()
+                } else {
+                    snap.extension
+                },
+                size: file_size,
+                title: snap.title,
+                artist: snap.artist,
+                album: snap.album,
+                duration_secs: snap.duration_secs,
+                year: snap.year,
+                track_number: snap.track_number,
+                genre: snap.genre,
+                cover_path: covers.thumb,
+                cover_path_full: covers.full,
+                audio_path: Some(audio),
+                cue_start_secs: snap.cue_start_secs,
+                cue_end_secs: snap.cue_end_secs,
+            }
+        } else {
+            let mut files = library::fetch_metadata(&[track_path.clone()])?;
+            let mut file = files
+                .pop()
+                .ok_or_else(|| format!("Could not re-read track: {track_path}"))?;
+            file.cover_path = covers.thumb.or(file.cover_path.take());
+            file.cover_path_full = covers.full.or(file.cover_path_full.take());
+            file
+        };
+
+        database.upsert_tracks(&[track.clone()])?;
+        if let Err(e) = app.emit("track:metadata-updated", &track) {
+            eprintln!("[library_set_track_cover] emit failed: {e}");
+        }
+        Ok(track)
+    })
+    .await
+    .map_err(|e| format!("Cover update task failed: {e}"))?
+}
+
+/// Write track tags into the source audio file and upsert SQLite.
+#[tauri::command]
+pub async fn library_update_track_metadata(
+    app: AppHandle,
+    database: State<'_, LibraryDatabase>,
+    update: TrackMetadataUpdate,
+) -> Result<TrackMetadataUpdateResult, String> {
+    let database = database.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = update.path.trim().to_string();
+        if path.is_empty() {
+            return Err("Empty track path".to_string());
+        }
+
+        let tags = crate::metadata::TrackTags {
+            title: update.title.clone(),
+            artist: update.artist.clone(),
+            album: update.album.clone(),
+            year: update.year,
+            track_number: update.track_number,
+            genre: update.genre.clone(),
+        };
+
+        let is_cue = crate::cue::is_cue_track_path(&path);
+        let write_path = tag_write_path(&path, update.audio_path.as_deref())?;
+        crate::metadata::write_track_metadata(&write_path, &tags)?;
+        let wrote_to_file = true;
+
+        let clean_text = |value: &Option<String>| -> Option<String> {
+            value
+                .as_ref()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        };
+
+        let track = if is_cue {
+            // Keep CUE segment identity; tags live on the shared audio image.
+            let audio_path = write_path.to_string_lossy().into_owned();
+            let file_name = update
+                .file_name
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| {
+                    path.rsplit(['\\', '/'])
+                        .next()
+                        .unwrap_or(&path)
+                        .to_string()
+                });
+            let size = if update.size.unwrap_or(0) > 0 {
+                update.size.unwrap_or(0)
+            } else {
+                std::fs::metadata(&write_path)
+                    .map(|m| m.len())
+                    .unwrap_or(0)
+            };
+            let extension = update.extension.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| {
+                write_path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase()
+            });
+
+            // Prefer covers already known for this row; fall back to re-read from image.
+            let (cover_path, cover_path_full) =
+                if update.cover_path.is_some() || update.cover_path_full.is_some() {
+                    (update.cover_path.clone(), update.cover_path_full.clone())
+                } else {
+                    let meta = crate::metadata::read_metadata(
+                        &write_path,
+                        write_path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or(""),
+                    );
+                    (meta.cover_path, meta.cover_path_full)
+                };
+
+            library::MusicFile {
+                path: path.clone(),
+                file_name,
+                extension,
+                size,
+                title: clean_text(&tags.title),
+                artist: clean_text(&tags.artist),
+                album: clean_text(&tags.album),
+                duration_secs: update.duration_secs,
+                year: tags.year.filter(|&y| y > 0),
+                track_number: tags.track_number.filter(|&n| n > 0),
+                genre: clean_text(&tags.genre),
+                cover_path,
+                cover_path_full,
+                audio_path: Some(audio_path),
+                cue_start_secs: update.cue_start_secs,
+                cue_end_secs: update.cue_end_secs,
+            }
+        } else {
+            let mut files = library::fetch_metadata(&[path.clone()])?;
+            let mut file = files
+                .pop()
+                .ok_or_else(|| format!("Could not re-read tags: {path}"))?;
+            // Mirror what the editor saved (file re-read can lag / normalize encoding).
+            file.title = clean_text(&tags.title);
+            file.artist = clean_text(&tags.artist);
+            file.album = clean_text(&tags.album);
+            file.genre = clean_text(&tags.genre);
+            file.year = tags.year.filter(|&y| y > 0);
+            file.track_number = tags.track_number.filter(|&n| n > 0);
+            file
+        };
+
+        database.upsert_tracks(&[track.clone()])?;
+
+        if let Err(e) = app.emit("track:metadata-updated", &track) {
+            eprintln!("[library_update_track_metadata] emit failed: {e}");
+        }
+
+        Ok(TrackMetadataUpdateResult {
+            track,
+            wrote_to_file,
+        })
+    })
+    .await
+    .map_err(|e| format!("Metadata update task failed: {e}"))?
+}
+
 fn cover_audio_path(path: &str) -> String {
     if crate::cue::is_cue_track_path(path) {
         if let Some((audio, _)) = crate::cue::parse_virtual_cue_path(path) {
