@@ -2836,7 +2836,41 @@ function setupListeners() {
     applyShuffleMode(mode);
   });
 
+  /**
+   * Mix Transition window owns BASS for dual-deck preview. Freeze main library
+   * transport UI so Preview doesn't look like "play everywhere".
+   */
+  let mixPreviewActive = false;
+  let frozenDuringMixPreview: PlayUiSnapshot | null = null;
+
+  listen<{ active?: boolean }>('player:mix-preview', (event) => {
+    const active = event.payload?.active === true;
+    if (active === mixPreviewActive) return;
+    if (active) {
+      frozenDuringMixPreview = snapshotPlayUi();
+      // Keep library transport looking paused/stopped; don't show mix as current track.
+      isPlaying = false;
+      isPaused = frozenDuringMixPreview.isPaused || !!frozenDuringMixPreview.currentFile;
+      mixPreviewActive = true;
+      return;
+    }
+    mixPreviewActive = false;
+    const frozen = frozenDuringMixPreview;
+    frozenDuringMixPreview = null;
+    if (frozen) {
+      // Restore pre-preview UI (track selection / pause). Audio was taken by mix — stay paused.
+      restorePlayUi({
+        ...frozen,
+        isPlaying: false,
+        isPaused: !!frozen.currentFile,
+      });
+    } else {
+      isPlaying = false;
+    }
+  });
+
   listen<StoreSyncPayload>('player:store-sync', (event) => {
+    if (mixPreviewActive) return;
     const prevPlayingId = playingPlaylistId;
     const prevFile = currentFile;
     applyStoreSync(event.payload);
@@ -2850,6 +2884,7 @@ function setupListeners() {
   });
 
   listen<{ path: string }>('player:track-changed', (event) => {
+    if (mixPreviewActive) return;
     const path = event.payload.path;
 
     // Protect recent manual plays from *stale* track-changed events (e.g. old gapless
@@ -2922,6 +2957,7 @@ function setupListeners() {
   // hidden/minimized WebView does not thrash Svelte reactivity during games.
   let lastHiddenPositionApply = 0;
   listen<{ position: number; duration: number; state?: string }>('player:position', (event) => {
+    if (mixPreviewActive) return;
     const newPos = event.payload.position;
     const backendDur = event.payload.duration;
     // Never let a full-file duration overwrite a tighter CUE INDEX length —
@@ -2985,6 +3021,7 @@ function setupListeners() {
   });
 
   listen<{ is_playing: boolean; is_paused: boolean }>('player:state', (event) => {
+    if (mixPreviewActive) return;
     applyBackendPlaybackState(event.payload);
   });
 
@@ -3060,6 +3097,7 @@ function setupListeners() {
   });
 
   listen<{ path?: string }>('player:track-ended', (event) => {
+    if (mixPreviewActive) return;
     const endedPath = event.payload?.path;
 
     // Stale ended from a previous track (manual skip / gapless already advanced).

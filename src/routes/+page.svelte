@@ -228,7 +228,17 @@
     switch (e.code) {
       case 'Space':
         e.preventDefault();
-        player.togglePlayPause();
+        // When Mix Transition is open, Space belongs to that window only
+        // (preview). Don't toggle the main transport underneath.
+        void (async () => {
+          try {
+            const mix = await WebviewWindow.getByLabel('mix-transition');
+            if (mix && (await mix.isVisible())) return;
+          } catch {
+            /* ignore */
+          }
+          player.togglePlayPause();
+        })();
         break;
       case 'ArrowRight':
         if (e.shiftKey) {

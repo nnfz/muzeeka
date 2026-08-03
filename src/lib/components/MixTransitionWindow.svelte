@@ -1046,12 +1046,15 @@
   }
 
   /**
-   * Snap so the grid stick under the cursor on the dragged track lands on the
-   * stick under the cursor on the other track (same screen X).
+   * Snap so a grid stick on the dragged track lands on a stick of the other
+   * track (same screen X). Works mid-gap too: we don't require a stick under
+   * the cursor — only that some nearby self stick is within SNAP_PX of some
+   * other stick on screen.
    *
-   * 1. time under mouse on self → nearest self stick S
-   * 2. time under mouse on other → nearest other stick O
-   * 3. if |x(S) − x(O)| < SNAP_PX → move self so S and O share one X
+   * For each self stick S near the grab:
+   *   O = other stick currently nearest to S's screen column
+   *   if |x(S) − x(O)| ≤ SNAP_PX → candidate
+   * Prefer bar↔bar, then smallest gap, then stick closest to cursor.
    */
   function snapViewStart(
     id: LaneId,
@@ -1095,40 +1098,78 @@
     const tSelfUnder = raw + xSelf / pxPerSec;
     const tOtherUnder = other.viewStartSecs + xOther / pxPerSec;
 
-    // Nearby sticks only (around the cursor ± a few seconds / beats).
-    const pad = Math.max(4, (SNAP_PX * 4) / pxPerSec);
+    // Search at least half a beat so a grab between sticks still sees both
+    // neighbors; also cover a few SNAP_PX of screen so zoom-out still works.
+    const selfBeat =
+      self.bpm != null && self.bpm > 0 ? 60 / self.bpm : 0.5;
+    const searchSecs = Math.max(
+      selfBeat * 0.55,
+      (SNAP_PX * 4) / pxPerSec,
+      0.05,
+    );
+    const pad = Math.max(searchSecs * 2, 2);
     const selfMarks = collectMarkers(
       self,
-      tSelfUnder - pad * 4,
-      tSelfUnder + pad * 4,
+      tSelfUnder - pad,
+      tSelfUnder + pad,
     );
     const otherMarks = collectMarkers(
       other,
-      tOtherUnder - pad * 4,
-      tOtherUnder + pad * 4,
+      tOtherUnder - pad * 2,
+      tOtherUnder + pad * 2,
     );
-
-    const s = nearestMarker(selfMarks, tSelfUnder);
-    const o = nearestMarker(otherMarks, tOtherUnder);
-    if (!s || !o) return { viewStart: raw, snapped: false };
-
-    // Screen X of those sticks with the raw drag position.
-    const xStickSelf = (s.t - raw) * pxPerSec;
-    const xStickOther = (o.t - other.viewStartSecs) * pxPerSec;
-    const gapPx = Math.abs(xStickSelf - xStickOther);
-
-    // Also require the self stick to actually be near the cursor (the one "under the mouse").
-    const stickToCursorPx = Math.abs(xStickSelf - xSelf);
-    if (stickToCursorPx > SNAP_PX * 1.5) {
-      return { viewStart: raw, snapped: false };
-    }
-    if (gapPx > SNAP_PX) {
+    if (selfMarks.length === 0 || otherMarks.length === 0) {
       return { viewStart: raw, snapped: false };
     }
 
-    // Put S exactly on O's screen column: s = viewStart' + xStickOther/pps
-    // viewStart' = s - (o - other.viewStart) = other.viewStart + s - o
-    const snappedStart = other.viewStartSecs + s.t - o.t;
+    type Cand = {
+      s: { t: number; bar: boolean };
+      o: { t: number; bar: boolean };
+      gapPx: number;
+      distCursorPx: number;
+    };
+    let best: Cand | null = null;
+
+    for (const s of selfMarks) {
+      // Only consider sticks near the grab point (mid-gap ≈ half beat away).
+      const distCursorPx = Math.abs((s.t - tSelfUnder) * pxPerSec);
+      if (Math.abs(s.t - tSelfUnder) > searchSecs) continue;
+
+      // Other-track time that currently shares S's screen column.
+      const tOtherAtS = other.viewStartSecs + (s.t - raw);
+      const o = nearestMarker(otherMarks, tOtherAtS);
+      if (!o) continue;
+
+      const gapPx =
+        Math.abs(s.t - raw - (o.t - other.viewStartSecs)) * pxPerSec;
+      if (gapPx > SNAP_PX) continue;
+
+      const cand: Cand = { s, o, gapPx, distCursorPx };
+      if (!best) {
+        best = cand;
+        continue;
+      }
+      const bestBars = (best.s.bar ? 1 : 0) + (best.o.bar ? 1 : 0);
+      const candBars = (cand.s.bar ? 1 : 0) + (cand.o.bar ? 1 : 0);
+      if (candBars > bestBars) {
+        best = cand;
+        continue;
+      }
+      if (candBars < bestBars) continue;
+      if (
+        cand.gapPx < best.gapPx - 0.5 ||
+        (Math.abs(cand.gapPx - best.gapPx) <= 0.5 &&
+          cand.distCursorPx < best.distCursorPx)
+      ) {
+        best = cand;
+      }
+    }
+
+    if (!best) return { viewStart: raw, snapped: false };
+
+    // Put S exactly on O's screen column:
+    // viewStart' = other.viewStart + s.t - o.t
+    const snappedStart = other.viewStartSecs + best.s.t - best.o.t;
     return { viewStart: snappedStart, snapped: true };
   }
 
@@ -1547,6 +1588,8 @@
 
     void listen("player:track-ended", () => {
       if (!previewing) return;
+      // Natural end of the last surviving deck — UI only; backend already
+      // released the stream (and clears mix-preview ownership).
       previewing = false;
       previewBusy = false;
       previewSession = null;
@@ -1555,8 +1598,8 @@
       unlistenEnded = fn;
     });
 
-    // Optional: when fade ends backend may emit track-changed — keep previewing
-    // until the surviving deck ends or user stops.
+    // When previous deck ends mid-mix, backend hands off to next and emits
+    // track-changed — keep previewing until that deck ends or user stops.
     void listen<{ path?: string }>("player:track-changed", () => {
       /* mix preview keeps running on the incoming deck */
     }).then((fn) => {

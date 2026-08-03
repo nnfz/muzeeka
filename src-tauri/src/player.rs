@@ -177,6 +177,9 @@ struct PlayerInner {
     suppress_gapless_until: u64,
     /// Two-deck mix: outgoing still in mixer until `fade_end_ms`.
     mix_crossfade: Option<MixCrossfadeState>,
+    /// True while Mix Transition window owns the shared BASS device for preview.
+    /// Main UI should ignore player events so library transport doesn't "join" the mix.
+    mix_preview_active: bool,
 }
 
 /// Layered two-deck mix preview — plays exactly as aligned on the timeline.
@@ -185,8 +188,9 @@ struct MixCrossfadeState {
     from_decode: u32,
     to_source: u32,
     to_decode: u32,
-    /// When to hard-drop the previous deck (unix ms). 0 = already gone / never.
-    from_end_ms: u64,
+    /// How long the previous deck should run from its cue start (seconds of audio).
+    /// 0 = no previous / already dropped.
+    from_duration_secs: f64,
     /// Inject next when previous has played this many seconds (graph delay). 0 = already in.
     to_delay_secs: f64,
     from_cue_start: f64,
@@ -276,6 +280,7 @@ impl Player {
                 user_paused: false,
                 suppress_gapless_until: 0,
                 mix_crossfade: None,
+                mix_preview_active: false,
             })),
             ops: Arc::new(Mutex::new(())),
             app: Arc::new(RwLock::new(None)),
@@ -785,6 +790,11 @@ impl Player {
     ) -> Result<(), String> {
         let expected_current = expected_current.map(str::to_string);
         self.run_on_bass_thread(move |inner| {
+            // Mix Transition preview owns the device — don't let main library
+            // gapless queue rebuilds stomp the two-deck session.
+            if inner.mix_preview_active {
+                return Ok(());
+            }
             // Queue refreshes are asynchronous. A refresh created for track N must
             // never replace the queue after playback has already moved to N+1.
             if !Self::queue_refresh_matches(
@@ -815,7 +825,9 @@ impl Player {
         let track_path = track_path.to_string();
         let track_path_for_stats = track_path.clone();
         let audio_path = audio_path.map(str::to_string);
-        self.run_on_bass_thread(move |inner| {
+        let cleared_mix = self.run_on_bass_thread(move |inner| {
+            let was_mix = inner.mix_preview_active;
+            inner.mix_preview_active = false;
             // Install the queue/index only — do NOT preload the next track yet.
             // Preloading before the current segment is open is wrong for single-image CUE:
             // the next entry is the same audio file seeked to track 2's offset, and
@@ -836,8 +848,11 @@ impl Player {
             inner.suppress_gapless_until = inner
                 .current_track_start_time
                 .saturating_add(MANUAL_SEGMENT_SUPPRESS_MS);
-            Ok(())
+            Ok(was_mix)
         })?;
+        if cleared_mix {
+            self.emit_mix_preview_active(false);
+        }
         // Wake the position poller out of idle sleep for gapless + seekbar.
         self.set_source_active(true);
         // Count after BASS open succeeds (manual play / remote / next-prev).
@@ -1037,6 +1052,16 @@ impl Player {
         inner.current_decode = 0;
     }
 
+    fn emit_mix_preview_active(&self, active: bool) {
+        if let Some(app) = self.app.read().clone() {
+            #[derive(Clone, Serialize)]
+            struct MixPreviewPayload {
+                active: bool,
+            }
+            let _ = app.emit("player:mix-preview", MixPreviewPayload { active });
+        }
+    }
+
     fn clear_mix_crossfade(inner: &mut PlayerInner) {
         let Some(mix) = inner.mix_crossfade.take() else {
             return;
@@ -1096,6 +1121,7 @@ impl Player {
     }
 
     /// Previous deck finished: drop it, keep next if already playing.
+    /// Returns the surviving next path when handoff succeeds.
     fn finish_mix_from_deck(inner: &mut PlayerInner) -> Option<String> {
         if inner
             .mix_crossfade
@@ -1116,22 +1142,39 @@ impl Player {
         if mix.to_source != 0 {
             let to_src = mix.to_source;
             let to_dec = mix.to_decode;
-            let next_path = mix.next_path;
-            inner.current_source = to_src;
-            inner.current_decode = to_dec;
-            inner.current_file = Some(next_path.clone());
-            inner.current_audio_path = Some(mix.next_audio_path.clone());
-            inner.cue_start = mix.next_cue_start;
-            inner.cue_end = mix.next_cue_end;
-            inner.gapless_queue = vec![GaplessTrack {
-                track_path: next_path.clone(),
-                audio_path: mix.next_audio_path,
-                cue_start: mix.next_cue_start,
-                cue_end: mix.next_cue_end,
-            }];
-            inner.gapless_queue_index = 0;
-            Self::detect_cue_position_mode(inner);
-            return Some(next_path);
+            let to_live = inner.bass.as_ref().is_some_and(|bass| {
+                bass.channel_is_active(to_src) != bass::BASS_ACTIVE_STOPPED
+            });
+            if to_live {
+                let next_path = mix.next_path;
+                // Prefer the still-playing next deck as the sole current source so
+                // get_state / end detection no longer key off the dead previous.
+                inner.current_source = to_src;
+                inner.current_decode = to_dec;
+                inner.current_file = Some(next_path.clone());
+                inner.current_audio_path = Some(mix.next_audio_path.clone());
+                inner.cue_start = mix.next_cue_start;
+                inner.cue_end = mix.next_cue_end;
+                inner.gapless_queue = vec![GaplessTrack {
+                    track_path: next_path.clone(),
+                    audio_path: mix.next_audio_path,
+                    cue_start: mix.next_cue_start,
+                    cue_end: mix.next_cue_end,
+                }];
+                inner.gapless_queue_index = 0;
+                // Fresh start clock so the next deck isn't treated as "already
+                // past the spurious-end guard" from the mix open time.
+                let now = Self::now_millis();
+                inner.current_track_start_time = now;
+                inner.suppress_gapless_until = now.saturating_add(MANUAL_SEGMENT_SUPPRESS_MS);
+                Self::detect_cue_position_mode(inner);
+                return Some(next_path);
+            }
+            // Next already finished — free it and fall through to full stop.
+            if let Some(bass) = inner.bass.as_ref() {
+                let _ = bass.mixer_channel_remove(to_src);
+                Self::free_playback_channel(bass, to_src, to_dec);
+            }
         }
 
         // Free pending if still held (shouldn't after inject).
@@ -1144,6 +1187,29 @@ impl Player {
         inner.current_source = 0;
         inner.current_decode = 0;
         None
+    }
+
+    /// True if any deck in the mix session is still producing audio.
+    fn mix_has_active_audio(inner: &PlayerInner) -> bool {
+        let Some(mix) = inner.mix_crossfade.as_ref() else {
+            return false;
+        };
+        let Some(bass) = inner.bass.as_ref() else {
+            return false;
+        };
+        let live = |src: u32| {
+            src != 0 && bass.channel_is_active(src) != bass::BASS_ACTIVE_STOPPED
+        };
+        if live(mix.from_source) || live(mix.to_source) {
+            return true;
+        }
+        if let Some(p) = mix.pending_to.as_ref() {
+            // Pending is silent until inject, but the session is still "live"
+            // if previous is playing — already covered by from. If only pending
+            // remains, inject should have happened; treat as inactive here.
+            let _ = p;
+        }
+        false
     }
 
     /// Two-deck mix: play as laid out on the timeline (full volume, no auto-fade).
@@ -1330,12 +1396,6 @@ impl Player {
             inner.current_track_start_time = now;
             inner.suppress_gapless_until = now.saturating_add(MANUAL_SEGMENT_SUPPRESS_MS);
 
-            let from_end_ms = if from_src != 0 {
-                now.saturating_add((from_dur * 1000.0) as u64)
-            } else {
-                0
-            };
-
             let (next_audio, next_cs, next_ce) = to_pb
                 .as_ref()
                 .map(|p| (p.audio_path.clone(), p.cue_start, p.cue_end))
@@ -1346,7 +1406,8 @@ impl Player {
                 from_decode: from_tracked,
                 to_source: to_src,
                 to_decode: to_tracked,
-                from_end_ms,
+                // Drop previous after this much *audio* time (not wall clock).
+                from_duration_secs: if from_src != 0 { from_dur } else { 0.0 },
                 // Use prev deck audio time for inject (not wall clock) so next
                 // lands on the same mix timeline as the waveform.
                 to_delay_secs: if pending_to.is_some() { to_delay } else { 0.0 },
@@ -1360,8 +1421,10 @@ impl Player {
             inner.gapless_queue.clear();
             inner.gapless_queue_index = 0;
 
+            inner.mix_preview_active = true;
             Ok(())
         })?;
+        self.emit_mix_preview_active(true);
         self.set_source_active(true);
         self.record_play_stat(&from_path_for_stats);
         Ok(())
@@ -2482,7 +2545,8 @@ impl Player {
 
     pub fn stop(&self) -> Result<(), String> {
         let _ops = self.ops.lock();
-        self.run_on_bass_thread(|inner| {
+        let cleared_mix = self.run_on_bass_thread(|inner| {
+            let was_mix = inner.mix_preview_active;
             Self::teardown_current(inner);
             Self::clear_preload(inner);
             if let Some(bass) = inner.bass.as_ref() {
@@ -2495,8 +2559,12 @@ impl Player {
             inner.gapless_queue_index = 0;
             inner.pending_next = None;
             inner.user_paused = false;
-            Ok(())
+            inner.mix_preview_active = false;
+            Ok(was_mix)
         })?;
+        if cleared_mix {
+            self.emit_mix_preview_active(false);
+        }
         self.set_source_active(false);
         Ok(())
     }
@@ -2695,21 +2763,28 @@ impl Player {
 
     /// Release a stream that finished playing (must run before AUTOFREE-style invalidation).
     pub fn release_ended_stream(&self) {
-        if self.on_bass_thread() {
-            Self::release_ended_stream_inner(&mut self.inner.lock());
-            return;
+        let was_mix = if self.on_bass_thread() {
+            Self::release_ended_stream_inner(&mut self.inner.lock())
+        } else {
+            self.run_on_bass_thread(|inner| Ok(Self::release_ended_stream_inner(inner)))
+                .unwrap_or(false)
+        };
+        if was_mix {
+            self.emit_mix_preview_active(false);
         }
-        let _ = self.run_on_bass_thread(|inner| {
-            Self::release_ended_stream_inner(inner);
-            Ok(())
-        });
     }
 
-    fn release_ended_stream_inner(inner: &mut PlayerInner) {
+    /// Returns true if a mix-preview session was active (caller should emit).
+    fn release_ended_stream_inner(inner: &mut PlayerInner) -> bool {
         Self::teardown_current(inner);
         inner.user_paused = false;
+        // Natural end of mix preview (or any stream) must release device ownership
+        // so the main library is not stuck frozen after Preview finishes.
+        let was_mix = inner.mix_preview_active;
+        inner.mix_preview_active = false;
         // Do not stop the mixer here — it allows smoother resume / next play.
         // Full stop() command will handle explicit stop.
+        was_mix
     }
 
     /// Get a snapshot of the current player state.
@@ -2731,6 +2806,57 @@ impl Player {
     }
 
     fn get_state_inner(inner: &mut PlayerInner) -> PlayerStateSnapshot {
+        // Dual-deck mix: current_source may still be the previous track after it
+        // ended, while next is still playing. Prefer any live mix deck so the
+        // poller does not emit track-ended and tear down the surviving deck.
+        if inner.mix_crossfade.is_some() && Self::mix_has_active_audio(inner) {
+            let mix = inner.mix_crossfade.as_ref().unwrap();
+            let bass = inner.bass.as_ref().unwrap();
+            let (src, dec) = if mix.from_source != 0
+                && bass.channel_is_active(mix.from_source) != bass::BASS_ACTIVE_STOPPED
+            {
+                (mix.from_source, mix.from_decode)
+            } else if mix.to_source != 0 {
+                (mix.to_source, mix.to_decode)
+            } else {
+                (inner.current_source, inner.current_decode)
+            };
+            let reported = if src != 0 {
+                Self::content_absolute_secs(bass, src, dec, true)
+            } else {
+                0.0
+            };
+            let decode = if src != 0 {
+                Self::decode_handle_for_channel(bass, src, dec)
+            } else {
+                0
+            };
+            let absolute_duration = if decode != 0 {
+                Self::stream_duration_secs(bass, decode)
+            } else {
+                0.0
+            };
+            let position = Self::cue_relative_position(inner, reported);
+            let duration = Self::cue_segment_duration(inner, absolute_duration);
+            let file_name = inner.current_file.as_ref().map(|f| {
+                std::path::Path::new(f)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_string()
+            });
+            return PlayerStateSnapshot {
+                state: PlaybackState::Playing,
+                is_playing: true,
+                is_paused: false,
+                volume: inner.volume,
+                position,
+                duration,
+                current_file: inner.current_file.clone(),
+                current_file_name: file_name,
+            };
+        }
+
         if inner.current_source == 0 || inner.mixer_handle == 0 || inner.bass.is_none() {
             let file_name = inner.current_file.as_ref().map(|f| {
                 std::path::Path::new(f)
@@ -2961,26 +3087,42 @@ impl Player {
 
             let now = Self::now_millis();
             // Mix timeline: inject next when prev has advanced the graph delay;
-            // drop prev when its remaining length is done.
+            // drop prev when its remaining length is done (audio time or STOPPED).
+            // Critical: hand off to next BEFORE get_state sees from as Stopped,
+            // otherwise release_ended_stream kills the still-playing next deck.
             if inner.mix_crossfade.is_some() {
                 let (inject, drop_from) = {
                     let mix = inner.mix_crossfade.as_ref().unwrap();
+                    let bass = inner.bass.as_ref().unwrap();
                     let mut inject = false;
-                    if mix.pending_to.is_some() && mix.to_delay_secs > 0.0 && mix.from_source != 0 {
-                        let bass = inner.bass.as_ref().unwrap();
+                    let from_played = if mix.from_source != 0 {
                         let abs = Self::content_absolute_secs(
                             bass,
                             mix.from_source,
                             mix.from_decode,
                             true,
                         );
-                        let played = (abs - mix.from_cue_start).max(0.0);
-                        inject = played + 0.002 >= mix.to_delay_secs;
-                    } else if mix.pending_to.is_some() && mix.to_delay_secs <= 0.0 {
-                        inject = true;
+                        (abs - mix.from_cue_start).max(0.0)
+                    } else {
+                        0.0
+                    };
+                    if mix.pending_to.is_some() {
+                        if mix.from_source == 0 {
+                            inject = true;
+                        } else if mix.to_delay_secs <= 0.0 {
+                            inject = true;
+                        } else {
+                            inject = from_played + 0.002 >= mix.to_delay_secs;
+                        }
                     }
-                    let drop_from =
-                        mix.from_end_ms > 0 && now >= mix.from_end_ms && mix.from_source != 0;
+                    let mut drop_from = false;
+                    if mix.from_source != 0 {
+                        let from_stopped = bass.channel_is_active(mix.from_source)
+                            == bass::BASS_ACTIVE_STOPPED;
+                        let duration_done = mix.from_duration_secs > 0.0
+                            && from_played + 0.05 >= mix.from_duration_secs;
+                        drop_from = from_stopped || duration_done;
+                    }
                     (inject, drop_from)
                 };
                 if inject {
@@ -2990,7 +3132,7 @@ impl Player {
                     let path = Self::finish_mix_from_deck(inner);
                     return Ok(path);
                 }
-                // Still in mix session — no normal gapless.
+                // Still in mix session — no normal gapless / end teardown.
                 return Ok(None);
             }
             // Pitch/rate topology rebuild and seeks can briefly look "ended".
