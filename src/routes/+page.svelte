@@ -18,6 +18,7 @@
   import { createSettingsStore, setSettingsStore } from '$lib/stores/settings.svelte';
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { WebviewWindow } from '@tauri-apps/api/webviewWindow';
+  import { trimCoverMemory } from '$lib/coverCache';
 
   const currentWin = getCurrentWindow();
   const isSettingsWindow = currentWin.label === 'settings';
@@ -246,6 +247,19 @@
         break;
     }
   }
+
+  // Long-running main window: drop bulk cover URL / data-URL caches when hidden.
+  $effect(() => {
+    if (isSecondaryWindow) return;
+
+    const onHidden = () => {
+      if (document.visibilityState === 'hidden') {
+        trimCoverMemory(24);
+      }
+    };
+    document.addEventListener('visibilitychange', onHidden);
+    return () => document.removeEventListener('visibilitychange', onHidden);
+  });
 
   $effect(() => {
     if (isSecondaryWindow) return;

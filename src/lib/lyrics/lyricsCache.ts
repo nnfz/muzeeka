@@ -1,18 +1,36 @@
 import { fetchLyrics, type FetchLyricsParams } from './fetchLyrics';
 import type { LyricsResult } from './types';
 
+/** Cap parsed lyrics payloads — each can hold hundreds of timed lines. */
+const MAX_LYRICS_CACHE = 24;
+
 /** In-memory lyrics by track path — instant apply on gapless / next so layout does not jump. */
 const byPath = new Map<string, LyricsResult | null>();
 const inflight = new Map<string, Promise<LyricsResult | null>>();
 
+function lruSet(path: string, result: LyricsResult | null) {
+  if (byPath.has(path)) byPath.delete(path);
+  byPath.set(path, result);
+  while (byPath.size > MAX_LYRICS_CACHE) {
+    const oldest = byPath.keys().next().value;
+    if (oldest === undefined) break;
+    byPath.delete(oldest);
+  }
+}
+
 export function peekLyricsCache(path: string): LyricsResult | null | undefined {
   if (!path) return undefined;
-  return byPath.has(path) ? byPath.get(path) : undefined;
+  if (!byPath.has(path)) return undefined;
+  const value = byPath.get(path);
+  // Touch for LRU.
+  byPath.delete(path);
+  byPath.set(path, value ?? null);
+  return value;
 }
 
 export function setLyricsCache(path: string, result: LyricsResult | null) {
   if (!path) return;
-  byPath.set(path, result);
+  lruSet(path, result);
 }
 
 export function invalidateLyricsCache(path?: string) {
@@ -34,8 +52,9 @@ export function loadLyricsForPath(
 ): Promise<LyricsResult | null> {
   if (!path) return Promise.resolve(null);
 
-  if (byPath.has(path)) {
-    return Promise.resolve(byPath.get(path) ?? null);
+  const peeked = peekLyricsCache(path);
+  if (peeked !== undefined) {
+    return Promise.resolve(peeked);
   }
 
   const existing = inflight.get(path);
@@ -43,12 +62,12 @@ export function loadLyricsForPath(
 
   const promise = fetchLyrics(params)
     .then((result) => {
-      byPath.set(path, result);
+      lruSet(path, result);
       return result;
     })
     .catch((error: unknown) => {
       console.warn('[lyrics] fetch failed', error);
-      byPath.set(path, null);
+      lruSet(path, null);
       return null;
     })
     .finally(() => {

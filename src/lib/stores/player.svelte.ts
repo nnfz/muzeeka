@@ -624,10 +624,8 @@ async function _doEnrichTrackMetadata() {
     try {
       const enriched = await invoke<MusicFile[]>('library_fetch_metadata', { paths });
       mergeMetadataIntoPlaylists(enriched);
-      prefetchCoverPaths([
-        ...enriched.map((t) => t.cover_path_full),
-        ...enriched.map((t) => t.cover_path),
-      ]);
+      // Thumbs only — never bulk-decode full covers into the image cache.
+      prefetchCoverPaths(enriched.map((t) => t.cover_path), 40);
     } catch (e) {
       console.error('Failed to fetch track metadata:', e);
     }
@@ -1254,12 +1252,14 @@ async function loadPlaylists() {
       rebuildShuffleOrder(currentTrackIndex >= 0);
       syncShufflePosition();
     }
-    prefetchCoverPaths([
-      ...playlists.flatMap((playlist) =>
-        playlist.tracks.flatMap((track) => [track.cover_path_full, track.cover_path])
-      ),
-      ...collectPlaylistCoverPaths(playlists),
-    ]);
+    // URL-string cache only (no warm decode) — virtual list loads visible thumbs on demand.
+    prefetchCoverPaths(
+      [
+        ...playlists.flatMap((playlist) => playlist.tracks.map((track) => track.cover_path)),
+        ...collectPlaylistCoverPaths(playlists),
+      ],
+      48,
+    );
     void enrichTrackMetadata();
   } catch (e) {
     console.error('Failed to load playlists:', e);
@@ -2390,12 +2390,16 @@ async function play(filePath: string) {
     const track = trackByPath.get(filePath);
     // Warm covers + shrink legacy multi‑MB fulls so fullscreen opens instantly.
     if (track) {
-      prefetchCoverPaths([track.cover_path_full, track.cover_path], 2);
+      // Current track only: allow full + warm for transport / fullscreen.
+      prefetchCoverPaths([track.cover_path, track.cover_path_full], 2, {
+        includeFull: true,
+        warm: true,
+      });
     }
     void invoke<string | null>('library_resolve_full_cover', { path: filePath })
       .then((fullPath) => {
         if (!fullPath) return;
-        prefetchCoverPaths([fullPath], 1);
+        prefetchCoverPaths([fullPath], 1, { includeFull: true, warm: true });
         // Keep playlist metadata in sync if we just created/shrank a full cover.
         const t = trackByPath.get(filePath);
         if (t && t.cover_path_full !== fullPath) {

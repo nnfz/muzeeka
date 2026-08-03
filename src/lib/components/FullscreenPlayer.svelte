@@ -3,6 +3,7 @@
     getCoverSrc,
     preferFullCoverPath,
     resolveCoverSrc,
+    trimCoverMemory,
     warmImageSrc,
   } from "$lib/coverCache";
   import { COVER_PLACEHOLDER_SRC } from "$lib/coverPlaceholder";
@@ -397,6 +398,8 @@
       clearArt();
       bgCoverSrc = null;
       resolvedFullCoverPath = null;
+      // Drop full-cover / data-url strings held while fullscreen was open.
+      trimCoverMemory();
       return;
     }
 

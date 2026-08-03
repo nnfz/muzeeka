@@ -500,16 +500,40 @@
 
     void lines;
     void syncType;
+    void isPlaying;
 
-    const tick = () => {
+    let disposed = false;
+
+    // One paint for current position when paused / tab hidden — no perpetual rAF.
+    const paintOnce = () => {
       if (syncType === 'richsync') paintWordFill();
       paintInstrumentalFill();
+    };
+
+    const syncLoop = () => {
+      if (disposed) return;
+      stopFillLoop();
+      const pageVisible =
+        typeof document === 'undefined' || document.visibilityState === 'visible';
+      if (!isPlaying || !pageVisible) {
+        paintOnce();
+        return;
+      }
+      const tick = () => {
+        if (disposed) return;
+        if (syncType === 'richsync') paintWordFill();
+        paintInstrumentalFill();
+        fillRaf = requestAnimationFrame(tick);
+      };
       fillRaf = requestAnimationFrame(tick);
     };
 
-    fillRaf = requestAnimationFrame(tick);
+    syncLoop();
+    document.addEventListener('visibilitychange', syncLoop);
 
     return () => {
+      disposed = true;
+      document.removeEventListener('visibilitychange', syncLoop);
       stopFillLoop();
     };
   });

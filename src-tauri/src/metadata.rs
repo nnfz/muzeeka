@@ -1295,14 +1295,17 @@ pub fn extract_covers_for_file(path: &Path) -> CoverPaths {
 }
 
 /// Read a cover image from disk and return a data URL (for paths outside the asset scope).
+///
+/// Hard size cap — base64 inflates ~33% and lives in the WebView JS heap if cached.
 pub fn cover_data_url(path: &Path) -> Result<Option<String>, String> {
     if !path.is_file() {
         return Ok(None);
     }
 
-    // Never base64 multi‑MB raw cover.jpg into the WebView (freezes the UI).
+    // Prefer thumbs / small cache files only. Full album art belongs on asset://.
+    const MAX_DATA_URL_BYTES: u64 = 96 * 1024;
     let meta = fs::metadata(path).map_err(|e| format!("Failed to stat cover: {e}"))?;
-    if meta.len() > MAX_FULL_CACHE_BYTES * 2 {
+    if meta.len() > MAX_DATA_URL_BYTES {
         return Ok(None);
     }
 

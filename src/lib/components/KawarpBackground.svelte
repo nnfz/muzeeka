@@ -413,8 +413,10 @@
         unlistenAppActive = unlistenRust;
 
         // Safety net: if focus events were missed, re-query while we might be animating.
+        // Only poll while the page is visible — no 2s IPC when the window is backgrounded.
         recheckTimer = setInterval(() => {
           if (disposed) return;
+          if (document.visibilityState !== 'visible') return;
           void win.isFocused().then((focused) => {
             if (disposed) return;
             if (osFocused !== focused) {
@@ -422,7 +424,7 @@
               sync();
             }
           });
-        }, 2000);
+        }, 4000);
       } catch {
         if (disposed) return;
         // Browser / non-Tauri: fall back to window focus events.
