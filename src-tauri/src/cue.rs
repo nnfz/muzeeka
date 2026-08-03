@@ -318,10 +318,12 @@ pub fn resolve_playback(
                 .or(expanded.audio_path.clone())
                 .unwrap_or(audio);
 
+            // Explicit caller bounds win (mix preview / seek into a segment).
+            // Fall back to INDEX times from the sheet when the caller did not override.
             return Ok(PlaybackTarget {
                 audio_path: resolved_audio,
-                cue_start: expanded.cue_start_secs.or(cue_start),
-                cue_end: expanded.cue_end_secs.or(cue_end),
+                cue_start: cue_start.or(expanded.cue_start_secs),
+                cue_end: cue_end.or(expanded.cue_end_secs),
             });
         }
 
@@ -367,8 +369,9 @@ pub fn resolve_playback(
     if Path::new(track_path).is_file() {
         return Ok(PlaybackTarget {
             audio_path: track_path.to_string(),
-            cue_start: None,
-            cue_end: None,
+            // Honour optional segment bounds (mix preview / partial play).
+            cue_start,
+            cue_end,
         });
     }
 

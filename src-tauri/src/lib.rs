@@ -324,6 +324,7 @@ pub fn run() {
             // Player
             commands::player_init,
             commands::player_play,
+            commands::player_mix_crossfade,
             commands::player_prepare_next,
             commands::player_pause,
             commands::player_resume,

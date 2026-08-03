@@ -85,6 +85,39 @@ pub fn player_prepare_next(
     player.prepare_next(current_file.as_deref(), parse_gapless_queue(queue))
 }
 
+/// Two-deck mix for the Mix transition editor (timeline-aligned, full volume).
+#[tauri::command]
+pub fn player_mix_crossfade(
+    player: State<'_, Player>,
+    discord: State<'_, DiscordPresence>,
+    controller: State<'_, Arc<RemoteController>>,
+    from_path: String,
+    from_audio_path: Option<String>,
+    from_cue_start: Option<f64>,
+    from_cue_end: Option<f64>,
+    to_path: String,
+    to_audio_path: Option<String>,
+    to_cue_start: Option<f64>,
+    to_cue_end: Option<f64>,
+    to_delay_secs: f64,
+    from_duration_secs: f64,
+) -> Result<(), String> {
+    player.play_mix_crossfade(
+        &from_path,
+        from_audio_path.as_deref(),
+        from_cue_start,
+        from_cue_end,
+        &to_path,
+        to_audio_path.as_deref(),
+        to_cue_start,
+        to_cue_end,
+        to_delay_secs,
+        from_duration_secs,
+    )?;
+    notify_playback_change(&player, &discord, controller.inner());
+    Ok(())
+}
+
 /// Pause the current playback.
 #[tauri::command]
 pub fn player_pause(
