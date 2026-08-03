@@ -282,14 +282,26 @@
 
 .mini-eq span {
   width: 3px;
+  height: 14px;
   border-radius: 1px;
   background: var(--accent);
+  transform-origin: bottom center;
+  transform: scaleY(0.28);
   animation: equalizer 0.7s ease-in-out infinite;
+  will-change: transform;
 }
 
 .mini-eq span:nth-child(1) { animation-delay: 0s; }
 .mini-eq span:nth-child(2) { animation-delay: 0.15s; }
 .mini-eq span:nth-child(3) { animation-delay: 0.3s; }
+
+/* Prefer compositor path; pause indicator animation when reduced-motion. */
+@media (prefers-reduced-motion: reduce) {
+  .mini-eq span {
+    animation: none;
+    transform: scaleY(0.55);
+  }
+}
 
 /* Title column */
 

@@ -101,7 +101,7 @@
   /* Layout */
   --sidebar-width: 280px;
   --header-height: 50px;
-  --transport-height: 88px;
+  --transport-height: 86px;
   --margin: 8px;
 
   /* Typography */
@@ -279,11 +279,12 @@ html.fullscreen-active .transport-bar {
   100% { background-position: 0% 50%; }
 }
 
+/* Compositor-only (scaleY) — never animate height (that forces layout every frame). */
 @keyframes equalizer {
-  0%, 100% { height: 4px; }
-  25% { height: 16px; }
-  50% { height: 8px; }
-  75% { height: 20px; }
+  0%, 100% { transform: scaleY(0.28); }
+  25% { transform: scaleY(0.85); }
+  50% { transform: scaleY(0.45); }
+  75% { transform: scaleY(1); }
 }
 
 /* --- Frameless window drag regions --- */

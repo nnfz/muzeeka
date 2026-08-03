@@ -272,7 +272,7 @@
           <span
             class="volume-pct"
             class:sticky={isDragging}
-            style="left: {liveVolume * 100}%"
+            style="--fill: {liveVolume}"
             onanimationend={(e) => onPctAnimationEnd(pctKey, e)}
             aria-hidden="true"
           >
@@ -284,6 +284,7 @@
         class="slider-track"
         class:is-dragging={isDragging}
         class:is-pending={pendingValue !== null}
+        style="--fill: {liveVolume}"
         bind:this={trackEl}
         onpointerdown={handleTrackPointerDown}
         onpointermove={handleTrackPointerMove}
@@ -296,7 +297,8 @@
         aria-valuemax={1}
         aria-valuenow={liveVolume}
       >
-        <div class="slider-fill" style="width: {liveVolume * 100}%">
+        <div class="slider-fill"></div>
+        <div class="slider-thumb-rail">
           <div class="slider-thumb" class:active={isDragging}></div>
         </div>
       </div>
@@ -308,6 +310,7 @@
       class="slider-track"
       class:is-dragging={isDragging}
       class:is-pending={pendingValue !== null}
+      style="--fill: {fillRatio}"
       bind:this={trackEl}
       onpointerdown={handleTrackPointerDown}
       onpointermove={handleTrackPointerMove}
@@ -320,7 +323,8 @@
       aria-valuemax={player.duration}
       aria-valuenow={player.position}
     >
-      <div class="slider-fill" style="width: {fillRatio * 100}%">
+      <div class="slider-fill"></div>
+      <div class="slider-thumb-rail">
         <div class="slider-thumb" class:active={isDragging}></div>
       </div>
     </div>

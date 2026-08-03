@@ -22,9 +22,8 @@
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
   align-items: center;
-  padding: 0 10px;
+  padding: 0 8px;
   gap: 16px;
-  margin-top: 4px;
   overflow: visible;
 }
 
@@ -62,8 +61,8 @@
 }
 
 .transport-info :global(.track-cover) {
-  width: 45px;
-  height: 45px;
+  width: 48px;
+  height: 48px;
 }
 
 .now-playing-text {

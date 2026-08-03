@@ -1,6 +1,8 @@
 <script lang="ts">
   import "../../app.css";
   import "../../routes/+page.css";
+  // Side-effect import: unscoped, avoids WebView2 issues when <style>@import is scoped.
+  import "./TrackPropertiesWindow.css";
   import WindowControls from "./WindowControls.svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -13,9 +15,10 @@
     trackDisplayTitle,
     type MusicFile,
   } from "$lib/stores/player.svelte";
-  import type {
-    TrackPropertiesOpenPayload,
-    TrackPropertiesRemovedPayload,
+  import {
+    takePendingTrackProperties,
+    type TrackPropertiesOpenPayload,
+    type TrackPropertiesRemovedPayload,
   } from "$lib/stores/trackProperties.svelte";
   import { hydrateAccentFromStorage } from "$lib/coverAccent";
   import {
@@ -24,6 +27,9 @@
     preferFullCoverPath,
   } from "$lib/coverCache";
   import { COVER_PLACEHOLDER_SRC } from "$lib/coverPlaceholder";
+
+  /** This webview is bound to one track window label for life. */
+  const windowLabel = getCurrentWindow().label;
 
   type Section = "metadata" | "details" | "lyrics";
 
@@ -67,6 +73,8 @@
 
   let track = $state<MusicFile | null>(null);
   let rows = $state<TagTableRow[]>([]);
+  /** Path the current `rows` belong to — prevents lyrics lookup using previous track tags. */
+  let rowsForPath = $state<string | null>(null);
   let tech = $state<AudioTechInfo | null>(null);
 
   let coverBusy = $state(false);
@@ -87,6 +95,9 @@
   let lyricsDirty = $state(false);
   let lyricsError = $state<string | null>(null);
   let lyricsSuccess = $state<string | null>(null);
+
+  /** Bumps on every loadTrack so stale async tag/tech/lyrics results are dropped. */
+  let loadGen = 0;
 
   let isCue = $derived(!!track?.path?.includes("#cue:"));
 
@@ -132,14 +143,15 @@
     return rows.find((r) => r.id === id)?.value?.trim() ?? "";
   }
 
+  /**
+   * Match FullscreenPlayer / disk cache keys exactly (library snapshot).
+   * Tag-table edits must not change the cache key or we miss cached TTML.
+   */
   function lyricsParams(t: MusicFile) {
-    const title = rowValue("TrackTitle") || trackDisplayTitle(t);
-    const artist = rowValue("TrackArtist") || trackDisplayArtist(t);
-    const album = rowValue("AlbumTitle") || t.album || null;
     return {
-      title,
-      artist,
-      album,
+      title: trackDisplayTitle(t),
+      artist: trackDisplayArtist(t),
+      album: t.album ?? null,
       durationSecs:
         t.duration_secs != null && t.duration_secs > 0
           ? Math.round(t.duration_secs)
@@ -148,34 +160,45 @@
     };
   }
 
-  async function loadTagTable(t: MusicFile) {
+  function stillCurrent(t: MusicFile, gen: number): boolean {
+    return gen === loadGen && !!track && sameTrackPath(track.path, t.path);
+  }
+
+  async function loadTagTable(t: MusicFile, gen = loadGen) {
     tableLoading = true;
     try {
-      rows = await invoke<TagTableRow[]>("library_get_tag_table", {
+      const nextRows = await invoke<TagTableRow[]>("library_get_tag_table", {
         path: t.path,
         audioPath: t.audio_path ?? null,
       });
+      if (!stillCurrent(t, gen)) return;
+      rows = nextRows;
+      rowsForPath = t.path;
     } catch (e) {
+      if (!stillCurrent(t, gen)) return;
       rows = [];
+      rowsForPath = null;
       error = typeof e === "string" ? e : String(e);
     } finally {
-      tableLoading = false;
+      if (gen === loadGen) tableLoading = false;
     }
   }
 
-  async function loadTechFor(t: MusicFile) {
-    tech = null;
+  async function loadTechFor(t: MusicFile, gen = loadGen) {
     try {
-      tech = await invoke<AudioTechInfo>("library_audio_tech_info", {
+      const next = await invoke<AudioTechInfo>("library_audio_tech_info", {
         path: t.path,
         audioPath: t.audio_path ?? null,
       });
+      if (!stillCurrent(t, gen)) return;
+      tech = next;
     } catch {
+      if (!stillCurrent(t, gen)) return;
       tech = null;
     }
   }
 
-  async function loadLyricsFor(t: MusicFile) {
+  async function loadLyricsFor(t: MusicFile, gen = loadGen) {
     lyricsLoading = true;
     lyricsDirty = false;
     lyricsError = null;
@@ -187,16 +210,32 @@
         album: params.album,
         durationSecs: params.durationSecs,
       });
-      lyricsText = ttml?.trim() ?? "";
+      if (!stillCurrent(t, gen)) return;
+      let text = ttml?.trim() ?? "";
+      // Fallback: embedded file tags when cache/network has nothing.
+      if (!text && rowsForPath && sameTrackPath(rowsForPath, t.path)) {
+        text = rowValue("UnsyncLyrics") || rowValue("Lyrics") || "";
+      }
+      lyricsText = text;
     } catch {
+      if (!stillCurrent(t, gen)) return;
       lyricsText = "";
     } finally {
-      lyricsLoading = false;
+      if (gen === loadGen) lyricsLoading = false;
     }
   }
 
   function loadTrack(next: MusicFile) {
+    // Each window is one track — ignore foreign payloads.
+    if (track && !sameTrackPath(track.path, next.path)) {
+      return;
+    }
+
+    const gen = ++loadGen;
     track = next;
+    rows = [];
+    rowsForPath = null;
+    tech = null;
     dirty = false;
     error = null;
     success = null;
@@ -206,10 +245,20 @@
     lyricsDirty = false;
     lyricsError = null;
     lyricsSuccess = null;
-    activeSection = "metadata";
-    void loadTagTable(next);
-    void loadTechFor(next);
-    void loadLyricsFor(next);
+
+    void loadTechFor(next, gen);
+    // Library snapshot lyrics key (parallel) + tags for metadata table.
+    void loadLyricsFor(next, gen);
+    void (async () => {
+      await loadTagTable(next, gen);
+      if (!stillCurrent(next, gen)) return;
+      // If network/cache was empty, fill from embedded tags once rows exist.
+      if (!lyricsText.trim() && !lyricsDirty) {
+        const embedded =
+          rowValue("UnsyncLyrics") || rowValue("Lyrics") || "";
+        if (embedded) lyricsText = embedded;
+      }
+    })();
   }
 
   function markDirty() {
@@ -457,14 +506,11 @@
   }
 
   async function closeWindow() {
+    // Multi-window: destroy this instance (do not hide/reuse a shared shell).
     try {
-      await getCurrentWindow().hide();
+      await getCurrentWindow().close();
     } catch {
-      try {
-        await getCurrentWindow().close();
-      } catch {
-        /* ignore */
-      }
+      /* ignore */
     }
   }
 
@@ -671,64 +717,95 @@
   }
 
   function clearAndClose() {
+    loadGen += 1;
     track = null;
     rows = [];
+    rowsForPath = null;
     tech = null;
     dirty = false;
     error = null;
     success = null;
     filter = "";
     lyricsText = "";
+    lyricsLoading = false;
     lyricsDirty = false;
     lyricsError = null;
     lyricsSuccess = null;
     void closeWindow();
   }
 
+  function acceptOpenPayload(
+    payload: TrackPropertiesOpenPayload | null | undefined,
+  ): boolean {
+    if (!payload?.track) return false;
+    // emitTo targets this label; global emit still filtered by windowLabel.
+    if (payload.windowLabel && payload.windowLabel !== windowLabel) {
+      return false;
+    }
+    // Window is single-track: allow first load or refresh of the same path.
+    if (track && !sameTrackPath(track.path, payload.track.path)) {
+      return false;
+    }
+    return true;
+  }
+
   onMount(() => {
     let unlistenOpen: (() => void) | undefined;
     let unlistenRemoved: (() => void) | undefined;
-    let unlistenClose: (() => void) | undefined;
+    let unlistenCloseAll: (() => void) | undefined;
+    let cancelled = false;
 
-    void listen<TrackPropertiesOpenPayload>(
-      "track-properties:open",
-      (event) => {
-        if (event.payload?.track) {
+    void (async () => {
+      unlistenOpen = await listen<TrackPropertiesOpenPayload>(
+        "track-properties:open",
+        (event) => {
+          if (!acceptOpenPayload(event.payload)) return;
           loadTrack(event.payload.track);
-        }
-      },
-    ).then((fn) => {
-      unlistenOpen = fn;
-    });
+        },
+      );
+      if (cancelled) {
+        unlistenOpen();
+        return;
+      }
 
-    void listen<TrackPropertiesRemovedPayload>(
-      "track-properties:tracks-removed",
-      (event) => {
-        if (!track) return;
-        const paths = event.payload?.paths ?? [];
-        if (paths.some((p) => sameTrackPath(p, track!.path))) {
-          clearAndClose();
-        }
-      },
-    ).then((fn) => {
-      unlistenRemoved = fn;
-    });
+      unlistenRemoved = await listen<TrackPropertiesRemovedPayload>(
+        "track-properties:tracks-removed",
+        (event) => {
+          if (!track) return;
+          const paths = event.payload?.paths ?? [];
+          if (paths.some((p) => sameTrackPath(p, track!.path))) {
+            clearAndClose();
+          }
+        },
+      );
+      if (cancelled) {
+        unlistenOpen?.();
+        unlistenRemoved?.();
+        return;
+      }
 
-    void listen("track-properties:close", () => {
-      clearAndClose();
-    }).then((fn) => {
-      unlistenClose = fn;
-    });
+      unlistenCloseAll = await listen("track-properties:close-all", () => {
+        clearAndClose();
+      });
+      if (cancelled) {
+        unlistenOpen?.();
+        unlistenRemoved?.();
+        unlistenCloseAll?.();
+        return;
+      }
 
-    void getCurrentWindow().onCloseRequested(async (event) => {
-      event.preventDefault();
-      await closeWindow();
-    });
+      // Per-label handoff written before this webview finished booting.
+      const pending = takePendingTrackProperties(windowLabel);
+      if (pending && acceptOpenPayload(pending)) {
+        loadTrack(pending.track);
+      }
+    })();
 
     return () => {
+      cancelled = true;
       unlistenOpen?.();
       unlistenRemoved?.();
-      unlistenClose?.();
+      unlistenCloseAll?.();
     };
   });
 </script>
@@ -737,7 +814,13 @@
 
 <div class="props-window">
   <header class="app-header props-header">
-    <div class="props-win-title" data-tauri-drag-region>Track properties</div>
+    <div class="props-win-title" data-tauri-drag-region>
+      {#if track}
+        {trackDisplayTitle(track)} — properties
+      {:else}
+        Track properties
+      {/if}
+    </div>
     <div class="app-header-spacer" data-tauri-drag-region></div>
     <WindowControls showMinimize={false} showMaximize={false} />
   </header>
@@ -1155,6 +1238,4 @@
   </div>
 </div>
 
-<style>
-  @import "./TrackPropertiesWindow.css";
-</style>
+<!-- styles: TrackPropertiesWindow.css imported in <script> -->

@@ -545,17 +545,8 @@
 
 .fullscreen-progress :global(.slider-time) {
   font-size: 11px;
-  min-width: 36px;
   flex-shrink: 0;
   color: var(--text-primary-md);
-}
-
-.fullscreen-progress :global(.slider-time.current) {
-  padding-left: 12px;
-}
-
-.fullscreen-progress :global(.slider-time.duration) {
-  padding-right: 12px;
 }
 
 

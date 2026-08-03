@@ -4,7 +4,7 @@
 }
 
 .media-slider.progress {
-  gap: 12px;
+  gap: 8px;
   width: 100%;
 }
 
@@ -27,7 +27,8 @@
   position: absolute;
   left: 0;
   bottom: calc(100% + 8px);
-  transform: translateX(-50%);
+  /* translateX(% of self width) for centering; position along track via rail-style % of wrap */
+  transform: translateX(calc(var(--fill, 0) * 110px - 50%));
   min-width: 2.5em;
   padding: 1px 4px;
   font-size: 11px;
@@ -65,6 +66,9 @@
   font-weight: 300;
   color: var(--text-secondary);
   font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+  line-height: 1;
+  white-space: nowrap;
 }
 
 .slider-time.current {
@@ -81,8 +85,8 @@
   border-radius: var(--radius-full);
   cursor: pointer;
   position: relative;
-  transition: height var(--transition-fast);
   touch-action: none;
+  /* no height grow on hover — constant 4px */
 }
 
 .slider-track::before {
@@ -97,6 +101,7 @@
 
 .media-slider.progress .slider-track {
   flex: 1;
+  min-width: 0;
 }
 
 .media-slider.volume .slider-track {
@@ -104,62 +109,59 @@
   flex-shrink: 0;
 }
 
-.slider-track:hover {
-  height: 6px;
-}
-
-.slider-track:active {
-  height: 6px;
-}
-
-.slider-track:active .slider-thumb {
+/* Thumb visible on hover/drag — no scale-up animation */
+.slider-track:hover .slider-thumb,
+.slider-track:active .slider-thumb,
+.slider-track.is-dragging .slider-thumb,
+.slider-thumb.active {
   opacity: 1;
-  transform: scale(1.2);
+  transform: translate(-50%, -50%);
 }
 
-.slider-track:hover:not(.slider-track:active) .slider-thumb {
-  opacity: 1;
-  transform: scale(1);
-}
-
+/*
+ * Real width (not scaleX): scaleX flattens border-radius on the leading edge
+ * → square cap. Width keeps a proper rounded pill. Updates ~UI_EMIT_HOT only.
+ */
 .slider-fill {
   height: 100%;
+  width: calc(var(--fill, 0) * 100%);
+  max-width: 100%;
   background: var(--accent);
   border-radius: var(--radius-full);
-  position: relative;
-  transition: width 80ms linear;
-  min-width: 0;
-  max-width: 100%;
+  position: absolute;
+  left: 0;
+  top: 0;
+  pointer-events: none;
 }
 
-.media-slider.volume .slider-fill {
-  transition: none;
-}
-
-.slider-track.is-dragging .slider-fill,
-.slider-track.is-pending .slider-fill {
-  transition: none;
+/* translateX(% of rail = % of track) — thumb position without left: */
+.slider-thumb-rail {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 100%;
+  transform: translateX(calc(var(--fill, 0) * 100%));
+  pointer-events: none;
 }
 
 .slider-thumb {
   position: absolute;
-  right: -6px;
-  top: -50%;
-  transform: scale(0) translateY(0%);
-  transform-origin: center;
+  left: 0;
+  top: 50%;
+  transform: translate(-50%, -50%);
   width: 12px;
   aspect-ratio: 1;
   border-radius: 50%;
   background: #fff;
   box-shadow: 0 0 8px var(--accent-glow), 0 2px 4px rgba(0, 0, 0, 0.3);
   opacity: 0;
-  transition: opacity var(--transition-fast), transform var(--transition-fast);
+  pointer-events: none;
+  transition: opacity var(--transition-fast);
 }
 
 .slider-track.is-dragging .slider-thumb {
   transition: none;
-  opacity: 1;
-  transform: scale(1.2);
 }
 
 .volume-btn {

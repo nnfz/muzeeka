@@ -58,12 +58,16 @@ const MIXER_BUFFER_SECS: f32 = 0.35;
 const GAPLESS_END_EPSILON_SECS: f64 = 0.025;
 /// Same-image CUE segments may continue without seeking only at the same boundary.
 const CUE_CONTIGUOUS_TOLERANCE_SECS: f64 = 0.075;
-/// How often BASS is polled for gapless / end detection (always).
+/// How often BASS is polled for gapless / end detection while a source is active.
 const POLL_INTERVAL_MS: u64 = 50;
+/// When nothing is loaded, the poll thread sleeps this long and skips main-thread hops.
+const POLL_IDLE_MS: u64 = 750;
 /// After a manual CUE seek / segment switch, ignore end/stop signals briefly.
 const MANUAL_SEGMENT_SUPPRESS_MS: u64 = 400;
 /// UI position events while the main window is focused (smooth seekbar).
-const UI_EMIT_HOT_MS: u64 = 50;
+/// Deliberately slower than POLL_INTERVAL_MS — gapless needs 50ms BASS checks,
+/// but WebView IPC + Svelte updates do not (MediaSlider CSS eases the bar).
+const UI_EMIT_HOT_MS: u64 = 150;
 /// UI position events while unfocused — keeps WebView/GPU quiet during games.
 const UI_EMIT_COLD_MS: u64 = 500;
 /// Re-push Discord RPC timestamps while playing so progress stays in sync.
@@ -208,6 +212,9 @@ pub struct Player {
     discord: Arc<RwLock<Option<DiscordPresence>>>,
     /// True while the main window is focused — drives UI event rate (games-friendly when false).
     ui_hot: Arc<AtomicBool>,
+    /// True while a decode source is loaded. Position-poll sleeps long and skips
+    /// main-thread hops when false (idle app / stopped).
+    source_active: Arc<AtomicBool>,
 }
 
 impl Player {
@@ -248,6 +255,7 @@ impl Player {
             bass_thread: Arc::new(RwLock::new(None)),
             discord: Arc::new(RwLock::new(None)),
             ui_hot: Arc::new(AtomicBool::new(true)),
+            source_active: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -258,6 +266,14 @@ impl Player {
 
     pub fn ui_is_hot(&self) -> bool {
         self.ui_hot.load(Ordering::Relaxed)
+    }
+
+    fn set_source_active(&self, active: bool) {
+        self.source_active.store(active, Ordering::Release);
+    }
+
+    fn is_source_active(&self) -> bool {
+        self.source_active.load(Ordering::Acquire)
     }
 
     fn cancel_pending_pause(inner: &mut PlayerInner) {
@@ -780,6 +796,8 @@ impl Player {
                 .saturating_add(MANUAL_SEGMENT_SUPPRESS_MS);
             Ok(())
         })?;
+        // Wake the position poller out of idle sleep for gapless + seekbar.
+        self.set_source_active(true);
         // Count after BASS open succeeds (manual play / remote / next-prev).
         self.record_play_stat(&track_path_for_stats);
         Ok(())
@@ -2105,7 +2123,9 @@ impl Player {
             inner.pending_next = None;
             inner.user_paused = false;
             Ok(())
-        })
+        })?;
+        self.set_source_active(false);
+        Ok(())
     }
 
     /// Stop playback and free the BASS audio device.
@@ -2460,9 +2480,12 @@ impl Player {
     /// Poll playback on the main thread and emit position / track-ended events.
     ///
     /// BASS must only be called from the thread that invoked `BASS_Init`.
-    /// Uses one long-lived worker (not a new OS thread every tick). While the
-    /// main window is unfocused, UI position events are throttled so games are
-    /// not fighting a 20 Hz WebView update loop; gapless still polls at 50 ms.
+    /// Uses one long-lived worker (not a new OS thread every tick).
+    ///
+    /// While a source is active, gapless polls at [`POLL_INTERVAL_MS`]. When idle
+    /// (no source), the worker sleeps [`POLL_IDLE_MS`] and **skips** main-thread
+    /// hops so the WebView message loop is not poked 20×/s with an empty player.
+    /// UI position IPC is further throttled via [`UI_EMIT_HOT_MS`] / cold.
     pub fn start_position_emitter(&self, app: AppHandle) {
         let player = self.clone();
         let was_playing = Arc::new(StdMutex::new(false));
@@ -2483,7 +2506,20 @@ impl Player {
             .name("muzeeka-position-poll".into())
             .spawn(move || {
                 loop {
-                    thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
+                    let active = player.is_source_active();
+                    let sleep_ms = if active {
+                        POLL_INTERVAL_MS
+                    } else {
+                        POLL_IDLE_MS
+                    };
+                    thread::sleep(Duration::from_millis(sleep_ms));
+
+                    // Still idle after sleep (and play() didn't arm the flag) —
+                    // do not bounce the UI/BASS thread for a no-op poll.
+                    if !player.is_source_active() {
+                        continue;
+                    }
+
                     let app_emit = app.clone();
                     let player_for_main = player.clone();
                     let was_for_main = was_playing.clone();
@@ -2545,6 +2581,7 @@ impl Player {
         last_ui_emit: &StdMutex<Instant>,
     ) {
         let poll_result = player_for_main.run_on_bass_thread(|inner| {
+
             if inner.current_source == 0 || inner.mixer_handle == 0 || inner.bass.is_none() {
                 return Ok(None);
             }
@@ -2634,6 +2671,7 @@ impl Player {
         if let Some(path) = advanced_path {
             // Gapless auto-advance is a new play start for the next track.
             player_for_main.record_play_stat(&path);
+            player_for_main.set_source_active(true);
             let mut was = was_for_main.lock().unwrap_or_else(|e| e.into_inner());
             *was = true;
             let snapshot = player_for_main.get_state();
@@ -2723,6 +2761,7 @@ impl Player {
 
                 if let Some(path) = recovered {
                     player_for_main.record_play_stat(&path);
+                    player_for_main.set_source_active(true);
                     *was = true;
                     let snapshot = player_for_main.get_state();
                     let _ = app_emit.emit(
@@ -2778,6 +2817,7 @@ impl Player {
 
                 player_for_main.release_ended_stream();
                 *was = false;
+                player_for_main.set_source_active(false);
                 let _ = app_emit.emit(
                     "player:track-ended",
                     serde_json::json!({ "path": ended_path }),
