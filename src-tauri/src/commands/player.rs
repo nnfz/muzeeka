@@ -7,7 +7,9 @@ use tauri::State;
 
 use crate::discord_rpc::DiscordPresence;
 use crate::equalizer::EqualizerSettings;
-use crate::player::{EqualizerStatus, GaplessTrack, Player, PlayerStateSnapshot};
+use crate::player::{
+    EqualizerStatus, GaplessTrack, MixVolSegment, Player, PlayerStateSnapshot,
+};
 use crate::remote_control::RemoteController;
 
 use super::notify::{notify_playback_change, notify_playback_seek};
@@ -85,7 +87,7 @@ pub fn player_prepare_next(
     player.prepare_next(current_file.as_deref(), parse_gapless_queue(queue))
 }
 
-/// Two-deck mix for the Mix transition editor (timeline-aligned, full volume).
+/// Two-deck mix for the Mix transition editor (timeline-aligned + volume envelopes).
 #[tauri::command]
 pub fn player_mix_crossfade(
     player: State<'_, Player>,
@@ -101,6 +103,14 @@ pub fn player_mix_crossfade(
     to_cue_end: Option<f64>,
     to_delay_secs: f64,
     from_duration_secs: f64,
+    from_vol: Option<Vec<MixVolSegment>>,
+    to_vol: Option<Vec<MixVolSegment>>,
+    from_lp: Option<Vec<MixVolSegment>>,
+    from_hp: Option<Vec<MixVolSegment>>,
+    to_lp: Option<Vec<MixVolSegment>>,
+    to_hp: Option<Vec<MixVolSegment>>,
+    from_speed: Option<Vec<MixVolSegment>>,
+    to_speed: Option<Vec<MixVolSegment>>,
 ) -> Result<(), String> {
     player.play_mix_crossfade(
         &from_path,
@@ -113,6 +123,14 @@ pub fn player_mix_crossfade(
         to_cue_end,
         to_delay_secs,
         from_duration_secs,
+        from_vol.unwrap_or_default(),
+        to_vol.unwrap_or_default(),
+        from_lp.unwrap_or_default(),
+        from_hp.unwrap_or_default(),
+        to_lp.unwrap_or_default(),
+        to_hp.unwrap_or_default(),
+        from_speed.unwrap_or_default(),
+        to_speed.unwrap_or_default(),
     )?;
     notify_playback_change(&player, &discord, controller.inner());
     Ok(())

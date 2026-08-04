@@ -10,13 +10,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex, RwLock};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::bass::{self, BassLibrary};
 use crate::cue::{self, PlaybackTarget};
 use crate::discord_rpc::DiscordPresence;
 use crate::equalizer::{eq_dsp_callback, EqDspContext, EqualizerSettings};
+use crate::mix_filter::{self, MixFilterCtx};
 
 /// Next track queued for gapless transition.
 #[derive(Debug, Clone)]
@@ -177,9 +178,47 @@ struct PlayerInner {
     suppress_gapless_until: u64,
     /// Two-deck mix: outgoing still in mixer until `fade_end_ms`.
     mix_crossfade: Option<MixCrossfadeState>,
+    /// Volume automation on the surviving next deck after dual-deck handoff.
+    mix_vol_follow: Option<MixVolFollow>,
     /// True while Mix Transition window owns the shared BASS device for preview.
     /// Main UI should ignore player events so library transport doesn't "join" the mix.
     mix_preview_active: bool,
+}
+
+/// Automation point: `t` in 0..1 of the segment, `v` gain 0..1.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MixVolPoint {
+    pub t: f64,
+    pub v: f64,
+}
+
+/// Envelope interpolation: straight segments or Catmull-Rom smooth.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MixEnvCurve {
+    #[default]
+    Linear,
+    Smooth,
+}
+
+/// One automation block on the mix timeline (seconds from preview start).
+/// Used for volume (gain) and filter (cutoff) envelopes.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MixVolSegment {
+    pub start_secs: f64,
+    pub duration_secs: f64,
+    pub points: Vec<MixVolPoint>,
+    #[serde(default)]
+    pub curve: MixEnvCurve,
+}
+
+/// LP/HP DSP attached to one mix deck source.
+struct MixDeckFilter {
+    source: u32,
+    dsp: u32,
+    ctx: Box<MixFilterCtx>,
 }
 
 /// Layered two-deck mix preview — plays exactly as aligned on the timeline.
@@ -193,13 +232,48 @@ struct MixCrossfadeState {
     from_duration_secs: f64,
     /// Inject next when previous has played this many seconds (graph delay). 0 = already in.
     to_delay_secs: f64,
+    /// Original graph delay of next (kept after inject for mix-clock on to).
+    to_graph_delay_secs: f64,
     from_cue_start: f64,
+    /// Wall-clock start of this mix session (for silence gaps after prev ends).
+    mix_timeline_start_ms: u64,
+    /// When prev was dropped before next's graph time: mix_secs at that moment.
+    /// 0 = prev still alive (or never started).
+    from_ended_mix_secs: f64,
+    /// Wall ms when prev was dropped early (0 = n/a).
+    from_ended_at_ms: u64,
     /// Pending next deck not yet in the mixer (to_source==0 until inject).
     pending_to: Option<PendingMixDeck>,
     next_path: String,
     next_audio_path: String,
     next_cue_start: Option<f64>,
     next_cue_end: Option<f64>,
+    /// Volume envelopes for previous / next decks (mix timeline).
+    from_vol: Vec<MixVolSegment>,
+    to_vol: Vec<MixVolSegment>,
+    /// Low-pass / high-pass cutoff envelopes (normalized v → Hz in apply).
+    from_lp: Vec<MixVolSegment>,
+    from_hp: Vec<MixVolSegment>,
+    to_lp: Vec<MixVolSegment>,
+    to_hp: Vec<MixVolSegment>,
+    /// Speed / rate envelopes (normalized v → 0.5×..2×).
+    from_speed: Vec<MixVolSegment>,
+    to_speed: Vec<MixVolSegment>,
+    from_filter: Option<MixDeckFilter>,
+    to_filter: Option<MixDeckFilter>,
+}
+
+/// After previous deck is dropped, keep driving next-deck automation.
+struct MixVolFollow {
+    source: u32,
+    decode: u32,
+    to_graph_delay_secs: f64,
+    to_cue_start: f64,
+    to_vol: Vec<MixVolSegment>,
+    to_lp: Vec<MixVolSegment>,
+    to_hp: Vec<MixVolSegment>,
+    to_speed: Vec<MixVolSegment>,
+    filter: Option<MixDeckFilter>,
 }
 
 struct PendingMixDeck {
@@ -280,6 +354,7 @@ impl Player {
                 user_paused: false,
                 suppress_gapless_until: 0,
                 mix_crossfade: None,
+                mix_vol_follow: None,
                 mix_preview_active: false,
             })),
             ops: Arc::new(Mutex::new(())),
@@ -1062,11 +1137,26 @@ impl Player {
         }
     }
 
+    fn detach_mix_deck_filter(bass: Option<&BassLibrary>, slot: Option<MixDeckFilter>) {
+        let Some(slot) = slot else {
+            return;
+        };
+        if let Some(bass) = bass {
+            mix_filter::detach_mix_filter(bass, slot.source, slot.dsp, slot.ctx);
+        }
+        // else ctx dropped with slot
+    }
+
     fn clear_mix_crossfade(inner: &mut PlayerInner) {
+        if let Some(follow) = inner.mix_vol_follow.take() {
+            Self::detach_mix_deck_filter(inner.bass.as_ref(), follow.filter);
+        }
         let Some(mix) = inner.mix_crossfade.take() else {
             return;
         };
         if let Some(bass) = inner.bass.as_ref() {
+            Self::detach_mix_deck_filter(Some(bass), mix.from_filter);
+            Self::detach_mix_deck_filter(Some(bass), mix.to_filter);
             let mut pairs = vec![
                 (mix.from_source, mix.from_decode),
                 (mix.to_source, mix.to_decode),
@@ -1081,10 +1171,315 @@ impl Player {
                 let _ = bass.mixer_channel_remove(src);
                 Self::free_playback_channel(bass, src, dec);
             }
+        } else {
+            // Drop filter boxes without BASS (process exit).
+            drop(mix.from_filter);
+            drop(mix.to_filter);
         }
         if inner.current_source == mix.from_source || inner.current_source == mix.to_source {
             inner.current_source = 0;
             inner.current_decode = 0;
+        }
+    }
+
+    fn attach_deck_filter(bass: &BassLibrary, source: u32) -> Option<MixDeckFilter> {
+        if source == 0 {
+            return None;
+        }
+        match mix_filter::attach_mix_filter(bass, source) {
+            Ok((dsp, ctx)) => Some(MixDeckFilter { source, dsp, ctx }),
+            Err(e) => {
+                eprintln!("[mix] filter DSP attach failed: {e}");
+                None
+            }
+        }
+    }
+
+    /// Sample gain 0..1 from automation segments at mix-timeline time `mix_secs`.
+    /// Outside all segments → unity (1.0). Overlapping segments multiply.
+    fn mix_gain_at(segments: &[MixVolSegment], mix_secs: f64) -> f32 {
+        if segments.is_empty() {
+            return 1.0;
+        }
+        let mut gain = 1.0f32;
+        let mut any = false;
+        for seg in segments {
+            let dur = seg.duration_secs.max(1e-6);
+            if mix_secs + 1e-4 < seg.start_secs {
+                continue;
+            }
+            if mix_secs > seg.start_secs + dur + 1e-4 {
+                continue;
+            }
+            let u = ((mix_secs - seg.start_secs) / dur).clamp(0.0, 1.0);
+            gain *= Self::sample_mix_envelope(&seg.points, u, seg.curve);
+            any = true;
+        }
+        if !any {
+            1.0
+        } else {
+            gain.clamp(0.0, 1.0)
+        }
+    }
+
+    /// Envelope v 0..1 → rate 0.5×..2× (v=0.5 → 1×). Matches frontend `envelopeVToRate`.
+    fn envelope_v_to_rate(v: f32) -> f32 {
+        let x = v.clamp(0.0, 1.0) as f64;
+        (2f64.powf((x - 0.5) * 2.0) as f32).clamp(0.25, 2.0)
+    }
+
+    /// Speed multiplier from blocks (outside blocks → 1.0). Overlapping multiply.
+    fn mix_speed_at(segments: &[MixVolSegment], mix_secs: f64) -> f32 {
+        if segments.is_empty() {
+            return 1.0;
+        }
+        let mut rate = 1.0f32;
+        let mut any = false;
+        for seg in segments {
+            let dur = seg.duration_secs.max(1e-6);
+            if mix_secs + 1e-4 < seg.start_secs {
+                continue;
+            }
+            if mix_secs > seg.start_secs + dur + 1e-4 {
+                continue;
+            }
+            let u = ((mix_secs - seg.start_secs) / dur).clamp(0.0, 1.0);
+            let v = Self::sample_mix_envelope(&seg.points, u, seg.curve);
+            rate *= Self::envelope_v_to_rate(v);
+            any = true;
+        }
+        if !any {
+            1.0
+        } else {
+            rate.clamp(0.25, 2.0)
+        }
+    }
+
+    fn apply_mix_deck_rate(
+        bass: &BassLibrary,
+        source: u32,
+        decode: u32,
+        rate: f32,
+        _pitch_enabled: bool,
+    ) {
+        if source == 0 {
+            return;
+        }
+        let r = rate.clamp(0.25, 2.0);
+        // Match normal transport: tempo wrapper → TEMPO %; plain decode → FREQ.
+        // Always target the decode handle for FREQ (never the mixer wrapper).
+        if Self::is_tempo_wrapped(bass, source, decode) {
+            let _ = Self::slide_tempo_pct(bass, source, r, 0);
+        } else {
+            let handle = if decode != 0 { decode } else { source };
+            Self::apply_freq_rate(bass, handle, r);
+        }
+    }
+
+    fn catmull_rom(p0: f64, p1: f64, p2: f64, p3: f64, u: f64) -> f64 {
+        let u2 = u * u;
+        let u3 = u2 * u;
+        0.5 * (2.0 * p1
+            + (-p0 + p2) * u
+            + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * u2
+            + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * u3)
+    }
+
+    fn sample_mix_envelope(points: &[MixVolPoint], t: f64, curve: MixEnvCurve) -> f32 {
+        if points.is_empty() {
+            return 1.0;
+        }
+        let x = t.clamp(0.0, 1.0);
+        // Points expected sorted; tolerate unsorted.
+        let mut pts: Vec<(f64, f64)> = points
+            .iter()
+            .map(|p| (p.t.clamp(0.0, 1.0), p.v.clamp(0.0, 1.0)))
+            .collect();
+        pts.sort_by(|a, b| a.0.total_cmp(&b.0));
+        if x <= pts[0].0 {
+            return pts[0].1 as f32;
+        }
+        for i in 1..pts.len() {
+            let (t0, v0) = pts[i - 1];
+            let (t1, v1) = pts[i];
+            if x <= t1 + 1e-12 {
+                let span = (t1 - t0).max(1e-9);
+                let u = (x - t0) / span;
+                if curve == MixEnvCurve::Smooth {
+                    let p0 = pts[i.saturating_sub(2)].1;
+                    let p1 = v0;
+                    let p2 = v1;
+                    let p3 = pts[(i + 1).min(pts.len() - 1)].1;
+                    return Self::catmull_rom(p0, p1, p2, p3, u).clamp(0.0, 1.0) as f32;
+                }
+                return (v0 + (v1 - v0) * u) as f32;
+            }
+        }
+        pts[pts.len() - 1].1 as f32
+    }
+
+    /// Active filter cutoff at mix time. LP → min of active segments; HP → max.
+    /// `None` = bypass (no block covers this time).
+    fn mix_filter_hz_at(
+        segments: &[MixVolSegment],
+        mix_secs: f64,
+        map_v: fn(f64) -> f64,
+        prefer_min: bool,
+    ) -> Option<f32> {
+        if segments.is_empty() {
+            return None;
+        }
+        let mut any = false;
+        let mut val = if prefer_min { f64::MAX } else { 0.0 };
+        for seg in segments {
+            let dur = seg.duration_secs.max(1e-6);
+            if mix_secs + 1e-4 < seg.start_secs {
+                continue;
+            }
+            if mix_secs > seg.start_secs + dur + 1e-4 {
+                continue;
+            }
+            let u = ((mix_secs - seg.start_secs) / dur).clamp(0.0, 1.0);
+            let v = Self::sample_mix_envelope(&seg.points, u, seg.curve) as f64;
+            let hz = map_v(v);
+            any = true;
+            if prefer_min {
+                val = val.min(hz);
+            } else {
+                val = val.max(hz);
+            }
+        }
+        if any {
+            Some(val as f32)
+        } else {
+            None
+        }
+    }
+
+    /// Drive per-deck volume + LP/HP + speed from mix-timeline automation blocks.
+    fn apply_mix_volume_automation(inner: &mut PlayerInner) {
+        if inner.bass.is_none() {
+            return;
+        }
+
+        if inner.mix_crossfade.is_some() {
+            let (
+                from_src,
+                from_dec,
+                to_src,
+                to_dec,
+                from_g,
+                to_g,
+                from_lp,
+                from_hp,
+                to_lp,
+                to_hp,
+                from_rate,
+                to_rate,
+                pitch,
+            ) = {
+                let mix = inner.mix_crossfade.as_ref().unwrap();
+                let bass = inner.bass.as_ref().unwrap();
+                let now = Self::now_millis();
+                // Includes silence-gap wall clock after prev ends early.
+                let mix_secs = Self::mix_timeline_secs(mix, bass, now);
+                let base = inner.playback_rate.clamp(0.25, 2.0);
+                let from_g = Self::mix_gain_at(&mix.from_vol, mix_secs);
+                let to_g = Self::mix_gain_at(&mix.to_vol, mix_secs);
+                let from_lp = Self::mix_filter_hz_at(
+                    &mix.from_lp,
+                    mix_secs,
+                    mix_filter::envelope_v_to_lp_hz,
+                    true,
+                );
+                let from_hp = Self::mix_filter_hz_at(
+                    &mix.from_hp,
+                    mix_secs,
+                    mix_filter::envelope_v_to_hp_hz,
+                    false,
+                );
+                let to_lp = Self::mix_filter_hz_at(
+                    &mix.to_lp,
+                    mix_secs,
+                    mix_filter::envelope_v_to_lp_hz,
+                    true,
+                );
+                let to_hp = Self::mix_filter_hz_at(
+                    &mix.to_hp,
+                    mix_secs,
+                    mix_filter::envelope_v_to_hp_hz,
+                    false,
+                );
+                let from_rate = base * Self::mix_speed_at(&mix.from_speed, mix_secs);
+                let to_rate = base * Self::mix_speed_at(&mix.to_speed, mix_secs);
+                (
+                    mix.from_source,
+                    mix.from_decode,
+                    mix.to_source,
+                    mix.to_decode,
+                    from_g,
+                    to_g,
+                    from_lp,
+                    from_hp,
+                    to_lp,
+                    to_hp,
+                    from_rate,
+                    to_rate,
+                    inner.pitch_enabled,
+                )
+            };
+            let bass = inner.bass.as_ref().unwrap();
+            if from_src != 0 {
+                let _ = bass.channel_set_attribute(from_src, bass::BASS_ATTRIB_VOL, from_g);
+                Self::apply_mix_deck_rate(bass, from_src, from_dec, from_rate, pitch);
+            }
+            if to_src != 0 {
+                let _ = bass.channel_set_attribute(to_src, bass::BASS_ATTRIB_VOL, to_g);
+                Self::apply_mix_deck_rate(bass, to_src, to_dec, to_rate, pitch);
+            }
+            if let Some(mix) = inner.mix_crossfade.as_ref() {
+                if let Some(f) = mix.from_filter.as_ref() {
+                    f.ctx.set_targets(from_lp, from_hp);
+                }
+                if let Some(f) = mix.to_filter.as_ref() {
+                    f.ctx.set_targets(to_lp, to_hp);
+                }
+            }
+            return;
+        }
+
+        if let Some(follow) = inner.mix_vol_follow.as_ref() {
+            if follow.source == 0 {
+                return;
+            }
+            let bass = inner.bass.as_ref().unwrap();
+            let abs =
+                Self::content_absolute_secs(bass, follow.source, follow.decode, true);
+            let mix_secs =
+                follow.to_graph_delay_secs + (abs - follow.to_cue_start).max(0.0);
+            let g = Self::mix_gain_at(&follow.to_vol, mix_secs);
+            let lp = Self::mix_filter_hz_at(
+                &follow.to_lp,
+                mix_secs,
+                mix_filter::envelope_v_to_lp_hz,
+                true,
+            );
+            let hp = Self::mix_filter_hz_at(
+                &follow.to_hp,
+                mix_secs,
+                mix_filter::envelope_v_to_hp_hz,
+                false,
+            );
+            let base = inner.playback_rate.clamp(0.25, 2.0);
+            let rate = base * Self::mix_speed_at(&follow.to_speed, mix_secs);
+            let src = follow.source;
+            let dec = follow.decode;
+            let pitch = inner.pitch_enabled;
+            let _ = bass.channel_set_attribute(src, bass::BASS_ATTRIB_VOL, g);
+            Self::apply_mix_deck_rate(bass, src, dec, rate, pitch);
+            if let Some(f) = follow.filter.as_ref() {
+                f.ctx.set_targets(lp, hp);
+            }
         }
     }
 
@@ -1106,37 +1501,134 @@ impl Player {
             Self::seek_content_absolute(bass, pending.source, pending.decode, false, to_cue);
         }
         if Self::add_source_to_mixer(inner, pending.source, true).is_ok() {
+            // Gain at inject time (mix clock ≈ to_delay).
+            let g = inner
+                .mix_crossfade
+                .as_ref()
+                .map(|m| {
+                    let t = m.to_graph_delay_secs.max(m.to_delay_secs);
+                    Self::mix_gain_at(&m.to_vol, t)
+                })
+                .unwrap_or(1.0);
+            let need_filter = inner.mix_crossfade.as_ref().is_some_and(|m| {
+                !m.to_lp.is_empty() || !m.to_hp.is_empty()
+            });
             if let Some(bass) = inner.bass.as_ref() {
-                let _ = bass.channel_set_attribute(pending.source, bass::BASS_ATTRIB_VOL, 1.0);
+                let _ = bass.channel_set_attribute(pending.source, bass::BASS_ATTRIB_VOL, g);
                 // Re-snap after plug-in (mixer may have advanced a buffer).
                 Self::seek_content_absolute(bass, pending.source, pending.decode, true, to_cue);
             }
+            let filter = if need_filter {
+                inner
+                    .bass
+                    .as_ref()
+                    .and_then(|b| Self::attach_deck_filter(b, pending.source))
+            } else {
+                None
+            };
             if let Some(mix) = inner.mix_crossfade.as_mut() {
+                // Drop any stale to_filter from a prior inject.
+                if let Some(old) = mix.to_filter.take() {
+                    if let Some(bass) = inner.bass.as_ref() {
+                        mix_filter::detach_mix_filter(bass, old.source, old.dsp, old.ctx);
+                    }
+                }
                 mix.to_source = pending.source;
                 mix.to_decode = pending.decode;
+                mix.to_filter = filter;
             }
         } else if let Some(bass) = inner.bass.as_ref() {
             Self::free_playback_channel(bass, pending.source, pending.decode);
         }
     }
 
+    /// Mix-timeline seconds since preview start = **wall clock** (1× graph / playhead).
+    ///
+    /// Speed blocks retune audio only so one deck can match the other; automation
+    /// and inject delays stay locked to the layout clock, not content time
+    /// (which would race ahead when rate ≠ 1).
+    fn mix_timeline_secs(mix: &MixCrossfadeState, _bass: &BassLibrary, now_ms: u64) -> f64 {
+        (now_ms.saturating_sub(mix.mix_timeline_start_ms) as f64 / 1000.0).max(0.0)
+    }
+
+    /// Drop previous only; keep pending next so a graph gap (silence) can pass.
+    fn drop_mix_from_only(inner: &mut PlayerInner, mix_secs_at_drop: f64) {
+        let Some(mix) = inner.mix_crossfade.as_mut() else {
+            return;
+        };
+        if mix.from_source == 0 {
+            return;
+        }
+        let from_src = mix.from_source;
+        let from_dec = mix.from_decode;
+        let from_filter = mix.from_filter.take();
+        mix.from_source = 0;
+        mix.from_decode = 0;
+        // Record wall mix-clock at drop (for diagnostics / future use).
+        mix.from_ended_mix_secs = mix_secs_at_drop.max(0.0);
+        mix.from_ended_at_ms = Self::now_millis();
+
+        Self::detach_mix_deck_filter(inner.bass.as_ref(), from_filter);
+        if let Some(bass) = inner.bass.as_ref() {
+            let _ = bass.mixer_channel_remove(from_src);
+            Self::free_playback_channel(bass, from_src, from_dec);
+        }
+        if inner.current_source == from_src {
+            // Silence until next inject — mixer stays NONSTOP.
+            if mix.to_source != 0 {
+                inner.current_source = mix.to_source;
+                inner.current_decode = mix.to_decode;
+            } else {
+                inner.current_source = 0;
+                inner.current_decode = 0;
+            }
+        }
+    }
+
     /// Previous deck finished: drop it, keep next if already playing.
+    /// Does NOT force-inject a pending next before its graph delay — that would
+    /// kill intentional pauses between tracks on the timeline.
     /// Returns the surviving next path when handoff succeeds.
     fn finish_mix_from_deck(inner: &mut PlayerInner) -> Option<String> {
-        if inner
-            .mix_crossfade
-            .as_ref()
-            .is_some_and(|m| m.pending_to.is_some())
-        {
+        // Only inject pending if its graph time has already arrived.
+        let should_inject = inner.mix_crossfade.as_ref().is_some_and(|m| {
+            m.pending_to.is_some() && {
+                let now = Self::now_millis();
+                let bass = inner.bass.as_ref();
+                let secs = bass
+                    .map(|b| Self::mix_timeline_secs(m, b, now))
+                    .unwrap_or(m.to_graph_delay_secs);
+                secs + 0.002 >= m.to_graph_delay_secs
+            }
+        });
+        if should_inject {
             Self::inject_pending_to_deck(inner);
         }
-        let mix = inner.mix_crossfade.take()?;
+        let mut mix = inner.mix_crossfade.take()?;
+
+        // Detach prev filter before freeing the channel.
+        let from_filter = mix.from_filter.take();
+        Self::detach_mix_deck_filter(inner.bass.as_ref(), from_filter);
 
         if let Some(bass) = inner.bass.as_ref() {
             if mix.from_source != 0 {
                 let _ = bass.mixer_channel_remove(mix.from_source);
                 Self::free_playback_channel(bass, mix.from_source, mix.from_decode);
             }
+        }
+        mix.from_source = 0;
+        mix.from_decode = 0;
+
+        // Still waiting for next's graph time — put mix state back without from.
+        if mix.pending_to.is_some() && mix.to_source == 0 {
+            if mix.from_ended_at_ms == 0 {
+                mix.from_ended_mix_secs = mix.from_duration_secs.max(0.0);
+                mix.from_ended_at_ms = Self::now_millis();
+            }
+            inner.current_source = 0;
+            inner.current_decode = 0;
+            inner.mix_crossfade = Some(mix);
+            return None;
         }
 
         if mix.to_source != 0 {
@@ -1162,6 +1654,28 @@ impl Player {
                     cue_end: mix.next_cue_end,
                 }];
                 inner.gapless_queue_index = 0;
+                // Keep automation on next until the track ends.
+                let keep_fx = !mix.to_vol.is_empty()
+                    || !mix.to_lp.is_empty()
+                    || !mix.to_hp.is_empty()
+                    || !mix.to_speed.is_empty()
+                    || mix.to_filter.is_some();
+                if keep_fx {
+                    inner.mix_vol_follow = Some(MixVolFollow {
+                        source: to_src,
+                        decode: to_dec,
+                        to_graph_delay_secs: mix.to_graph_delay_secs,
+                        to_cue_start: mix.next_cue_start.unwrap_or(0.0).max(0.0),
+                        to_vol: mix.to_vol,
+                        to_lp: mix.to_lp,
+                        to_hp: mix.to_hp,
+                        to_speed: mix.to_speed,
+                        filter: mix.to_filter,
+                    });
+                } else {
+                    Self::detach_mix_deck_filter(inner.bass.as_ref(), mix.to_filter);
+                    inner.mix_vol_follow = None;
+                }
                 // Fresh start clock so the next deck isn't treated as "already
                 // past the spurious-end guard" from the mix open time.
                 let now = Self::now_millis();
@@ -1171,6 +1685,7 @@ impl Player {
                 return Some(next_path);
             }
             // Next already finished — free it and fall through to full stop.
+            Self::detach_mix_deck_filter(inner.bass.as_ref(), mix.to_filter);
             if let Some(bass) = inner.bass.as_ref() {
                 let _ = bass.mixer_channel_remove(to_src);
                 Self::free_playback_channel(bass, to_src, to_dec);
@@ -1184,38 +1699,36 @@ impl Player {
                 Self::free_playback_channel(bass, p.source, p.decode);
             }
         }
+        inner.mix_vol_follow = None;
         inner.current_source = 0;
         inner.current_decode = 0;
         None
     }
 
-    /// True if any deck in the mix session is still producing audio.
+    /// True if the mix session is still live (playing or intentional silence gap).
     fn mix_has_active_audio(inner: &PlayerInner) -> bool {
         let Some(mix) = inner.mix_crossfade.as_ref() else {
             return false;
         };
+        // Waiting for delayed next = session still active (silence is intentional).
+        if mix.pending_to.is_some() {
+            return true;
+        }
         let Some(bass) = inner.bass.as_ref() else {
             return false;
         };
         let live = |src: u32| {
             src != 0 && bass.channel_is_active(src) != bass::BASS_ACTIVE_STOPPED
         };
-        if live(mix.from_source) || live(mix.to_source) {
-            return true;
-        }
-        if let Some(p) = mix.pending_to.as_ref() {
-            // Pending is silent until inject, but the session is still "live"
-            // if previous is playing — already covered by from. If only pending
-            // remains, inject should have happened; treat as inactive here.
-            let _ = p;
-        }
-        false
+        live(mix.from_source) || live(mix.to_source)
     }
 
-    /// Two-deck mix: play as laid out on the timeline (full volume, no auto-fade).
+    /// Two-deck mix: play as laid out on the timeline.
     ///
     /// - `to_delay_secs > 0`: next is later on the mix timeline — start it after that delay at `to_cue_start`.
     /// - `from_duration_secs`: how long previous keeps playing from its cue start (to end of track).
+    /// - `from_vol` / `to_vol`: optional gain envelopes (mix timeline from preview start).
+    /// - `from_lp` / `from_hp` / `to_lp` / `to_hp`: cutoff envelopes (normalized v → Hz).
     pub fn play_mix_crossfade(
         &self,
         from_path: &str,
@@ -1229,6 +1742,14 @@ impl Player {
         // Delay before next deck (later on mix timeline). from_duration: how long prev runs.
         to_delay_secs: f64,
         from_duration_secs: f64,
+        from_vol: Vec<MixVolSegment>,
+        to_vol: Vec<MixVolSegment>,
+        from_lp: Vec<MixVolSegment>,
+        from_hp: Vec<MixVolSegment>,
+        to_lp: Vec<MixVolSegment>,
+        to_hp: Vec<MixVolSegment>,
+        from_speed: Vec<MixVolSegment>,
+        to_speed: Vec<MixVolSegment>,
     ) -> Result<(), String> {
         let _ops = self.ops.lock();
         let from_path_owned = from_path.to_string();
@@ -1273,6 +1794,7 @@ impl Player {
             Self::cancel_pending_pause(inner);
             Self::clear_preload(inner);
             Self::clear_mix_crossfade(inner);
+            inner.mix_vol_follow = None;
             if inner.current_source != 0 {
                 if let Some(bass) = inner.bass.as_ref() {
                     let _ = bass.mixer_channel_remove(inner.current_source);
@@ -1356,6 +1878,10 @@ impl Player {
                 }
             }
 
+            // Initial gains at mix t=0 (envelope start).
+            let from_g0 = Self::mix_gain_at(&from_vol, 0.0);
+            let to_g0 = Self::mix_gain_at(&to_vol, 0.0);
+
             // 2) Add active decks while mixer is still paused, then one synchronized start.
             if from_src != 0 {
                 Self::add_source_to_mixer(inner, from_src, true)?;
@@ -1366,11 +1892,11 @@ impl Player {
             {
                 let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
                 if from_src != 0 {
-                    let _ = bass.channel_set_attribute(from_src, bass::BASS_ATTRIB_VOL, 1.0);
+                    let _ = bass.channel_set_attribute(from_src, bass::BASS_ATTRIB_VOL, from_g0);
                     Self::seek_content_absolute(bass, from_src, from_tracked, true, from_start);
                 }
                 if to_src != 0 {
-                    let _ = bass.channel_set_attribute(to_src, bass::BASS_ATTRIB_VOL, 1.0);
+                    let _ = bass.channel_set_attribute(to_src, bass::BASS_ATTRIB_VOL, to_g0);
                     Self::seek_content_absolute(bass, to_src, to_tracked, true, to_start);
                 }
                 let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_VOL, volume);
@@ -1401,6 +1927,40 @@ impl Player {
                 .map(|p| (p.audio_path.clone(), p.cue_start, p.cue_end))
                 .unwrap_or_default();
 
+            // Graph delay of next is always the original to_delay (even if already injected).
+            let graph_delay = if from_src != 0 { to_delay } else { 0.0 };
+
+            // Attach LP/HP DSP only when that deck has filter blocks.
+            let from_filter = if from_src != 0 && (!from_lp.is_empty() || !from_hp.is_empty()) {
+                inner
+                    .bass
+                    .as_ref()
+                    .and_then(|b| Self::attach_deck_filter(b, from_src))
+            } else {
+                None
+            };
+            let to_filter = if to_src != 0 && (!to_lp.is_empty() || !to_hp.is_empty()) {
+                inner
+                    .bass
+                    .as_ref()
+                    .and_then(|b| Self::attach_deck_filter(b, to_src))
+            } else {
+                None
+            };
+            // Seed cutoffs at t=0 before first poll.
+            if let Some(ref f) = from_filter {
+                f.ctx.set_targets(
+                    Self::mix_filter_hz_at(&from_lp, 0.0, mix_filter::envelope_v_to_lp_hz, true),
+                    Self::mix_filter_hz_at(&from_hp, 0.0, mix_filter::envelope_v_to_hp_hz, false),
+                );
+            }
+            if let Some(ref f) = to_filter {
+                f.ctx.set_targets(
+                    Self::mix_filter_hz_at(&to_lp, 0.0, mix_filter::envelope_v_to_lp_hz, true),
+                    Self::mix_filter_hz_at(&to_hp, 0.0, mix_filter::envelope_v_to_hp_hz, false),
+                );
+            }
+
             inner.mix_crossfade = Some(MixCrossfadeState {
                 from_source: from_src,
                 from_decode: from_tracked,
@@ -1411,15 +1971,33 @@ impl Player {
                 // Use prev deck audio time for inject (not wall clock) so next
                 // lands on the same mix timeline as the waveform.
                 to_delay_secs: if pending_to.is_some() { to_delay } else { 0.0 },
+                to_graph_delay_secs: graph_delay,
                 from_cue_start: from_start,
+                mix_timeline_start_ms: now,
+                from_ended_mix_secs: 0.0,
+                from_ended_at_ms: 0,
                 pending_to,
                 next_path: to_path.clone(),
                 next_audio_path: next_audio,
                 next_cue_start: next_cs,
                 next_cue_end: next_ce,
+                from_vol,
+                to_vol,
+                from_lp,
+                from_hp,
+                to_lp,
+                to_hp,
+                from_speed,
+                to_speed,
+                from_filter,
+                to_filter,
             });
+            // Only-to preview: mix_crossfade owns vol + filters for the whole session.
             inner.gapless_queue.clear();
             inner.gapless_queue_index = 0;
+
+            // Seed vol / filter / speed automation at t=0 (don't wait for first poll).
+            Self::apply_mix_volume_automation(inner);
 
             inner.mix_preview_active = true;
             Ok(())
@@ -3081,59 +3659,64 @@ impl Player {
     ) {
         let poll_result = player_for_main.run_on_bass_thread(|inner| {
 
-            if inner.current_source == 0 || inner.mixer_handle == 0 || inner.bass.is_none() {
+            if inner.mixer_handle == 0 || inner.bass.is_none() {
+                return Ok(None);
+            }
+            // Allow current_source==0 during intentional silence gap (pending next).
+            if inner.current_source == 0 && inner.mix_crossfade.is_none() {
                 return Ok(None);
             }
 
             let now = Self::now_millis();
-            // Mix timeline: inject next when prev has advanced the graph delay;
-            // drop prev when its remaining length is done (audio time or STOPPED).
-            // Critical: hand off to next BEFORE get_state sees from as Stopped,
-            // otherwise release_ended_stream kills the still-playing next deck.
+            // Mix timeline: inject next only when graph delay has elapsed
+            // (never early when prev ends — that kills user-planned pauses).
+            // Drop prev when its remaining length is done (audio time or STOPPED).
             if inner.mix_crossfade.is_some() {
-                let (inject, drop_from) = {
+                let (inject, drop_from, mix_secs, delay_left) = {
                     let mix = inner.mix_crossfade.as_ref().unwrap();
                     let bass = inner.bass.as_ref().unwrap();
-                    let mut inject = false;
-                    let from_played = if mix.from_source != 0 {
-                        let abs = Self::content_absolute_secs(
-                            bass,
-                            mix.from_source,
-                            mix.from_decode,
-                            true,
-                        );
-                        (abs - mix.from_cue_start).max(0.0)
-                    } else {
-                        0.0
-                    };
-                    if mix.pending_to.is_some() {
-                        if mix.from_source == 0 {
-                            inject = true;
-                        } else if mix.to_delay_secs <= 0.0 {
-                            inject = true;
-                        } else {
-                            inject = from_played + 0.002 >= mix.to_delay_secs;
-                        }
-                    }
+                    // Graph / playhead clock (1× wall) — not content time under Speed.
+                    let mix_secs = Self::mix_timeline_secs(mix, bass, now);
+                    let inject = mix.pending_to.is_some()
+                        && mix_secs + 0.002 >= mix.to_graph_delay_secs;
                     let mut drop_from = false;
                     if mix.from_source != 0 {
                         let from_stopped = bass.channel_is_active(mix.from_source)
                             == bass::BASS_ACTIVE_STOPPED;
+                        // End prev when the *layout* says so (or stream already dry).
                         let duration_done = mix.from_duration_secs > 0.0
-                            && from_played + 0.05 >= mix.from_duration_secs;
+                            && mix_secs + 0.05 >= mix.from_duration_secs;
                         drop_from = from_stopped || duration_done;
                     }
-                    (inject, drop_from)
+                    let delay_left = mix.to_graph_delay_secs - mix_secs;
+                    (inject, drop_from, mix_secs, delay_left)
                 };
                 if inject {
                     Self::inject_pending_to_deck(inner);
                 }
                 if drop_from {
+                    // Prev done but next still in the future on the graph → silence gap.
+                    let wait_for_next = inner.mix_crossfade.as_ref().is_some_and(|m| {
+                        m.pending_to.is_some() && delay_left > 0.05
+                    });
+                    if wait_for_next {
+                        Self::drop_mix_from_only(inner, mix_secs);
+                        Self::apply_mix_volume_automation(inner);
+                        return Ok(None);
+                    }
                     let path = Self::finish_mix_from_deck(inner);
+                    // Apply follow-volume immediately after handoff.
+                    Self::apply_mix_volume_automation(inner);
                     return Ok(path);
                 }
+                // Drive volume envelopes every poll tick while dual-deck is live.
+                Self::apply_mix_volume_automation(inner);
                 // Still in mix session — no normal gapless / end teardown.
                 return Ok(None);
+            }
+            // Surviving next deck after handoff — keep envelope running.
+            if inner.mix_vol_follow.is_some() {
+                Self::apply_mix_volume_automation(inner);
             }
             // Pitch/rate topology rebuild and seeks can briefly look "ended".
             // Never advance or tear down during the suppress window.

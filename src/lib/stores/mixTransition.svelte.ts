@@ -6,6 +6,11 @@ import {
   trackDisplayTitle,
   type MusicFile,
 } from '$lib/stores/player.svelte';
+import {
+  parseBlocks,
+  serializeBlocks,
+  type MixBlock,
+} from '$lib/mix/blocks';
 
 export const MIX_TRANSITION_LABEL = 'mix-transition';
 
@@ -21,6 +26,8 @@ export interface MixTransitionMemory {
   playheadFromSecs: number;
   fromGridOffset: number;
   toGridOffset: number;
+  /** Transition + effect blocks on the timeline. */
+  blocks: MixBlock[];
   savedAt: number;
 }
 
@@ -67,6 +74,9 @@ export function loadMixTransitionMemory(
         typeof parsed.fromGridOffset === 'number' ? parsed.fromGridOffset : 0,
       toGridOffset:
         typeof parsed.toGridOffset === 'number' ? parsed.toGridOffset : 0,
+      blocks: parseBlocks(
+        (parsed as MixTransitionMemory & { blocks?: unknown }).blocks,
+      ),
       savedAt: typeof parsed.savedAt === 'number' ? parsed.savedAt : 0,
     };
   } catch {
@@ -83,6 +93,7 @@ export function saveMixTransitionMemory(
   try {
     const payload: MixTransitionMemory = {
       ...memory,
+      blocks: serializeBlocks(memory.blocks ?? []),
       savedAt: Date.now(),
     };
     localStorage.setItem(
@@ -98,9 +109,9 @@ const WINDOW_OPTIONS = {
   url: import.meta.env.DEV ? 'http://localhost:1420/' : 'index.html',
   title: 'Mix transition',
   width: 1040,
-  height: 560,
+  height: 640,
   minWidth: 760,
-  minHeight: 420,
+  minHeight: 500,
   decorations: false,
   resizable: true,
   visible: false,

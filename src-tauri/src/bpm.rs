@@ -144,6 +144,151 @@ pub fn detect_bpm_for_path(player: &Player, path: &str) -> Result<f32, String> {
     Ok(bpm)
 }
 
+/// Find beat-grid phase (seconds) so sticks land on kicks / strong onsets.
+///
+/// `offset` is in [0, beat_period): first beat of the grid at that time from
+/// track start. Uses onset energy under a fixed BPM (from tags or detection).
+pub fn detect_beat_offset_for_path(
+    player: &Player,
+    path: &str,
+    bpm: f32,
+) -> Result<f64, String> {
+    let path = path.trim().to_string();
+    if path.is_empty() {
+        return Err("Empty audio path".into());
+    }
+    if !Path::new(&path).is_file() {
+        return Err(format!("File not found: {path}"));
+    }
+    if !bpm.is_finite() || bpm < MIN_BPM || bpm > MAX_BPM * 1.5 {
+        return Err(format!("BPM out of range: {bpm}"));
+    }
+
+    player.init()?;
+    let path_for_bass = path.clone();
+    player.with_bass(move |bass| detect_beat_offset_with_bass(bass, &path_for_bass, bpm))
+}
+
+fn detect_beat_offset_with_bass(
+    bass: &BassLibrary,
+    path: &str,
+    bpm: f32,
+) -> Result<f64, String> {
+    let (handle, _mode) = open_decode(bass, path)?;
+    let result = (|| {
+        let info = decode_info(bass, handle)?;
+        // Prefer a mid-track window (kicks usually clearer than intro).
+        let start = window_starts_secs(info.total_secs)
+            .get(1)
+            .copied()
+            .unwrap_or(MIN_START_SKIP_SECS);
+        let max_mono =
+            ((WINDOW_SECS * info.sample_rate as f64) as usize).max(info.sample_rate as usize);
+        let pos = bass.channel_seconds2bytes(handle, start);
+        bass.channel_set_position(handle, pos, bass::BASS_POS_BYTE)?;
+        let mono = pull_mono(bass, handle, &info, max_mono)?;
+        if mono.len() < info.sample_rate as usize / 2 {
+            return Err("Not enough audio for beat align".into());
+        }
+        let local = estimate_beat_offset(&mono, info.sample_rate, bpm)
+            .ok_or_else(|| "Could not estimate beat phase".to_string())?;
+        // Local offset is relative to the analysis window start — convert to
+        // absolute track time mod beat, then fold into [0, beat).
+        let beat = 60.0 / bpm as f64;
+        let abs = start + local;
+        let mut off = abs.rem_euclid(beat);
+        // Prefer small offsets near 0 for display stability.
+        if off > beat * 0.5 {
+            // Keep in [0, beat) — no change needed for phase equivalence, but
+            // leave as rem_euclid result so first stick after 0 is consistent.
+        }
+        let _ = off;
+        // Re-score absolute phase against a second window if possible.
+        if let Some(&start2) = window_starts_secs(info.total_secs).first() {
+            if (start2 - start).abs() > 1.0 {
+                let pos2 = bass.channel_seconds2bytes(handle, start2);
+                if bass
+                    .channel_set_position(handle, pos2, bass::BASS_POS_BYTE)
+                    .is_ok()
+                {
+                    if let Ok(mono2) = pull_mono(bass, handle, &info, max_mono) {
+                        if let Some(local2) =
+                            estimate_beat_offset(&mono2, info.sample_rate, bpm)
+                        {
+                            let abs2 = start2 + local2;
+                            let off2 = abs2.rem_euclid(beat);
+                            // Average circularly on the beat circle.
+                            let a = off * std::f64::consts::TAU / beat;
+                            let b = off2 * std::f64::consts::TAU / beat;
+                            let mx = a.cos() + b.cos();
+                            let my = a.sin() + b.sin();
+                            off = my.atan2(mx).rem_euclid(std::f64::consts::TAU) * beat
+                                / std::f64::consts::TAU;
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("[bpm] beat offset for {path} @ {bpm} BPM → {off:.4}s");
+        Ok(off)
+    })();
+    let _ = bass.channel_free(handle);
+    result
+}
+
+/// Phase in [0, beat_period) maximizing onset energy under fixed BPM.
+fn estimate_beat_offset(mono: &[f32], sample_rate: u32, bpm: f32) -> Option<f64> {
+    if mono.len() < sample_rate as usize / 2 || sample_rate < 8000 {
+        return None;
+    }
+    let onset = compute_onset_envelope(mono)?;
+    let hop_rate = sample_rate as f64 / HOP as f64;
+    let beat_secs = 60.0 / bpm as f64;
+    let beat_hops = beat_secs * hop_rate;
+    if beat_hops < 2.0 || onset.len() < 32 {
+        return None;
+    }
+
+    const N_PHASES: usize = 72;
+    let mut best_phase = 0.0f64;
+    let mut best_score = f64::NEG_INFINITY;
+
+    for p in 0..N_PHASES {
+        let phase_hops = (p as f64 / N_PHASES as f64) * beat_hops;
+        let mut score = 0.0f64;
+        let mut n = 0usize;
+        let mut t = phase_hops;
+        while (t as usize) + 1 < onset.len() {
+            let i = t.round() as usize;
+            // Small neighborhood — kick hits a bit wide.
+            let mut local = onset[i] as f64;
+            if i > 0 {
+                local = local.max(onset[i - 1] as f64 * 0.6);
+            }
+            if i + 1 < onset.len() {
+                local = local.max(onset[i + 1] as f64 * 0.6);
+            }
+            score += local * local;
+            n += 1;
+            t += beat_hops;
+        }
+        if n == 0 {
+            continue;
+        }
+        score /= n as f64;
+        if score > best_score {
+            best_score = score;
+            best_phase = (p as f64 / N_PHASES as f64) * beat_secs;
+        }
+    }
+
+    if !best_score.is_finite() || best_score <= 0.0 {
+        None
+    } else {
+        Some(best_phase)
+    }
+}
+
 // ── Decode / multi-window pull ───────────────────────────────────────────────
 
 fn open_decode(bass: &BassLibrary, path: &str) -> Result<(u32, &'static str), String> {

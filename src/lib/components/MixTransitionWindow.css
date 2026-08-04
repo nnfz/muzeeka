@@ -257,6 +257,45 @@
   opacity: 0.7;
 }
 
+.mix-grid-tools {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+.mix-grid-btn {
+  height: 22px;
+  min-width: 22px;
+  padding: 0 6px;
+  border-radius: 5px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-secondary, #cbcbcb);
+  font-family: var(--font-family);
+  font-size: 10px;
+  font-weight: 600;
+  cursor: pointer;
+  line-height: 1;
+}
+
+.mix-grid-btn:hover:not(:disabled) {
+  color: var(--accent, #7c5cff);
+  border-color: color-mix(in srgb, var(--accent, #7c5cff) 40%, transparent);
+  background: color-mix(in srgb, var(--accent, #7c5cff) 10%, transparent);
+}
+
+.mix-grid-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.mix-grid-align {
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  font-size: 9px;
+}
+
 .mix-time-hint {
   font-size: 10px;
   font-variant-numeric: tabular-nums;
@@ -384,6 +423,403 @@
   border: 2px solid color-mix(in srgb, var(--accent, #7c5cff) 30%, transparent);
   border-top-color: var(--accent, #7c5cff);
   animation: mix-spin 0.7s linear infinite;
+}
+
+/* ── Blocks layer (transition zone + effects) ───────────────────────────── */
+
+.mix-blocks-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 12;
+  pointer-events: none;
+  /* Clip blocks that extend past the wave column while pan/zoom —
+     geometry stays fixed to the audio timeline, only the camera moves. */
+  overflow: hidden;
+}
+
+.mix-block {
+  position: absolute;
+  pointer-events: auto;
+  display: flex;
+  flex-direction: column;
+  border-radius: 8px;
+  border: 1px solid color-mix(in srgb, var(--block-accent, #7c5cff) 55%, transparent);
+  background: color-mix(in srgb, var(--block-accent, #7c5cff) 14%, rgba(10, 10, 15, 0.55));
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 255, 255, 0.04),
+    0 4px 18px rgba(0, 0, 0, 0.25);
+  cursor: grab;
+  touch-action: none;
+  overflow: hidden;
+  /* Full duration width from layout — do not force a camera-relative min that
+     distorts short/long envelopes when partially off-screen. */
+  min-width: 0;
+  box-sizing: border-box;
+}
+
+.mix-block-chrome {
+  display: flex;
+  align-items: stretch;
+  flex-shrink: 0;
+  min-height: 24px;
+  height: 26px;
+}
+
+.mix-block.is-expanded .mix-block-chrome {
+  border-bottom: 1px solid color-mix(in srgb, var(--block-accent, #7c5cff) 30%, transparent);
+}
+
+.mix-block-editor {
+  flex: 1;
+  min-height: 0;
+  /* Stretch with the full timeline width of the block (not the visible camera slice). */
+  min-width: 0;
+  width: 100%;
+  background: rgba(0, 0, 0, 0.22);
+  cursor: default;
+}
+
+.mix-block.is-transition {
+  background:
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--block-accent, #7c5cff) 18%, transparent),
+      color-mix(in srgb, var(--block-accent, #7c5cff) 8%, rgba(10, 10, 15, 0.35))
+    );
+  border-style: dashed;
+  border-width: 1.5px;
+}
+
+/* Transition fills both decks — chrome stretches full height. */
+.mix-block.is-transition .mix-block-chrome {
+  flex: 1;
+  height: auto;
+  min-height: 100%;
+}
+
+.mix-block.is-effect {
+  border-style: solid;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--block-accent, #38bdf8) 22%, rgba(10, 10, 15, 0.72));
+}
+
+.mix-block.is-effect.lane-from {
+  box-shadow:
+    inset 2px 0 0 color-mix(in srgb, #a78bfa 80%, transparent),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.04),
+    0 4px 18px rgba(0, 0, 0, 0.25);
+}
+
+.mix-block.is-effect.lane-to {
+  box-shadow:
+    inset 2px 0 0 color-mix(in srgb, #34d399 80%, transparent),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.04),
+    0 4px 18px rgba(0, 0, 0, 0.25);
+}
+
+.mix-block.is-expanded {
+  z-index: 3;
+  /* Width comes only from timeline duration × pxPerSec — never camera-relative. */
+  overflow: hidden;
+}
+
+.mix-block.is-selected {
+  border-color: color-mix(in srgb, var(--block-accent, #7c5cff) 90%, white);
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--block-accent, #7c5cff) 50%, transparent),
+    0 0 20px color-mix(in srgb, var(--block-accent, #7c5cff) 28%, transparent);
+  z-index: 2;
+}
+
+/* Pinned: block is visual-only so track pan/zoom under it still works.
+   Action buttons re-enable hits (parent none + child auto). */
+.mix-block.is-pinned {
+  cursor: default;
+  pointer-events: none;
+}
+
+.mix-block.is-pinned .mix-block-handle {
+  opacity: 0.2;
+  pointer-events: none;
+}
+
+.mix-block.is-pinned .mix-block-actions,
+.mix-block.is-pinned .mix-block-act,
+.mix-block.is-pinned .mix-block-editor {
+  pointer-events: auto;
+  cursor: pointer;
+}
+
+.mix-block.is-pinned .mix-block-editor {
+  cursor: default;
+}
+
+.mix-block.is-pinned .mix-block-body {
+  opacity: 0.92;
+}
+
+.mix-block-handle {
+  flex: 0 0 8px;
+  align-self: stretch;
+  cursor: ew-resize;
+  background: color-mix(in srgb, var(--block-accent, #7c5cff) 35%, transparent);
+  opacity: 0.55;
+  transition: opacity 120ms ease, background 120ms ease;
+}
+
+.mix-block:hover .mix-block-handle,
+.mix-block.is-selected .mix-block-handle {
+  opacity: 1;
+}
+
+.mix-block-handle:hover {
+  background: color-mix(in srgb, var(--block-accent, #7c5cff) 70%, white);
+}
+
+.mix-block-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  pointer-events: none;
+}
+
+.mix-block-badge {
+  flex-shrink: 0;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--block-accent, #7c5cff);
+  background: color-mix(in srgb, var(--block-accent, #7c5cff) 18%, transparent);
+  border: 1px solid color-mix(in srgb, var(--block-accent, #7c5cff) 35%, transparent);
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+
+.mix-block-lane {
+  flex-shrink: 0;
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  padding: 1px 4px;
+  border-radius: 3px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  color: var(--text-secondary, #cbcbcb);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.mix-block-lane.lane-from {
+  color: #c4b5fd;
+  border-color: rgba(167, 139, 250, 0.4);
+  background: rgba(167, 139, 250, 0.12);
+}
+
+.mix-block-lane.lane-to {
+  color: #6ee7b7;
+  border-color: rgba(52, 211, 153, 0.4);
+  background: rgba(52, 211, 153, 0.12);
+}
+
+.mix-block-name {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-primary, #f0f0f5);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mix-block-time {
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted, #8a8a98);
+  flex-shrink: 0;
+}
+
+.mix-block-actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  pointer-events: auto;
+  flex-shrink: 0;
+}
+
+.mix-block-act {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-secondary, #cbcbcb);
+  cursor: pointer;
+  padding: 0;
+}
+
+.mix-block-act:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-primary, #f0f0f5);
+}
+
+.mix-block-act.is-on {
+  color: var(--block-accent, #7c5cff);
+  background: color-mix(in srgb, var(--block-accent, #7c5cff) 18%, transparent);
+}
+
+.mix-block-act.danger:hover {
+  color: #fecaca;
+  background: rgba(248, 113, 113, 0.16);
+}
+
+.mix-block.is-effect .mix-block-name {
+  font-size: 10px;
+}
+
+.mix-block.is-effect:not(.is-expanded) .mix-block-time {
+  display: none;
+}
+
+.mix-block.is-effect:not(.is-expanded) .mix-block-name {
+  max-width: 72px;
+}
+
+/* ── Bottom palette ─────────────────────────────────────────────────────── */
+
+.mix-palette {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px 6px;
+  border-radius: var(--radius-sm, 10px);
+  background: rgba(17, 17, 24, 0.55);
+  border: 1px solid var(--border-subtle, rgba(255, 255, 255, 0.06));
+}
+
+.mix-palette-label {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-muted, #8a8a98);
+}
+
+.mix-palette-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.mix-palette-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 10px 0 8px;
+  border-radius: 8px;
+  border: 1px solid color-mix(in srgb, var(--chip-accent, #7c5cff) 40%, transparent);
+  background: color-mix(in srgb, var(--chip-accent, #7c5cff) 12%, rgba(255, 255, 255, 0.02));
+  color: var(--text-primary, #f0f0f5);
+  font-family: var(--font-family);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+  transition:
+    background 120ms ease,
+    border-color 120ms ease,
+    transform 120ms ease,
+    opacity 120ms ease;
+}
+
+.mix-palette-chip.is-container {
+  border-style: dashed;
+  border-width: 1.5px;
+}
+
+.mix-palette-chip:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--chip-accent, #7c5cff) 22%, transparent);
+  border-color: color-mix(in srgb, var(--chip-accent, #7c5cff) 65%, transparent);
+}
+
+.mix-palette-chip:disabled,
+.mix-palette-chip.is-disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  filter: grayscale(0.4);
+}
+
+.mix-palette-chip.is-dragging {
+  opacity: 0.45;
+  transform: scale(0.97);
+}
+
+.mix-palette-short {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 22px;
+  height: 18px;
+  padding: 0 4px;
+  border-radius: 4px;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  color: var(--chip-accent, #7c5cff);
+  background: color-mix(in srgb, var(--chip-accent, #7c5cff) 18%, transparent);
+}
+
+.mix-palette-name {
+  white-space: nowrap;
+}
+
+.mix-palette-hint {
+  margin: 0;
+  font-size: 10px;
+  color: var(--text-muted, #8a8a98);
+  line-height: 1.35;
+}
+
+.mix-palette-hint strong {
+  color: var(--text-secondary, #cbcbcb);
+  font-weight: 600;
+}
+
+.mix-block-error {
+  flex-shrink: 0;
+  padding: 5px 10px;
+  border-radius: var(--radius-mini, 6px);
+  font-size: 11px;
+  color: #fde68a;
+  background: rgba(251, 191, 36, 0.1);
+  border: 1px solid rgba(251, 191, 36, 0.28);
+}
+
+.mix-palette-ghost {
+  position: fixed;
+  z-index: 9999;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 10px 0 8px;
+  border-radius: 8px;
+  border: 1.5px dashed color-mix(in srgb, var(--chip-accent, #7c5cff) 70%, white);
+  background: color-mix(in srgb, var(--chip-accent, #7c5cff) 28%, rgba(10, 10, 15, 0.92));
+  color: var(--text-primary, #f0f0f5);
+  font-size: 11px;
+  font-weight: 600;
+  pointer-events: none;
+  transform: translate(-20%, -110%);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
 }
 
 .mix-help {

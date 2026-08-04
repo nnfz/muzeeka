@@ -930,6 +930,32 @@ pub async fn library_get_bpm(
     .map_err(|e| format!("BPM read task failed: {e}"))?
 }
 
+/// Align beat-grid phase to kicks/onsets for a known BPM.
+/// Returns offset seconds in [0, beat_period) from track start.
+#[tauri::command]
+pub async fn library_detect_beat_offset(
+    player: State<'_, Player>,
+    path: String,
+    audio_path: Option<String>,
+    bpm: f32,
+) -> Result<f64, String> {
+    let write_path = tag_write_path(path.trim(), audio_path.as_deref())?;
+    let path_str = write_path.to_string_lossy().into_owned();
+    let player = player.inner().clone();
+    match tauri::async_runtime::spawn_blocking(move || {
+        crate::bpm::detect_beat_offset_for_path(&player, &path_str, bpm)
+    })
+    .await
+    {
+        Ok(Ok(off)) => Ok(off),
+        Ok(Err(e)) => {
+            eprintln!("[library_detect_beat_offset] {e}");
+            Err(e)
+        }
+        Err(e) => Err(format!("Beat align task failed: {e}")),
+    }
+}
+
 /// Write BPM into the audio file tags (`Bpm` + `IntegerBpm`).
 #[tauri::command]
 pub async fn library_set_track_bpm(

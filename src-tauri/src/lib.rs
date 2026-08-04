@@ -15,6 +15,7 @@ mod imgbb;
 mod musicbrainz;
 
 mod equalizer;
+mod mix_filter;
 mod library;
 mod m3u;
 mod lrc;
@@ -375,6 +376,7 @@ pub fn run() {
             commands::track_prefs_set_playback_rate,
             commands::library_detect_bpm,
             commands::library_get_bpm,
+            commands::library_detect_beat_offset,
             commands::library_set_track_bpm,
             commands::library_get_waveform,
             commands::library_set_liked,

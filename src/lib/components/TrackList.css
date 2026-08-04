@@ -234,12 +234,7 @@
   flex: 1;
   min-width: 12px;
   height: 1px;
-  background: linear-gradient(
-    90deg,
-    transparent,
-    color-mix(in srgb, var(--accent) 35%, rgba(255, 255, 255, 0.12)),
-    transparent
-  );
+  background: var(--border-subtle);
 }
 
 .mix-transition-btn {

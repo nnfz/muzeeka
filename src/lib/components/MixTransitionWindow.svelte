@@ -19,6 +19,32 @@
     type MixTransitionOpenPayload,
   } from "$lib/stores/mixTransition.svelte";
   import { hydrateAccentFromStorage } from "$lib/coverAccent";
+  import MixEnvelopeGraph from "./MixEnvelopeGraph.svelte";
+  import {
+    MIX_PALETTE,
+    MIN_BLOCK_SECS,
+    blockEnd,
+    childrenOf,
+    childrenOnLane,
+    clampBlock,
+    createBlock,
+    envelopeParamLabel,
+    envelopeVToRate,
+    isContainerKind,
+    normalizeCurve,
+    normalizeEnvelope,
+    paletteItem,
+    primaryTransition,
+    sampleEnvelope,
+    serializeBlocks,
+    transitionAt,
+    transitionBlocks,
+    type EnvelopeCurve,
+    type EnvelopePoint,
+    type MixBlock,
+    type MixBlockKind,
+    type MixBlockTarget,
+  } from "$lib/mix/blocks";
 
   interface WaveformPeaks {
     peaks: number[];
@@ -140,6 +166,49 @@
     active: boolean;
     /** True while the magnet is holding a snap target. */
     snapped: boolean;
+  } | null>(null);
+
+  /** Timeline blocks: transition containers + effect inserts. */
+  let blocks = $state<MixBlock[]>([]);
+  let selectedBlockId = $state<string | null>(null);
+  /** Expanded effect editor (automation graph). */
+  let expandedBlockId = $state<string | null>(null);
+  let blockError = $state<string | null>(null);
+
+  /** Undo / redo for editor mutations (blocks, playhead, views). */
+  type EditorSnapshot = {
+    blocks: MixBlock[];
+    selectedBlockId: string | null;
+    expandedBlockId: string | null;
+    playheadFromSecs: number;
+    fromViewStart: number;
+    toViewStart: number;
+    fromGridOffset: number;
+    toGridOffset: number;
+    pxPerSec: number;
+  };
+  const UNDO_MAX = 80;
+  let undoStack = $state<EditorSnapshot[]>([]);
+  let redoStack = $state<EditorSnapshot[]>([]);
+  /** True while restoring a snapshot — don't record that as a new undo step. */
+  let undoSuspended = false;
+
+  /** Drag a palette chip onto the stage. */
+  let paletteDrag = $state<{
+    kind: MixBlockKind;
+    pointerId: number;
+    clientX: number;
+    clientY: number;
+  } | null>(null);
+
+  /** Move / resize a placed block. */
+  let blockInteract = $state<{
+    id: string;
+    mode: "move" | "resize-l" | "resize-r";
+    pointerId: number;
+    originStart: number;
+    originDur: number;
+    originClientX: number;
   } | null>(null);
 
   const LANE_PAN_THRESHOLD = 4;
@@ -339,6 +408,9 @@
       gridOffsetSecs: mem.toGridOffset,
     };
     playheadFromSecs = mem.playheadFromSecs;
+    blocks = mem.blocks ?? [];
+    selectedBlockId = null;
+    expandedBlockId = null;
   }
 
   function scheduleMemorySave() {
@@ -355,11 +427,601 @@
         playheadFromSecs,
         fromGridOffset: fromLane.gridOffsetSecs,
         toGridOffset: toLane.gridOffsetSecs,
+        blocks,
       });
     }, MEMORY_SAVE_MS);
   }
 
-  /** Screen X of playhead inside the wave column (clamped to the view). */
+  function cloneBlocks(list: MixBlock[]): MixBlock[] {
+    return serializeBlocks(list);
+  }
+
+  function captureSnapshot(): EditorSnapshot {
+    return {
+      blocks: cloneBlocks(blocks),
+      selectedBlockId,
+      expandedBlockId,
+      playheadFromSecs,
+      fromViewStart: fromLane.viewStartSecs,
+      toViewStart: toLane.viewStartSecs,
+      fromGridOffset: fromLane.gridOffsetSecs,
+      toGridOffset: toLane.gridOffsetSecs,
+      pxPerSec,
+    };
+  }
+
+  /** Record current state before a user mutation (once per gesture). */
+  function pushUndo() {
+    if (undoSuspended || suppressMemorySave) return;
+    const snap = captureSnapshot();
+    undoStack = [...undoStack.slice(-(UNDO_MAX - 1)), snap];
+    redoStack = [];
+  }
+
+  function clearUndoHistory() {
+    undoStack = [];
+    redoStack = [];
+  }
+
+  function applySnapshot(snap: EditorSnapshot) {
+    undoSuspended = true;
+    blocks = cloneBlocks(snap.blocks);
+    selectedBlockId = snap.selectedBlockId;
+    expandedBlockId = snap.expandedBlockId;
+    playheadFromSecs = snap.playheadFromSecs;
+    pxPerSec = Math.min(
+      MAX_PX_PER_SEC,
+      Math.max(MIN_PX_PER_SEC, snap.pxPerSec),
+    );
+    fromLane = {
+      ...fromLane,
+      viewStartSecs: snap.fromViewStart,
+      gridOffsetSecs: snap.fromGridOffset,
+    };
+    toLane = {
+      ...toLane,
+      viewStartSecs: snap.toViewStart,
+      gridOffsetSecs: snap.toGridOffset,
+    };
+    undoSuspended = false;
+    scheduleMemorySave();
+  }
+
+  function undo() {
+    if (undoStack.length === 0) return;
+    const prev = undoStack[undoStack.length - 1]!;
+    undoStack = undoStack.slice(0, -1);
+    redoStack = [...redoStack.slice(-(UNDO_MAX - 1)), captureSnapshot()];
+    applySnapshot(prev);
+  }
+
+  function redo() {
+    if (redoStack.length === 0) return;
+    const next = redoStack[redoStack.length - 1]!;
+    redoStack = redoStack.slice(0, -1);
+    undoStack = [...undoStack.slice(-(UNDO_MAX - 1)), captureSnapshot()];
+    applySnapshot(next);
+  }
+
+  function updateBlock(id: string, patch: Partial<MixBlock>) {
+    blocks = blocks.map((b) => (b.id === id ? { ...b, ...patch } : b));
+    scheduleMemorySave();
+  }
+
+  function removeBlock(id: string) {
+    const victim = blocks.find((b) => b.id === id);
+    if (!victim) return;
+    pushUndo();
+    // Removing a transition also drops its children.
+    if (victim.kind === "transition") {
+      blocks = blocks.filter((b) => b.id !== id && b.parentId !== id);
+    } else {
+      blocks = blocks.filter((b) => b.id !== id);
+    }
+    if (selectedBlockId === id) selectedBlockId = null;
+    if (expandedBlockId === id) expandedBlockId = null;
+    scheduleMemorySave();
+  }
+
+  function togglePin(id: string) {
+    const b = blocks.find((x) => x.id === id);
+    if (!b) return;
+    pushUndo();
+    updateBlock(id, { pinned: !b.pinned });
+  }
+
+  function toggleExpand(id: string) {
+    const b = blocks.find((x) => x.id === id);
+    if (!b || isContainerKind(b.kind)) return;
+    // Expand is UI chrome only — no undo entry.
+    expandedBlockId = expandedBlockId === id ? null : id;
+    selectedBlockId = id;
+  }
+
+  function toggleTargetLane(id: string) {
+    const b = blocks.find((x) => x.id === id);
+    if (!b || isContainerKind(b.kind)) return;
+    pushUndo();
+    const next: MixBlockTarget = b.targetLane === "to" ? "from" : "to";
+    updateBlock(id, { targetLane: next });
+  }
+
+  function setBlockEnvelope(id: string, envelope: EnvelopePoint[]) {
+    const b = blocks.find((x) => x.id === id);
+    if (!b) return;
+    updateBlock(id, {
+      params: {
+        ...b.params,
+        envelope: normalizeEnvelope(envelope),
+      },
+    });
+  }
+
+  function setBlockCurve(id: string, curve: EnvelopeCurve) {
+    const b = blocks.find((x) => x.id === id);
+    if (!b) return;
+    if (normalizeCurve(b.params.curve) === curve) return;
+    updateBlock(id, {
+      params: {
+        ...b.params,
+        curve,
+      },
+    });
+  }
+
+  /** Called once at the start of an envelope edit gesture. */
+  function beginEnvelopeEdit() {
+    pushUndo();
+  }
+
+  /** Which deck a pointer Y is over (upper = prev, lower = next). */
+  function targetLaneAtClientY(clientY: number): MixBlockTarget {
+    if (!fromWrap || !toWrap) return "from";
+    const fromRect = fromWrap.getBoundingClientRect();
+    const toRect = toWrap.getBoundingClientRect();
+    if (clientY < fromRect.bottom - 2) return "from";
+    if (clientY > toRect.top + 2) return "to";
+    // Gap between lanes — nearer deck.
+    const mid = (fromRect.bottom + toRect.top) / 2;
+    return clientY < mid ? "from" : "to";
+  }
+
+  /** Prev-track time under a client X (wave column). */
+  function timeAtClientX(clientX: number): number | null {
+    if (!fromWrap || pxPerSec <= 0) return null;
+    const rect = fromWrap.getBoundingClientRect();
+    const x = Math.max(0, Math.min(rect.width, clientX - rect.left));
+    return fromLane.viewStartSecs + x / pxPerSec;
+  }
+
+  function stageWaveFrame(): {
+    left: number;
+    top: number;
+    width: number;
+    height: number;
+    fromTop: number;
+    fromHeight: number;
+    toTop: number;
+    toHeight: number;
+  } | null {
+    if (!stageEl || !fromWrap || !toWrap) return null;
+    const stageRect = stageEl.getBoundingClientRect();
+    const fromRect = fromWrap.getBoundingClientRect();
+    const toRect = toWrap.getBoundingClientRect();
+    const w = fromWrap.clientWidth;
+    if (w <= 0) return null;
+    return {
+      left: fromRect.left - stageRect.left,
+      top: fromRect.top - stageRect.top,
+      width: w,
+      height: Math.max(0, toRect.bottom - fromRect.top),
+      fromTop: fromRect.top - stageRect.top,
+      fromHeight: fromRect.height,
+      toTop: toRect.top - stageRect.top,
+      toHeight: toRect.height,
+    };
+  }
+
+  type BlockLayout = {
+    id: string;
+    kind: MixBlockKind;
+    left: number;
+    top: number;
+    width: number;
+    height: number;
+    label: string;
+    short: string;
+    accent: string;
+    pinned: boolean;
+    selected: boolean;
+    expanded: boolean;
+    targetLane: MixBlockTarget | null;
+    parentId: string | null;
+    startFromSecs: number;
+    durationSecs: number;
+    envelope: EnvelopePoint[];
+    curve: EnvelopeCurve;
+  };
+
+  const EFFECT_STRIP_H = 26;
+  const EFFECT_EXPANDED_H = 132;
+
+  function layoutBlocks(): BlockLayout[] {
+    const frame = stageWaveFrame();
+    if (!frame || pxPerSec <= 0) return [];
+    const out: BlockLayout[] = [];
+    const view0 = fromLane.viewStartSecs;
+    const view1 = view0 + frame.width / pxPerSec;
+
+    const place = (b: MixBlock, top: number, height: number) => {
+      const end = blockEnd(b);
+      // Cull only when fully off-screen (keep a small pad for pan).
+      if (end < view0 - 0.05 || b.startFromSecs > view1 + 0.05) return;
+      // Full timeline geometry — never clip width to the camera.
+      // Envelope graphs must map 0..1 of *block duration* to this full width;
+      // the layer's overflow clips what sticks out of the wave column.
+      const rawL = (b.startFromSecs - view0) * pxPerSec;
+      const rawR = (end - view0) * pxPerSec;
+      const fullW = Math.max(4, rawR - rawL);
+      // Skip microscopic strips only (extreme zoom-out of tiny blocks).
+      if (fullW < 2 && b.durationSecs < 0.05) return;
+      const meta = paletteItem(b.kind);
+      const expanded = expandedBlockId === b.id;
+      out.push({
+        id: b.id,
+        kind: b.kind,
+        left: frame.left + rawL,
+        top,
+        width: fullW,
+        height,
+        label: meta?.label ?? b.kind,
+        short: meta?.short ?? b.kind.slice(0, 2).toUpperCase(),
+        accent: meta?.accent ?? "#7c5cff",
+        pinned: b.pinned,
+        selected: selectedBlockId === b.id,
+        expanded,
+        targetLane: b.targetLane,
+        parentId: b.parentId,
+        startFromSecs: b.startFromSecs,
+        durationSecs: b.durationSecs,
+        envelope: normalizeEnvelope(
+          b.params.envelope ??
+            (isContainerKind(b.kind) ? [{ t: 0, v: 0.5 }, { t: 1, v: 0.5 }] : undefined),
+        ),
+        curve: normalizeCurve(b.params.curve),
+      });
+    };
+
+    const stackLane = (
+      kids: MixBlock[],
+      laneTop: number,
+      laneH: number,
+    ) => {
+      if (kids.length === 0 || laneH <= 0) return;
+      // Stack from bottom of the lane so waveforms stay readable on top.
+      let y = laneTop + laneH - 4;
+      for (let i = kids.length - 1; i >= 0; i--) {
+        const child = kids[i]!;
+        const h =
+          expandedBlockId === child.id ? EFFECT_EXPANDED_H : EFFECT_STRIP_H;
+        y -= h + 3;
+        const top = Math.max(laneTop + 2, y);
+        place(child, top, Math.min(h, laneTop + laneH - top - 2));
+      }
+    };
+
+    // Transition containers span both waveforms.
+    for (const t of transitionBlocks(blocks)) {
+      place(t, frame.top, frame.height);
+      stackLane(
+        childrenOnLane(blocks, t.id, "from"),
+        frame.fromTop,
+        frame.fromHeight,
+      );
+      stackLane(
+        childrenOnLane(blocks, t.id, "to"),
+        frame.toTop,
+        frame.toHeight,
+      );
+    }
+
+    // Orphan effects — place on their target lane.
+    for (const b of blocks) {
+      if (b.parentId != null) continue;
+      if (isContainerKind(b.kind)) continue;
+      const lane = b.targetLane === "to" ? "to" : "from";
+      const top = lane === "to" ? frame.toTop : frame.fromTop;
+      const h = lane === "to" ? frame.toHeight : frame.fromHeight;
+      const eh =
+        expandedBlockId === b.id ? EFFECT_EXPANDED_H : EFFECT_STRIP_H;
+      place(b, top + h - eh - 6, eh);
+    }
+
+    return out;
+  }
+
+  let blockLayouts = $derived.by(() => {
+    void blocks;
+    void selectedBlockId;
+    void expandedBlockId;
+    void fromLane.viewStartSecs;
+    void toLane.viewStartSecs;
+    void pxPerSec;
+    void fromWrap;
+    void toWrap;
+    void stageEl;
+    void fromLane.durationSecs;
+    void toLane.durationSecs;
+    return layoutBlocks();
+  });
+
+  function onPalettePointerDown(e: PointerEvent, kind: MixBlockKind) {
+    const item = paletteItem(kind);
+    if (!item?.enabled) return;
+    if (e.button !== 0) return;
+    e.preventDefault();
+    const target = e.currentTarget as HTMLElement;
+    target.setPointerCapture(e.pointerId);
+    paletteDrag = {
+      kind,
+      pointerId: e.pointerId,
+      clientX: e.clientX,
+      clientY: e.clientY,
+    };
+    blockError = null;
+  }
+
+  function onPalettePointerMove(e: PointerEvent) {
+    if (!paletteDrag || paletteDrag.pointerId !== e.pointerId) return;
+    paletteDrag = {
+      ...paletteDrag,
+      clientX: e.clientX,
+      clientY: e.clientY,
+    };
+  }
+
+  function onPalettePointerUp(e: PointerEvent) {
+    if (!paletteDrag || paletteDrag.pointerId !== e.pointerId) return;
+    const kind = paletteDrag.kind;
+    const cx = e.clientX;
+    const cy = e.clientY;
+    paletteDrag = null;
+    try {
+      (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
+    } catch {
+      /* ignore */
+    }
+
+    // Must drop over the wave stage.
+    if (!stageEl || !fromWrap || !toWrap) return;
+    const fromRect = fromWrap.getBoundingClientRect();
+    const toRect = toWrap.getBoundingClientRect();
+    const over =
+      cx >= fromRect.left &&
+      cx <= fromRect.right &&
+      cy >= fromRect.top &&
+      cy <= toRect.bottom;
+    if (!over) {
+      blockError = "Drop on the waveforms to place a block";
+      return;
+    }
+
+    const t = timeAtClientX(cx);
+    if (t == null) return;
+
+    if (isContainerKind(kind)) {
+      // One transition is enough for a pair in v1 — replace if user re-drops.
+      pushUndo();
+      const existing = transitionBlocks(blocks);
+      const dur = createBlock(kind, t, { bpm: fromLane.bpm }).durationSecs;
+      let start = t - dur * 0.35;
+      let nb = clampBlock(
+        createBlock(kind, start, { durationSecs: dur, bpm: fromLane.bpm }),
+        {
+          minStart: 0,
+          maxEnd:
+            fromLane.durationSecs > 0
+              ? Math.max(fromLane.durationSecs, t + dur)
+              : t + dur * 2,
+        },
+      );
+      // Keep children of previous transition if replacing.
+      if (existing.length > 0) {
+        const oldId = existing[0]!.id;
+        const kids = childrenOf(blocks, oldId).map((c) => ({
+          ...c,
+          parentId: nb.id,
+          // Re-clamp into new container.
+          ...(() => {
+            const clamped = clampBlock(c, {
+              minStart: nb.startFromSecs,
+              maxEnd: blockEnd(nb),
+            });
+            return {
+              startFromSecs: clamped.startFromSecs,
+              durationSecs: clamped.durationSecs,
+            };
+          })(),
+        }));
+        blocks = [
+          nb,
+          ...blocks.filter((b) => b.id !== oldId && b.parentId !== oldId),
+          ...kids,
+        ];
+      } else {
+        blocks = [...blocks, nb];
+      }
+      selectedBlockId = nb.id;
+      // Nudge playhead into the block for preview context.
+      if (
+        playheadFromSecs < nb.startFromSecs ||
+        playheadFromSecs > blockEnd(nb)
+      ) {
+        playheadFromSecs = nb.startFromSecs;
+      }
+      blockError = null;
+      scheduleMemorySave();
+      return;
+    }
+
+    // Effect — must land inside a transition; deck from drop Y (top/bottom).
+    const host = transitionAt(blocks, t);
+    if (!host) {
+      blockError = "Place a Transition block first, then drop effects into it";
+      return;
+    }
+    pushUndo();
+    const targetLane = targetLaneAtClientY(cy);
+    const dur = Math.min(
+      createBlock(kind, t, { bpm: fromLane.bpm }).durationSecs,
+      host.durationSecs,
+    );
+    let start = Math.max(host.startFromSecs, t - dur * 0.25);
+    let nb = clampBlock(
+      createBlock(kind, start, {
+        durationSecs: dur,
+        parentId: host.id,
+        targetLane,
+        bpm: fromLane.bpm,
+      }),
+      { minStart: host.startFromSecs, maxEnd: blockEnd(host) },
+    );
+    blocks = [...blocks, nb];
+    selectedBlockId = nb.id;
+    expandedBlockId = nb.id;
+    blockError = null;
+    scheduleMemorySave();
+  }
+
+  function onBlockPointerDown(
+    e: PointerEvent,
+    id: string,
+    mode: "move" | "resize-l" | "resize-r",
+  ) {
+    const b = blocks.find((x) => x.id === id);
+    if (!b) return;
+    // Pinned blocks use pointer-events:none (except action buttons) so
+    // waveform pan reaches the tracks underneath — never capture here.
+    if (b.pinned) return;
+
+    e.preventDefault();
+    e.stopPropagation();
+    // One undo step for the whole move/resize drag.
+    pushUndo();
+    selectedBlockId = id;
+    const target = e.currentTarget as HTMLElement;
+    target.setPointerCapture(e.pointerId);
+    blockInteract = {
+      id,
+      mode,
+      pointerId: e.pointerId,
+      originStart: b.startFromSecs,
+      originDur: b.durationSecs,
+      originClientX: e.clientX,
+    };
+  }
+
+  function onBlockPointerMove(e: PointerEvent) {
+    if (!blockInteract || blockInteract.pointerId !== e.pointerId) return;
+    if (pxPerSec <= 0) return;
+    const b = blocks.find((x) => x.id === blockInteract!.id);
+    if (!b || b.pinned) return;
+
+    const dx = e.clientX - blockInteract.originClientX;
+    const dt = dx / pxPerSec;
+
+    let bounds: { minStart?: number; maxEnd?: number } = {
+      minStart: 0,
+      maxEnd:
+        fromLane.durationSecs > 0
+          ? fromLane.durationSecs + 60
+          : Number.POSITIVE_INFINITY,
+    };
+    if (b.parentId) {
+      const parent = blocks.find((x) => x.id === b.parentId);
+      if (parent) {
+        bounds = {
+          minStart: parent.startFromSecs,
+          maxEnd: blockEnd(parent),
+        };
+      }
+    }
+
+    let next = { ...b };
+    if (blockInteract.mode === "move") {
+      next.startFromSecs = blockInteract.originStart + dt;
+    } else if (blockInteract.mode === "resize-l") {
+      const newStart = blockInteract.originStart + dt;
+      const end = blockInteract.originStart + blockInteract.originDur;
+      const start = Math.min(newStart, end - MIN_BLOCK_SECS);
+      next.startFromSecs = start;
+      next.durationSecs = end - start;
+    } else {
+      next.durationSecs = Math.max(
+        MIN_BLOCK_SECS,
+        blockInteract.originDur + dt,
+      );
+    }
+    next = clampBlock(next, bounds);
+
+    // Keep children inside transition when the container moves/resizes.
+    if (b.kind === "transition") {
+      const kids = childrenOf(blocks, b.id).map((c) =>
+        clampBlock(c, {
+          minStart: next.startFromSecs,
+          maxEnd: blockEnd(next),
+        }),
+      );
+      blocks = blocks.map((x) => {
+        if (x.id === b.id) return next;
+        const kid = kids.find((k) => k.id === x.id);
+        return kid ?? x;
+      });
+    } else {
+      blocks = blocks.map((x) => (x.id === b.id ? next : x));
+    }
+  }
+
+  function onBlockPointerUp(e: PointerEvent) {
+    if (!blockInteract || blockInteract.pointerId !== e.pointerId) return;
+    try {
+      (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
+    } catch {
+      /* ignore */
+    }
+    blockInteract = null;
+    scheduleMemorySave();
+  }
+
+  /**
+   * Keep the playhead on-screen while preview runs — otherwise it sticks to the
+   * right edge of the wave strip ("divider") and looks frozen even though time advances.
+   * Both lanes pan together so alignment is preserved.
+   */
+  function followPlayheadInView() {
+    if (!fromWrap || pxPerSec <= 0) return;
+    const w = fromWrap.clientWidth;
+    if (w <= 0) return;
+    // Prefer playhead in the right-center of the viewport (DAW-style transport).
+    const softLeft = w * 0.12;
+    const softRight = w * 0.72;
+    const x = (playheadFromSecs - fromLane.viewStartSecs) * pxPerSec;
+    let deltaPx = 0;
+    if (x > softRight) deltaPx = x - softRight;
+    else if (x < softLeft) deltaPx = x - softLeft;
+    if (Math.abs(deltaPx) < 0.5) return;
+    const dt = deltaPx / pxPerSec;
+    fromLane = {
+      ...fromLane,
+      viewStartSecs: fromLane.viewStartSecs + dt,
+    };
+    toLane = {
+      ...toLane,
+      viewStartSecs: toLane.viewStartSecs + dt,
+    };
+  }
+
+  /** Screen X of playhead inside the wave column. */
   function playheadLayout(): {
     left: number;
     top: number;
@@ -376,6 +1038,8 @@
 
     const rawX = (playheadFromSecs - fromLane.viewStartSecs) * pxPerSec;
     const inView = rawX >= -0.5 && rawX <= waveW + 0.5;
+    // While previewing we auto-scroll — still clamp a bit so the knob isn't lost.
+    // When editing (not previewing), clamp to the strip so drag stays usable.
     const xInWave = Math.max(0, Math.min(waveW, rawX));
     return {
       left: fromRect.left - stageRect.left + xInWave,
@@ -431,6 +1095,71 @@
     } catch {
       if (gen !== loadGen) return;
       setLane(id, { bpm: null });
+    }
+  }
+
+  /** Fold offset into [0, beat). */
+  function foldGridOffset(offset: number, bpm: number): number {
+    const beat = 60 / bpm;
+    if (!(beat > 1e-6)) return 0;
+    let o = offset % beat;
+    if (o < 0) o += beat;
+    return o;
+  }
+
+  /** Place a grid stick under track-relative time `t` (click-on-kick). */
+  function alignGridToTime(id: LaneId, t: number) {
+    const lane = laneOf(id);
+    if (lane.bpm == null || lane.bpm <= 0) return;
+    pushUndo();
+    const off = foldGridOffset(t, lane.bpm);
+    setLane(id, { gridOffsetSecs: off });
+    scheduleMemorySave();
+  }
+
+  /** Nudge grid phase by a fraction of a beat (negative = earlier sticks). */
+  function nudgeGrid(id: LaneId, beatFraction: number) {
+    const lane = laneOf(id);
+    if (lane.bpm == null || lane.bpm <= 0) return;
+    pushUndo();
+    const beat = 60 / lane.bpm;
+    const off = foldGridOffset(
+      lane.gridOffsetSecs + beat * beatFraction,
+      lane.bpm,
+    );
+    setLane(id, { gridOffsetSecs: off });
+    scheduleMemorySave();
+  }
+
+  let gridAlignBusy = $state<"from" | "to" | null>(null);
+
+  /**
+   * Analyze onsets and snap grid sticks to kicks.
+   * `silent` — no undo entry (used on first open).
+   */
+  async function alignGridToKick(id: LaneId, silent = false) {
+    const track = trackOf(id);
+    const lane = laneOf(id);
+    if (!track || lane.bpm == null || lane.bpm <= 0) return;
+    if (gridAlignBusy) return;
+    gridAlignBusy = id;
+    try {
+      const off = await invoke<number>("library_detect_beat_offset", {
+        path: track.path,
+        audioPath: track.audio_path ?? null,
+        bpm: lane.bpm,
+      });
+      if (typeof off !== "number" || !Number.isFinite(off)) return;
+      if (!silent) pushUndo();
+      setLane(id, {
+        gridOffsetSecs: foldGridOffset(off, lane.bpm),
+      });
+      scheduleMemorySave();
+      redrawAll();
+    } catch (e) {
+      console.warn("beat align failed", e);
+    } finally {
+      gridAlignBusy = null;
     }
   }
 
@@ -652,6 +1381,13 @@
     toLane = { ...emptyLane(), loading: true };
     drag = null;
     playheadDrag = null;
+    blockInteract = null;
+    paletteDrag = null;
+    blocks = [];
+    selectedBlockId = null;
+    expandedBlockId = null;
+    blockError = null;
+    clearUndoHistory();
     previewSession = null;
     previewing = false;
     previewError = null;
@@ -679,8 +1415,14 @@
     // Wait a frame so wraps have real width before placing views.
     requestAnimationFrame(() => {
       if (gen !== loadGen) return;
-      if (mem) applyMemoryViews(mem);
-      else applyDefaultViews();
+      if (mem) {
+        applyMemoryViews(mem);
+      } else {
+        applyDefaultViews();
+        // First open for this edge — snap grids to kicks when BPM is known.
+        if (fromLane.bpm) void alignGridToKick("from", true);
+        if (toLane.bpm) void alignGridToKick("to", true);
+      }
       suppressMemorySave = false;
       redrawAll();
       scheduleLodRefresh();
@@ -707,6 +1449,67 @@
     const i1 = Math.min(peaks.length - 1, i0 + 1);
     const f = idx - i0;
     return peaks[i0]! * (1 - f) + peaks[i1]! * f;
+  }
+
+  function speedBlocksForLane(id: LaneId): MixBlock[] {
+    return blocks
+      .filter((b) => b.kind === "speed" && (b.targetLane ?? "from") === id)
+      .sort((a, b) => a.startFromSecs - b.startFromSecs);
+  }
+
+  function buildSpeedWarpTable(b: MixBlock): number[] {
+    const steps = 48;
+    const envelope = b.params.envelope;
+    const curve = normalizeCurve(b.params.curve);
+    const table = new Array<number>(steps + 1);
+    table[0] = 0;
+    let acc = 0;
+    for (let i = 1; i <= steps; i++) {
+      const u0 = (i - 1) / steps;
+      const u1 = i / steps;
+      const r0 = envelopeVToRate(sampleEnvelope(envelope, u0, curve));
+      const r1 = envelopeVToRate(sampleEnvelope(envelope, u1, curve));
+      acc += ((r0 + r1) / 2) * (u1 - u0) * b.durationSecs;
+      table[i] = acc;
+    }
+    return table;
+  }
+
+  function sourceConsumedInBlock(
+    b: MixBlock,
+    table: number[],
+    localT: number,
+  ): number {
+    const steps = table.length - 1;
+    const u = Math.max(0, Math.min(1, localT / b.durationSecs));
+    const pos = u * steps;
+    const i0 = Math.floor(pos);
+    const i1 = Math.min(steps, i0 + 1);
+    const frac = pos - i0;
+    const v0 = table[i0]!;
+    const v1 = table[i1]!;
+    return v0 + (v1 - v0) * frac;
+  }
+
+  function makeLaneWarp(id: LaneId): (wallT: number) => number {
+    const list = speedBlocksForLane(id);
+    if (list.length === 0) return () => 0;
+    const tables = list.map((b) => buildSpeedWarpTable(b));
+    return (wallT: number) => {
+      let delta = 0;
+      for (let i = 0; i < list.length; i++) {
+        const b = list[i]!;
+        if (wallT <= b.startFromSecs) break;
+        const end = blockEnd(b);
+        if (wallT >= end) {
+          delta += tables[i]![tables[i]!.length - 1]! - b.durationSecs;
+        } else {
+          const local = wallT - b.startFromSecs;
+          delta += sourceConsumedInBlock(b, tables[i]!, local) - local;
+        }
+      }
+      return delta;
+    };
   }
 
   function drawLane(id: LaneId) {
@@ -813,10 +1616,13 @@
     }
 
     const maxAmp = cssH * 0.42;
-    // One sample per CSS pixel; max several peaks inside the column.
     const cols = Math.max(1, Math.ceil(cssW));
     const top: number[] = new Array(cols);
     const bot: number[] = new Array(cols);
+
+    const wallOffset =
+      id === "to" ? toLane.viewStartSecs - fromLane.viewStartSecs : 0;
+    const warp = makeLaneWarp(id);
 
     for (let col = 0; col < cols; col++) {
       const t0 = viewStart + (col / cols) * viewDur;
@@ -825,7 +1631,9 @@
       const steps = 4;
       for (let s = 0; s < steps; s++) {
         const t = t0 + ((s + 0.5) / steps) * (t1 - t0);
-        amp = Math.max(amp, sampleLaneAmp(lane, t, viewDur));
+        const wallT = t - wallOffset;
+        const tWarped = t + warp(wallT);
+        amp = Math.max(amp, sampleLaneAmp(lane, tWarped, viewDur));
       }
       const a = Math.max(0.4, amp * maxAmp);
       top[col] = mid - a;
@@ -864,7 +1672,7 @@
   }
 
   $effect(() => {
-    // Reactive deps for redraw.
+    void blocks;
     void fromLane.overview;
     void fromLane.detail;
     void fromLane.viewStartSecs;
@@ -1197,17 +2005,28 @@
   function onWheel(e: WheelEvent, id: LaneId) {
     // Ctrl/Cmd + wheel → zoom (shared scale, both lanes stay put).
     // Plain wheel → pan the whole view (both lanes).
+    // stopPropagation: stage/blocks-layer may also listen so we don't double-fire.
+    e.preventDefault();
+    e.stopPropagation();
     if (e.ctrlKey || e.metaKey) {
-      e.preventDefault();
       const direction = e.deltaY > 0 ? 1 / 1.12 : 1.12;
       zoomShared(direction, { clientX: e.clientX, anchorId: id });
       return;
     }
-    e.preventDefault();
     // Prefer horizontal delta when present (trackpads).
     const dx =
       Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
     panBoth(-dx);
+  }
+
+  /**
+   * Wheel over unpinned blocks never hits the wave wraps (blocks sit on top).
+   * Route pan/zoom the same way regardless of pin state.
+   */
+  function onBlocksLayerWheel(e: WheelEvent) {
+    const lane: LaneId =
+      targetLaneAtClientY(e.clientY) === "to" ? "to" : "from";
+    onWheel(e, lane);
   }
 
   function onPointerDown(e: PointerEvent, id: LaneId) {
@@ -1250,9 +2069,16 @@
     if (!drag || drag.lane !== id || drag.pointerId !== e.pointerId) return;
     const wrap = wrapOf(id);
     const wasPan = drag.active;
-    // Tap (no pan) → place playhead under cursor.
+    // Tap (no pan):
+    //   Alt → put a beat stick under the cursor (align grid to that kick)
+    //   plain → place playhead
     if (!wasPan) {
-      setPlayheadFromClientX(e.clientX);
+      if (e.altKey && laneOf(id).bpm != null) {
+        const t = timeAtClientX(e.clientX);
+        if (t != null) alignGridToTime(id, t);
+      } else {
+        setPlayheadFromClientX(e.clientX);
+      }
     } else if (!e.altKey) {
       // Final snap on release using cursor position.
       const dx = e.clientX - drag.startX;
@@ -1316,11 +2142,11 @@
   function setPlayheadFromClientX(clientX: number) {
     if (!fromWrap || pxPerSec <= 0) return;
     const rect = fromWrap.getBoundingClientRect();
+    // Clamp to the *visible strip only* — not to prev-track duration.
+    // Time past prev end is the gap / silence region on the mix timeline.
     const x = Math.max(0, Math.min(rect.width, clientX - rect.left));
     const t = fromLane.viewStartSecs + x / pxPerSec;
-    const maxT =
-      fromLane.durationSecs > 0 ? fromLane.durationSecs : Number.MAX_VALUE;
-    playheadFromSecs = Math.max(0, Math.min(maxT, t));
+    playheadFromSecs = Math.max(0, t);
     scheduleMemorySave();
   }
 
@@ -1355,6 +2181,10 @@
    * Timeline plan from the graph (no clamp that ruins offset):
    * at playhead: t_prev = playhead, t_next = playhead + (to.viewStart - from.viewStart)
    * If t_next < 0 → next starts later (delay). If t_next past end → no next yet.
+   *
+   * Transition block (if any) only limits *where mix automation runs* (fromDuration /
+   * cue end). Without a transition block the playhead is free and preview can run
+   * to the natural end of the tracks — no artificial seekbar/zone clamp.
    */
   function buildPreviewPlan(): {
     fromStartRel: number | null;
@@ -1366,15 +2196,33 @@
     if (!from || !to) return null;
     if (fromLane.durationSecs <= 0.05 && toLane.durationSecs <= 0.05) return null;
 
-    // Free playhead (can sit past end / before start when scrolling).
-    const tFrom = playheadFromSecs;
+    const zone = primaryTransition(blocks);
+    // Start exactly where the playhead is (free). Only if a transition zone exists
+    // *and* the playhead sits outside it, snap the *preview start* into the zone
+    // so Preview still makes sense — the on-graph playhead itself is not clamped
+    // when placing/scrubbing.
+    let tFrom = playheadFromSecs;
+    let zoneEnd: number | null = null;
+    if (zone) {
+      const zEnd = blockEnd(zone);
+      zoneEnd = zEnd;
+      if (tFrom < zone.startFromSecs) tFrom = zone.startFromSecs;
+      if (tFrom >= zEnd - 0.02) tFrom = Math.max(zone.startFromSecs, zEnd - 0.05);
+    }
+
     const tTo = mapPrevToNext(tFrom);
 
     let fromStartRel: number | null = null;
     let fromDurationSecs = 0;
     if (tFrom < fromLane.durationSecs) {
       fromStartRel = Math.max(0, tFrom);
-      fromDurationSecs = Math.max(0.05, fromLane.durationSecs - fromStartRel);
+      // No transition block → play to the end of prev (and next follows graph).
+      // With a zone → stop prev at zone end so DSP only covers the transition.
+      const naturalEnd =
+        zoneEnd != null
+          ? Math.min(fromLane.durationSecs, zoneEnd)
+          : fromLane.durationSecs;
+      fromDurationSecs = Math.max(0.05, naturalEnd - fromStartRel);
     }
 
     let toStartRel: number | null = null;
@@ -1392,10 +2240,21 @@
 
     if (fromStartRel == null && toStartRel == null) return null;
 
-    const toEndAbs =
+    let toEndAbs: number | null =
       typeof to.cue_end_secs === "number" && Number.isFinite(to.cue_end_secs)
         ? to.cue_end_secs
         : null;
+
+    // Only when a transition zone exists: cap next cue end to the mapped zone end.
+    // Without a zone — leave next free to its natural/CUE end.
+    if (zone && zoneEnd != null && toStartRel != null) {
+      const toZoneEndRel = mapPrevToNext(zoneEnd);
+      if (toZoneEndRel > 0) {
+        const absEnd = absTime(to, Math.min(toLane.durationSecs, toZoneEndRel));
+        toEndAbs =
+          toEndAbs != null ? Math.min(toEndAbs, absEnd) : absEnd;
+      }
+    }
 
     return {
       fromStartRel,
@@ -1409,6 +2268,7 @@
   let previewHint = $derived.by(() => {
     const plan = buildPreviewPlan();
     if (!plan) return null;
+    const zone = primaryTransition(blocks);
     const prev =
       plan.fromStartRel != null
         ? `prev ${formatTime(plan.fromStartRel)}`
@@ -1419,7 +2279,10 @@
           ? `next in ${plan.toDelaySecs.toFixed(1)}s @ ${formatTime(plan.toStartRel)}`
           : `next ${formatTime(plan.toStartRel)}`
         : "next —";
-    return `${prev} · ${next}`;
+    const zoneLabel = zone
+      ? ` · zone ${formatTime(zone.durationSecs)}`
+      : "";
+    return `${prev} · ${next}${zoneLabel}`;
   });
 
   async function stopPreview() {
@@ -1469,6 +2332,33 @@
       const toCueStart =
         plan.toStartRel != null ? absTime(to, plan.toStartRel) : null;
 
+      // Automation blocks → mix clock (t=0 at preview start), per deck.
+      const mixOrigin =
+        plan.fromStartRel ??
+        (plan.toStartRel != null
+          ? plan.toStartRel - (toLane.viewStartSecs - fromLane.viewStartSecs)
+          : playheadFromSecs);
+      const collectEnv = (
+        lane: "from" | "to",
+        kind: "volume" | "lowpass" | "highpass" | "speed",
+      ) =>
+        blocks
+          .filter(
+            (b) =>
+              b.kind === kind &&
+              (b.targetLane ?? "from") === lane &&
+              b.durationSecs > 0.02,
+          )
+          .map((b) => ({
+            startSecs: b.startFromSecs - mixOrigin,
+            durationSecs: b.durationSecs,
+            curve: normalizeCurve(b.params.curve),
+            points: normalizeEnvelope(b.params.envelope).map((p) => ({
+              t: p.t,
+              v: p.v,
+            })),
+          }));
+
       await invoke("player_mix_crossfade", {
         fromPath: from.path,
         fromAudioPath: audioPathFor(from),
@@ -1480,6 +2370,14 @@
         toCueEnd: plan.toEndAbs ?? undefined,
         toDelaySecs: plan.toDelaySecs,
         fromDurationSecs: plan.fromDurationSecs,
+        fromVol: collectEnv("from", "volume"),
+        toVol: collectEnv("to", "volume"),
+        fromLp: collectEnv("from", "lowpass"),
+        fromHp: collectEnv("from", "highpass"),
+        toLp: collectEnv("to", "lowpass"),
+        toHp: collectEnv("to", "highpass"),
+        fromSpeed: collectEnv("from", "speed"),
+        toSpeed: collectEnv("to", "speed"),
       });
       if (gen !== previewGen) return;
       previewing = true;
@@ -1502,7 +2400,9 @@
     }
   }
 
-  // Smooth playhead while previewing (RAF) — follows mix time from start.
+  // Playhead = mix timeline at 1× wall-clock (not content rate).
+  // Speed blocks only retune *audio* so one deck can match the other;
+  // the graph/playhead stay on the layout clock.
   $effect(() => {
     if (!previewing || !previewSession) return;
     const session = previewSession;
@@ -1512,6 +2412,7 @@
       if (!previewing || !previewSession) return;
       const elapsed = (performance.now() - session.wallStartMs) / 1000;
       playheadFromSecs = startOrigin + elapsed;
+      followPlayheadInView();
       raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
@@ -1525,25 +2426,53 @@
   }
 
   function handleKeydown(e: KeyboardEvent) {
+    const t = e.target;
+    const typing =
+      t instanceof HTMLInputElement ||
+      t instanceof HTMLTextAreaElement ||
+      (t instanceof HTMLElement && t.isContentEditable);
+
+    // Ctrl+Z undo · Ctrl+Shift+Z / Ctrl+Y redo — use e.code (physical key),
+    // not e.key, so RU/other layouts still work (KeyZ stays Z-row, not "я").
+    if ((e.ctrlKey || e.metaKey) && !typing) {
+      if (e.code === "KeyZ" && !e.shiftKey) {
+        e.preventDefault();
+        undo();
+        return;
+      }
+      if ((e.code === "KeyZ" && e.shiftKey) || e.code === "KeyY") {
+        e.preventDefault();
+        redo();
+        return;
+      }
+    }
+
     if (e.key === "Escape") {
       if (previewing) {
         e.preventDefault();
         void stopPreview();
         return;
       }
+      if (selectedBlockId) {
+        e.preventDefault();
+        selectedBlockId = null;
+        return;
+      }
       void appWindow.close();
       return;
     }
+    if (
+      (e.key === "Delete" || e.key === "Backspace") &&
+      selectedBlockId &&
+      !previewing &&
+      !typing
+    ) {
+      e.preventDefault();
+      removeBlock(selectedBlockId);
+      return;
+    }
     // Space — preview (don't steal when typing in future fields).
-    if (e.key === " " || e.code === "Space") {
-      const t = e.target;
-      if (
-        t instanceof HTMLInputElement ||
-        t instanceof HTMLTextAreaElement ||
-        (t instanceof HTMLElement && t.isContentEditable)
-      ) {
-        return;
-      }
+    if ((e.key === " " || e.code === "Space") && !typing) {
       e.preventDefault();
       void togglePreview();
       return;
@@ -1673,6 +2602,37 @@
               {formatBpm(fromLane.bpm)}
               <span class="mix-bpm-unit">BPM</span>
             </span>
+            {#if fromLane.bpm}
+              <div class="mix-grid-tools" title="Beat grid phase">
+                <button
+                  type="button"
+                  class="mix-grid-btn"
+                  title="Nudge grid earlier (1/16 beat)"
+                  disabled={gridAlignBusy === "from"}
+                  onclick={() => nudgeGrid("from", -1 / 16)}
+                >
+                  ◀
+                </button>
+                <button
+                  type="button"
+                  class="mix-grid-btn mix-grid-align"
+                  title="Auto-align sticks to kicks"
+                  disabled={gridAlignBusy === "from"}
+                  onclick={() => void alignGridToKick("from")}
+                >
+                  {gridAlignBusy === "from" ? "…" : "Kick"}
+                </button>
+                <button
+                  type="button"
+                  class="mix-grid-btn"
+                  title="Nudge grid later (1/16 beat)"
+                  disabled={gridAlignBusy === "from"}
+                  onclick={() => nudgeGrid("from", 1 / 16)}
+                >
+                  ▶
+                </button>
+              </div>
+            {/if}
             {#if fromLane.durationSecs > 0}
               <span class="mix-time-hint">
                 {formatTime(fromLane.viewStartSecs)}
@@ -1728,6 +2688,10 @@
             {/if}
             {#if !fromLane.bpm}
               <div class="mix-wave-hint">No BPM tag — grid hidden</div>
+            {:else}
+              <div class="mix-wave-hint">
+                Alt+click kick to pin grid · Kick auto-align
+              </div>
             {/if}
           {/if}
         </div>
@@ -1741,6 +2705,37 @@
               {formatBpm(toLane.bpm)}
               <span class="mix-bpm-unit">BPM</span>
             </span>
+            {#if toLane.bpm}
+              <div class="mix-grid-tools" title="Beat grid phase">
+                <button
+                  type="button"
+                  class="mix-grid-btn"
+                  title="Nudge grid earlier (1/16 beat)"
+                  disabled={gridAlignBusy === "to"}
+                  onclick={() => nudgeGrid("to", -1 / 16)}
+                >
+                  ◀
+                </button>
+                <button
+                  type="button"
+                  class="mix-grid-btn mix-grid-align"
+                  title="Auto-align sticks to kicks"
+                  disabled={gridAlignBusy === "to"}
+                  onclick={() => void alignGridToKick("to")}
+                >
+                  {gridAlignBusy === "to" ? "…" : "Kick"}
+                </button>
+                <button
+                  type="button"
+                  class="mix-grid-btn"
+                  title="Nudge grid later (1/16 beat)"
+                  disabled={gridAlignBusy === "to"}
+                  onclick={() => nudgeGrid("to", 1 / 16)}
+                >
+                  ▶
+                </button>
+              </div>
+            {/if}
             {#if toLane.durationSecs > 0}
               <span class="mix-time-hint">
                 {formatTime(toLane.viewStartSecs)}
@@ -1794,10 +2789,220 @@
             {/if}
             {#if !toLane.bpm}
               <div class="mix-wave-hint">No BPM tag — grid hidden</div>
+            {:else}
+              <div class="mix-wave-hint">
+                Alt+click kick to pin grid · Kick auto-align
+              </div>
             {/if}
           {/if}
         </div>
       </section>
+
+      <!-- Block layer: transition zone + effect inserts over both lanes -->
+      <div
+        class="mix-blocks-layer"
+        aria-label="Mix blocks"
+        onwheel={onBlocksLayerWheel}
+      >
+        {#each blockLayouts as bl (bl.id)}
+          <div
+            class="mix-block"
+            class:is-transition={bl.kind === "transition"}
+            class:is-effect={bl.kind !== "transition"}
+            class:is-selected={bl.selected}
+            class:is-pinned={bl.pinned}
+            class:is-expanded={bl.expanded}
+            class:lane-from={bl.targetLane === "from"}
+            class:lane-to={bl.targetLane === "to"}
+            style:left="{bl.left}px"
+            style:top="{bl.top}px"
+            style:width="{bl.width}px"
+            style:height="{bl.height}px"
+            style:--block-accent={bl.accent}
+            title="{bl.label}{bl.targetLane
+              ? bl.targetLane === 'from'
+                ? ' · Prev (top)'
+                : ' · Next (bottom)'
+              : ''} · {formatTime(bl.startFromSecs)}–{formatTime(
+              bl.startFromSecs + bl.durationSecs,
+            )}{bl.pinned ? ' · pinned' : ''}"
+            onpointerdown={(e) => onBlockPointerDown(e, bl.id, "move")}
+            onpointermove={onBlockPointerMove}
+            onpointerup={onBlockPointerUp}
+            onpointercancel={onBlockPointerUp}
+            onwheel={onBlocksLayerWheel}
+            role="group"
+            aria-label={bl.label}
+          >
+            <div class="mix-block-chrome">
+              <div
+                class="mix-block-handle mix-block-handle-l"
+                onpointerdown={(e) => onBlockPointerDown(e, bl.id, "resize-l")}
+                onpointermove={onBlockPointerMove}
+                onpointerup={onBlockPointerUp}
+                onpointercancel={onBlockPointerUp}
+                role="separator"
+                aria-orientation="vertical"
+                aria-label="Resize start"
+              ></div>
+              <div class="mix-block-body">
+                <span class="mix-block-badge">{bl.short}</span>
+                {#if bl.targetLane}
+                  <span
+                    class="mix-block-lane"
+                    class:lane-from={bl.targetLane === "from"}
+                    class:lane-to={bl.targetLane === "to"}
+                    title={bl.targetLane === "from"
+                      ? "Previous deck (top)"
+                      : "Next deck (bottom)"}
+                  >
+                    {bl.targetLane === "from" ? "↑ Prev" : "↓ Next"}
+                  </span>
+                {/if}
+                <span class="mix-block-name">{bl.label}</span>
+                <span class="mix-block-time">
+                  {formatTime(bl.durationSecs)}
+                </span>
+                <div
+                  class="mix-block-actions"
+                  role="toolbar"
+                  aria-label="Block actions"
+                  onpointerdown={(e) => {
+                    e.stopPropagation();
+                  }}
+                >
+                  {#if bl.kind !== "transition"}
+                    <button
+                      type="button"
+                      class="mix-block-act"
+                      class:is-on={bl.expanded}
+                      title={bl.expanded
+                        ? "Collapse graph"
+                        : "Expand · edit envelope"}
+                      onpointerdown={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        toggleExpand(bl.id);
+                      }}
+                    >
+                      <svg
+                        width="11"
+                        height="11"
+                        viewBox="0 0 24 24"
+                        fill="currentColor"
+                        aria-hidden="true"
+                        style:transform={bl.expanded
+                          ? "rotate(180deg)"
+                          : "none"}
+                      >
+                        <path d="M7 10l5 5 5-5H7z" />
+                      </svg>
+                    </button>
+                    <button
+                      type="button"
+                      class="mix-block-act"
+                      title={bl.targetLane === "from"
+                        ? "Move to next deck (bottom)"
+                        : "Move to previous deck (top)"}
+                      onpointerdown={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        selectedBlockId = bl.id;
+                        toggleTargetLane(bl.id);
+                      }}
+                    >
+                      <svg
+                        width="11"
+                        height="11"
+                        viewBox="0 0 24 24"
+                        fill="currentColor"
+                        aria-hidden="true"
+                      >
+                        <path
+                          d="M8 7h8v2H8V7zm0 4h8v2H8v-2zm0 4h5v2H8v-2zM18 5v14l-4-3.5L18 5z"
+                          opacity="0.9"
+                        />
+                      </svg>
+                    </button>
+                  {/if}
+                  <button
+                    type="button"
+                    class="mix-block-act"
+                    class:is-on={bl.pinned}
+                    title={bl.pinned ? "Unpin" : "Pin (lock size/position)"}
+                    onpointerdown={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      selectedBlockId = bl.id;
+                      togglePin(bl.id);
+                    }}
+                  >
+                    {#if bl.pinned}
+                      <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                        <path
+                          d="M16 12V4h1V2H7v2h1v8l-2 2v2h5.2v6h1.6v-6H18v-2l-2-2z"
+                        />
+                      </svg>
+                    {:else}
+                      <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                        <path
+                          d="M16 12V4h1V2H7v2h1v8l-2 2v2h5.2v6h1.6v-6H18v-2l-2-2z"
+                          opacity="0.55"
+                        />
+                      </svg>
+                    {/if}
+                  </button>
+                  <button
+                    type="button"
+                    class="mix-block-act danger"
+                    title="Delete (Del)"
+                    onpointerdown={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      removeBlock(bl.id);
+                    }}
+                  >
+                    <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                      <path
+                        d="M6 7h12v2H6V7zm2 3h8l-.8 10H8.8L8 10zm3-6h2l1 1h5v2H5V5h5l1-1z"
+                      />
+                    </svg>
+                  </button>
+                </div>
+              </div>
+              <div
+                class="mix-block-handle mix-block-handle-r"
+                onpointerdown={(e) => onBlockPointerDown(e, bl.id, "resize-r")}
+                onpointermove={onBlockPointerMove}
+                onpointerup={onBlockPointerUp}
+                onpointercancel={onBlockPointerUp}
+                role="separator"
+                aria-orientation="vertical"
+                aria-label="Resize end"
+              ></div>
+            </div>
+            {#if bl.expanded && bl.kind !== "transition"}
+              <div
+                class="mix-block-editor"
+                role="group"
+                aria-label="Envelope editor"
+                onpointerdown={(e) => e.stopPropagation()}
+              >
+                <MixEnvelopeGraph
+                  kind={bl.kind}
+                  points={bl.envelope}
+                  curve={bl.curve}
+                  accent={bl.accent}
+                  label={envelopeParamLabel(bl.kind)}
+                  onGestureStart={beginEnvelopeEdit}
+                  onChange={(pts) => setBlockEnvelope(bl.id, pts)}
+                  onCurveChange={(c) => setBlockCurve(bl.id, c)}
+                />
+              </div>
+            {/if}
+          </div>
+        {/each}
+      </div>
 
       {#if playheadUi && playheadUi.height > 0}
         <div
@@ -1816,7 +3021,14 @@
           tabindex="0"
           aria-label="Transition playhead"
           aria-valuemin={0}
-          aria-valuemax={fromLane.durationSecs || 0}
+          aria-valuemax={Math.max(
+            playheadFromSecs + 1,
+            fromLane.durationSecs || 0,
+            // Prev-time of next-track end so scrubbing past the gap is allowed.
+            toLane.durationSecs -
+              (toLane.viewStartSecs - fromLane.viewStartSecs) +
+              1,
+          )}
           aria-valuenow={playheadFromSecs}
           title={`Cut · prev ${formatTime(playheadFromSecs)} · next ${formatTime(mapPrevToNext(playheadFromSecs))}`}
         >
@@ -1826,9 +3038,59 @@
       {/if}
     </div>
 
+    {#if blockError}
+      <div class="mix-block-error" role="status">{blockError}</div>
+    {/if}
+
+    <div class="mix-palette" aria-label="Block palette">
+      <div class="mix-palette-label">Blocks</div>
+      <div class="mix-palette-row">
+        {#each MIX_PALETTE as item (item.kind)}
+          <button
+            type="button"
+            class="mix-palette-chip"
+            class:is-container={item.isContainer}
+            class:is-disabled={!item.enabled}
+            class:is-dragging={paletteDrag?.kind === item.kind}
+            style:--chip-accent={item.accent}
+            disabled={!item.enabled}
+            title={item.description}
+            onpointerdown={(e) => onPalettePointerDown(e, item.kind)}
+            onpointermove={onPalettePointerMove}
+            onpointerup={onPalettePointerUp}
+            onpointercancel={onPalettePointerUp}
+          >
+            <span class="mix-palette-short">{item.short}</span>
+            <span class="mix-palette-name">{item.label}</span>
+          </button>
+        {/each}
+      </div>
+      <p class="mix-palette-hint">
+        Drag <strong>Transition</strong> · drop effects on <strong>top</strong>
+        (prev) or <strong>bottom</strong> (next) · expand for graphs ·
+        <kbd>Ctrl+Z</kbd> undo
+      </p>
+    </div>
+
     <p class="mix-help">
-      <kbd>Space</kbd> play as on the graph (from playhead) · drag playhead ·
-      scroll both / LMB pan one · saved per transition
+      <kbd>Space</kbd> preview · <kbd>Ctrl+Z</kbd> undo ·
+      <kbd>Ctrl+Y</kbd> redo · playhead · pan · saved per edge
     </p>
   </div>
 </div>
+
+{#if paletteDrag}
+  {@const ghost = paletteItem(paletteDrag.kind)}
+  {#if ghost}
+    <div
+      class="mix-palette-ghost"
+      style:left="{paletteDrag.clientX}px"
+      style:top="{paletteDrag.clientY}px"
+      style:--chip-accent={ghost.accent}
+      aria-hidden="true"
+    >
+      <span class="mix-palette-short">{ghost.short}</span>
+      <span class="mix-palette-name">{ghost.label}</span>
+    </div>
+  {/if}
+{/if}
