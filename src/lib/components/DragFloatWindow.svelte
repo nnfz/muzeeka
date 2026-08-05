@@ -86,16 +86,6 @@
 </div>
 
 <style>
-  :global(html),
-  :global(body) {
-    margin: 0 !important;
-    padding: 0 !important;
-    background: transparent !important;
-    overflow: hidden !important;
-    width: 100%;
-    height: 100%;
-  }
-
   .df-root {
     width: 100%;
     height: 100%;
@@ -136,7 +126,6 @@
     height: 44px;
     flex-shrink: 0;
     border-radius: 8px;
-    overflow: hidden;
     background: rgba(255, 255, 255, 0.04);
     box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
   }

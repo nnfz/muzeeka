@@ -463,9 +463,7 @@
   function formatBpm(value: number | null | undefined): string {
     if (value == null || !Number.isFinite(value) || value <= 0) return "—";
     const rounded = Math.round(value * 10) / 10;
-    return Number.isInteger(rounded)
-      ? String(rounded)
-      : rounded.toFixed(1);
+    return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1);
   }
 
   function bpmOf(path: string): number | null {
@@ -662,8 +660,7 @@
     const top = trackOffset(start, unit);
     const totalH = contentHeight(total, unit, mix);
     // When `end` reaches the last track, content ends mid-unit (no final strip).
-    const endOffset =
-      end >= total ? totalH : trackOffset(end, unit);
+    const endOffset = end >= total ? totalH : trackOffset(end, unit);
 
     return {
       start,
@@ -1173,9 +1170,7 @@
     // Prefer full cover, then list thumb — Rust re-encodes to PNG for the OS ghost.
     const lead = trackByPath(drag.paths[0]);
     const iconPath =
-      lead?.cover_path_full?.trim() ||
-      lead?.cover_path?.trim() ||
-      null;
+      lead?.cover_path_full?.trim() || lead?.cover_path?.trim() || null;
     const { paths, sourcePlaylistId, isCopy } = drag;
     beginExportTrackDragUi(paths, isCopy);
     cleanupTrackPointerDrag(false);
@@ -1230,15 +1225,11 @@
     // Outside the scroll viewport vertically → no reorder target.
     if (clientY < rect.top - 4 || clientY > rect.bottom + 4) return null;
 
-    const yInContent =
-      clientY - rect.top + el.scrollTop - LIST_PAD_Y;
+    const yInContent = clientY - rect.top + el.scrollTop - LIST_PAD_Y;
     // Map Y onto insert slots [0 .. n] at unit midpoints (stable coordinates).
     // In mix mode each unit is track + transition strip (last has no strip; round is fine).
     const raw = yInContent / listUnitHeight;
-    return Math.max(
-      0,
-      Math.min(displayedTracks.length, Math.round(raw)),
-    );
+    return Math.max(0, Math.min(displayedTracks.length, Math.round(raw)));
   }
 
   /**
@@ -1305,12 +1296,7 @@
     // Fully outside for ~180ms → same (natural pull to Explorer / messengers).
     if (
       !trackDrag.fileExportStarted &&
-      shouldStartNativeFileDrag(
-        trackDrag,
-        e.clientX,
-        e.clientY,
-        e.altKey,
-      )
+      shouldStartNativeFileDrag(trackDrag, e.clientX, e.clientY, e.altKey)
     ) {
       beginOsFileExport(trackDrag);
       return;
@@ -1340,8 +1326,7 @@
       setTrackDragCopyTarget(playlistId);
     } else if (canReorder) {
       const overList =
-        !!el?.closest(".track-rows") ||
-        !!el?.closest("[data-track-drop-zone]");
+        !!el?.closest(".track-rows") || !!el?.closest("[data-track-drop-zone]");
       if (overList) {
         const rawIndex = dropIndexFromPointerY(e.clientY);
         trackDrag.dropIndex = stabilizeDropIndex(
@@ -1503,7 +1488,6 @@
     const shift = e.shiftKey;
 
     if (ctrl && shift && selectionAnchor !== null) {
-      // Ctrl+Shift: add range from anchor to current to existing selection.
       e.preventDefault();
       const start = Math.min(selectionAnchor, index);
       const end = Math.max(selectionAnchor, index);
@@ -1513,7 +1497,6 @@
       }
       selectedPaths = next;
     } else if (ctrl) {
-      // Ctrl: toggle individual track selection.
       e.preventDefault();
       const next = new Set(selectedPaths);
       if (next.has(item.track.path)) {
@@ -1523,9 +1506,10 @@
         selectionAnchor = index;
       }
       selectedPaths = next;
-    } else {
-      // Regular click: clear selection and play.
+    } else if (selectedPaths.size > 0) {
       selectedPaths = new Set();
+      selectionAnchor = null;
+    } else {
       selectionAnchor = index;
       player.play(item.track.path);
     }
@@ -1652,10 +1636,7 @@
                 {/if}
               </button>
 
-              {#if i < visibleColumns.length - 1 &&
-                column !== "index" &&
-                column !== "album" &&
-                column !== "bpm"}
+              {#if i < visibleColumns.length - 1 && column !== "index" && column !== "album" && column !== "bpm"}
                 {@const rightColumn = visibleColumns[i + 1]}
                 <button
                   type="button"
@@ -1694,8 +1675,7 @@
               {@const isActive = sameTrackPath(track.path, player.currentFile)}
               {@const isSelected = selectedPaths.has(track.path)}
               {@const isDraggingRow =
-                (!!trackDrag?.active &&
-                  trackDrag.paths.includes(track.path)) ||
+                (!!trackDrag?.active && trackDrag.paths.includes(track.path)) ||
                 (trackDragUi.isExportSession &&
                   trackDragUi.draggingPaths.includes(track.path))}
               {@const gapShift =
@@ -1889,7 +1869,8 @@
     class="track-drag-float"
     class:is-copy={dragPreview.isCopy}
     class:is-export={dragPreview.exportMode}
-    style="left: {dragPreview.x + 14}px; top: {dragPreview.y + 12}px; transform: rotate({dragPreview.rotate.toFixed(2)}deg)"
+    style="left: {dragPreview.x + 14}px; top: {dragPreview.y +
+      12}px; transform: rotate({dragPreview.rotate.toFixed(2)}deg)"
     aria-hidden="true"
   >
     <div class="track-drag-float-cover">

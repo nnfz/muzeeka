@@ -93,6 +93,7 @@
 .virtual-playlists {
   flex-shrink: 0;
   padding-bottom: 8px;
+  padding-right: 6px;
   border-bottom: 1px solid var(--border-subtle);
 }
 

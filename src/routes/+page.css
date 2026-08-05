@@ -14,7 +14,7 @@
   background: transparent;
   gap: 8px;
   height: var(--header-height);
-  padding: 0 8px;
+  padding: 0 var(--margin);
   flex-shrink: 0;
   z-index: 10;
   overflow: visible;

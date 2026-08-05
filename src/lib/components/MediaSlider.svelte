@@ -70,6 +70,7 @@
     const remote = player.volume;
     if (Math.abs(remote - liveVolume) > 0.0005) {
       liveVolume = remote;
+      flashPct();
     }
   });
 
