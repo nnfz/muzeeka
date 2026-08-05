@@ -111,7 +111,7 @@ impl Drop for FinishExportGuard<'_> {
 /// `drag::start_drag` blocks until the OS drag ends — run it on the blocking pool
 /// so a long drag does not pin a Tauri command worker.
 #[tauri::command]
-pub async fn start_file_drag(
+pub fn start_file_drag(
     window: Window,
     paths: Vec<String>,
     icon_path: Option<String>,
@@ -128,8 +128,12 @@ pub async fn start_file_drag(
         return Err("File not found".into());
     }
 
-    tauri::async_runtime::spawn_blocking(move || {
-        let export_state = window.state::<ExportDragState>();
+    // Создаем дешевый клон окна (счетчик ссылок Arc) для использования внутри замыкания
+    let window_clone = window.clone();
+
+    // Выполняем строго в главном UI-потоке
+    let _ = window.run_on_main_thread(move || {
+        let export_state = window_clone.state::<ExportDragState>();
         let context = track_paths
             .filter(|tracks| !tracks.is_empty())
             .map(|track_paths| ExportDragContext {
@@ -137,8 +141,9 @@ pub async fn start_file_drag(
                 source_playlist_id,
                 is_copy: is_copy.unwrap_or(false),
             });
+            
         export_state.register_export(&files, context);
-        // Always clear suppress state — even if preview/start_drag fails later.
+        
         let _finish = FinishExportGuard {
             state: &export_state,
         };
@@ -146,15 +151,14 @@ pub async fn start_file_drag(
         let item = drag::DragItem::Files(files.clone());
         let image = drag_preview_image(icon_path.as_deref(), &files[0]);
 
-        drag::start_drag(
-            &window,
+        let _ = drag::start_drag(
+            &window_clone,
             item,
             image,
             |_result, _pos| {},
             drag::Options::default(),
-        )
-        .map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| format!("Drag task failed: {e}"))?
+        );
+    });
+
+    Ok(())
 }

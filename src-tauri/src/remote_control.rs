@@ -217,7 +217,9 @@ impl RemoteController {
             current_idx.is_some_and(|idx| idx + 1 < tracks.len())
         };
 
-        let has_prev = if data.shuffle_enabled {
+        let has_prev = if repeat == RepeatMode::All {
+            true
+        } else if data.shuffle_enabled {
             self.ensure_shuffle_order(&data);
             let pos = *self.shuffle_position.lock();
             pos > 0 || snapshot.position > 3.0
@@ -952,15 +954,23 @@ impl RemoteController {
         let data = self.load_data()?;
         let playing_id = Self::playing_id_from_data(&data);
         let tracks = Self::playing_tracks(&data, playing_id.as_deref());
+        let repeat = Self::repeat_mode(&data);
 
         if data.shuffle_enabled {
             self.ensure_shuffle_order(&data);
-            let mut pos = *self.shuffle_position.lock();
-            if pos > 0 {
-                pos -= 1;
-                *self.shuffle_position.lock() = pos;
+            let pos = *self.shuffle_position.lock();
+            let order_len = self.shuffle_order.lock().len();
+            let new_pos = if pos > 0 {
+                Some(pos - 1)
+            } else if repeat == RepeatMode::All && order_len > 0 {
+                Some(order_len - 1)
+            } else {
+                None
+            };
+            if let Some(new_pos) = new_pos {
+                *self.shuffle_position.lock() = new_pos;
                 let order = self.shuffle_order.lock();
-                if let Some(&idx) = order.get(pos) {
+                if let Some(&idx) = order.get(new_pos) {
                     if let Some(track) = tracks.get(idx) {
                         return self.play_track(&track.path, playing_id.as_deref());
                     }
@@ -974,6 +984,11 @@ impl RemoteController {
         if let Some(idx) = idx {
             if idx > 0 {
                 return self.play_track(&tracks[idx - 1].path, playing_id.as_deref());
+            }
+            if repeat == RepeatMode::All {
+                if let Some(track) = tracks.last() {
+                    return self.play_track(&track.path, playing_id.as_deref());
+                }
             }
         }
         Ok(())

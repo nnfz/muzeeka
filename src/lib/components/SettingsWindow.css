@@ -274,8 +274,6 @@
   height: 52px;
   flex-shrink: 0;
   overflow: hidden;
-  background: linear-gradient(145deg, var(--accent-soft), rgba(139, 92, 246, 0.06));
-  border: 1px solid var(--border-accent);
   border-radius: var(--radius-md);
 }
 
@@ -486,6 +484,7 @@
   color: var(--text-secondary);
   border: 1px solid var(--border-subtle);
   border-radius: 999px;
+  line-height: 0;
   cursor: pointer;
   transition: all var(--transition-fast);
 }
