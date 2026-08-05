@@ -160,7 +160,7 @@ pub fn detect_beat_offset_for_path(
     if !Path::new(&path).is_file() {
         return Err(format!("File not found: {path}"));
     }
-    if !bpm.is_finite() || bpm < MIN_BPM || bpm > MAX_BPM * 1.5 {
+    if !bpm.is_finite() || !(MIN_BPM..=MAX_BPM * 1.5).contains(&bpm) {
         return Err(format!("BPM out of range: {bpm}"));
     }
 

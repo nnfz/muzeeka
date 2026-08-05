@@ -6,7 +6,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use encoding_rs;
 
 /// True for `.m3u` / `.m3u8` (case-insensitive).
 pub fn is_m3u_extension(ext: &str) -> bool {
@@ -40,7 +39,7 @@ fn read_m3u_text(path: &Path) -> Option<String> {
 
     {
         let (cow, _, _) = encoding_rs::WINDOWS_1252.decode(&bytes);
-        return Some(cow.into_owned());
+        Some(cow.into_owned())
     }
 }
 

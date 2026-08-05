@@ -205,7 +205,7 @@ pub fn run() {
                         if last_save.elapsed() >= Duration::from_millis(700) {
                             let app = window.app_handle();
                             if let Some(webview_window) = app.get_webview_window(window.label()) {
-                                save_window_state(&app, &webview_window);
+                                save_window_state(app, &webview_window);
                             }
                             *last_save = Instant::now();
                         }
@@ -228,7 +228,7 @@ pub fn run() {
                 if window.label() == "main" {
                     let app = window.app_handle();
                     if let Some(webview_window) = app.get_webview_window(window.label()) {
-                        save_window_state(&app, &webview_window);
+                        save_window_state(app, &webview_window);
                     }
                     // Ensure audio is stopped and BASS device is freed when the main player window closes.
                     // Without this, sound could continue after the app exits.
@@ -265,7 +265,7 @@ pub fn run() {
             metadata::set_ffmpeg_bin(ffmpeg);
 
             // One settings load for window geometry, EQ, Discord, and remote server.
-            let app_settings = settings::load_settings(&app.handle()).ok();
+            let app_settings = settings::load_settings(app.handle()).ok();
 
             if let Some(window) = app.get_webview_window("main") {
                 if let Some(window_state) = app_settings
@@ -284,7 +284,7 @@ pub fn run() {
             player.set_discord_presence(discord_presence.clone());
             player.mark_bass_thread();
             player.init().map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::Other, e)
+                std::io::Error::other(e)
             })?;
 
             // Apply saved equalizer settings as early as possible (before any playback)

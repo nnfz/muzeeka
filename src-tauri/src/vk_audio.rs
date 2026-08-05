@@ -1102,7 +1102,7 @@ fn vk_s_child(t_len: usize, e: i32) -> Vec<usize> {
     let mut o = Vec::with_capacity(t_len);
     let mut e = e;
     for a in (0..t_len).rev() {
-        e = ((t_len as i32) * (a as i32 + 1) ^ e + a as i32).rem_euclid(t_len as i32);
+        e = (((t_len as i32) * (a as i32 + 1)) ^ (e + a as i32)).rem_euclid(t_len as i32);
         o.push(e as usize);
     }
     o.reverse();
@@ -1118,9 +1118,7 @@ fn vk_s(t: &str, e: i32) -> String {
     let mut t: Vec<char> = t.chars().collect();
     for a in 1..i {
         let idx = o[i - 1 - a];
-        let y = t[idx];
-        t[idx] = t[a];
-        t[a] = y;
+        t.swap(idx, a);
     }
     t.into_iter().collect()
 }
@@ -1523,7 +1521,7 @@ fn scrap_ids_from_html(html: &str) -> Vec<(i64, u64, String, String)> {
 
     // Also scrape raw audio arrays embedded in page JS
     if ids.is_empty() {
-        if let Some(re) = Regex::new(r#"\[(-?\d+),(-?\d+),(\d+),[^]]*?"([^"]*?/[^"]*?)"#).ok() {
+        if let Ok(re) = Regex::new(r#"\[(-?\d+),(-?\d+),(\d+),[^]]*?"([^"]*?/[^"]*?)"#) {
             for caps in re.captures_iter(html) {
                 // too loose — skip
                 let _ = caps;
@@ -1643,7 +1641,7 @@ fn reload_audio_ids(
         tracks.extend(
             chunk_tracks
                 .into_iter()
-                .filter(|t| has_playable_stream(t)),
+                .filter(has_playable_stream),
         );
         std::thread::sleep(Duration::from_millis(250));
     }
@@ -1740,7 +1738,7 @@ fn fetch_single_track(
     for page_url in &page_urls {
         if let Ok(html) = http_get(page_url, cookie, page_url.contains("m.vk")) {
             // Direct URL embedded in HTML (rare but free win)
-            if let Some(re) = Regex::new(r#"https://[a-zA-Z0-9._/-]+\.(?:mp3|m3u8)[^"'\s]*"#).ok()
+            if let Ok(re) = Regex::new(r#"https://[a-zA-Z0-9._/-]+\.(?:mp3|m3u8)[^"'\s]*"#)
             {
                 if let Some(m) = re.find(&html) {
                     let mut url = m.as_str().to_string();
@@ -2660,7 +2658,7 @@ true
                 out.extend(
                     tracks_from_reload_json(text, user_id)
                         .into_iter()
-                        .filter(|t| has_playable_stream(t)),
+                        .filter(has_playable_stream),
                 );
             }
         }
@@ -2909,7 +2907,7 @@ async fn fetch_playlist_tracks_async(
     // Dedup by (owner, id), preserve order
     let mut seen = std::collections::HashSet::new();
     resolved.retain(|t| seen.insert((t.owner_id, t.id)));
-    resolved.retain(|t| has_playable_stream(t));
+    resolved.retain(has_playable_stream);
 
     if resolved.is_empty() {
         return Err(

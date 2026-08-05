@@ -440,7 +440,7 @@ impl BassLibrary {
         if buffer.is_empty() {
             return Ok(0);
         }
-        let want_bytes = (buffer.len() * std::mem::size_of::<f32>()) as DWORD;
+        let want_bytes = std::mem::size_of_val(buffer) as DWORD;
         let length = want_bytes | BASS_DATA_FLOAT;
         let got = unsafe {
             (self.bass_channel_get_data)(
@@ -467,7 +467,7 @@ impl BassLibrary {
         if buffer.is_empty() {
             return Ok(0);
         }
-        let want_bytes = (buffer.len() * std::mem::size_of::<i16>()) as DWORD;
+        let want_bytes = std::mem::size_of_val(buffer) as DWORD;
         let got = unsafe {
             (self.bass_channel_get_data)(
                 handle,

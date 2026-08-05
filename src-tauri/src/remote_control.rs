@@ -810,7 +810,7 @@ impl RemoteController {
         let track = snapshot.current_file.as_ref().and_then(|path| {
             Self::track_map(&data)
                 .get(path)
-                .map(|t| Self::to_remote_track(t))
+                .map(Self::to_remote_track)
         });
 
         Ok(RemoteState {
@@ -942,14 +942,13 @@ impl RemoteController {
 
     pub fn prev(&self) -> Result<(), String> {
         let state = self.player.get_state();
-        if state.position > 3.0 {
-            if state.current_file.is_some() {
+        if state.position > 3.0
+            && state.current_file.is_some() {
                 self.player.seek(0.0)?;
                 self.sync_discord();
                 self.notify_playback();
                 return Ok(());
             }
-        }
 
         let data = self.load_data()?;
         let playing_id = Self::playing_id_from_data(&data);

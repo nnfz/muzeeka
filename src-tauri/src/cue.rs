@@ -814,7 +814,7 @@ fn expand_cue_file_impl(cue_path: &Path, resolve_covers: bool) -> Vec<MusicFile>
     let track_refs: Vec<(usize, &CUETrack)> = cue
         .tracks
         .iter()
-        .map(|(file_id, track)| (*file_id as usize, track))
+        .map(|(file_id, track)| ((*file_id), track))
         .collect();
 
     // How many TRACK rows reference each FILE id.

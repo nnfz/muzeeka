@@ -564,7 +564,7 @@ impl Player {
 
     /// Initialize the BASS audio system. Must be called before any playback.
     pub fn init(&self) -> Result<(), String> {
-        self.run_on_bass_thread(|inner| Self::init_inner(inner))
+        self.run_on_bass_thread(Self::init_inner)
     }
 
     /// Run a closure with the live `BassLibrary` on the BASS thread (for analysis etc.).

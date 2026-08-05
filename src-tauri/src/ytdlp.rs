@@ -636,7 +636,7 @@ fn strip_ansi(s: &str) -> String {
             // ESC[ ... letter
             if chars.peek() == Some(&'[') {
                 chars.next();
-                while let Some(n) = chars.next() {
+                for n in chars.by_ref() {
                     if n.is_ascii_alphabetic() {
                         break;
                     }

@@ -244,7 +244,7 @@ pub fn read_tag_table(path: &Path) -> Result<Vec<TagTableRow>, String> {
         .filter(|(k, v)| !seen.contains(k) && v.iter().any(|s| !s.trim().is_empty()))
         .map(|(k, v)| (k, v.join("; ")))
         .collect();
-    extras.sort_by(|a, b| item_key_label(a.0).cmp(&item_key_label(b.0)));
+    extras.sort_by_key(|a| item_key_label(a.0));
 
     for (key, value) in extras {
         rows.push(TagTableRow {
