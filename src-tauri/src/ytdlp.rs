@@ -368,32 +368,6 @@ fn unescape_html(s: &str) -> String {
     .replace("&quot;", "\"")
 }
 
-fn parse_jsonld_track(item: &serde_json::Value) -> Option<String> {
-    let title = item.get("name").and_then(|n| n.as_str()).unwrap_or("");
-    let mut artist_name = String::new();
-
-    if let Some(by_artist) = item.get("byArtist") {
-        if let Some(arr) = by_artist.as_array() {
-            let names: Vec<&str> = arr.iter().filter_map(|a| a.get("name").and_then(|n| n.as_str())).collect();
-            artist_name = names.join(", ");
-        } else if let Some(obj) = by_artist.as_object() {
-            artist_name = obj.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
-        }
-    }
-
-    if !title.is_empty() {
-        let clean_title = unescape_html(title);
-        let clean_artist = unescape_html(&artist_name);
-
-        if clean_artist.is_empty() {
-            Some(format!("ytsearch1:{} audio", clean_title))
-        } else {
-            Some(format!("ytsearch1:{} {} audio", clean_artist, clean_title))
-        }
-    } else {
-        None
-    }
-}
 
 fn extract_spotify_playlist_queries(url: &str) -> (Vec<String>, Option<String>) {
     let mut queries = Vec::new();

@@ -327,30 +327,6 @@ impl LibraryDatabase {
         Ok(id)
     }
 
-    /// Point an existing root at a new absolute path (drive letter / machine move).
-    pub fn relocate_root(&self, root_id: i64, new_absolute: &str) -> Result<(), String> {
-        let cleaned = path_store::normalize_display_path(new_absolute);
-        if cleaned.trim().is_empty() {
-            return Err("Root path is empty".into());
-        }
-        let key = path_key(&cleaned);
-        let connection = self.inner.connection.lock();
-        connection
-            .execute(
-                "UPDATE library_roots SET path = ?2, path_key = ?3 WHERE id = ?1",
-                params![root_id, cleaned, key],
-            )
-            .map_err(db_error)?;
-        drop(connection);
-        self.changed();
-        Ok(())
-    }
-
-    pub fn list_roots(&self) -> Result<Vec<(i64, String)>, String> {
-        let connection = self.inner.connection.lock();
-        load_roots(&connection)
-    }
-
     pub fn revision(&self) -> u64 {
         self.inner.revision.load(Ordering::Acquire)
     }

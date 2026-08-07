@@ -38,18 +38,6 @@ pub fn register_audio_thread() {
     }
 }
 
-pub fn unregister_current_audio_thread() {
-    #[cfg(windows)]
-    {
-        let mut handles = MMCSS_HANDLES.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(MmcssHandle(handle)) = handles.pop() {
-            unsafe {
-                let _ = AvRevertMmThreadCharacteristics(handle);
-            }
-        }
-    }
-}
-
 pub fn set_background_mode(background: bool) {
     #[cfg(windows)]
     {
@@ -95,5 +83,4 @@ unsafe extern "system" {
         task_index: *mut u32,
     ) -> *mut core::ffi::c_void;
     fn AvSetMmThreadPriority(av_rt_handle: *mut core::ffi::c_void, priority: i32) -> i32;
-    fn AvRevertMmThreadCharacteristics(av_rt_handle: *mut core::ffi::c_void) -> i32;
 }
