@@ -2,9 +2,9 @@
 **Pronunciation:** *moo-ZEE-kah* (рус. «музыка»)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![CodeFactor](https://www.codefactor.io/repository/github/nnfz/muzeeka/badge)](https://www.codefactor.io/repository/github/nnfz/muzeeka)
 [![Tauri](https://img.shields.io/badge/Tauri-v2-24C8DB)](https://tauri.app/)
 [![SvelteKit](https://img.shields.io/badge/SvelteKit-FF3E00?logo=svelte&logoColor=white)](https://svelte.dev/docs/kit)
-
 <p align="center">
 	<img src="logo/logo-1024.png" alt="Muzeeka logo" width="180" />
 </p>
