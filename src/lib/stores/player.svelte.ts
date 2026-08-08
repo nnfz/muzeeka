@@ -19,6 +19,13 @@ import {
   readShuffleMode,
   type ShuffleMode,
 } from '$lib/stores/settings.svelte';
+import { loadMixTransitionMemory } from '$lib/mix/memory';
+import {
+  buildArmMixArgs,
+  mixEdgeHandoff,
+  trackPlayableSecs,
+  type ArmMixArgs,
+} from '$lib/mix/plan';
 
 // Yield to the browser event loop so the UI stays responsive
 function yieldToUI() {
@@ -197,6 +204,16 @@ let persistenceChain: Promise<void> = Promise.resolve();
 let lastGaplessChangeAt = 0;
 let lastManualPlayAt = 0;
 let lastPlayedFile = '';
+/**
+ * The current track arrived from a mix handoff rather than a play request.
+ *
+ * A handoff drops the transport somewhere inside the incoming track, a click starts it
+ * at the beginning — the same file, two different starting points, so the transport can
+ * only rebase onto the transition when it knows which one happened.
+ */
+let enteredViaMixHandoff = $state(false);
+/** Bumped when the editor saves a layout — its store is plain localStorage. */
+let mixMemoryRevision = $state(0);
 /** Paths last sent to the backend gapless queue (same order the player will advance). */
 let lastGaplessQueuePaths: string[] = [];
 let lastPauseRequestAt = 0;
@@ -414,7 +431,71 @@ let currentTrack = $derived.by(() => {
   );
 });
 
-let progress = $derived(duration > 0 ? Math.min(1, Math.max(0, position / duration)) : 0);
+/**
+ * Mix mode: the slice of the current track this set actually plays, or null when the
+ * track runs in full and the raw position/duration already describe it.
+ *
+ * A mixed track is picked up part-way through by the transition into it and handed over
+ * before its own end, so the file's length stops matching what the transport is showing
+ * the listener. Both edges come from the same saved layouts the engine plays, so the
+ * transport agrees with the track list (`mixedTrackDurations`) by construction.
+ */
+let mixPlaybackWindow = $derived.by<{ startSecs: number; endSecs: number } | null>(
+  () => {
+    // Re-read on every editor save; localStorage is not reactive on its own.
+    void mixMemoryRevision;
+    const path = currentFile;
+    const playlistId = playingPlaylistId;
+    const track = currentTrack;
+    if (!path || !playlistId || !track) return null;
+    if (!playlistById.get(playlistId)?.mix_mode) return null;
+
+    // Head spent by the transition into this track. Only when the engine brought us
+    // here: a track the user clicked starts at its own beginning, mix or not.
+    let startSecs = 0;
+    if (enteredViaMixHandoff) {
+      const prev = prevInPlayOrder(path);
+      const memory =
+        prev && !sameTrackPath(prev.path, path)
+          ? loadMixTransitionMemory(playlistId, prev.path, path)
+          : null;
+      const inEdge = prev && memory ? mixEdgeHandoff(prev, track, memory) : null;
+      if (inEdge) startSecs = inEdge.toEnterSecs;
+    }
+
+    const playable = trackPlayableSecs(track);
+    const next = nextInPlayOrder(path);
+    const outMemory =
+      next && !sameTrackPath(next.path, path)
+        ? loadMixTransitionMemory(playlistId, path, next.path)
+        : null;
+    const outEdge = next && outMemory ? mixEdgeHandoff(track, next, outMemory) : null;
+
+    let endSecs = playable > 0 ? playable : duration;
+    if (outEdge) {
+      endSecs = endSecs > 0 ? Math.min(endSecs, outEdge.fromExitSecs) : outEdge.fromExitSecs;
+    }
+    if (!outEdge && startSecs <= 0.05) return null;
+    if (endSecs - startSecs < 1) return null;
+    return { startSecs, endSecs };
+  },
+);
+
+/** What the transport measures: the mix window when there is one, else the file. */
+let displayDuration = $derived(
+  mixPlaybackWindow
+    ? Math.max(0, mixPlaybackWindow.endSecs - mixPlaybackWindow.startSecs)
+    : duration,
+);
+let displayPosition = $derived(
+  mixPlaybackWindow
+    ? Math.min(Math.max(0, position - mixPlaybackWindow.startSecs), displayDuration)
+    : position,
+);
+
+let progress = $derived(
+  displayDuration > 0 ? Math.min(1, Math.max(0, displayPosition / displayDuration)) : 0,
+);
 let hasTrack = $derived(currentFile !== null);
 // hasCurrentTrack: track is remembered but player is fully stopped (e.g. after app restart)
 let hasCurrentTrack = $derived(currentFile !== null && !isPlaying && !isPaused);
@@ -435,8 +516,8 @@ let hasPrev = $derived(
     : currentTrackIndex > 0
 );
 
-let formattedPosition = $derived(formatTime(position));
-let formattedDuration = $derived(formatTime(duration));
+let formattedPosition = $derived(formatTime(displayPosition));
+let formattedDuration = $derived(formatTime(displayDuration));
 
 // --- Helpers ---
 
@@ -1437,6 +1518,10 @@ function setPlaylistMixMode(id: string, mixMode: boolean) {
     p.id === id ? { ...p, mix_mode: mixMode } : p,
   );
   persistMutation('playlist_set_mix_mode', { id, mixMode });
+  // Toggling the playing playlist takes effect on the current edge, not the next track.
+  if (id === playingPlaylistId && currentFile) {
+    void armMixForCurrentEdge(currentFile);
+  }
 }
 
 async function setPlaylistCover(id: string, sourcePath: string) {
@@ -2313,6 +2398,61 @@ function buildGaplessQueue(filePath: string) {
   return [gaplessArgsForTrack(track ?? ({ path: filePath } as MusicFile), filePath)];
 }
 
+/** Next track in the active play order (repeat-all wraps; repeat-one has no edge). */
+function nextInPlayOrder(filePath: string): MusicFile | null {
+  if (repeatMode === 'one') return null;
+  return getUpcomingTracks(filePath, 1)[0] ?? null;
+}
+
+/** Track the play order came from — the mix edge that handed this one the display. */
+function prevInPlayOrder(filePath: string): MusicFile | null {
+  if (repeatMode === 'one' || !hasPlayingTracks) return null;
+  const idx = playingTracks.findIndex((t) => sameTrackPath(t.path, filePath));
+  if (idx < 0) return null;
+  const at = (i: number) => playingTracks[i] ?? null;
+  if (shuffleEnabled) {
+    const orderPos = shuffleOrder.indexOf(idx);
+    if (orderPos < 0) return null;
+    if (orderPos > 0) return at(shuffleOrder[orderPos - 1]!);
+    return repeatMode === 'all'
+      ? at(shuffleOrder[shuffleOrder.length - 1]!)
+      : null;
+  }
+  if (idx > 0) return at(idx - 1);
+  return repeatMode === 'all' ? at(playingTracks.length - 1) : null;
+}
+
+/**
+ * Mix mode: hand the saved transition for the current edge to the engine so it fires
+ * on its own when the playhead reaches the cut. Without this, a saved mix would only
+ * ever be audible inside the Mix Transition window.
+ */
+async function armMixForCurrentEdge(filePath: string) {
+  const playlistId = playingPlaylistId;
+  const playlist = playlistId ? playlistById.get(playlistId) : undefined;
+  let args: ArmMixArgs | null = null;
+
+  if (playlist?.mix_mode && playlistId) {
+    const from =
+      findTrackByPath(playingTracks, filePath) ?? trackByPath.get(filePath);
+    const to = nextInPlayOrder(filePath);
+    if (from && to && !sameTrackPath(from.path, to.path)) {
+      const memory = loadMixTransitionMemory(playlistId, from.path, to.path);
+      if (memory) args = buildArmMixArgs(from, to, memory);
+    }
+  }
+
+  try {
+    if (args) {
+      await invoke('player_arm_mix', { mix: args });
+    } else {
+      await invoke('player_disarm_mix');
+    }
+  } catch (e) {
+    console.error('Failed to arm mix transition:', e);
+  }
+}
+
 async function prepareGaplessNext(filePath: string) {
   const requestId = ++gaplessPrepareRequestId;
   const queue = buildGaplessQueue(filePath);
@@ -2327,6 +2467,11 @@ async function prepareGaplessNext(filePath: string) {
     }
   } catch (e) {
     console.error('Failed to prepare gapless queue:', e);
+  }
+  // Same trigger points as the gapless queue: whenever the upcoming edge changes,
+  // the armed transition has to follow it (or be dropped).
+  if (requestId === gaplessPrepareRequestId) {
+    await armMixForCurrentEdge(filePath);
   }
 }
 
@@ -2394,6 +2539,8 @@ async function play(filePath: string) {
     lastManualPlayAt = Date.now();
     lastPlayedFile = filePath;
     lastPauseRequestAt = 0;
+    // Started by request, so it starts at its beginning — no mix entry to rebase onto.
+    enteredViaMixHandoff = false;
     isPlaying = true;
     isPaused = false;
     // Smart shuffle: count this track as heard once playback is requested.
@@ -2510,6 +2657,9 @@ async function play(filePath: string) {
       if (requestId === playRequestId) {
         rememberGaplessQueue(queueToSend);
         queueConfirmedForPlay = requestId;
+        // player_play drops any armed transition on the backend; re-arm for the
+        // edge we just landed on (mix mode saved layouts fire from the poll loop).
+        void armMixForCurrentEdge(currentFile ?? filePath);
 
         // Seek immediately after open (saved position after restart / first Play).
         if (resumeAt > 0.25) {
@@ -2602,12 +2752,19 @@ async function stop() {
 let seekGuardUntil = 0;
 let seekGuardPosition = 0;
 
+/** Seek in transport time — mix-window relative when the current track is mixed. */
 async function seek(pos: number) {
+  await seekAbsolute((mixPlaybackWindow?.startSecs ?? 0) + Math.max(0, pos));
+}
+
+/** Seek in the track's own time, ignoring any mix window. For lyric timestamps. */
+async function seekAbsolute(pos: number) {
   // Prefer CUE segment length so scrubbing never targets past INDEX end.
   const track = currentTrack;
   const seg = cueSegmentDuration(track);
   const maxDur = seg != null && seg > 0 ? seg : duration;
-  const clamped = Math.max(0, maxDur > 0 ? Math.min(pos, maxDur) : pos);
+  const target = Math.max(0, pos);
+  const clamped = Math.max(0, maxDur > 0 ? Math.min(target, maxDur) : target);
   position = clamped;
   seekGuardPosition = clamped;
   seekGuardUntil = Date.now() + (isCueVirtualPath(currentFile) ? 700 : 400);
@@ -2869,6 +3026,20 @@ function setupListeners() {
     }
   });
 
+  // Editor saved a layout — if it belongs to the edge we're on, pick it up live.
+  listen<{ playlistId?: string; fromPath?: string; toPath?: string }>(
+    'mix-transition:saved',
+    (event) => {
+      // Any edge can change what the transport measures, even one we're not on yet.
+      mixMemoryRevision += 1;
+      if (mixPreviewActive || !currentFile) return;
+      const { playlistId, fromPath } = event.payload ?? {};
+      if (!playlistId || playlistId !== playingPlaylistId) return;
+      if (fromPath && !sameTrackPath(fromPath, currentFile)) return;
+      void armMixForCurrentEdge(currentFile);
+    },
+  );
+
   listen<StoreSyncPayload>('player:store-sync', (event) => {
     if (mixPreviewActive) return;
     const prevPlayingId = playingPlaylistId;
@@ -2911,6 +3082,13 @@ function setupListeners() {
     // Record what we're transitioning from (for track-ended double-advance guard).
     lastTrackChangedFromPath = currentFile ?? '';
     lastTrackChangedAt = Date.now();
+    // A track the user just asked for starts at its beginning; anything the engine
+    // advanced to on its own may have been entered part-way by a mix transition.
+    enteredViaMixHandoff = !(
+      Date.now() - lastManualPlayAt < 800 &&
+      lastPlayedFile &&
+      sameTrackPath(path, lastPlayedFile)
+    );
     currentFile = track?.path ?? path;
     lastPlayedFile = currentFile ?? path;
     markSmartPlayed(currentFile ?? path);
@@ -3169,6 +3347,10 @@ export function createPlayerStore() {
     get isPaused() { return isPaused; },
     get position() { return position; },
     get duration() { return duration; },
+    /** Transport time: the mix window when the track is mixed, else the file. */
+    get displayPosition() { return displayPosition; },
+    get displayDuration() { return displayDuration; },
+    get isMixWindowed() { return mixPlaybackWindow !== null; },
     get volume() { return volume; },
     get currentFile() { return currentFile; },
     get currentFileName() { return currentFileName; },
@@ -3228,6 +3410,7 @@ export function createPlayerStore() {
     resume,
     stop,
     seek,
+    seekAbsolute,
     setVolume,
     togglePlayPause,
     nextTrack,

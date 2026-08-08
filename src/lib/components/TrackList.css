@@ -464,6 +464,11 @@
   flex-shrink: 0;
 }
 
+/* Mix mode: this length is the track's span in the set, not the file's length. */
+.duration-text.mixed {
+  color: color-mix(in srgb, var(--accent) 65%, var(--text-muted));
+}
+
 /* --- Empty state --- */
 
 .empty-state {

@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 
+use crate::dsp_chain::{ChainSlotSettings, EffectSettings};
 use crate::equalizer::EqualizerSettings;
+use crate::limiter::LimiterSettings;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CustomPreset {
@@ -37,8 +39,20 @@ pub enum ShuffleMode {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
+    /// The effect rack: ordered slots, any effect any number of times.
+    ///
+    /// `None` means "written by a version that predates the rack" — see
+    /// `migrate_dsp_chain`, which folds the legacy fields below into a chain once.
+    /// After that the chain is the only source of truth for DSP.
+    #[serde(default)]
+    pub dsp_chain: Option<Vec<ChainSlotSettings>>,
+    /// Legacy single equalizer. Kept only so an old settings.json still migrates;
+    /// nothing reads it once `dsp_chain` exists.
     #[serde(default)]
     pub equalizer: EqualizerSettings,
+    /// Legacy single limiter. Same story as `equalizer`.
+    #[serde(default)]
+    pub limiter: LimiterSettings,
     #[serde(default)]
     pub custom_presets: Vec<CustomPreset>,
     /// Playback rate multiplier. 1.0 = normal. Persisted so it survives restarts.
@@ -73,7 +87,12 @@ pub struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
+            // A fresh profile starts with an empty rack. `Some(vec![])` (not `None`)
+            // marks it as "the chain is the source of truth", so `migrate_dsp_chain`
+            // — which only fires for files that predate the rack — leaves it alone.
+            dsp_chain: Some(Vec::new()),
             equalizer: EqualizerSettings::default(),
+            limiter: LimiterSettings::default(),
             custom_presets: Vec::new(),
             playback_rate: default_playback_rate(),
             pitch_enabled: default_pitch_enabled(),
@@ -124,9 +143,56 @@ fn settings_bak_path(primary: &std::path::Path) -> PathBuf {
     primary.with_extension("json.bak")
 }
 
+/// Fold a pre-rack settings file into a chain: EQ then limiter, which is the
+/// order the old fixed priorities produced. Runs once — after this the file has a
+/// `dsp_chain` and the legacy fields are never consulted again.
+///
+/// Each slot keeps the effect's own `enabled`, so a user who had the EQ on and
+/// the limiter off gets exactly that back, just as two rack rows.
+///
+/// An effect the user never touched contributes no slot: carrying a flat, disabled
+/// EQ forward would mean every fresh install opens on a rack of dead rows. A new
+/// profile therefore starts empty — see `AppSettings::default`.
+fn migrate_dsp_chain(settings: &mut AppSettings) {
+    if settings.dsp_chain.is_some() {
+        return;
+    }
+    let mut slots = Vec::new();
+    if settings.equalizer != EqualizerSettings::default() {
+        slots.push(ChainSlotSettings {
+            id: "legacy-equalizer".into(),
+            enabled: settings.equalizer.enabled,
+            effect: EffectSettings::Equalizer(settings.equalizer.clone()),
+        });
+    }
+    if settings.limiter != LimiterSettings::default() {
+        slots.push(ChainSlotSettings {
+            id: "legacy-limiter".into(),
+            enabled: settings.limiter.enabled,
+            effect: EffectSettings::Limiter(settings.limiter.clone()),
+        });
+    }
+    settings.dsp_chain = Some(slots);
+}
+
 /// Clamp fields that can be hand-edited or come from older app versions.
 fn normalize_settings(mut settings: AppSettings) -> AppSettings {
     settings.equalizer = settings.equalizer.clamp();
+    settings.limiter = settings.limiter.clone().clamp();
+    migrate_dsp_chain(&mut settings);
+    if let Some(chain) = settings.dsp_chain.as_mut() {
+        chain.truncate(crate::dsp_chain::MAX_SLOTS);
+        let mut seen = std::collections::HashSet::new();
+        for (i, slot) in chain.iter_mut().enumerate() {
+            slot.effect = slot.effect.clone().clamp();
+            // Ids are identity in the rack: duplicates would make two rows fight
+            // over one node, so a hand-edited file gets its collisions renamed.
+            if slot.id.trim().is_empty() || !seen.insert(slot.id.clone()) {
+                slot.id = format!("slot-{i}");
+                seen.insert(slot.id.clone());
+            }
+        }
+    }
     settings.playback_rate = settings.playback_rate.clamp(0.25, 2.0);
     settings.remote_port = crate::remote_server::sanitize_port(settings.remote_port);
     for preset in &mut settings.custom_presets {
@@ -253,4 +319,82 @@ pub fn save_settings(app: &AppHandle, settings: &AppSettings) -> Result<(), Stri
         .map_err(|e| format!("Failed to serialize settings: {}", e))?;
 
     write_file_atomic(&path, &json)
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn legacy_json(body: &str) -> AppSettings {
+        serde_json::from_str(body).expect("fixture parses")
+    }
+
+    #[test]
+    fn a_fresh_profile_starts_with_an_empty_rack() {
+        // Not a migration: nothing to carry over, so the user opens Settings on a
+        // clean slate rather than on two dead rows.
+        let settings = normalize_settings(AppSettings::default());
+        assert!(settings.dsp_chain.expect("chain").is_empty());
+    }
+
+    #[test]
+    fn an_untouched_legacy_file_migrates_to_nothing() {
+        // Old file, DSP never used. Carrying a flat disabled EQ forward would put
+        // clutter in the rack that the user never asked for.
+        let settings = normalize_settings(legacy_json(r#"{"playback_rate": 1.0}"#));
+        assert!(settings.dsp_chain.expect("chain").is_empty());
+    }
+
+    #[test]
+    fn a_configured_legacy_eq_becomes_one_slot() {
+        let settings = normalize_settings(legacy_json(
+            r#"{"equalizer": {"enabled": true, "preamp_db": -3.0, "bands_db": [4.0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}}"#,
+        ));
+        let chain = settings.dsp_chain.expect("chain");
+        assert_eq!(chain.len(), 1, "the untouched limiter must not add a slot");
+        assert_eq!(chain[0].id, "legacy-equalizer");
+        assert!(chain[0].enabled);
+        match &chain[0].effect {
+            EffectSettings::Equalizer(eq) => {
+                assert_eq!(eq.preamp_db, -3.0);
+                assert_eq!(eq.bands_db[0], 4.0);
+            }
+            other => panic!("expected an equalizer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_disabled_but_edited_legacy_effect_still_migrates() {
+        // The user tuned the limiter and then switched it off. The tuning is worth
+        // keeping — it comes back as a bypassed row, not as a deletion.
+        let settings = normalize_settings(legacy_json(
+            r#"{"limiter": {"enabled": false, "gain_db": 6.0, "ceiling_db": -1.0, "release_ms": 200.0, "clip": true}}"#,
+        ));
+        let chain = settings.dsp_chain.expect("chain");
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].id, "legacy-limiter");
+        assert!(!chain[0].enabled, "row should come back bypassed");
+    }
+
+    #[test]
+    fn both_configured_legacy_effects_keep_eq_before_limiter() {
+        // The order the old fixed BASS priorities produced.
+        let settings = normalize_settings(legacy_json(
+            r#"{"equalizer": {"enabled": true, "preamp_db": 2.0, "bands_db": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]},
+                "limiter": {"enabled": true, "gain_db": 3.0, "ceiling_db": -0.3, "release_ms": 120.0, "clip": false}}"#,
+        ));
+        let chain = settings.dsp_chain.expect("chain");
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[0].id, "legacy-equalizer");
+        assert_eq!(chain[1].id, "legacy-limiter");
+    }
+
+    #[test]
+    fn an_existing_rack_is_never_re_migrated() {
+        // `dsp_chain` present — even empty — means the user already lives in the
+        // rack world. Re-running the migration would resurrect deleted effects.
+        let settings = normalize_settings(legacy_json(
+            r#"{"dsp_chain": [], "equalizer": {"enabled": true, "preamp_db": 5.0, "bands_db": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}}"#,
+        ));
+        assert!(settings.dsp_chain.expect("chain").is_empty());
+    }
 }

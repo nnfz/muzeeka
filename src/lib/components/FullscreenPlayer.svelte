@@ -752,7 +752,7 @@
             currentTime={player.position}
             isPlaying={player.isPlaying}
             {chromeVisible}
-            onSeek={(time) => void player.seek(time)}
+            onSeek={(time) => void player.seekAbsolute(time)}
           />
         {/if}
       </div>

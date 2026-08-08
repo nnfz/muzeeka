@@ -14,7 +14,11 @@ mod cover_url_cache;
 mod imgbb;
 mod musicbrainz;
 
+mod biquad;
+mod dsp_chain;
 mod equalizer;
+mod filter;
+mod limiter;
 mod mix_filter;
 mod library;
 mod m3u;
@@ -287,10 +291,10 @@ pub fn run() {
                 std::io::Error::other(e)
             })?;
 
-            // Apply saved equalizer settings as early as possible (before any playback)
+            // Apply the saved effect rack as early as possible (before any playback)
             // so the first seconds of audio are processed by DSP.
             if let Some(ref app_settings) = app_settings {
-                let _ = player.set_equalizer(app_settings.equalizer.clone());
+                let _ = player.set_dsp_chain(app_settings.dsp_chain.clone().unwrap_or_default());
                 discord_presence.configure(app_settings.discord_rpc_enabled);
             }
 
@@ -326,6 +330,8 @@ pub fn run() {
             commands::player_init,
             commands::player_play,
             commands::player_mix_crossfade,
+            commands::player_arm_mix,
+            commands::player_disarm_mix,
             commands::player_prepare_next,
             commands::player_pause,
             commands::player_resume,
@@ -335,9 +341,9 @@ pub fn run() {
             commands::player_set_playback_rate,
             commands::player_set_pitch_enabled,
             commands::player_get_state,
-            commands::player_get_equalizer,
-            commands::player_get_equalizer_status,
-            commands::player_set_equalizer,
+            commands::player_get_dsp_chain,
+            commands::player_get_dsp_chain_status,
+            commands::player_set_dsp_chain,
             commands::load_addon,
             // Settings / remote / input
             commands::settings_load,

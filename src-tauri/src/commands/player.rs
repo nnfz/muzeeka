@@ -6,9 +6,9 @@ use serde::Deserialize;
 use tauri::State;
 
 use crate::discord_rpc::DiscordPresence;
-use crate::equalizer::EqualizerSettings;
+use crate::dsp_chain::{ChainSlotSettings, DspChainStatus};
 use crate::player::{
-    EqualizerStatus, GaplessTrack, MixVolSegment, Player, PlayerStateSnapshot,
+    ArmedMix, GaplessTrack, MixVolSegment, Player, PlayerStateSnapshot,
 };
 use crate::remote_control::RemoteController;
 
@@ -136,6 +136,19 @@ pub fn player_mix_crossfade(
     Ok(())
 }
 
+/// Arm a saved transition on the track that is already playing (playlist mix mode).
+/// Fires by itself once the playhead reaches the layout origin.
+#[tauri::command]
+pub fn player_arm_mix(player: State<'_, Player>, mix: ArmedMix) -> Result<(), String> {
+    player.arm_mix(mix)
+}
+
+/// Drop the armed transition (mix mode off, edge changed, playlist switched).
+#[tauri::command]
+pub fn player_disarm_mix(player: State<'_, Player>) -> Result<(), String> {
+    player.disarm_mix()
+}
+
 /// Pause the current playback.
 #[tauri::command]
 pub fn player_pause(
@@ -217,23 +230,24 @@ pub fn load_addon(player: State<'_, Player>, path: String) -> Result<(), String>
     player.load_addon(&path)
 }
 
-/// Get the current equalizer settings.
+/// Get the current effect rack — ordered slots with each effect's settings.
 #[tauri::command]
-pub fn player_get_equalizer(player: State<'_, Player>) -> EqualizerSettings {
-    player.get_equalizer()
+pub fn player_get_dsp_chain(player: State<'_, Player>) -> Vec<ChainSlotSettings> {
+    player.get_dsp_chain()
 }
 
-/// Equalizer diagnostics — whether DSP is attached and processing audio.
+/// Rack diagnostics — attach state, buffers processed, and per-slot meters.
 #[tauri::command]
-pub fn player_get_equalizer_status(player: State<'_, Player>) -> EqualizerStatus {
-    player.get_equalizer_status()
+pub fn player_get_dsp_chain_status(player: State<'_, Player>) -> DspChainStatus {
+    player.get_dsp_chain_status()
 }
 
-/// Update equalizer settings (applied live to the DSP chain).
+/// Replace the effect rack. Order is the list order; slots are matched to live
+/// nodes by `id`, so reordering keeps each effect's filter state.
 #[tauri::command]
-pub fn player_set_equalizer(
+pub fn player_set_dsp_chain(
     player: State<'_, Player>,
-    settings: EqualizerSettings,
+    slots: Vec<ChainSlotSettings>,
 ) -> Result<(), String> {
-    player.set_equalizer(settings)
+    player.set_dsp_chain(slots)
 }

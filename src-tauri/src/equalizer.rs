@@ -52,7 +52,7 @@ where
     Ok(bands)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EqualizerSettings {
     pub enabled: bool,
     pub preamp_db: f32,
@@ -229,24 +229,24 @@ impl Default for EqRuntimeSnapshot {
     }
 }
 
-/// Thread-safe EQ context passed as BASS DSP user data.
+/// Thread-safe EQ context. One instance per rack slot, driven by `dsp_chain`.
 pub struct EqDspContext {
     settings: RwLock<EqualizerSettings>,
     enabled: AtomicBool,
     coeffs_dirty: AtomicBool,
     sample_rate_hz: AtomicU32,
     channels: AtomicUsize,
-    /// Bytes per sample in the DSP buffer (2 = int16, 4 = float32).
-    bytes_per_sample: AtomicU32,
-    /// Set when BASS_CONFIG_FLOATDSP is active — buffer is always float32.
-    float_dsp: AtomicBool,
-    /// Set when DSP was attached with BASS_DSP_FLOAT.
-    dsp_float_forced: AtomicBool,
     process_count: AtomicU64,
     /// Coeffs / preamp / channel count — lock-free load in the audio callback.
     runtime: ArcSwap<EqRuntimeSnapshot>,
     /// IIR memory only; must stay Mutex (mutated every buffer).
     states: Mutex<Vec<Vec<BiquadState>>>,
+}
+
+impl Default for EqDspContext {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl EqDspContext {
@@ -257,23 +257,9 @@ impl EqDspContext {
             coeffs_dirty: AtomicBool::new(true),
             sample_rate_hz: AtomicU32::new(44100),
             channels: AtomicUsize::new(2),
-            bytes_per_sample: AtomicU32::new(4),
-            float_dsp: AtomicBool::new(false),
-            dsp_float_forced: AtomicBool::new(false),
             process_count: AtomicU64::new(0),
             runtime: ArcSwap::from_pointee(EqRuntimeSnapshot::default()),
             states: Mutex::new(vec![vec![BiquadState::default(); BAND_COUNT]; 2]),
-        }
-    }
-
-    pub fn set_float_dsp_enabled(&self, enabled: bool) {
-        self.float_dsp.store(enabled, Ordering::Release);
-    }
-
-    pub fn set_dsp_float_forced(&self, forced: bool) {
-        self.dsp_float_forced.store(forced, Ordering::Release);
-        if forced {
-            self.bytes_per_sample.store(4, Ordering::Release);
         }
     }
 
@@ -292,23 +278,13 @@ impl EqDspContext {
         self.coeffs_dirty.store(true, Ordering::Release);
     }
 
-    pub fn configure_stream(&self, sample_rate: u32, channels: u32, channel_flags: u32) {
+    /// Sample format is the chain's business (`dsp_chain.rs` decides once per
+    /// buffer for the whole rack), so this only takes rate and channel count.
+    pub fn configure_stream(&self, sample_rate: u32, channels: u32) {
         let chans = channels.max(1) as usize;
-        let float_channel = channel_flags & crate::bass::BASS_SAMPLE_FLOAT != 0;
-        let bytes_per_sample = if self.dsp_float_forced.load(Ordering::Acquire)
-            || self.float_dsp.load(Ordering::Acquire)
-            || float_channel
-        {
-            4
-        } else {
-            2
-        };
-
         let rate = if sample_rate > 0 { sample_rate } else { 44100 };
         self.sample_rate_hz.store(rate, Ordering::Release);
         self.channels.store(chans, Ordering::Release);
-        self.bytes_per_sample
-            .store(bytes_per_sample, Ordering::Release);
         *self.states.lock() = vec![vec![BiquadState::default(); BAND_COUNT]; chans];
         self.coeffs_dirty.store(true, Ordering::Release);
         // Publish matching channel count immediately so the next buffer is consistent.
@@ -411,49 +387,6 @@ impl EqDspContext {
                 samples[idx] = (processed.clamp(-1.0, 1.0) * 32767.0).round() as i16;
             }
         }
-    }
-}
-
-/// BASS DSP callback — must match DSPPROC signature.
-pub unsafe extern "system" fn eq_dsp_callback(
-    _handle: u32,
-    _channel: u32,
-    buffer: *mut std::ffi::c_void,
-    length: u32,
-    user: *mut std::ffi::c_void,
-) {
-    if buffer.is_null() || user.is_null() || length < 2 {
-        return;
-    }
-
-    // First call runs on BASS's mixer/update thread — register it as audio-critical
-    // so process BELOW_NORMAL (unfocused window) does not starve the callback.
-    {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        static DSP_THREAD_REGISTERED: AtomicBool = AtomicBool::new(false);
-        if !DSP_THREAD_REGISTERED.swap(true, Ordering::Relaxed) {
-            crate::process_util::register_audio_thread();
-        }
-    }
-
-    let ctx = &*(user as *const EqDspContext);
-    let use_float = ctx.dsp_float_forced.load(Ordering::Acquire)
-        || ctx.bytes_per_sample.load(Ordering::Acquire) >= 4;
-
-    if use_float {
-        let sample_count = (length / 4) as usize;
-        if sample_count == 0 {
-            return;
-        }
-        let samples = std::slice::from_raw_parts_mut(buffer as *mut f32, sample_count);
-        ctx.process_buffer_f32(samples);
-    } else {
-        let sample_count = (length / 2) as usize;
-        if sample_count == 0 {
-            return;
-        }
-        let samples = std::slice::from_raw_parts_mut(buffer as *mut i16, sample_count);
-        ctx.process_buffer_i16(samples);
     }
 }
 

@@ -127,6 +127,12 @@
   gap: 10px;
 }
 
+/* Middle-mouse grab-pan: one cursor for the whole stage, children included. */
+.mix-stage.is-panning,
+.mix-stage.is-panning * {
+  cursor: grabbing !important;
+}
+
 /* Shared playhead over both lanes (view-clamped). */
 .mix-playhead {
   position: absolute;
@@ -233,6 +239,20 @@
   text-transform: uppercase;
   color: var(--text-muted, #8a8a98);
   flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+/* Dot in the lane's own cover accent — ties the label to its waveform. */
+.mix-track-role::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--lane-accent, var(--accent, #7c5cff));
+  box-shadow: 0 0 6px
+    color-mix(in srgb, var(--lane-accent, var(--accent, #7c5cff)) 55%, transparent);
 }
 
 .mix-bpm-badge {
@@ -303,32 +323,6 @@
   flex-shrink: 0;
 }
 
-.mix-reset-btn {
-  flex-shrink: 0;
-  height: 22px;
-  padding: 0 8px;
-  border-radius: var(--radius-mini, 6px);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  background: rgba(255, 255, 255, 0.04);
-  color: var(--text-secondary, #cbcbcb);
-  font-family: var(--font-family);
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  cursor: pointer;
-  transition:
-    color var(--transition-fast, 150ms ease),
-    background var(--transition-fast, 150ms ease),
-    border-color var(--transition-fast, 150ms ease);
-}
-
-.mix-reset-btn:hover {
-  color: var(--accent, #7c5cff);
-  border-color: color-mix(in srgb, var(--accent, #7c5cff) 40%, transparent);
-  background: color-mix(in srgb, var(--accent, #7c5cff) 10%, transparent);
-}
-
 .mix-track-name {
   font-size: 12px;
   font-weight: 500;
@@ -363,8 +357,23 @@
 
 .mix-wave-wrap.is-snapped {
   box-shadow:
-    inset 0 0 0 1px color-mix(in srgb, var(--accent, #7c5cff) 45%, transparent),
-    inset 0 0 24px color-mix(in srgb, var(--accent, #7c5cff) 12%, transparent);
+    inset 0 0 0 1px
+      color-mix(
+        in srgb,
+        var(--lane-accent, var(--accent, #7c5cff)) 45%,
+        transparent
+      ),
+    inset 0 0 24px
+      color-mix(
+        in srgb,
+        var(--lane-accent, var(--accent, #7c5cff)) 12%,
+        transparent
+      );
+}
+
+/* Middle-mouse pan is active on this lane. */
+.mix-wave-wrap.is-panning {
+  cursor: grabbing;
 }
 
 .mix-wave-canvas {
@@ -597,31 +606,6 @@
   border: 1px solid color-mix(in srgb, var(--block-accent, #7c5cff) 35%, transparent);
   border-radius: 4px;
   padding: 1px 5px;
-}
-
-.mix-block-lane {
-  flex-shrink: 0;
-  font-size: 8px;
-  font-weight: 700;
-  letter-spacing: 0.03em;
-  text-transform: uppercase;
-  padding: 1px 4px;
-  border-radius: 3px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  color: var(--text-secondary, #cbcbcb);
-  background: rgba(255, 255, 255, 0.05);
-}
-
-.mix-block-lane.lane-from {
-  color: #c4b5fd;
-  border-color: rgba(167, 139, 250, 0.4);
-  background: rgba(167, 139, 250, 0.12);
-}
-
-.mix-block-lane.lane-to {
-  color: #6ee7b7;
-  border-color: rgba(52, 211, 153, 0.4);
-  background: rgba(52, 211, 153, 0.12);
 }
 
 .mix-block-name {

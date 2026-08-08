@@ -1,33 +1,31 @@
 <script lang="ts">
-  import { onDestroy } from 'svelte';
-  import {
-    BAND_COUNT,
-    BAND_FREQUENCIES,
-    getSettingsStore,
-  } from '$lib/stores/settings.svelte';
+  import { onDestroy, untrack } from 'svelte';
+  import { BAND_COUNT, BAND_FREQUENCIES, getSettingsStore } from '$lib/stores/settings.svelte';
+  import { formatHz, type EqualizerSettings } from '$lib/dsp/effects';
   import Dropdown from '$lib/components/Dropdown.svelte';
+
+  interface Props {
+    /** Which rack slot this editor writes to. */
+    slotId: string;
+    value: EqualizerSettings;
+  }
+
+  let { slotId, value }: Props = $props();
 
   const settings = getSettingsStore();
 
-  let displayPreamp = $state(settings.equalizer.preamp_db);
+  // Seeded once on mount; the $effect below keeps it in sync afterwards, except
+  // while the user is dragging or an animation owns the sliders.
+  let displayPreamp = $state(untrack(() => value.preamp_db));
   let displayBands = $state<number[]>(
-    Array.from({ length: BAND_COUNT }, (_, i) => settings.equalizer.bands_db[i] ?? 0),
+    untrack(() => Array.from({ length: BAND_COUNT }, (_, i) => value.bands_db[i] ?? 0)),
   );
   let userTouched = $state(false);
   let animRaf = 0;
 
-  function formatFreq(freq: number): string {
-    if (freq >= 1000) {
-      const k = freq / 1000;
-      // 12.5k not 12.5k with trailing noise; 16k / 20k stay clean integers.
-      return Number.isInteger(k) ? `${k}k` : `${k.toFixed(1)}k`;
-    }
-    return String(freq);
-  }
-
-  function fillPct(value: number, min: number, max: number): number {
+  function fillPct(v: number, min: number, max: number): number {
     if (max <= min) return 0;
-    return Math.max(0, Math.min(100, ((value - min) / (max - min)) * 100));
+    return Math.max(0, Math.min(100, ((v - min) / (max - min)) * 100));
   }
 
   function cancelAnim() {
@@ -65,7 +63,7 @@
   }
 
   $effect(() => {
-    const eq = settings.equalizer;
+    const eq = value;
     if (userTouched || animRaf) return;
     displayPreamp = eq.preamp_db;
     displayBands = Array.from({ length: BAND_COUNT }, (_, i) => eq.bands_db[i] ?? 0);
@@ -74,17 +72,19 @@
   function handleBandInput(index: number, e: Event) {
     userTouched = true;
     cancelAnim();
-    const value = Number((e.target as HTMLInputElement).value);
-    displayBands = displayBands.map((g, i) => (i === index ? value : g));
-    void settings.setBandGain(index, value);
+    const db = Number((e.target as HTMLInputElement).value);
+    displayBands = displayBands.map((g, i) => (i === index ? db : g));
+    const bands_db = [...value.bands_db];
+    bands_db[index] = db;
+    void settings.updateSlot(slotId, { bands_db });
   }
 
   function handlePreampInput(e: Event) {
     userTouched = true;
     cancelAnim();
-    const value = Number((e.target as HTMLInputElement).value);
-    displayPreamp = value;
-    void settings.setPreamp(value);
+    const db = Number((e.target as HTMLInputElement).value);
+    displayPreamp = db;
+    void settings.updateSlot(slotId, { preamp_db: db });
   }
 
   function applyPresetAndClose(name: string) {
@@ -94,13 +94,13 @@
     dropdownOpen = false;
     saveMode = false;
     newPresetName = '';
-    void settings.applyPreset(name);
+    void settings.applyPreset(slotId, name);
     animateDisplay(p.preamp_db, p.bands_db);
   }
 
   function handleReset() {
     userTouched = true;
-    void settings.resetEqualizer();
+    void settings.resetSlot(slotId);
     animateDisplay(0, Array(BAND_COUNT).fill(0));
   }
 
@@ -109,12 +109,11 @@
   let newPresetName = $state('');
 
   const currentPresetName = $derived.by(() => {
-    const eq = settings.equalizer;
     for (const p of settings.customPresets) {
       if (
-        Math.abs(p.preamp_db - eq.preamp_db) < 0.05 &&
-        p.bands_db.length === eq.bands_db.length &&
-        p.bands_db.every((v, i) => Math.abs(v - eq.bands_db[i]) < 0.05)
+        Math.abs(p.preamp_db - value.preamp_db) < 0.05 &&
+        p.bands_db.length === value.bands_db.length &&
+        p.bands_db.every((v, i) => Math.abs(v - value.bands_db[i]) < 0.05)
       ) {
         return p.name;
       }
@@ -137,7 +136,7 @@
     e?.stopPropagation?.();
     const name = newPresetName.trim();
     if (!name) return;
-    await settings.savePreset(name);
+    await settings.savePreset(slotId, name);
     dropdownOpen = false;
     saveMode = false;
     newPresetName = '';
@@ -167,15 +166,6 @@
 
 <div class="equalizer">
   <div class="eq-toolbar">
-    <label class="eq-toggle">
-      <input
-        type="checkbox"
-        checked={settings.equalizer.enabled}
-        onchange={(e) => settings.setEqualizerEnabled((e.target as HTMLInputElement).checked)}
-      />
-      <span>Enable EQ</span>
-    </label>
-
     <div class="eq-presets">
       <span class="eq-presets-label">Preset:</span>
       <Dropdown class="preset-dropdown" bind:open={dropdownOpen} align="right">
@@ -277,7 +267,7 @@
           aria-label={`${BAND_FREQUENCIES[i]} Hz`}
         />
         <span class="eq-gain">{gain > 0 ? '+' : ''}{gain.toFixed(1)}</span>
-        <span class="eq-freq">{formatFreq(BAND_FREQUENCIES[i])}</span>
+        <span class="eq-freq">{formatHz(BAND_FREQUENCIES[i])}</span>
       </div>
     {/each}
   </div>

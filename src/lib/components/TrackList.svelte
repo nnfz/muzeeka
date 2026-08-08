@@ -26,6 +26,7 @@
     type ContextMenuItem,
   } from "$lib/contextMenu";
   import { invoke } from "@tauri-apps/api/core";
+  import { listen } from "@tauri-apps/api/event";
   import { open } from "@tauri-apps/plugin-dialog";
   import { revealItemInDir } from "@tauri-apps/plugin-opener";
   import { audioPathsForDrag, startFileDrag } from "$lib/fileDrag";
@@ -38,6 +39,7 @@
   import LikeButton from "./LikeButton.svelte";
   import { openTrackPropertiesWindow } from "$lib/stores/trackProperties.svelte";
   import { openMixTransitionWindow } from "$lib/stores/mixTransition.svelte";
+  import { mixedTrackDurations } from "$lib/mix/plan";
 
   type ColumnId = "index" | "title" | "album" | "bpm" | "duration";
   type SortDirection = "asc" | "desc";
@@ -272,6 +274,9 @@
     mixMode ? ROW_HEIGHT + MIX_STRIP_HEIGHT : ROW_HEIGHT,
   );
 
+  /** Bumped when the editor saves a layout — its store is plain localStorage. */
+  let mixMemoryRevision = $state(0);
+
   /** True while reordering inside the list (not copy-to-playlist / file export). */
   let reorderGapActive = $derived(
     !!trackDrag?.active &&
@@ -340,7 +345,15 @@
     hardResetDragUi();
     // Kill any orphan always-on-top drag-float window from earlier builds.
     void dragFloatHide();
-    return () => hardResetDragUi();
+    // Saved layouts change the mixed durations we show, and localStorage writes
+    // from the editor window are invisible to this one without the event.
+    const unlisten = listen("mix-transition:saved", () => {
+      mixMemoryRevision += 1;
+    });
+    return () => {
+      hardResetDragUi();
+      void unlisten.then((off) => off()).catch(() => {});
+    };
   });
 
   let trackMenuItems = $derived.by((): ContextMenuItem[] => {
@@ -620,6 +633,29 @@
     }
     const paths = displayedTracks.map((item) => item.track.path);
     player.setViewPlayOrder(playlistId, paths);
+  });
+
+  /**
+   * How long each track runs once its saved transitions apply, by path.
+   *
+   * A mixed track is picked up part-way in and handed over before it ends, so the
+   * file length stops describing what the playlist plays. Measured at the same point
+   * the engine moves the display to the next track, so the number is exactly how long
+   * the row stays the active one.
+   *
+   * Read in display order — that is the order playback walks, so it is the order the
+   * edges pair up in. Deliberately kept out of `compareTracks`: sorting by duration
+   * would reorder the edges, which changes these lengths, which reorders again.
+   */
+  let mixedDurations = $derived.by(() => {
+    // Re-read on every editor save; localStorage is not reactive on its own.
+    void mixMemoryRevision;
+    const playlistId = player.activePlaylistId;
+    if (!mixMode || !playlistId) return new Map<string, number>();
+    return mixedTrackDurations(
+      displayedTracks.map((item) => item.track),
+      playlistId,
+    );
   });
 
   const HEADER_HEIGHT = 36;
@@ -1757,6 +1793,7 @@
                       >{formatBpm(bpmByPath.get(track.path))}</span
                     >
                   {:else}
+                    {@const mixedSecs = mixedDurations.get(track.path)}
                     <span class="col-duration">
                       <span
                         role="presentation"
@@ -1766,8 +1803,13 @@
                       >
                         <LikeButton file={track.path} class="like-duration" />
                       </span>
-                      <span class="duration-text"
-                        >{formatDuration(track.duration_secs)}</span
+                      <span
+                        class="duration-text"
+                        class:mixed={mixedSecs != null}
+                        title={mixedSecs != null
+                          ? `In the mix: ${formatDuration(mixedSecs)} (track ${formatDuration(track.duration_secs)})`
+                          : undefined}
+                        >{formatDuration(mixedSecs ?? track.duration_secs)}</span
                       >
                     </span>
                   {/if}

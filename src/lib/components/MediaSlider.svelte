@@ -39,7 +39,7 @@
 
   let displayTime = $derived(
     variant === 'progress'
-      ? formatTime(activeRatio * player.duration)
+      ? formatTime(activeRatio * player.displayDuration)
       : player.formattedPosition
   );
 
@@ -168,7 +168,7 @@
 
     if (variant === 'progress') {
       pendingValue = dragValue;
-      void player.seek(dragValue * player.duration);
+      void player.seek(dragValue * player.displayDuration);
       isDragging = false;
     } else {
       finishVolumeDrag();
@@ -205,9 +205,12 @@
     if (variant !== 'progress') return;
     e.preventDefault();
     e.stopPropagation();
-    if (!player.hasTrack || player.duration <= 0) return;
+    if (!player.hasTrack || player.displayDuration <= 0) return;
     const step = e.deltaY > 0 ? -SEEK_STEP_SEC : SEEK_STEP_SEC;
-    const next = Math.max(0, Math.min(player.duration, player.position + step));
+    const next = Math.max(
+      0,
+      Math.min(player.displayDuration, player.displayPosition + step)
+    );
     void player.seek(next);
   }
 
@@ -321,8 +324,8 @@
       tabindex="0"
       aria-label="Seek position"
       aria-valuemin={0}
-      aria-valuemax={player.duration}
-      aria-valuenow={player.position}
+      aria-valuemax={player.displayDuration}
+      aria-valuenow={player.displayPosition}
     >
       <div class="slider-fill"></div>
       <div class="slider-thumb-rail">

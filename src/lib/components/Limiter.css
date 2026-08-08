@@ -1,0 +1,225 @@
+/* Matches the .rate-card look in SettingsWindow.css — same fader shape as
+   .rate-slider / .eq-slider. Duplicated rather than shared because Svelte styles
+   are component-scoped. The card sits inside an expanded rack row, so it brings
+   no chrome of its own. */
+
+.limiter-card {
+  display: flex;
+  flex-direction: column;
+}
+
+.limiter-row-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+
+.limiter-row-label {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.limiter-row-value {
+  font-size: 12px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+}
+
+.limiter-gain .limiter-row-value {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--accent);
+}
+
+.limiter-slider {
+  width: 100%;
+  height: 4px;
+  margin: 0;
+  appearance: none;
+  -webkit-appearance: none;
+  border-radius: var(--radius-full);
+  cursor: pointer;
+  background: linear-gradient(
+    to right,
+    var(--accent) 0%,
+    var(--accent) var(--fill, 50%),
+    rgba(255, 255, 255, 0.08) var(--fill, 50%),
+    rgba(255, 255, 255, 0.08) 100%
+  );
+  transition: height var(--transition-fast);
+}
+
+.limiter-slider.gain {
+  height: 6px;
+}
+
+.limiter-slider:hover,
+.limiter-slider:active {
+  height: 8px;
+}
+
+.limiter-slider::-webkit-slider-runnable-track {
+  height: 100%;
+  border-radius: var(--radius-full);
+  background: transparent;
+}
+
+.limiter-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 12px;
+  height: 12px;
+  margin-top: -4px;
+  border-radius: 50%;
+  background: #fff;
+  border: none;
+  box-shadow: 0 0 8px var(--accent-glow), 0 2px 4px rgba(0, 0, 0, 0.3);
+  transition: transform var(--transition-fast), box-shadow var(--transition-fast);
+}
+
+.limiter-slider:hover::-webkit-slider-thumb,
+.limiter-slider:active::-webkit-slider-thumb {
+  transform: scale(1.15);
+}
+
+.limiter-slider::-moz-range-track {
+  height: 4px;
+  border-radius: var(--radius-full);
+  background: transparent;
+  border: none;
+}
+
+.limiter-slider::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #fff;
+  border: none;
+  box-shadow: 0 0 8px var(--accent-glow), 0 2px 4px rgba(0, 0, 0, 0.3);
+}
+
+.limiter-bounds {
+  display: flex;
+  justify-content: space-between;
+  font-size: 10px;
+  color: var(--text-muted);
+  margin-top: 4px;
+}
+
+.limiter-clip {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  margin-top: 14px;
+  padding: 9px 10px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  transition: border-color var(--transition-fast), background var(--transition-fast);
+}
+.limiter-clip:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.limiter-clip.on {
+  border-color: #f07178;
+  background: rgba(240, 113, 120, 0.08);
+}
+
+.limiter-clip input {
+  margin: 1px 0 0;
+  accent-color: #f07178;
+  flex-shrink: 0;
+}
+
+.clip-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.clip-label {
+  font-size: 12px;
+  color: var(--text-primary);
+}
+
+.clip-hint {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.limiter-meter {
+  margin-top: 14px;
+  transition: opacity var(--transition-fast);
+}
+
+.limiter-meter.idle {
+  opacity: 0.4;
+}
+
+.meter-track {
+  height: 6px;
+  border-radius: var(--radius-full);
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+/* Green while it is just tidying peaks, red once it is really squeezing. */
+.meter-fill {
+  height: 100%;
+  border-radius: var(--radius-full);
+  background: linear-gradient(to right, #7fd99a 0%, #e0c05a 55%, #f07178 100%);
+  transition: width 90ms linear;
+}
+
+/* Clipping is never "fine" — no green stretch to imply otherwise. */
+.meter-fill.clipping {
+  background: linear-gradient(to right, #e0c05a 0%, #f07178 60%, #ff4d4d 100%);
+}
+
+.limiter-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  margin-top: 16px;
+}
+
+.limiter-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 14px;
+}
+
+.preset-btn {
+  padding: 5px 10px;
+  font-size: 11px;
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-secondary);
+  border: 1px solid var(--border-subtle);
+  border-radius: 999px;
+  line-height: 1;
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.preset-btn:hover {
+  background: var(--accent-soft);
+  color: var(--text-primary);
+  border-color: var(--accent);
+}
+
+.preset-btn.active {
+  background: var(--accent);
+  color: white;
+  border-color: var(--accent);
+}
+
+.preset-btn.reset {
+  margin-left: auto;
+  color: var(--text-muted);
+}

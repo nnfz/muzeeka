@@ -5,7 +5,7 @@
   import WindowControls from "./WindowControls.svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { getCurrentWindow } from "@tauri-apps/api/window";
-  import { listen } from "@tauri-apps/api/event";
+  import { emit, listen } from "@tauri-apps/api/event";
   import { onMount } from "svelte";
   import {
     sameTrackPath,
@@ -18,7 +18,9 @@
     trackLabel,
     type MixTransitionOpenPayload,
   } from "$lib/stores/mixTransition.svelte";
-  import { hydrateAccentFromStorage } from "$lib/coverAccent";
+  import { mixEnvelopeArgs } from "$lib/mix/plan";
+  import { coverAccentRgb, hydrateAccentFromStorage } from "$lib/coverAccent";
+  import { resolveCoverSrc, resolveTrackCoverPath } from "$lib/coverCache";
   import MixEnvelopeGraph from "./MixEnvelopeGraph.svelte";
   import {
     MIX_PALETTE,
@@ -139,6 +141,16 @@
   /** Skip save while restoring memory / opening a pair. */
   let suppressMemorySave = false;
 
+  /**
+   * Per-lane waveform colour taken from that track's own cover art, so the two
+   * decks read as the tracks they are. Null until extracted (falls back to the
+   * global accent for prev / a cool tint for next).
+   */
+  let laneAccents = $state<{ from: string | null; to: string | null }>({
+    from: null,
+    to: null,
+  });
+
   let previewing = $state(false);
   let previewBusy = $state(false);
   let previewError = $state<string | null>(null);
@@ -166,6 +178,15 @@
     active: boolean;
     /** True while the magnet is holding a snap target. */
     snapped: boolean;
+  } | null>(null);
+
+  /**
+   * Middle-mouse pan — grabs the whole view (both lanes together) from anywhere:
+   * waveforms, blocks, even on top of pinned blocks. Alignment never changes.
+   */
+  let panDrag = $state<{
+    pointerId: number;
+    lastX: number;
   } | null>(null);
 
   /** Timeline blocks: transition containers + effect inserts. */
@@ -428,6 +449,12 @@
         fromGridOffset: fromLane.gridOffsetSecs,
         toGridOffset: toLane.gridOffsetSecs,
         blocks,
+      });
+      // The main window may be playing this very edge — let it re-read the layout.
+      void emit("mix-transition:saved", {
+        playlistId,
+        fromPath: from.path,
+        toPath: to.path,
       });
     }, MEMORY_SAVE_MS);
   }
@@ -900,6 +927,8 @@
   ) {
     const b = blocks.find((x) => x.id === id);
     if (!b) return;
+    // Middle mouse is reserved for grab-panning the stage.
+    if (e.button !== 0) return;
     // Pinned blocks use pointer-events:none (except action buttons) so
     // waveform pan reaches the tracks underneath — never capture here.
     if (b.pinned) return;
@@ -1404,6 +1433,10 @@
       /* main may already own BASS */
     }
 
+    laneAccents = { from: null, to: null };
+    void loadLaneAccent(payload.from, gen, "from");
+    void loadLaneAccent(payload.to, gen, "to");
+
     await Promise.all([
       loadWaveformOverview(payload.from, gen, "from"),
       loadWaveformOverview(payload.to, gen, "to"),
@@ -1435,6 +1468,65 @@
       .getPropertyValue("--accent")
       .trim();
     return v || "#7c5cff";
+  }
+
+  /** Fallback lane tint when a track has no usable cover art. */
+  const LANE_FALLBACK_ACCENT: Record<LaneId, string> = {
+    from: "",
+    to: "#8f86d6",
+  };
+
+  /** Waveform colour for a lane: its own cover accent, else a sane fallback. */
+  function laneAccent(id: LaneId): string {
+    const own = id === "from" ? laneAccents.from : laneAccents.to;
+    if (own) return own;
+    return LANE_FALLBACK_ACCENT[id] || accentColor();
+  }
+
+  /** `rgb()` string → `rgba()` at the given alpha (accepts hex too). */
+  function withAlpha(color: string, alpha: number): string {
+    const rgb = color.match(/^rgb\((\d+),\s*(\d+),\s*(\d+)\)$/i);
+    if (rgb) return `rgba(${rgb[1]}, ${rgb[2]}, ${rgb[3]}, ${alpha})`;
+    const hex = color.trim().replace(/^#/, "");
+    if (hex.length === 6 || hex.length === 3) {
+      const full =
+        hex.length === 3
+          ? hex
+              .split("")
+              .map((c) => c + c)
+              .join("")
+          : hex;
+      const n = Number.parseInt(full, 16);
+      if (Number.isFinite(n)) {
+        return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${alpha})`;
+      }
+    }
+    return color;
+  }
+
+  /**
+   * Pull the vibrant colour out of this track's cover so its waveform is painted
+   * in the track's own accent. Silent no-op when there is no artwork.
+   */
+  async function loadLaneAccent(track: MusicFile, gen: number, id: LaneId) {
+    try {
+      let coverPath = track.cover_path?.trim() || null;
+      if (!coverPath) {
+        coverPath = await resolveTrackCoverPath(track.path);
+      }
+      if (gen !== loadGen || !coverPath) return;
+      const src = await resolveCoverSrc(coverPath);
+      if (gen !== loadGen || !src) return;
+      const rgb = await coverAccentRgb(src);
+      if (gen !== loadGen || !rgb) return;
+      const css = `rgb(${rgb[0]}, ${rgb[1]}, ${rgb[2]})`;
+      laneAccents =
+        id === "from"
+          ? { ...laneAccents, from: css }
+          : { ...laneAccents, to: css };
+    } catch {
+      /* no cover / decode failure — keep the fallback tint */
+    }
   }
 
   function peakAt(buf: PeakBuf, t: number): number {
@@ -1536,8 +1628,8 @@
     const viewStart = lane.viewStartSecs;
     const viewDur = cssW / pxPerSec;
     const viewEnd = viewStart + viewDur;
-    const muted = id === "to";
-    const accent = accentColor();
+    // Every lane paints in its own track's cover accent.
+    const accent = laneAccent(id);
     const mid = cssH / 2;
 
     // ── Beat grid ──────────────────────────────────────────────────────────
@@ -1561,19 +1653,13 @@
         const isDownbeat = isBar && b % (BEATS_PER_BAR * 4) === 0;
 
         if (isDownbeat) {
-          ctx.strokeStyle = muted
-            ? "rgba(200, 190, 255, 0.28)"
-            : "rgba(255, 255, 255, 0.22)";
+          ctx.strokeStyle = "rgba(255, 255, 255, 0.22)";
           ctx.lineWidth = 1.5;
         } else if (isBar) {
-          ctx.strokeStyle = muted
-            ? "rgba(180, 170, 230, 0.18)"
-            : "rgba(255, 255, 255, 0.14)";
+          ctx.strokeStyle = "rgba(255, 255, 255, 0.14)";
           ctx.lineWidth = 1;
         } else {
-          ctx.strokeStyle = muted
-            ? "rgba(160, 150, 210, 0.08)"
-            : "rgba(255, 255, 255, 0.06)";
+          ctx.strokeStyle = "rgba(255, 255, 255, 0.06)";
           ctx.lineWidth = 1;
         }
         ctx.beginPath();
@@ -1583,8 +1669,8 @@
       }
     }
 
-    // Center guide
-    ctx.strokeStyle = "rgba(255,255,255,0.05)";
+    // Center guide — faintly tinted with the lane's own colour.
+    ctx.strokeStyle = withAlpha(accent, 0.18);
     ctx.lineWidth = 1;
     ctx.beginPath();
     ctx.moveTo(0, mid);
@@ -1640,7 +1726,7 @@
       bot[col] = mid + a;
     }
 
-    ctx.fillStyle = muted ? "rgba(160, 150, 210, 0.7)" : accent;
+    ctx.fillStyle = accent;
     ctx.beginPath();
     ctx.moveTo(0, mid);
     for (let col = 0; col < cols; col++) {
@@ -1654,9 +1740,7 @@
     ctx.fill();
     ctx.globalAlpha = 1;
 
-    ctx.strokeStyle = muted
-      ? "rgba(220, 220, 240, 0.35)"
-      : "rgba(255,255,255,0.3)";
+    ctx.strokeStyle = "rgba(255, 255, 255, 0.3)";
     ctx.lineWidth = 1;
     ctx.beginPath();
     for (let col = 0; col < cols; col++) {
@@ -1673,6 +1757,7 @@
 
   $effect(() => {
     void blocks;
+    void laneAccents;
     void fromLane.overview;
     void fromLane.detail;
     void fromLane.viewStartSecs;
@@ -2002,6 +2087,41 @@
     scheduleMemorySave();
   }
 
+  /** Middle mouse down anywhere on the stage → grab-pan the whole view. */
+  function onStagePointerDown(e: PointerEvent) {
+    if (e.button !== 1) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const target = e.currentTarget as HTMLElement;
+    try {
+      target.setPointerCapture(e.pointerId);
+    } catch {
+      /* ignore */
+    }
+    panDrag = { pointerId: e.pointerId, lastX: e.clientX };
+  }
+
+  function onStagePointerMove(e: PointerEvent) {
+    if (!panDrag || panDrag.pointerId !== e.pointerId) return;
+    e.preventDefault();
+    const dx = e.clientX - panDrag.lastX;
+    if (dx === 0) return;
+    panDrag = { ...panDrag, lastX: e.clientX };
+    panBoth(-dx);
+  }
+
+  function onStagePointerUp(e: PointerEvent) {
+    if (!panDrag || panDrag.pointerId !== e.pointerId) return;
+    const target = e.currentTarget as HTMLElement;
+    try {
+      target.releasePointerCapture(e.pointerId);
+    } catch {
+      /* ignore */
+    }
+    panDrag = null;
+    scheduleMemorySave();
+  }
+
   function onWheel(e: WheelEvent, id: LaneId) {
     // Ctrl/Cmd + wheel → zoom (shared scale, both lanes stay put).
     // Plain wheel → pan the whole view (both lanes).
@@ -2078,6 +2198,8 @@
         if (t != null) alignGridToTime(id, t);
       } else {
         setPlayheadFromClientX(e.clientX);
+        // Click-to-seek also works while the preview is running.
+        if (previewing || previewBusy) void seekPreviewToPlayhead();
       }
     } else if (!e.altKey) {
       // Final snap on release using cursor position.
@@ -2095,20 +2217,6 @@
       /* ignore */
     }
     drag = null;
-  }
-
-  function resetView(id: LaneId) {
-    const wrap = wrapOf(id);
-    const lane = laneOf(id);
-    if (!wrap || lane.durationSecs <= 0) return;
-    const vp = viewportSecsFor(wrap);
-    if (id === "from") {
-      setLane(id, {
-        viewStartSecs: lane.durationSecs - vp * PREV_END_FRACTION,
-      });
-    } else {
-      setLane(id, { viewStartSecs: 0 });
-    }
   }
 
   // ── Playhead + preview ───────────────────────────────────────────────────
@@ -2175,6 +2283,18 @@
     }
     playheadDrag = null;
     scheduleMemorySave();
+    // Scrubbed while playing → relaunch the mix from the new cut.
+    if (previewing || previewBusy) void seekPreviewToPlayhead();
+  }
+
+  /**
+   * Re-arm the two-deck mix at the current playhead. Used when the user scrubs
+   * during preview: the mix is a scheduled timeline, so a new cut means a new
+   * plan (both decks re-seek and automation re-zeroes at the new origin).
+   */
+  async function seekPreviewToPlayhead() {
+    if (!from || !to) return;
+    await startPreview();
   }
 
   /**
@@ -2182,9 +2302,10 @@
    * at playhead: t_prev = playhead, t_next = playhead + (to.viewStart - from.viewStart)
    * If t_next < 0 → next starts later (delay). If t_next past end → no next yet.
    *
-   * Transition block (if any) only limits *where mix automation runs* (fromDuration /
-   * cue end). Without a transition block the playhead is free and preview can run
-   * to the natural end of the tracks — no artificial seekbar/zone clamp.
+   * The preview is **never** limited by the transition block: it starts exactly
+   * where the playhead sits and both decks run to their natural (or CUE) end.
+   * The transition block only scopes *which* automation the effects inside it
+   * describe — it is not a playback window.
    */
   function buildPreviewPlan(): {
     fromStartRel: number | null;
@@ -2196,33 +2317,15 @@
     if (!from || !to) return null;
     if (fromLane.durationSecs <= 0.05 && toLane.durationSecs <= 0.05) return null;
 
-    const zone = primaryTransition(blocks);
-    // Start exactly where the playhead is (free). Only if a transition zone exists
-    // *and* the playhead sits outside it, snap the *preview start* into the zone
-    // so Preview still makes sense — the on-graph playhead itself is not clamped
-    // when placing/scrubbing.
-    let tFrom = playheadFromSecs;
-    let zoneEnd: number | null = null;
-    if (zone) {
-      const zEnd = blockEnd(zone);
-      zoneEnd = zEnd;
-      if (tFrom < zone.startFromSecs) tFrom = zone.startFromSecs;
-      if (tFrom >= zEnd - 0.02) tFrom = Math.max(zone.startFromSecs, zEnd - 0.05);
-    }
-
+    const tFrom = Math.max(0, playheadFromSecs);
     const tTo = mapPrevToNext(tFrom);
 
     let fromStartRel: number | null = null;
     let fromDurationSecs = 0;
-    if (tFrom < fromLane.durationSecs) {
-      fromStartRel = Math.max(0, tFrom);
-      // No transition block → play to the end of prev (and next follows graph).
-      // With a zone → stop prev at zone end so DSP only covers the transition.
-      const naturalEnd =
-        zoneEnd != null
-          ? Math.min(fromLane.durationSecs, zoneEnd)
-          : fromLane.durationSecs;
-      fromDurationSecs = Math.max(0.05, naturalEnd - fromStartRel);
+    if (tFrom < fromLane.durationSecs - 0.02) {
+      fromStartRel = tFrom;
+      // Always to the natural end of prev — next follows the graph alignment.
+      fromDurationSecs = Math.max(0.05, fromLane.durationSecs - fromStartRel);
     }
 
     let toStartRel: number | null = null;
@@ -2240,21 +2343,11 @@
 
     if (fromStartRel == null && toStartRel == null) return null;
 
-    let toEndAbs: number | null =
+    // Next deck plays to its own CUE end (or file end) — no zone cap.
+    const toEndAbs: number | null =
       typeof to.cue_end_secs === "number" && Number.isFinite(to.cue_end_secs)
         ? to.cue_end_secs
         : null;
-
-    // Only when a transition zone exists: cap next cue end to the mapped zone end.
-    // Without a zone — leave next free to its natural/CUE end.
-    if (zone && zoneEnd != null && toStartRel != null) {
-      const toZoneEndRel = mapPrevToNext(zoneEnd);
-      if (toZoneEndRel > 0) {
-        const absEnd = absTime(to, Math.min(toLane.durationSecs, toZoneEndRel));
-        toEndAbs =
-          toEndAbs != null ? Math.min(toEndAbs, absEnd) : absEnd;
-      }
-    }
 
     return {
       fromStartRel,
@@ -2307,6 +2400,9 @@
 
     previewError = null;
     previewBusy = true;
+    // Park the transport clock while we re-arm — otherwise the old session keeps
+    // dragging the playhead away from where the user just dropped it.
+    previewSession = null;
     const gen = ++previewGen;
 
     try {
@@ -2332,32 +2428,13 @@
       const toCueStart =
         plan.toStartRel != null ? absTime(to, plan.toStartRel) : null;
 
-      // Automation blocks → mix clock (t=0 at preview start), per deck.
+      // Automation blocks → mix clock (t=0 at the cut), per deck. Same helper the
+      // playlist arming path uses, so preview and playback can't drift apart.
       const mixOrigin =
         plan.fromStartRel ??
         (plan.toStartRel != null
           ? plan.toStartRel - (toLane.viewStartSecs - fromLane.viewStartSecs)
           : playheadFromSecs);
-      const collectEnv = (
-        lane: "from" | "to",
-        kind: "volume" | "lowpass" | "highpass" | "speed",
-      ) =>
-        blocks
-          .filter(
-            (b) =>
-              b.kind === kind &&
-              (b.targetLane ?? "from") === lane &&
-              b.durationSecs > 0.02,
-          )
-          .map((b) => ({
-            startSecs: b.startFromSecs - mixOrigin,
-            durationSecs: b.durationSecs,
-            curve: normalizeCurve(b.params.curve),
-            points: normalizeEnvelope(b.params.envelope).map((p) => ({
-              t: p.t,
-              v: p.v,
-            })),
-          }));
 
       await invoke("player_mix_crossfade", {
         fromPath: from.path,
@@ -2370,14 +2447,7 @@
         toCueEnd: plan.toEndAbs ?? undefined,
         toDelaySecs: plan.toDelaySecs,
         fromDurationSecs: plan.fromDurationSecs,
-        fromVol: collectEnv("from", "volume"),
-        toVol: collectEnv("to", "volume"),
-        fromLp: collectEnv("from", "lowpass"),
-        fromHp: collectEnv("from", "highpass"),
-        toLp: collectEnv("to", "lowpass"),
-        toHp: collectEnv("to", "highpass"),
-        fromSpeed: collectEnv("from", "speed"),
-        toSpeed: collectEnv("to", "speed"),
+        ...mixEnvelopeArgs(blocks, mixOrigin),
       });
       if (gen !== previewGen) return;
       previewing = true;
@@ -2410,9 +2480,13 @@
     let raf = 0;
     const tick = () => {
       if (!previewing || !previewSession) return;
-      const elapsed = (performance.now() - session.wallStartMs) / 1000;
-      playheadFromSecs = startOrigin + elapsed;
-      followPlayheadInView();
+      // Hand the playhead over to the user while they scrub / pan — the transport
+      // keeps running, and on release the mix relaunches from the new cut.
+      if (!playheadDrag && !panDrag) {
+        const elapsed = (performance.now() - session.wallStartMs) / 1000;
+        playheadFromSecs = startOrigin + elapsed;
+        followPlayheadInView();
+      }
       raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
@@ -2593,8 +2667,27 @@
   {/if}
 
   <div class="mix-body">
-    <div class="mix-stage" bind:this={stageEl}>
-      <section class="mix-track-panel" aria-label="Previous track">
+    <div
+      class="mix-stage"
+      class:is-panning={!!panDrag}
+      bind:this={stageEl}
+      onpointerdowncapture={onStagePointerDown}
+      onpointermove={onStagePointerMove}
+      onpointerup={onStagePointerUp}
+      onpointercancel={onStagePointerUp}
+      onmousedown={(e) => {
+        if (e.button === 1) e.preventDefault();
+      }}
+      onauxclick={(e) => {
+        if (e.button === 1) e.preventDefault();
+      }}
+      role="presentation"
+    >
+      <section
+        class="mix-track-panel"
+        style:--lane-accent={laneAccent("from")}
+        aria-label="Previous track"
+      >
         <div class="mix-track-meta">
           <div class="mix-track-meta-left">
             <span class="mix-track-role">Previous</span>
@@ -2644,17 +2737,6 @@
             {/if}
           </div>
           <div class="mix-track-meta-right">
-            <button
-              type="button"
-              class="mix-reset-btn"
-              title="Jump to end"
-              onclick={() => {
-                resetView("from");
-                scheduleMemorySave();
-              }}
-            >
-              End
-            </button>
             <span class="mix-track-name" title={from ? trackLabel(from) : ""}>
               {from ? trackLabel(from) : "—"}
             </span>
@@ -2697,7 +2779,11 @@
         </div>
       </section>
 
-      <section class="mix-track-panel" aria-label="Next track">
+      <section
+        class="mix-track-panel"
+        style:--lane-accent={laneAccent("to")}
+        aria-label="Next track"
+      >
         <div class="mix-track-meta">
           <div class="mix-track-meta-left">
             <span class="mix-track-role">Next</span>
@@ -2745,17 +2831,6 @@
             {/if}
           </div>
           <div class="mix-track-meta-right">
-            <button
-              type="button"
-              class="mix-reset-btn"
-              title="Jump to start"
-              onclick={() => {
-                resetView("to");
-                scheduleMemorySave();
-              }}
-            >
-              Start
-            </button>
             <span class="mix-track-name" title={to ? trackLabel(to) : ""}>
               {to ? trackLabel(to) : "—"}
             </span>
@@ -2847,18 +2922,6 @@
               ></div>
               <div class="mix-block-body">
                 <span class="mix-block-badge">{bl.short}</span>
-                {#if bl.targetLane}
-                  <span
-                    class="mix-block-lane"
-                    class:lane-from={bl.targetLane === "from"}
-                    class:lane-to={bl.targetLane === "to"}
-                    title={bl.targetLane === "from"
-                      ? "Previous deck (top)"
-                      : "Next deck (bottom)"}
-                  >
-                    {bl.targetLane === "from" ? "↑ Prev" : "↓ Next"}
-                  </span>
-                {/if}
                 <span class="mix-block-name">{bl.label}</span>
                 <span class="mix-block-time">
                   {formatTime(bl.durationSecs)}

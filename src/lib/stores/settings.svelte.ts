@@ -1,25 +1,56 @@
 import { invoke } from '@tauri-apps/api/core';
+import { emit, listen } from '@tauri-apps/api/event';
 import { getContext, setContext } from 'svelte';
-import { setCachedGlobalPlaybackRate } from '$lib/trackPrefs';
+import { clampPlaybackRate, setCachedGlobalPlaybackRate } from '$lib/trackPrefs';
+import { reorderItemsAtBoundary } from '$lib/trackOrder';
+import {
+  BAND_COUNT,
+  MAX_SLOTS,
+  clampSlot,
+  defaultSettings,
+  makeSlot,
+  type ChainSlot,
+  type DspChainStatus,
+  type EffectKind,
+  type EffectSettingsMap,
+  type EqualizerSettings,
+  type LimiterSettings,
+} from '$lib/dsp/effects';
 
-export const BAND_COUNT = 17;
+/**
+ * A partial patch for any one effect's settings.
+ *
+ * Union of partials rather than a partial of the union: an editor only ever
+ * sends its own fields, and `clampSlot` drops anything foreign to the slot's
+ * kind on the way out.
+ */
+export type EffectPatch =
+  | Partial<EffectSettingsMap['equalizer']>
+  | Partial<EffectSettingsMap['filter']>
+  | Partial<EffectSettingsMap['limiter']>;
 
-/** Must match `BAND_FREQUENCIES` in src-tauri/src/equalizer.rs (top band = high-shelf). */
-export const BAND_FREQUENCIES = [
-  25, 40, 63, 100, 160, 250, 400, 630, 1000, 1600, 2500, 4000, 6300, 10000, 12500, 16000, 20000,
-] as const;
-
-export interface EqualizerSettings {
-  enabled: boolean;
-  preamp_db: number;
-  bands_db: number[];
-}
+export {
+  BAND_COUNT,
+  BAND_FREQUENCIES,
+  LIMITER_MAX_GAIN_DB,
+  type ChainSlot,
+  type DspChainStatus,
+  type EffectKind,
+  type EqualizerSettings,
+  type FilterSettings,
+  type LimiterSettings,
+  type SlotStatus,
+} from '$lib/dsp/effects';
 
 /** Classic random vs no-repeat until every track in the playlist has played. */
 export type ShuffleMode = 'normal' | 'smart';
 
 export interface AppSettings {
-  equalizer: EqualizerSettings;
+  /** The effect rack. Absent only in a settings file written before the rack. */
+  dsp_chain?: ChainSlot[] | null;
+  /** Legacy singletons — read once at migration time, then never written again. */
+  equalizer?: EqualizerSettings;
+  limiter?: LimiterSettings;
   playback_rate?: number;
   pitch_enabled?: boolean;
   custom_presets?: EQPreset[];
@@ -47,15 +78,13 @@ export interface RemoteStatus {
   last_error: string | null;
 }
 
-const DEFAULT_EQUALIZER: EqualizerSettings = {
-  enabled: false,
-  preamp_db: 0,
-  bands_db: Array(BAND_COUNT).fill(0),
-};
-
 const DEFAULT_REMOTE_PORT = 8765;
 
-let equalizer = $state<EqualizerSettings>({ ...DEFAULT_EQUALIZER, bands_db: [...DEFAULT_EQUALIZER.bands_db] });
+/** Global playback rate changed — every window mirrors it (see `bindGlobalRateSync`). */
+const RATE_EVENT = 'settings:playback-rate';
+
+/** The rack, in order. Slots are plain values; identity comes from `id`. */
+let dspChain = $state<ChainSlot[]>([]);
 let customPresets = $state<EQPreset[]>([]);
 let playbackRate = $state(1.0);
 let pitchEnabled = $state(true);
@@ -72,17 +101,29 @@ let saveTimer: ReturnType<typeof setTimeout> | null = null;
 /** Coalesce slider spam so backend gets one settled target and a full smooth ramp. */
 let rateApplyTimer: ReturnType<typeof setTimeout> | null = null;
 let rateApplySeq = 0;
+let rateSyncBound = false;
 
-function clampEqualizer(settings: EqualizerSettings): EqualizerSettings {
-  const bands = Array.from(
-    { length: BAND_COUNT },
-    (_, i) => Math.max(-20, Math.min(20, settings.bands_db[i] ?? 0)),
-  );
-  return {
-    enabled: settings.enabled,
-    preamp_db: Math.max(-15, Math.min(15, settings.preamp_db)),
-    bands_db: bands,
-  };
+/**
+ * Mirror the Settings global rate into this window.
+ *
+ * Every webview runs its own module instance, so the rate the Settings window sets
+ * would otherwise stay invisible here — and the main window pushes its own stale
+ * copy back into the player on the next track change (`applyEffectivePlaybackRate`),
+ * which is what made a global rate "work once and reset".
+ *
+ * Listener only mirrors state; it never re-applies or re-emits, so the broadcast
+ * that reaches its own sender is harmless.
+ */
+function bindGlobalRateSync() {
+  if (rateSyncBound || typeof window === 'undefined') return;
+  rateSyncBound = true;
+  void listen<{ rate: number }>(RATE_EVENT, (event) => {
+    const rate = clampPlaybackRate(event.payload?.rate ?? 1);
+    playbackRate = rate;
+    setCachedGlobalPlaybackRate(rate);
+  }).catch(() => {
+    rateSyncBound = false;
+  });
 }
 
 function clampRemotePort(port: number): number {
@@ -101,7 +142,7 @@ function scheduleSave() {
   saveTimer = setTimeout(() => {
     saveTimer = null;
     const payload: AppSettings = {
-      equalizer: clampEqualizer(equalizer),
+      dsp_chain: dspChain.map((slot) => clampSlot(slot)),
       playback_rate: playbackRate,
       pitch_enabled: pitchEnabled,
       custom_presets: customPresets.map((p) => ({
@@ -122,17 +163,20 @@ function scheduleSave() {
   }, 250);
 }
 
-async function applyEqualizer(settings: EqualizerSettings) {
-  const clamped = clampEqualizer(settings);
-  equalizer = {
-    enabled: clamped.enabled,
-    preamp_db: clamped.preamp_db,
-    bands_db: [...clamped.bands_db],
-  };
+/**
+ * Push the whole rack to the player.
+ *
+ * Every mutation (add, remove, reorder, bypass, slider drag) funnels through
+ * here. The backend reuses DSP nodes by id, so a reorder or a drag allocates
+ * nothing and never clicks; only the empty↔non-empty transition touches BASS.
+ */
+async function applyChain() {
+  const clamped = dspChain.slice(0, MAX_SLOTS).map((slot) => clampSlot(slot));
+  dspChain = clamped;
   try {
-    await invoke('player_set_equalizer', { settings: clamped });
+    await invoke('player_set_dsp_chain', { slots: clamped });
   } catch (e) {
-    console.error('Failed to apply equalizer:', e);
+    console.error('Failed to apply DSP chain:', e);
     throw e;
   }
   scheduleSave();
@@ -151,6 +195,9 @@ async function applyPlaybackRate(rate: number, opts?: { immediate?: boolean }) {
 
   const send = async (value: number) => {
     const seq = ++rateApplySeq;
+    // Other windows hold their own copy of the global rate — broadcast on the same
+    // (debounced) beat as the player push, so dragging the slider stays cheap.
+    void emit(RATE_EVENT, { rate: value }).catch(() => {});
     try {
       await invoke('player_set_playback_rate', { rate: value });
     } catch (e) {
@@ -193,20 +240,19 @@ export function createSettingsStore(
   ensurePlayerReady: () => Promise<void>,
   opts?: { applyToPlayer?: boolean },
 ) {
-  /** Main window applies EQ/rate/pitch on boot. Secondary windows only display state. */
+  /** Main window applies the rack/rate/pitch on boot. Secondary windows only display state. */
   const applyToPlayer = opts?.applyToPlayer !== false;
+
+  bindGlobalRateSync();
 
   async function bootstrap() {
     try {
       const data = await invoke<AppSettings>('settings_load');
-      if (data.equalizer) {
-        const bands = data.equalizer.bands_db ?? [];
-        equalizer = clampEqualizer({
-          enabled: data.equalizer.enabled ?? false,
-          preamp_db: data.equalizer.preamp_db ?? 0,
-          bands_db: Array.from({ length: BAND_COUNT }, (_, i) => bands[i] ?? 0),
-        });
-      }
+      // The backend migrates a pre-rack file into a chain before it answers, so
+      // `dsp_chain` is only missing if the load itself failed.
+      dspChain = Array.isArray(data.dsp_chain)
+        ? data.dsp_chain.slice(0, MAX_SLOTS).map((slot) => clampSlot(slot))
+        : [];
       if (Array.isArray(data.custom_presets)) {
         customPresets = data.custom_presets.map((p) => {
           const b = p.bands_db ?? [];
@@ -247,11 +293,16 @@ export function createSettingsStore(
       // Never re-apply DSP from the settings/download webview on open: that races the
       // main player, can rebuild pitch topology mid-playback, and freezes the UI via
       // run_on_main_thread while BASS is busy.
-      // On main window: push EQ (cheap, live coeffs). Rate/pitch only when non-default —
-      // backend no-ops when already matching, so this is safe after Ctrl+R.
+      // On main window: re-push the rack (cheap — one ArcSwap store unless it has to
+      // attach). Rate/pitch only when non-default: backend no-ops when already
+      // matching, so this is safe after Ctrl+R.
       if (applyToPlayer) {
         await ensurePlayerReady();
-        await invoke('player_set_equalizer', { settings: equalizer }).catch(() => {});
+        // Backend already applied the saved rack during setup; re-push only when
+        // there is one, so an empty rack costs no IPC on every reload.
+        if (dspChain.length) {
+          await invoke('player_set_dsp_chain', { slots: dspChain }).catch(() => {});
+        }
         if (playbackRate !== 1.0) {
           await invoke('player_set_playback_rate', { rate: playbackRate }).catch(() => {});
         }
@@ -271,8 +322,8 @@ export function createSettingsStore(
   void bootstrap();
 
   return {
-    get equalizer() {
-      return equalizer;
+    get dspChain() {
+      return dspChain;
     },
     get playbackRate() {
       return playbackRate;
@@ -336,42 +387,100 @@ export function createSettingsStore(
         return null;
       }
     },
-    async setEqualizerEnabled(enabled: boolean) {
-      await applyEqualizer({ ...equalizer, enabled });
+    // ── Effect rack ────────────────────────────────────────────────────────────
+    /** Insert a fresh effect at `atIndex` (default: append). Returns its slot id. */
+    async addEffect(kind: EffectKind, atIndex?: number): Promise<string | null> {
+      if (dspChain.length >= MAX_SLOTS) return null;
+      const slot = makeSlot(kind);
+      const at =
+        atIndex === undefined ? dspChain.length : Math.max(0, Math.min(atIndex, dspChain.length));
+      dspChain = [...dspChain.slice(0, at), slot, ...dspChain.slice(at)];
+      await applyChain();
+      return slot.id;
     },
-    async setPreamp(db: number) {
-      await applyEqualizer({ ...equalizer, preamp_db: db, enabled: true });
+    async removeSlot(id: string) {
+      const next = dspChain.filter((slot) => slot.id !== id);
+      if (next.length === dspChain.length) return;
+      dspChain = next;
+      await applyChain();
     },
-    async setBandGain(index: number, db: number) {
-      const bands_db = [...equalizer.bands_db];
-      bands_db[index] = db;
-      await applyEqualizer({ ...equalizer, bands_db, enabled: true });
+    /**
+     * Move a slot to the boundary `insertIndex` of the *current* list.
+     *
+     * Boundary, not target index: `insertIndex` counts gaps between rows, which
+     * is what a drop line points at. `reorderItemsAtBoundary` handles the shift
+     * from removing the row before re-inserting it.
+     */
+    async moveSlot(id: string, insertIndex: number) {
+      const next = reorderItemsAtBoundary(dspChain, [id], insertIndex, (slot) => slot.id);
+      if (next.every((slot, i) => slot.id === dspChain[i]?.id)) return;
+      dspChain = next;
+      await applyChain();
     },
-    async resetEqualizer() {
-      await applyEqualizer({ ...DEFAULT_EQUALIZER, bands_db: [...DEFAULT_EQUALIZER.bands_db] });
+    /** Row bypass. The backend folds this into the effect's own `enabled`. */
+    async setSlotEnabled(id: string, enabled: boolean) {
+      dspChain = dspChain.map((slot) => (slot.id === id ? { ...slot, enabled } : slot));
+      await applyChain();
     },
-    async applyPreset(name: string) {
-      const p = customPresets.find((p) => p.name === name);
-      if (!p) return;
-      await applyEqualizer({
-        enabled: true,
-        preamp_db: p.preamp_db,
-        bands_db: [...p.bands_db],
-      });
+    /**
+     * Patch one slot's settings. Keys foreign to the slot's kind are dropped by
+     * `clampSlot`, so an editor can only ever change its own effect.
+     */
+    async updateSlot(id: string, patch: EffectPatch) {
+      dspChain = dspChain.map((slot) =>
+        slot.id === id ? ({ ...slot, settings: { ...slot.settings, ...patch } } as ChainSlot) : slot,
+      );
+      await applyChain();
     },
-    async savePreset(name: string) {
+    /** Back to the effect's defaults, staying enabled and keeping its position. */
+    async resetSlot(id: string) {
+      dspChain = dspChain.map((slot) =>
+        slot.id === id
+          ? ({ ...slot, enabled: true, settings: defaultSettings(slot.kind) } as ChainSlot)
+          : slot,
+      );
+      await applyChain();
+    },
+    async clearChain() {
+      if (!dspChain.length) return;
+      dspChain = [];
+      await applyChain();
+    },
+    async fetchChainStatus(): Promise<DspChainStatus | null> {
+      try {
+        return await invoke<DspChainStatus>('player_get_dsp_chain_status');
+      } catch {
+        return null;
+      }
+    },
+
+    // ── EQ presets (global list, applied to whichever EQ slot is being edited) ──
+    async applyPreset(slotId: string, name: string) {
+      const preset = customPresets.find((p) => p.name === name);
+      if (!preset) return;
+      dspChain = dspChain.map((slot) =>
+        slot.id === slotId && slot.kind === 'equalizer'
+          ? {
+              ...slot,
+              enabled: true,
+              settings: { enabled: true, preamp_db: preset.preamp_db, bands_db: [...preset.bands_db] },
+            }
+          : slot,
+      );
+      await applyChain();
+    },
+    async savePreset(slotId: string, name: string) {
       const trimmed = name.trim();
       if (!trimmed) return;
+      const slot = dspChain.find((s) => s.id === slotId);
+      if (slot?.kind !== 'equalizer') return;
       const newPreset: EQPreset = {
         name: trimmed,
-        preamp_db: equalizer.preamp_db,
-        bands_db: [...equalizer.bands_db],
+        preamp_db: slot.settings.preamp_db,
+        bands_db: [...slot.settings.bands_db],
       };
       // Overwrite if same name exists (put at end to indicate recently saved)
-      customPresets = [
-        ...customPresets.filter((p) => p.name !== trimmed),
-        newPreset,
-      ];
+      customPresets = [...customPresets.filter((p) => p.name !== trimmed), newPreset];
       scheduleSave();
     },
     async deletePreset(name: string) {

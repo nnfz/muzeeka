@@ -3,7 +3,7 @@
   import '../../routes/+page.css';
   import WindowControls from './WindowControls.svelte';
   import SettingsSidebar from './SettingsSidebar.svelte';
-  import Equalizer from './Equalizer.svelte';
+  import DspChain from './DspChain.svelte';
   import Dropdown from '$lib/components/Dropdown.svelte';
   import { getSettingsStore, type RemoteStatus } from '$lib/stores/settings.svelte';
   import {
@@ -609,8 +609,10 @@
       {:else if activeSection === 'audio'}
         <div class="settings-section">
           <h2 class="section-title">Audio</h2>
-          <p class="section-desc">15-band graphic equalizer and playback speed.</p>
-          <Equalizer />
+          <p class="section-desc">
+            Build an effect chain — drag effects in, stack them in any order, tune each one.
+          </p>
+          <DspChain />
 
           <!-- Playback Rate -->
           <div class="rate-card">

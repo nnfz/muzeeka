@@ -244,14 +244,14 @@
         if (e.shiftKey) {
           player.nextTrack();
         } else {
-          player.seek(Math.min(player.position + 5, player.duration));
+          player.seek(Math.min(player.displayPosition + 5, player.displayDuration));
         }
         break;
       case 'ArrowLeft':
         if (e.shiftKey) {
           player.prevTrack();
         } else {
-          player.seek(Math.max(player.position - 5, 0));
+          player.seek(Math.max(player.displayPosition - 5, 0));
         }
         break;
       case 'ArrowUp':

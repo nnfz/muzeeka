@@ -287,6 +287,25 @@ export async function extractVibrantFromCover(
   ];
 }
 
+/**
+ * Accent for one cover, tuned exactly like the global accent but **not** applied
+ * to any CSS var. Used where several covers are on screen at once (mix editor
+ * lanes) and each element needs its own track colour.
+ */
+export async function coverAccentRgb(
+  src: string | null | undefined,
+): Promise<[number, number, number] | null> {
+  const next = src?.trim();
+  if (!next) return null;
+  try {
+    const rgb = await extractVibrantFromCover(next);
+    if (!rgb) return null;
+    return tuneForAccent(rgb[0], rgb[1], rgb[2]);
+  } catch {
+    return null;
+  }
+}
+
 export async function setAccentFromCoverSrc(src: string | null | undefined) {
   const next = src?.trim() || null;
   if (next === lastSrc) return;
