@@ -375,6 +375,7 @@ pub fn run() {
             commands::playlist_add_tracks,
             commands::playlist_remove_tracks,
             commands::playlist_reorder,
+            commands::playlists_reorder,
             commands::library_reorder,
             commands::library_remove_tracks,
             commands::library_clear_all,

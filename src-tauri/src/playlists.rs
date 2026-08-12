@@ -686,6 +686,29 @@ impl LibraryDatabase {
         Ok(())
     }
 
+    /// Persist sidebar order. `ids` must be a permutation of the stored playlists.
+    pub fn reorder_playlists(&self, ids: &[String]) -> Result<(), String> {
+        let mut connection = self.inner.connection.lock();
+        let transaction = connection.transaction().map_err(db_error)?;
+        let current = ordered_text_ids(
+            &transaction,
+            "SELECT id FROM playlists ORDER BY position, id",
+        )?;
+        validate_reorder(&current, ids, "playlists")?;
+        for (position, id) in ids.iter().enumerate() {
+            transaction
+                .execute(
+                    "UPDATE playlists SET position = ?2 WHERE id = ?1",
+                    params![id, position as i64],
+                )
+                .map_err(db_error)?;
+        }
+        transaction.commit().map_err(db_error)?;
+        drop(connection);
+        self.changed();
+        Ok(())
+    }
+
     /// Cover paths stored for a track path (list thumb + fullscreen full).
     pub fn get_track_covers(
         &self,
@@ -1561,18 +1584,22 @@ fn ordered_text_ids(transaction: &Transaction<'_>, sql: &str) -> Result<Vec<Stri
     rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
 }
 
-fn validate_reorder(current: &[i64], requested: &[i64], label: &str) -> Result<(), String> {
+fn validate_reorder<T: Eq + std::hash::Hash>(
+    current: &[T],
+    requested: &[T],
+    label: &str,
+) -> Result<(), String> {
     if current.len() != requested.len() {
         return Err(format!(
-            "Cannot reorder {label}: expected {} tracks, received {}",
+            "Cannot reorder {label}: expected {} entries, received {}",
             current.len(),
             requested.len()
         ));
     }
-    let current: HashSet<_> = current.iter().copied().collect();
-    let requested: HashSet<_> = requested.iter().copied().collect();
+    let current: HashSet<&T> = current.iter().collect();
+    let requested: HashSet<&T> = requested.iter().collect();
     if current != requested {
-        return Err(format!("Cannot reorder {label}: track set changed"));
+        return Err(format!("Cannot reorder {label}: entry set changed"));
     }
     Ok(())
 }
@@ -1782,8 +1809,37 @@ mod tests {
             .unwrap();
 
         let error = db.reorder_playlist("one", &["a.flac".into()]).unwrap_err();
-        assert!(error.contains("expected 2 tracks"));
+        assert!(error.contains("expected 2 entries"));
         assert_eq!(db.load().unwrap().playlists[0].tracks.len(), 2);
+    }
+
+    #[test]
+    fn playlist_order_is_persisted_and_validated() {
+        let db = database();
+        db.create_playlist("one", "One").unwrap();
+        db.create_playlist("two", "Two").unwrap();
+        db.create_playlist("three", "Three").unwrap();
+
+        db.reorder_playlists(&["three".into(), "one".into(), "two".into()])
+            .unwrap();
+        let ids: Vec<String> = db
+            .load()
+            .unwrap()
+            .playlists
+            .into_iter()
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(ids, ["three", "one", "two"]);
+
+        // A stale order (playlist created/deleted meanwhile) must not drop rows.
+        let error = db
+            .reorder_playlists(&["three".into(), "one".into()])
+            .unwrap_err();
+        assert!(error.contains("expected 3 entries"));
+        let error = db
+            .reorder_playlists(&["three".into(), "one".into(), "gone".into()])
+            .unwrap_err();
+        assert!(error.contains("entry set changed"));
     }
 
     #[test]

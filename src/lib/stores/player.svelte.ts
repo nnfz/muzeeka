@@ -1583,6 +1583,28 @@ function renamePlaylist(id: string, name: string) {
   persistMutation('playlist_rename', { id, name: trimmed });
 }
 
+/**
+ * Apply a sidebar drag & drop reorder. `orderedIds` must be a permutation of
+ * the current playlists — a stale order (import/delete raced the drag) is
+ * ignored instead of dropping playlists.
+ */
+function reorderPlaylists(orderedIds: string[]) {
+  if (orderedIds.length !== playlists.length) return;
+
+  const remaining = new Map(playlists.map((p) => [p.id, p]));
+  const next: Playlist[] = [];
+  for (const id of orderedIds) {
+    const playlist = remaining.get(id);
+    if (!playlist) return;
+    remaining.delete(id);
+    next.push(playlist);
+  }
+  if (next.every((playlist, index) => playlist === playlists[index])) return;
+
+  playlists = next;
+  persistMutation('playlists_reorder', { ids: orderedIds });
+}
+
 export function isEditablePlaylist(id: string | null | undefined): boolean {
   return !!id && id !== VIRTUAL_ALL_ID && id !== VIRTUAL_LIKED_ID;
 }
@@ -3388,6 +3410,7 @@ export function createPlayerStore() {
     selectPlaylist,
     deletePlaylist,
     renamePlaylist,
+    reorderPlaylists,
     setPlaylistCover,
     setPlaylistMixMode,
     clearPlaylistCover,

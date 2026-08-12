@@ -18,6 +18,7 @@
 .settings-layout {
   flex: 1;
   min-height: 0;
+  gap: 8px;
   display: flex;
 }
 
@@ -25,13 +26,19 @@
   flex: 1;
   min-width: 0;
   overflow: auto;
-  padding: 12px 14px 20px 8px;
+  padding: 0 14px 20px 8px;
 }
 
 .settings-section {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 12px;
+}
+
+.settings-section-header {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
 }
 
 .settings-header {
@@ -51,16 +58,15 @@
 }
 
 .section-title-spaced {
-  margin-top: 18px;
+  margin-top: 12px;
 }
 
 /* --- Cards (match app glass surfaces) --- */
 .settings-card {
   margin-top: 8px;
-  background: var(--bg-elevated);
+  background: var(--bg-surface);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
-  overflow: hidden;
 }
 
 .card-row {
@@ -116,32 +122,84 @@
 
 .card-actions {
   display: flex;
-  gap: 6px;
+  gap: 8px;
   flex-shrink: 0;
   align-items: center;
 }
 
 .settings-toggle {
+  position: relative;
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  font-size: 12px;
-  color: var(--text-secondary);
+  flex-shrink: 0;
   cursor: pointer;
   user-select: none;
 }
 
 .settings-toggle input {
-  accent-color: var(--accent);
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
+  z-index: 1;
+}
+
+.settings-switch {
+  position: relative;
+  display: block;
+  width: 32px;
+  height: 18px;
+  border-radius: var(--radius-full);
+  background: rgba(255, 255, 255, 0.12);
+  transition: background var(--transition-fast);
+}
+
+.settings-switch::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  transition: transform var(--transition-fast), background var(--transition-fast);
+}
+
+.settings-toggle input:checked + .settings-switch {
+  background: var(--accent);
+}
+
+.settings-toggle input:checked + .settings-switch::after {
+  transform: translateX(14px);
+  background: white;
+}
+
+.settings-toggle input:focus-visible + .settings-switch {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.settings-toggle:hover .settings-switch {
+  background: rgba(255, 255, 255, 0.16);
+}
+
+.settings-toggle:hover input:checked + .settings-switch {
+  background: var(--accent-hover);
 }
 
 .card-badge {
+  align-content: center;
   font-size: 10px;
-  padding: 2px 8px;
+  height: stretch;
+  line-height: 1;
+  padding: 0 8px;
   border-radius: var(--radius-full);
   background: var(--accent-soft);
   color: var(--accent);
-  white-space: nowrap;
 }
 
 .card-badge.muted {
@@ -170,18 +228,16 @@
 .action-btn {
   padding: 7px 12px;
   font-size: 12px;
-  background: rgba(255, 255, 255, 0.05);
+  background: var(--bg-elevated);
   color: var(--text-secondary);
-  border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
   cursor: pointer;
   transition: all var(--transition-fast);
 }
 
 .action-btn:hover:not(:disabled) {
-  background: rgba(255, 255, 255, 0.08);
+  background: var(--hover);
   color: var(--text-primary);
-  border-color: var(--border-accent);
 }
 
 .action-btn:disabled {
@@ -213,6 +269,10 @@
   border-color: transparent;
 }
 
+.playlist-dropdown {
+  flex-shrink: 0;
+}
+
 .playlist-select,
 .port-input {
   min-width: 160px;
@@ -225,7 +285,35 @@
   border-radius: var(--radius-sm);
   outline: none;
   font-family: var(--font-family);
-  transition: border-color var(--transition-fast);
+  transition: border-color var(--transition-fast), background var(--transition-fast);
+}
+
+button.playlist-select {
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  max-width: 220px;
+  cursor: pointer;
+  text-align: left;
+}
+
+button.playlist-select:hover {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: var(--border-accent);
+}
+
+.playlist-select-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.playlist-select-chevron {
+  flex-shrink: 0;
+  font-size: 9px;
+  opacity: 0.6;
 }
 
 .port-input {
@@ -235,6 +323,7 @@
 }
 
 .playlist-select:focus,
+.playlist-select:focus-visible,
 .port-input:focus {
   border-color: var(--border-accent);
 }
@@ -255,6 +344,13 @@
 
 .remote-url:hover {
   text-decoration: underline;
+}
+
+.remote-urls {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
 }
 
 /* --- About section --- */
@@ -338,7 +434,7 @@
 .rate-card {
   margin-top: 16px;
   padding: 14px;
-  background: var(--bg-elevated);
+  background: var(--bg-surface);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
 }
@@ -478,11 +574,10 @@
 }
 
 .preset-btn {
-  padding: 4px 10px;
+  padding: 16px 10px;
   font-size: 11px;
   background: rgba(255, 255, 255, 0.05);
   color: var(--text-secondary);
-  border: 1px solid var(--border-subtle);
   border-radius: 999px;
   line-height: 0;
   cursor: pointer;
@@ -492,7 +587,6 @@
 .preset-btn:hover {
   background: var(--accent-soft);
   color: var(--text-primary);
-  border-color: var(--accent);
 }
 
 .preset-btn.active {

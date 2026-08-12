@@ -1,0 +1,133 @@
+.effect-presets {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.effect-presets-label {
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.preset-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 96px;
+  padding: 6px 10px;
+  font-size: 11px;
+  font-weight: 500;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-subtle);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-primary);
+  cursor: pointer;
+  transition: background var(--transition-fast), border-color var(--transition-fast),
+    color var(--transition-fast);
+}
+
+.preset-trigger:hover {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: var(--border-accent);
+}
+
+.preset-trigger.custom {
+  color: var(--text-secondary);
+  font-style: italic;
+}
+
+.preset-label {
+  max-width: 110px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.preset-chevron {
+  font-size: 9px;
+  opacity: 0.6;
+  margin-left: 2px;
+}
+
+.preset-save {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.preset-save-input {
+  width: 100%;
+  font-size: 12px;
+  padding: 6px 8px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-primary);
+  outline: none;
+  font-family: var(--font-family);
+}
+
+.preset-save-input:focus {
+  border-color: var(--border-accent);
+}
+
+.preset-save-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.preset-action-btn {
+  flex: 1;
+  padding: 4px 8px;
+  font-size: 11px;
+  font-weight: 500;
+  border-radius: var(--radius-mini);
+  border: 1px solid var(--border-subtle);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.preset-action-btn:hover {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.preset-action-btn.cancel {
+  color: var(--text-muted);
+}
+
+.preset-action-btn.cancel:hover {
+  color: #f87171;
+}
+
+.effect-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 12px;
+}
+
+.effect-toolbar .effect-presets {
+  margin-left: auto;
+}
+
+.effect-reset {
+  padding: 4px 12px;
+  border-radius: var(--radius-sm);
+  font-size: 11px;
+  height: stretch;
+  align-content: center;
+  font-weight: 500;
+  line-height: 1;
+  color: var(--text-secondary);
+  background: rgba(255, 255, 255, 0.06);
+  transition: color var(--transition-fast), background var(--transition-fast);
+}
+
+.effect-reset:hover {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.1);
+}

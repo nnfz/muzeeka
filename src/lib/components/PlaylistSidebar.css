@@ -248,6 +248,31 @@
   z-index: 1;
 }
 
+/* Reorder drag: the lifted row follows its drop slot, the rest slide around it. */
+.playlist-row.dragging {
+  position: relative;
+  z-index: 2;
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent),
+    var(--shadow-sm);
+  opacity: 0.85;
+}
+
+:global(body.playlist-reorder-dragging) {
+  cursor: grabbing !important;
+  user-select: none !important;
+}
+
+:global(body.playlist-reorder-dragging *) {
+  cursor: grabbing !important;
+}
+
+/* Play overlays would flicker under the moving cursor mid-drag. */
+:global(body.playlist-reorder-dragging) .playlist-play-btn {
+  opacity: 0;
+}
+
 .rename-input {
   width: 100%;
   height: 20px;

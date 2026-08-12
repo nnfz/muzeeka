@@ -8,12 +8,31 @@ use crate::dsp_chain::{ChainSlotSettings, EffectSettings};
 use crate::equalizer::EqualizerSettings;
 use crate::limiter::LimiterSettings;
 
+/// EQ preset (legacy field name `custom_presets` in settings.json).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CustomPreset {
     pub name: String,
     pub preamp_db: f32,
     #[serde(default)]
     pub bands_db: Vec<f32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct FilterPreset {
+    pub name: String,
+    pub lp_hz: f32,
+    pub hp_hz: f32,
+    pub resonance: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LimiterPreset {
+    pub name: String,
+    pub gain_db: f32,
+    pub ceiling_db: f32,
+    pub release_ms: f32,
+    #[serde(default)]
+    pub clip: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,6 +74,12 @@ pub struct AppSettings {
     pub limiter: LimiterSettings,
     #[serde(default)]
     pub custom_presets: Vec<CustomPreset>,
+    /// User-saved filter presets (no factory defaults).
+    #[serde(default)]
+    pub filter_presets: Vec<FilterPreset>,
+    /// User-saved limiter presets (no factory defaults).
+    #[serde(default)]
+    pub limiter_presets: Vec<LimiterPreset>,
     /// Playback rate multiplier. 1.0 = normal. Persisted so it survives restarts.
     #[serde(default = "default_playback_rate")]
     pub playback_rate: f32,
@@ -94,6 +119,8 @@ impl Default for AppSettings {
             equalizer: EqualizerSettings::default(),
             limiter: LimiterSettings::default(),
             custom_presets: Vec::new(),
+            filter_presets: Vec::new(),
+            limiter_presets: Vec::new(),
             playback_rate: default_playback_rate(),
             pitch_enabled: default_pitch_enabled(),
             download_folder: None,
@@ -200,6 +227,16 @@ fn normalize_settings(mut settings: AppSettings) -> AppSettings {
         for gain in &mut preset.bands_db {
             *gain = gain.clamp(-20.0, 20.0);
         }
+    }
+    for preset in &mut settings.filter_presets {
+        preset.lp_hz = preset.lp_hz.clamp(20.0, 20_000.0);
+        preset.hp_hz = preset.hp_hz.clamp(20.0, 20_000.0);
+        preset.resonance = preset.resonance.clamp(0.5, 8.0);
+    }
+    for preset in &mut settings.limiter_presets {
+        preset.gain_db = preset.gain_db.clamp(0.0, 12.0);
+        preset.ceiling_db = preset.ceiling_db.clamp(-6.0, 0.0);
+        preset.release_ms = preset.release_ms.clamp(10.0, 1000.0);
     }
     settings
 }

@@ -15,7 +15,9 @@
   } from "$lib/stores/player.svelte";
   import { externalDrop } from "$lib/stores/externalDrop.svelte";
   import { trackDrag } from "$lib/stores/trackDrag.svelte";
+  import { reorderItemsAtBoundary } from "$lib/trackOrder";
   import { open } from "@tauri-apps/plugin-dialog";
+  import { flip } from "svelte/animate";
 
   const player = getPlayerStore();
 
@@ -23,6 +25,17 @@
   const DEFAULT_WIDTH = 220;
   const MIN_WIDTH = 200;
   const MAX_WIDTH = 300;
+
+  /** Pointer travel before a click on a playlist becomes a reorder drag (px). */
+  const DRAG_THRESHOLD = 5;
+  /** Overshoot needed to move the drop slot, so boundaries don't flicker (px). */
+  const DROP_INDEX_HYSTERESIS = 4;
+  /** Distance from the list edges where dragging starts auto-scrolling (px). */
+  const AUTOSCROLL_EDGE = 32;
+  const AUTOSCROLL_MAX_SPEED = 18;
+  /** Slack around the list where the drag keeps a drop target (px). */
+  const DROP_SLACK = 60;
+  const REORDER_FLIP_MS = 170;
 
   const AUDIO_DIALOG_EXTENSIONS = [
     "mp3",
@@ -65,6 +78,37 @@
     null,
   );
   let addMenu = $state<{ x: number; y: number } | null>(null);
+
+  type PlaylistDragState = {
+    id: string;
+    startX: number;
+    startY: number;
+    pointerY: number;
+    active: boolean;
+    /** Insert boundary in the *original* list, or null when off target. */
+    dropIndex: number | null;
+    /** Row centers in list content space, frozen when the drag starts. */
+    slots: number[];
+  };
+
+  let listEl = $state<HTMLDivElement | null>(null);
+  let playlistDrag = $state<PlaylistDragState | null>(null);
+  let dragPointerId: number | null = null;
+  let autoScrollFrame: number | null = null;
+  let suppressPlaylistClick = false;
+  let suppressClickTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /** Live preview: the dragged playlist sits at its drop slot while dragging. */
+  let displayedPlaylists = $derived.by((): Playlist[] => {
+    const drag = playlistDrag;
+    if (!drag?.active || drag.dropIndex === null) return player.playlists;
+    return reorderItemsAtBoundary(
+      player.playlists,
+      [drag.id],
+      drag.dropIndex,
+      (playlist) => playlist.id,
+    );
+  });
 
   let playlistMenuItems = $derived.by((): ContextMenuItem[] => {
     const target = contextMenu?.playlist;
@@ -309,6 +353,188 @@
     player.selectPlaylist(playlistId);
   }
 
+  function selectPlaylistFromClick(playlistId: string) {
+    // Swallow the ghost click that ends a reorder drag.
+    if (suppressPlaylistClick) return;
+    player.selectPlaylist(playlistId);
+  }
+
+  function armSuppressPlaylistClick() {
+    suppressPlaylistClick = true;
+    if (suppressClickTimer) clearTimeout(suppressClickTimer);
+    suppressClickTimer = setTimeout(() => {
+      suppressPlaylistClick = false;
+      suppressClickTimer = null;
+    }, 80);
+  }
+
+  /**
+   * Row centers in list content space (scroll-independent), in the order the
+   * playlists are stored. Captured once per drag: the geometry must not move
+   * with the live preview, or the drop slot would oscillate.
+   */
+  function captureDragSlots(): number[] {
+    const el = listEl;
+    if (!el) return [];
+
+    const listTop = el.getBoundingClientRect().top;
+    return [...el.querySelectorAll<HTMLElement>(".playlist-row")].map((row) => {
+      const rect = row.getBoundingClientRect();
+      return rect.top - listTop + el.scrollTop + rect.height / 2;
+    });
+  }
+
+  function nextDropIndex(clientY: number): number | null {
+    const el = listEl;
+    const drag = playlistDrag;
+    if (!el || !drag || drag.slots.length === 0) return null;
+
+    const rect = el.getBoundingClientRect();
+    if (clientY < rect.top - DROP_SLACK || clientY > rect.bottom + DROP_SLACK) {
+      return null;
+    }
+
+    const y = clientY - rect.top + el.scrollTop;
+    let index = 0;
+    while (index < drag.slots.length && y > drag.slots[index]) index += 1;
+
+    const prev = drag.dropIndex;
+    if (prev === null || prev === index) return index;
+
+    // Both slots share one boundary — require a clear crossing before flipping.
+    const boundary = drag.slots[Math.min(prev, index)];
+    if (index > prev && y - boundary < DROP_INDEX_HYSTERESIS) return prev;
+    if (index < prev && boundary - y < DROP_INDEX_HYSTERESIS) return prev;
+    return index;
+  }
+
+  function autoScrollStep() {
+    autoScrollFrame = null;
+    const el = listEl;
+    const drag = playlistDrag;
+    if (!el || !drag?.active) return;
+
+    const rect = el.getBoundingClientRect();
+    const above = rect.top + AUTOSCROLL_EDGE - drag.pointerY;
+    const below = drag.pointerY - (rect.bottom - AUTOSCROLL_EDGE);
+    const delta =
+      above > 0 ? -scrollSpeed(above) : below > 0 ? scrollSpeed(below) : 0;
+
+    if (delta !== 0) {
+      const before = el.scrollTop;
+      el.scrollTop = before + delta;
+      if (el.scrollTop !== before) {
+        drag.dropIndex = nextDropIndex(drag.pointerY);
+      }
+    }
+
+    autoScrollFrame = requestAnimationFrame(autoScrollStep);
+  }
+
+  function scrollSpeed(distance: number): number {
+    return Math.min(AUTOSCROLL_MAX_SPEED, 2 + distance / 3);
+  }
+
+  function cleanupPlaylistDrag() {
+    window.removeEventListener("pointermove", onDragPointerMove);
+    window.removeEventListener("pointerup", onDragPointerUp);
+    window.removeEventListener("pointercancel", onDragPointerUp);
+    dragPointerId = null;
+    if (autoScrollFrame !== null) {
+      cancelAnimationFrame(autoScrollFrame);
+      autoScrollFrame = null;
+    }
+    document.body.classList.remove("playlist-reorder-dragging");
+    playlistDrag = null;
+  }
+
+  function onPlaylistPointerDown(e: PointerEvent, playlist: Playlist) {
+    if (e.button !== 0) return;
+    if (editingId === playlist.id) return;
+    if (player.playlists.length < 2) return;
+
+    const target = e.target as HTMLElement | null;
+    if (target?.closest(".playlist-play-btn") || target?.closest(".rename-input")) {
+      return;
+    }
+
+    if (playlistDrag) cleanupPlaylistDrag();
+
+    playlistDrag = {
+      id: playlist.id,
+      startX: e.clientX,
+      startY: e.clientY,
+      pointerY: e.clientY,
+      active: false,
+      dropIndex: null,
+      slots: [],
+    };
+    dragPointerId = e.pointerId;
+    // No setPointerCapture — capture breaks the drop when the row moves away.
+    window.addEventListener("pointermove", onDragPointerMove);
+    window.addEventListener("pointerup", onDragPointerUp);
+    window.addEventListener("pointercancel", onDragPointerUp);
+  }
+
+  function onDragPointerMove(e: PointerEvent) {
+    const drag = playlistDrag;
+    if (!drag) return;
+
+    if (!drag.active) {
+      const travelled = Math.hypot(e.clientX - drag.startX, e.clientY - drag.startY);
+      if (travelled < DRAG_THRESHOLD) return;
+
+      drag.active = true;
+      drag.slots = captureDragSlots();
+      document.body.classList.add("playlist-reorder-dragging");
+      closeContextMenu();
+      closeAddMenu();
+    }
+
+    drag.pointerY = e.clientY;
+    drag.dropIndex = nextDropIndex(e.clientY);
+    if (autoScrollFrame === null) {
+      autoScrollFrame = requestAnimationFrame(autoScrollStep);
+    }
+  }
+
+  /**
+   * Also handles `pointercancel` — the WebView cancels the pointer when the
+   * cursor leaves the window, and dropping where the preview showed it is
+   * friendlier than silently losing the gesture.
+   */
+  function onDragPointerUp(e: PointerEvent) {
+    if (dragPointerId !== null && e.pointerId !== dragPointerId) return;
+
+    const drag = playlistDrag;
+    const dropped =
+      drag?.active && drag.dropIndex !== null
+        ? { id: drag.id, dropIndex: drag.dropIndex }
+        : null;
+    const wasActive = drag?.active ?? false;
+    cleanupPlaylistDrag();
+
+    if (!wasActive) return;
+    armSuppressPlaylistClick();
+    if (dropped) commitPlaylistOrder(dropped.id, dropped.dropIndex);
+  }
+
+  function commitPlaylistOrder(id: string, dropIndex: number) {
+    const current = player.playlists;
+    const next = reorderItemsAtBoundary(
+      current,
+      [id],
+      dropIndex,
+      (playlist) => playlist.id,
+    );
+    if (next.every((playlist, index) => playlist.id === current[index]?.id)) {
+      return;
+    }
+    player.reorderPlaylists(next.map((playlist) => playlist.id));
+  }
+
+  $effect(() => () => cleanupPlaylistDrag());
+
   /**
    * Focus the rename input and place the caret at the END of the text.
    * Uses multiple passes (immediate + rAF + setTimeout) to ensure the caret
@@ -489,7 +715,7 @@
       </div>
     </div>
 
-    <div class="user-playlists">
+    <div class="user-playlists" bind:this={listEl}>
       {#if !player.hasPlaylists}
         <div class="empty-state" data-tauri-drag-region>
           <div class="empty-icon">
@@ -518,7 +744,7 @@
           </button>
         </div>
       {:else}
-        {#each player.playlists as playlist (playlist.id)}
+        {#each displayedPlaylists as playlist (playlist.id)}
           {@const isActive = playlist.id === player.activePlaylistId}
           {@const isPlayingFrom =
             (player.isPlaying || player.isPaused) &&
@@ -532,10 +758,13 @@
           <div
             class="playlist-row"
             role="listitem"
+            animate:flip={{ duration: REORDER_FLIP_MS }}
             class:active={isActive}
             class:playing={isPlayingFrom}
             class:has-current={hasCurrentStopped}
             class:mix-mode={!!playlist.mix_mode}
+            class:dragging={playlistDrag?.active &&
+              playlistDrag.id === playlist.id}
             class:drop-target={(trackDrag.isDraggingTracks &&
               trackDrag.copyTargetPlaylistId === playlist.id) ||
               (externalDrop.active &&
@@ -552,7 +781,8 @@
               class="playlist-item"
               role="button"
               tabindex="0"
-              onclick={() => player.selectPlaylist(playlist.id)}
+              onpointerdown={(e) => onPlaylistPointerDown(e, playlist)}
+              onclick={() => selectPlaylistFromClick(playlist.id)}
               onkeydown={(e) => handlePlaylistItemKeydown(e, playlist.id)}
               oncontextmenu={(e) => openPlaylistContextMenu(e, playlist)}
               title={playlist.name}

@@ -2,7 +2,7 @@
   import { onDestroy, untrack } from 'svelte';
   import { BAND_COUNT, BAND_FREQUENCIES, getSettingsStore } from '$lib/stores/settings.svelte';
   import { formatHz, type EqualizerSettings } from '$lib/dsp/effects';
-  import Dropdown from '$lib/components/Dropdown.svelte';
+  import EffectPresets from '$lib/components/EffectPresets.svelte';
 
   interface Props {
     /** Which rack slot this editor writes to. */
@@ -87,14 +87,10 @@
     void settings.updateSlot(slotId, { preamp_db: db });
   }
 
-  function applyPresetAndClose(name: string) {
+  function handlePresetApplied(name: string) {
+    userTouched = true;
     const p = settings.customPresets.find((x) => x.name === name);
     if (!p) return;
-    userTouched = true;
-    dropdownOpen = false;
-    saveMode = false;
-    newPresetName = '';
-    void settings.applyPreset(slotId, name);
     animateDisplay(p.preamp_db, p.bands_db);
   }
 
@@ -104,135 +100,18 @@
     animateDisplay(0, Array(BAND_COUNT).fill(0));
   }
 
-  let dropdownOpen = $state(false);
-  let saveMode = $state(false);
-  let newPresetName = $state('');
-
-  const currentPresetName = $derived.by(() => {
-    for (const p of settings.customPresets) {
-      if (
-        Math.abs(p.preamp_db - value.preamp_db) < 0.05 &&
-        p.bands_db.length === value.bands_db.length &&
-        p.bands_db.every((v, i) => Math.abs(v - value.bands_db[i]) < 0.05)
-      ) {
-        return p.name;
-      }
-    }
-    return null;
-  });
-
-  function startSaveMode(e?: Event) {
-    e?.stopPropagation?.();
-    saveMode = true;
-    newPresetName = '';
-    setTimeout(() => {
-      const input = document.querySelector('.preset-save-input') as HTMLInputElement | null;
-      input?.focus();
-      input?.select();
-    }, 0);
-  }
-
-  async function confirmSavePreset(e?: Event) {
-    e?.stopPropagation?.();
-    const name = newPresetName.trim();
-    if (!name) return;
-    await settings.savePreset(slotId, name);
-    dropdownOpen = false;
-    saveMode = false;
-    newPresetName = '';
-  }
-
-  function cancelSaveMode(e?: Event) {
-    e?.stopPropagation?.();
-    saveMode = false;
-    newPresetName = '';
-  }
-
-  function handleSaveKeydown(e: KeyboardEvent) {
-    if (e.key === 'Enter') {
-      void confirmSavePreset();
-    } else if (e.key === 'Escape') {
-      cancelSaveMode();
-    }
-  }
-
-  function handleDeletePreset(e: MouseEvent | KeyboardEvent, name: string) {
-    e.stopPropagation();
-    void settings.deletePreset(name);
-  }
-
   onDestroy(() => cancelAnim());
 </script>
 
 <div class="equalizer">
-  <div class="eq-toolbar">
-    <div class="eq-presets">
-      <span class="eq-presets-label">Preset:</span>
-      <Dropdown class="preset-dropdown" bind:open={dropdownOpen} align="right">
-        {#snippet trigger({ toggle })}
-          <button
-            type="button"
-            class="preset-trigger"
-            class:custom={!currentPresetName && settings.customPresets.length > 0}
-            onclick={toggle}
-            aria-haspopup="listbox"
-            aria-expanded={dropdownOpen}
-          >
-            <span class="preset-label">{currentPresetName || (settings.customPresets.length ? 'Custom' : 'None')}</span>
-            <span class="preset-chevron">▾</span>
-          </button>
-        {/snippet}
-        {#snippet menu()}
-          {#if saveMode}
-            <div class="preset-save">
-              <input
-                type="text"
-                class="preset-save-input"
-                placeholder="Preset name"
-                bind:value={newPresetName}
-                onkeydown={handleSaveKeydown}
-              />
-              <div class="preset-save-actions">
-                <button type="button" class="preset-action-btn" onclick={confirmSavePreset}>Save</button>
-                <button type="button" class="preset-action-btn cancel" onclick={cancelSaveMode}>Cancel</button>
-              </div>
-            </div>
-          {:else}
-            <button type="button" class="dropdown-item accent" onclick={startSaveMode}>
-              <span class="dropdown-item-label">+ Save current as...</span>
-            </button>
-
-            {#if settings.customPresets.length > 0}
-              <div class="dropdown-divider"></div>
-
-              {#each settings.customPresets as preset (preset.name)}
-                <button type="button" class="dropdown-item" onclick={() => applyPresetAndClose(preset.name)}>
-                  <span class="dropdown-item-label">{preset.name}</span>
-                  <span
-                    class="dropdown-item-action danger"
-                    title="Delete preset"
-                    role="button"
-                    tabindex="0"
-                    onclick={(e) => handleDeletePreset(e, preset.name)}
-                    onkeydown={(e) => {
-                      if (e.key !== 'Enter' && e.key !== ' ') return;
-                      e.preventDefault();
-                      handleDeletePreset(e, preset.name);
-                    }}
-                  >
-                    ×
-                  </span>
-                </button>
-              {/each}
-            {/if}
-          {/if}
-        {/snippet}
-      </Dropdown>
-    </div>
-
-    <button type="button" class="eq-reset" onclick={handleReset}>
-      Reset
-    </button>
+  <div class="effect-toolbar">
+    <button type="button" class="effect-reset" onclick={handleReset}>Reset</button>
+    <EffectPresets
+      slotId={slotId}
+      kind="equalizer"
+      value={value}
+      onApply={handlePresetApplied}
+    />
   </div>
 
   <div class="eq-sliders">
@@ -275,4 +154,5 @@
 
 <style>
   @import './Equalizer.css';
+  @import './EffectPresets.css';
 </style>

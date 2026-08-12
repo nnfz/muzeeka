@@ -1,22 +1,25 @@
 <script lang="ts">
-  import '../../app.css';
-  import '../../routes/+page.css';
-  import WindowControls from './WindowControls.svelte';
-  import SettingsSidebar from './SettingsSidebar.svelte';
-  import DspChain from './DspChain.svelte';
-  import Dropdown from '$lib/components/Dropdown.svelte';
-  import { getSettingsStore, type RemoteStatus } from '$lib/stores/settings.svelte';
+  import "../../app.css";
+  import "../../routes/+page.css";
+  import WindowControls from "./WindowControls.svelte";
+  import SettingsSidebar from "./SettingsSidebar.svelte";
+  import DspChain from "./DspChain.svelte";
+  import Dropdown from "$lib/components/Dropdown.svelte";
+  import {
+    getSettingsStore,
+    type RemoteStatus,
+  } from "$lib/stores/settings.svelte";
   import {
     applyAccentPalette,
     hydrateAccentFromStorage,
     type AccentPalette,
-  } from '$lib/coverAccent';
-  type Section = 'general' | 'downloads' | 'remote' | 'audio' | 'about';
-  import { getVersion, getName } from '@tauri-apps/api/app';
-  import { invoke } from '@tauri-apps/api/core';
-  import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-  import { open } from '@tauri-apps/plugin-dialog';
-  import { onMount } from 'svelte';
+  } from "$lib/coverAccent";
+  type Section = "general" | "downloads" | "remote" | "audio" | "about";
+  import { getVersion, getName } from "@tauri-apps/api/app";
+  import { invoke } from "@tauri-apps/api/core";
+  import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+  import { open } from "@tauri-apps/plugin-dialog";
+  import { onMount } from "svelte";
 
   interface VkAuthStatus {
     logged_in: boolean;
@@ -30,11 +33,16 @@
   let clearAllConfirm = $state(false);
   let clearAllError = $state<string | null>(null);
 
-  let activeSection = $state<Section>('general');
-  let appVersion = $state('0.1.0');
-  let appName = $state('muzeeka');
+  let activeSection = $state<Section>("general");
+  let appVersion = $state("0.1.0");
+  let appName = $state("muzeeka");
   let playlists = $state<{ id: string; name: string }[]>([]);
-  let vkAuth = $state<VkAuthStatus>({ logged_in: false, user_id: null, user_name: null });
+  let downloadPlaylistOpen = $state(false);
+  let vkAuth = $state<VkAuthStatus>({
+    logged_in: false,
+    user_id: null,
+    user_name: null,
+  });
   let vkAuthBusy = $state(false);
   let vkAuthError = $state<string | null>(null);
 
@@ -59,10 +67,18 @@
   }
 
   // Prevent white flash when the window becomes visible
-  if (typeof document !== 'undefined') {
-    document.documentElement.style.setProperty('background-color', '#0a0a0a', 'important');
+  if (typeof document !== "undefined") {
+    document.documentElement.style.setProperty(
+      "background-color",
+      "#0a0a0a",
+      "important",
+    );
     if (document.body) {
-      document.body.style.setProperty('background-color', '#0a0a0a', 'important');
+      document.body.style.setProperty(
+        "background-color",
+        "#0a0a0a",
+        "important",
+      );
     }
     // Match main window cover accent (shared localStorage origin).
     hydrateAccentFromStorage();
@@ -70,11 +86,11 @@
 
   async function refreshVkAuth() {
     try {
-      vkAuth = await invoke<VkAuthStatus>('vk_auth_status');
+      vkAuth = await invoke<VkAuthStatus>("vk_auth_status");
       vkAuthError = null;
     } catch (e) {
       vkAuth = { logged_in: false, user_id: null, user_name: null };
-      vkAuthError = typeof e === 'string' ? e : String(e);
+      vkAuthError = typeof e === "string" ? e : String(e);
     }
   }
 
@@ -103,7 +119,9 @@
       try {
         // Meta-only list: no full library, no per-track Path::exists prune.
         // Full playlists_load was freezing the app on open for large / network libs.
-        playlists = await invoke<{ id: string; name: string }[]>('playlists_list_meta');
+        playlists = await invoke<{ id: string; name: string }[]>(
+          "playlists_list_meta",
+        );
       } catch {
         playlists = [];
       }
@@ -113,7 +131,7 @@
       portDraft = String(settings.remotePort);
 
       try {
-        unlistenVk = await listen<VkAuthStatus>('vk:auth-changed', (event) => {
+        unlistenVk = await listen<VkAuthStatus>("vk:auth-changed", (event) => {
           vkAuth = event.payload;
           vkAuthError = null;
         });
@@ -122,15 +140,18 @@
       }
 
       try {
-        unlistenAccent = await listen<AccentPalette>('muzeeka:accent', (event) => {
-          applyAccentPalette(event.payload, { persist: false });
-        });
+        unlistenAccent = await listen<AccentPalette>(
+          "muzeeka:accent",
+          (event) => {
+            applyAccentPalette(event.payload, { persist: false });
+          },
+        );
       } catch {
         // non-fatal
       }
 
       remotePoll = setInterval(() => {
-        if (activeSection === 'remote') {
+        if (activeSection === "remote") {
           void refreshRemoteStatus();
         }
       }, 2000);
@@ -160,9 +181,9 @@
     vkAuthBusy = true;
     vkAuthError = null;
     try {
-      vkAuth = await invoke<VkAuthStatus>('vk_login');
+      vkAuth = await invoke<VkAuthStatus>("vk_login");
     } catch (e) {
-      vkAuthError = typeof e === 'string' ? e : String(e);
+      vkAuthError = typeof e === "string" ? e : String(e);
       await refreshVkAuth();
     } finally {
       vkAuthBusy = false;
@@ -174,9 +195,9 @@
     vkAuthBusy = true;
     vkAuthError = null;
     try {
-      vkAuth = await invoke<VkAuthStatus>('vk_logout');
+      vkAuth = await invoke<VkAuthStatus>("vk_logout");
     } catch (e) {
-      vkAuthError = typeof e === 'string' ? e : String(e);
+      vkAuthError = typeof e === "string" ? e : String(e);
       await refreshVkAuth();
     } finally {
       vkAuthBusy = false;
@@ -184,29 +205,31 @@
   }
 
   function vkStatusLabel(status: VkAuthStatus): string {
-    if (!status.logged_in) return 'Not logged in';
+    if (!status.logged_in) return "Not logged in";
     if (status.user_name && status.user_id) {
       return `${status.user_name} (id${status.user_id})`;
     }
     if (status.user_name) return status.user_name;
     if (status.user_id) return `id${status.user_id}`;
-    return 'Logged in';
+    return "Logged in";
   }
 
   async function clearAll() {
     if (!clearAllConfirm) {
       clearAllConfirm = true;
       clearAllError = null;
-      setTimeout(() => { clearAllConfirm = false; }, 3000);
+      setTimeout(() => {
+        clearAllConfirm = false;
+      }, 3000);
       return;
     }
     clearAllBusy = true;
     clearAllConfirm = false;
     clearAllError = null;
     try {
-      await invoke('library_clear_all');
+      await invoke("library_clear_all");
     } catch (e) {
-      clearAllError = typeof e === 'string' ? e : String(e);
+      clearAllError = typeof e === "string" ? e : String(e);
     } finally {
       clearAllBusy = false;
     }
@@ -218,7 +241,7 @@
     coverRebuildMsg = null;
     coverRebuildError = null;
     try {
-      const stats = await invoke<CoverRebuildStats>('library_rebuild_covers');
+      const stats = await invoke<CoverRebuildStats>("library_rebuild_covers");
       const parts = [
         `cleared ${stats.cleared_files}`,
         `tracks ${stats.track_covers}`,
@@ -226,9 +249,9 @@
         `playlists ${stats.playlist_covers}`,
       ];
       if (stats.errors > 0) parts.push(`errors ${stats.errors}`);
-      coverRebuildMsg = `Done — ${parts.join(' · ')}. Same album art is stored once.`;
+      coverRebuildMsg = `Done — ${parts.join(" · ")}. Same album art is stored once.`;
     } catch (e) {
-      coverRebuildError = typeof e === 'string' ? e : String(e);
+      coverRebuildError = typeof e === "string" ? e : String(e);
     } finally {
       coverRebuildBusy = false;
     }
@@ -251,12 +274,15 @@
     setTimeout(() => void refreshRemoteStatus(), 450);
   }
 
-  function remoteStatusBadge(status: RemoteStatus | null): { text: string; kind: 'ok' | 'warn' | 'muted' } {
-    if (!status) return { text: '…', kind: 'muted' };
-    if (!status.enabled) return { text: 'Off', kind: 'muted' };
-    if (status.running) return { text: 'Running', kind: 'ok' };
-    if (status.last_error) return { text: 'Error', kind: 'warn' };
-    return { text: 'Starting…', kind: 'warn' };
+  function remoteStatusBadge(status: RemoteStatus | null): {
+    text: string;
+    kind: "ok" | "warn" | "muted";
+  } {
+    if (!status) return { text: "…", kind: "muted" };
+    if (!status.enabled) return { text: "Off", kind: "muted" };
+    if (status.running) return { text: "Running", kind: "ok" };
+    if (status.last_error) return { text: "Error", kind: "warn" };
+    return { text: "Starting…", kind: "warn" };
   }
 
   let remoteBadge = $derived(remoteStatusBadge(remoteStatus));
@@ -322,10 +348,12 @@
     <SettingsSidebar bind:activeSection />
 
     <div class="settings-content">
-      {#if activeSection === 'general'}
+      {#if activeSection === "general"}
         <div class="settings-section">
-          <h2 class="section-title">General</h2>
-          <p class="section-desc">App behavior and integrations.</p>
+          <div class="settings-section-header">
+            <h2 class="section-title">General</h2>
+            <p class="section-desc">App behavior and integrations.</p>
+          </div>
 
           <div class="settings-card">
             <div class="card-row">
@@ -336,23 +364,27 @@
               <label class="settings-toggle">
                 <input
                   type="checkbox"
+                  role="switch"
                   checked={settings.discordRpcEnabled}
+                  aria-label="Discord Rich Presence"
                   onchange={(e) =>
-                    settings.setDiscordRpcEnabled((e.target as HTMLInputElement).checked)}
+                    settings.setDiscordRpcEnabled(
+                      (e.target as HTMLInputElement).checked,
+                    )}
                 />
-                <span>Enabled</span>
+                <span class="settings-switch" aria-hidden="true"></span>
               </label>
             </div>
             <div class="card-row card-row-stack">
               <div>
                 <div class="card-label">Shuffle mode</div>
                 <div class="card-value">
-                  {#if settings.shuffleMode === 'smart'}
-                    Smart: remembers tracks already played in this playlist and won’t
-                    repeat them until every track has had a turn
+                  {#if settings.shuffleMode === "smart"}
+                    Smart: remembers tracks already played in this playlist and
+                    won’t repeat them until every track has had a turn
                   {:else}
-                    Normal: classic random order; tracks may come up again sooner when
-                    the order reshuffles
+                    Normal: classic random order; tracks may come up again
+                    sooner when the order reshuffles
                   {/if}
                 </div>
               </div>
@@ -360,16 +392,16 @@
                 <button
                   type="button"
                   class="mode-btn"
-                  class:active={settings.shuffleMode === 'smart'}
-                  onclick={() => settings.setShuffleMode('smart')}
+                  class:active={settings.shuffleMode === "smart"}
+                  onclick={() => settings.setShuffleMode("smart")}
                 >
                   Smart
                 </button>
                 <button
                   type="button"
                   class="mode-btn"
-                  class:active={settings.shuffleMode === 'normal'}
-                  onclick={() => settings.setShuffleMode('normal')}
+                  class:active={settings.shuffleMode === "normal"}
+                  onclick={() => settings.setShuffleMode("normal")}
                 >
                   Normal
                 </button>
@@ -385,7 +417,9 @@
                   <div class="card-value card-value-ok">{coverRebuildMsg}</div>
                 {/if}
                 {#if coverRebuildError}
-                  <div class="card-value card-value-error">{coverRebuildError}</div>
+                  <div class="card-value card-value-error">
+                    {coverRebuildError}
+                  </div>
                 {/if}
               </div>
               <div class="card-actions">
@@ -395,7 +429,7 @@
                   disabled={coverRebuildBusy}
                   onclick={() => void rebuildCovers()}
                 >
-                  {coverRebuildBusy ? 'Rebuilding…' : 'Rebuild covers'}
+                  {coverRebuildBusy ? "Rebuilding…" : "Rebuild covers"}
                 </button>
               </div>
             </div>
@@ -405,7 +439,9 @@
             <div class="card-row card-row-stack">
               <div>
                 <div class="card-label">Library</div>
-                <div class="card-value">Remove all playlists and tracks from the library</div>
+                <div class="card-value">
+                  Remove all playlists and tracks from the library
+                </div>
                 {#if clearAllError}
                   <div class="card-value card-value-error">{clearAllError}</div>
                 {/if}
@@ -417,38 +453,50 @@
                   disabled={clearAllBusy}
                   onclick={() => void clearAll()}
                 >
-                  {clearAllBusy ? 'Clearing…' : clearAllConfirm ? 'Are you sure?' : 'Delete all'}
+                  {clearAllBusy
+                    ? "Clearing…"
+                    : clearAllConfirm
+                      ? "Are you sure?"
+                      : "Delete all"}
                 </button>
               </div>
             </div>
           </div>
-
-          <div class="settings-info">
-            Keyboard shortcuts and mouse controls are available in the main window.
-            Use Alt + scroll to adjust volume.
-          </div>
         </div>
-      {:else if activeSection === 'downloads'}
+      {:else if activeSection === "downloads"}
         <div class="settings-section">
-          <h2 class="section-title">Downloads</h2>
-          <p class="section-desc">
-            Where downloaded tracks are saved and which playlist receives them.
-          </p>
+          <div class="settings-section-header">
+            <h2 class="section-title">Downloads</h2>
+            <p class="section-desc">
+              Where downloaded tracks are saved and which playlist receives
+              them.
+            </p>
+          </div>
 
           <div class="settings-card">
             <div class="card-row card-row-stack">
               <div>
                 <div class="card-label">Download folder</div>
                 <div class="card-value card-value-path">
-                  {settings.downloadFolder ?? (settings.effectiveDownloadFolder || 'App data / downloads')}
+                  {settings.downloadFolder ??
+                    (settings.effectiveDownloadFolder ||
+                      "App data / downloads")}
                 </div>
               </div>
               <div class="card-actions">
-                <button type="button" class="action-btn" onclick={pickDownloadFolder}>
+                <button
+                  type="button"
+                  class="action-btn"
+                  onclick={pickDownloadFolder}
+                >
                   Choose…
                 </button>
                 {#if settings.downloadFolder}
-                  <button type="button" class="action-btn" onclick={clearDownloadFolder}>
+                  <button
+                    type="button"
+                    class="action-btn"
+                    onclick={clearDownloadFolder}
+                  >
                     Reset
                   </button>
                 {/if}
@@ -457,28 +505,69 @@
             <div class="card-row card-row-stack">
               <div>
                 <div class="card-label">Download playlist</div>
-                <div class="card-value">Tracks are added here after download</div>
+                <div class="card-value">
+                  Tracks are added here after download
+                </div>
               </div>
-              <select
-                class="playlist-select"
-                value={settings.downloadPlaylistId ?? ''}
-                onchange={(e) => {
-                  const val = (e.target as HTMLSelectElement).value;
-                  settings.setDownloadPlaylistId(val || null);
-                }}
+              <Dropdown
+                class="playlist-dropdown"
+                bind:open={downloadPlaylistOpen}
+                align="right"
               >
-                <option value="">Downloads (auto-create)</option>
-                {#each playlists as pl (pl.id)}
-                  <option value={pl.id}>{pl.name}</option>
-                {/each}
-              </select>
+                {#snippet trigger({ toggle })}
+                  <button
+                    type="button"
+                    class="playlist-select"
+                    onclick={toggle}
+                    aria-haspopup="listbox"
+                    aria-expanded={downloadPlaylistOpen}
+                  >
+                    <span class="playlist-select-label">
+                      {playlists.find((p) => p.id === settings.downloadPlaylistId)
+                        ?.name ?? "Downloads (auto-create)"}
+                    </span>
+                    <span class="playlist-select-chevron">▾</span>
+                  </button>
+                {/snippet}
+                {#snippet menu()}
+                  <button
+                    type="button"
+                    class="dropdown-item"
+                    class:active={!settings.downloadPlaylistId}
+                    onclick={() => {
+                      settings.setDownloadPlaylistId(null);
+                      downloadPlaylistOpen = false;
+                    }}
+                  >
+                    <span class="dropdown-item-label">Downloads (auto-create)</span>
+                  </button>
+                  {#if playlists.length}
+                    <div class="dropdown-divider"></div>
+                    {#each playlists as pl (pl.id)}
+                      <button
+                        type="button"
+                        class="dropdown-item"
+                        class:active={settings.downloadPlaylistId === pl.id}
+                        onclick={() => {
+                          settings.setDownloadPlaylistId(pl.id);
+                          downloadPlaylistOpen = false;
+                        }}
+                      >
+                        <span class="dropdown-item-label">{pl.name}</span>
+                      </button>
+                    {/each}
+                  {/if}
+                {/snippet}
+              </Dropdown>
             </div>
           </div>
-
-          <h2 class="section-title section-title-spaced">VK Music</h2>
-          <p class="section-desc">
-            Log in to download tracks and playlists from vk.com / vk.ru. Session stays on this device.
-          </p>
+          <div class="settings-section-header">
+            <h2 class="section-title section-title-spaced">VK Music</h2>
+            <p class="section-desc">
+              Log in to download tracks and playlists from vk.com / vk.ru. Session
+              stays on this device.
+            </p>
+          </div>
 
           <div class="settings-card">
             <div class="card-row card-row-stack">
@@ -493,14 +582,13 @@
               </div>
               <div class="card-actions">
                 {#if vkAuth.logged_in}
-                  <div class="card-badge">Connected</div>
                   <button
                     type="button"
                     class="action-btn"
                     disabled={vkAuthBusy}
                     onclick={() => void vkLogout()}
                   >
-                    {vkAuthBusy ? 'Working…' : 'Log out'}
+                    {vkAuthBusy ? "Working…" : "Log out"}
                   </button>
                 {:else}
                   <button
@@ -509,36 +597,46 @@
                     disabled={vkAuthBusy}
                     onclick={() => void vkLogin()}
                   >
-                    {vkAuthBusy ? 'Waiting…' : 'Log in with VK'}
+                    {vkAuthBusy ? "Waiting…" : "Log in with VK"}
                   </button>
                 {/if}
               </div>
             </div>
           </div>
         </div>
-      {:else if activeSection === 'remote'}
+      {:else if activeSection === "remote"}
         <div class="settings-section">
-          <h2 class="section-title">Remote control</h2>
-          <p class="section-desc">
-            Control playback from a phone or browser on the same network.
-          </p>
+          <div class="settings-section-header">
+            <h2 class="section-title">Remote control</h2>
+            <p class="section-desc">
+              Control playback from a phone or browser on the same network.
+            </p>
+          </div>
 
           <div class="settings-card">
             <div class="card-row">
               <div>
                 <div class="card-label">Remote server</div>
-                <div class="card-value">HTTP control panel on your local network</div>
+                <div class="card-value">
+                  HTTP control panel on your local network
+                </div>
               </div>
               <div class="card-actions">
-                <div class="card-badge {remoteBadge.kind}">{remoteBadge.text}</div>
+                <div class="card-badge {remoteBadge.kind}">
+                  {remoteBadge.text}
+                </div>
                 <label class="settings-toggle">
                   <input
                     type="checkbox"
+                    role="switch"
                     checked={settings.remoteEnabled}
+                    aria-label="Remote server"
                     onchange={(e) =>
-                      onRemoteEnabledChange((e.target as HTMLInputElement).checked)}
+                      onRemoteEnabledChange(
+                        (e.target as HTMLInputElement).checked,
+                      )}
                   />
-                  <span>Enabled</span>
+                  <span class="settings-switch" aria-hidden="true"></span>
                 </label>
               </div>
             </div>
@@ -547,13 +645,16 @@
               <div>
                 <div class="card-label">Computer IP</div>
                 <div class="card-value card-value-mono">
-                  {remoteStatus?.local_ip ?? '—'}
+                  {remoteStatus?.local_ip ?? "—"}
                 </div>
                 {#if remoteStatus?.local_ips?.length}
                   <div class="card-value">
                     Also:
                     {#each remoteStatus.local_ips as ip, i (ip)}
-                      <span class="card-value-mono">{ip}</span>{i < remoteStatus.local_ips.length - 1 ? ', ' : ''}
+                      <span class="card-value-mono">{ip}</span>{i <
+                      remoteStatus.local_ips.length - 1
+                        ? ", "
+                        : ""}
                     {/each}
                   </div>
                 {/if}
@@ -575,7 +676,7 @@
                 bind:value={portDraft}
                 onchange={commitRemotePort}
                 onkeydown={(e) => {
-                  if (e.key === 'Enter') {
+                  if (e.key === "Enter") {
                     (e.target as HTMLInputElement).blur();
                     commitRemotePort();
                   }
@@ -588,30 +689,43 @@
                 <div>
                   <div class="card-label">Open on phone</div>
                   <div class="card-value">Same Wi‑Fi as this PC</div>
-                  {#each remoteStatus.urls as url (url)}
-                    <a class="remote-url" href={url} target="_blank" rel="noreferrer">{url}</a>
-                  {/each}
+                  <div class="remote-urls">
+                    {#each remoteStatus.urls as url (url)}
+                      <a
+                        class="remote-url"
+                        href={url}
+                        target="_blank"
+                        rel="noreferrer">{url}</a
+                      >
+                    {/each}
+                  </div>
                 </div>
               </div>
             {/if}
 
             {#if remoteStatus?.last_error}
               <div class="card-row">
-                <div class="card-value card-value-error">{remoteStatus.last_error}</div>
+                <div class="card-value card-value-error">
+                  {remoteStatus.last_error}
+                </div>
               </div>
             {/if}
           </div>
 
           <div class="settings-info">
-            Open the URL on your phone. If it doesn’t load, check firewall rules for the chosen port.
+            Open the URL on your phone. If it doesn’t load, check firewall rules
+            for the chosen port.
           </div>
         </div>
-      {:else if activeSection === 'audio'}
+      {:else if activeSection === "audio"}
         <div class="settings-section">
-          <h2 class="section-title">Audio</h2>
-          <p class="section-desc">
-            Build an effect chain — drag effects in, stack them in any order, tune each one.
-          </p>
+          <div class="settings-section-header">
+            <h2 class="section-title">Audio</h2>
+            <p class="section-desc">
+              Build an effect chain — drag effects in, stack them in any order,
+              tune each one.
+            </p>
+          </div>
           <DspChain />
 
           <!-- Playback Rate -->
@@ -664,17 +778,18 @@
                 type="button"
                 class="preset-btn pitch-btn"
                 class:active={settings.pitchEnabled}
-                onclick={() => void settings.setPitchEnabled(!settings.pitchEnabled)}
+                onclick={() =>
+                  void settings.setPitchEnabled(!settings.pitchEnabled)}
                 title={settings.pitchEnabled
-                  ? 'Pitch shifts with speed — click to preserve pitch'
-                  : 'Pitch preserved — click to couple pitch with speed'}
+                  ? "Pitch shifts with speed — click to preserve pitch"
+                  : "Pitch preserved — click to couple pitch with speed"}
               >
                 Pitch
               </button>
             </div>
           </div>
         </div>
-      {:else if activeSection === 'about'}
+      {:else if activeSection === "about"}
         <div class="settings-section about-section">
           <div class="about-header">
             <div class="about-logo">
@@ -716,5 +831,5 @@
 </div>
 
 <style>
-  @import './SettingsWindow.css';
+  @import "./SettingsWindow.css";
 </style>

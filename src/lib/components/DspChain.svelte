@@ -100,8 +100,8 @@
 
   function beginDrag(e: PointerEvent, seed: Pick<RackDrag, 'slotId' | 'kind' | 'label'>) {
     if (e.button !== 0) return;
-    // Let the checkbox and the × button work as buttons.
-    if ((e.target as HTMLElement).closest('.slot-power, .slot-remove')) return;
+    // Let the power switch, remove, and catalog + work as buttons (not drag handles).
+    if ((e.target as HTMLElement).closest('.slot-power, .slot-remove, .catalog-add')) return;
     drag = {
       ...seed,
       startX: e.clientX,
@@ -152,9 +152,8 @@
     dropAt = null;
 
     if (!active) {
-      // Never moved: a catalog press is a plain add, a row press falls through
-      // to the row's own click handler, which expands it.
-      if (kind) void add(kind);
+      // Never moved: catalog clicks do nothing (add only via + or a real drag).
+      // Slot-row presses fall through to the header click handler, which expands.
       return;
     }
     swallowClick = true;
@@ -224,13 +223,19 @@
           >
             <span class="slot-grip" aria-hidden="true">⠿</span>
             <span class="slot-index">{i + 1}</span>
-            <label class="slot-power" title={slot.enabled ? 'Bypass this effect' : 'Enable this effect'}>
+            <label
+              class="slot-power"
+              title={slot.enabled ? 'Bypass this effect' : 'Enable this effect'}
+            >
               <input
                 type="checkbox"
+                role="switch"
                 checked={slot.enabled}
+                aria-label={slot.enabled ? `Disable ${meta.label}` : `Enable ${meta.label}`}
                 onchange={(e) =>
                   void settings.setSlotEnabled(slot.id, (e.target as HTMLInputElement).checked)}
               />
+              <span class="slot-switch" aria-hidden="true"></span>
             </label>
             <button
               type="button"
@@ -241,7 +246,6 @@
             >
               <span class="slot-name">{meta.label}</span>
               <span class="slot-summary">{slotSummary(slot)}</span>
-              <span class="slot-chevron" class:up={expanded.has(slot.id)}>▾</span>
             </button>
             <button
               type="button"
@@ -250,7 +254,11 @@
               aria-label={`Remove ${meta.label}`}
               onclick={() => remove(slot.id)}
             >
-              ×
+              <span
+                class="slot-icon"
+                style:--slot-icon={"url('/icons/close.svg')"}
+                aria-hidden="true"
+              ></span>
             </button>
           </div>
 
@@ -297,10 +305,7 @@
           role="listitem"
           onpointerdown={(e) => startCatalogDrag(e, effect.kind, effect.label)}
         >
-          <div class="catalog-text">
-            <span class="catalog-name">{effect.label}</span>
-            <span class="catalog-blurb">{effect.blurb}</span>
-          </div>
+          <span class="catalog-name">{effect.label}</span>
           <button
             type="button"
             class="catalog-add"
@@ -311,15 +316,17 @@
             aria-label={`Add ${effect.label}`}
             onclick={() => void add(effect.kind)}
           >
-            +
+            <span
+              class="slot-icon"
+              style:--slot-icon={"url('/icons/plus.svg')"}
+              aria-hidden="true"
+            ></span>
           </button>
         </div>
       {/each}
     </div>
     {#if full}
       <p class="catalog-note">Chain is full — remove an effect to add another.</p>
-    {:else}
-      <p class="catalog-note">Drag one into the chain, or click it to append.</p>
     {/if}
   </div>
 </div>

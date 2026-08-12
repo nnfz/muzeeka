@@ -1,6 +1,12 @@
 <script lang="ts">
-  import { getSettingsStore } from '$lib/stores/settings.svelte';
-  import { HP_OPEN_HZ, LP_OPEN_HZ, formatHz, type FilterSettings } from '$lib/dsp/effects';
+  import { getSettingsStore } from "$lib/stores/settings.svelte";
+  import {
+    HP_OPEN_HZ,
+    LP_OPEN_HZ,
+    formatHz,
+    type FilterSettings,
+  } from "$lib/dsp/effects";
+  import EffectPresets from "$lib/components/EffectPresets.svelte";
 
   interface Props {
     /** Which rack slot this editor writes to. */
@@ -45,62 +51,79 @@
 </script>
 
 <div class="filter-card">
-  <div class="filter-grid">
-    <div class="filter-field">
-      <div class="filter-row-head">
-        <span class="filter-row-label">High-pass</span>
-        <span class="filter-row-value" class:open={hpOpen}>
-          {hpOpen ? 'Open' : `${formatHz(value.hp_hz)} Hz`}
-        </span>
-      </div>
-      <input
-        type="range"
-        class="filter-slider"
-        min="0"
-        max="100"
-        step="0.1"
-        value={hzToPos(value.hp_hz)}
-        style={`--fill: ${hzToPos(value.hp_hz)}%`}
-        oninput={(e) => patch({ hp_hz: posToHz(Number((e.target as HTMLInputElement).value)) })}
-        aria-label="High-pass cutoff"
-      />
-      <div class="filter-bounds">
-        <span>Open</span>
-        <span>20k</span>
-      </div>
-    </div>
-
-    <div class="filter-field">
-      <div class="filter-row-head">
-        <span class="filter-row-label">Low-pass</span>
-        <span class="filter-row-value" class:open={lpOpen}>
-          {lpOpen ? 'Open' : `${formatHz(value.lp_hz)} Hz`}
-        </span>
-      </div>
-      <input
-        type="range"
-        class="filter-slider"
-        min="0"
-        max="100"
-        step="0.1"
-        value={hzToPos(value.lp_hz)}
-        style={`--fill: ${hzToPos(value.lp_hz)}%`}
-        oninput={(e) => patch({ lp_hz: posToHz(Number((e.target as HTMLInputElement).value)) })}
-        aria-label="Low-pass cutoff"
-      />
-      <div class="filter-bounds">
-        <span>20</span>
-        <span>Open</span>
-      </div>
-    </div>
+  <div class="effect-toolbar">
+    <button
+      type="button"
+      class="effect-reset"
+      onclick={() => void settings.resetSlot(slotId)}
+    >
+      Reset
+    </button>
+    <EffectPresets {slotId} kind="filter" {value} />
   </div>
+  <div class="filter-content">
+    <div class="filter-grid">
+      <div class="filter-field">
+        <div class="filter-row-head">
+          <span class="filter-row-label">High-pass</span>
+          <span class="filter-row-value" class:open={hpOpen}>
+            {hpOpen ? "Open" : `${formatHz(value.hp_hz)} Hz`}
+          </span>
+        </div>
+        <input
+          type="range"
+          class="filter-slider"
+          min="0"
+          max="100"
+          step="0.1"
+          value={hzToPos(value.hp_hz)}
+          style={`--fill: ${hzToPos(value.hp_hz)}%`}
+          oninput={(e) =>
+            patch({
+              hp_hz: posToHz(Number((e.target as HTMLInputElement).value)),
+            })}
+          aria-label="High-pass cutoff"
+        />
+        <div class="filter-bounds">
+          <span>Open</span>
+          <span>20k</span>
+        </div>
+      </div>
 
-  <div class="filter-field resonance">
-    <div class="filter-row-head">
-      <span class="filter-row-label">Resonance</span>
-      <span class="filter-row-value">Q {value.resonance.toFixed(2)}</span>
+      <div class="filter-field">
+        <div class="filter-row-head">
+          <span class="filter-row-label">Low-pass</span>
+          <span class="filter-row-value" class:open={lpOpen}>
+            {lpOpen ? "Open" : `${formatHz(value.lp_hz)} Hz`}
+          </span>
+        </div>
+        <input
+          type="range"
+          class="filter-slider"
+          min="0"
+          max="100"
+          step="0.1"
+          value={hzToPos(value.lp_hz)}
+          style={`--fill: ${hzToPos(value.lp_hz)}%`}
+          oninput={(e) =>
+            patch({
+              lp_hz: posToHz(Number((e.target as HTMLInputElement).value)),
+            })}
+          aria-label="Low-pass cutoff"
+        />
+        <div class="filter-bounds">
+          <span>20</span>
+          <span>Open</span>
+        </div>
+      </div>
     </div>
-    <input
+    
+    <div class="filter-field resonance">
+      <div class="filter-row-head">
+        <span class="filter-row-label">Resonance</span>
+        <span class="filter-row-value">Q {value.resonance.toFixed(2)}</span>
+      </div>
+      <input
       type="range"
       class="filter-slider"
       min="0.5"
@@ -108,44 +131,25 @@
       step="0.05"
       value={value.resonance}
       style={`--fill: ${((value.resonance - 0.5) / 7.5) * 100}%`}
-      oninput={(e) => patch({ resonance: Number((e.target as HTMLInputElement).value) })}
+      oninput={(e) =>
+        patch({ resonance: Number((e.target as HTMLInputElement).value) })}
       aria-label="Filter resonance"
-    />
-    <div class="filter-bounds">
-      <span>Flat</span>
-      <span>Squelch</span>
+      />
+      <div class="filter-bounds">
+        <span>Flat</span>
+        <span>Squelch</span>
+      </div>
     </div>
   </div>
-
+    
   {#if inverted}
     <div class="filter-warning">
       High-pass is above low-pass — nothing is left in the passband.
     </div>
   {/if}
-
-  <div class="filter-presets">
-    {#each [
-      { label: 'Open', lp: LP_OPEN_HZ, hp: HP_OPEN_HZ },
-      { label: 'Telephone', lp: 3000, hp: 400 },
-      { label: 'Muffled', lp: 800, hp: HP_OPEN_HZ },
-      { label: 'Thin', lp: LP_OPEN_HZ, hp: 400 },
-      { label: 'Sub only', lp: 120, hp: HP_OPEN_HZ },
-    ] as p (p.label)}
-      <button
-        type="button"
-        class="preset-btn"
-        class:active={Math.abs(value.lp_hz - p.lp) < 1 && Math.abs(value.hp_hz - p.hp) < 1}
-        onclick={() => patch({ lp_hz: p.lp, hp_hz: p.hp })}
-      >
-        {p.label}
-      </button>
-    {/each}
-    <button type="button" class="preset-btn reset" onclick={() => void settings.resetSlot(slotId)}>
-      Reset
-    </button>
-  </div>
 </div>
 
 <style>
-  @import './Filter.css';
+  @import "./Filter.css";
+  @import "./EffectPresets.css";
 </style>

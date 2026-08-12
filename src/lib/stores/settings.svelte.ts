@@ -53,7 +53,10 @@ export interface AppSettings {
   limiter?: LimiterSettings;
   playback_rate?: number;
   pitch_enabled?: boolean;
+  /** EQ presets (legacy field name). */
   custom_presets?: EQPreset[];
+  filter_presets?: FilterPreset[];
+  limiter_presets?: LimiterPreset[];
   download_folder?: string | null;
   download_playlist_id?: string | null;
   discord_rpc_enabled?: boolean;
@@ -67,6 +70,23 @@ export interface EQPreset {
   preamp_db: number;
   bands_db: number[];
 }
+
+export interface FilterPreset {
+  name: string;
+  lp_hz: number;
+  hp_hz: number;
+  resonance: number;
+}
+
+export interface LimiterPreset {
+  name: string;
+  gain_db: number;
+  ceiling_db: number;
+  release_ms: number;
+  clip: boolean;
+}
+
+export type EffectPreset = EQPreset | FilterPreset | LimiterPreset;
 
 export interface RemoteStatus {
   enabled: boolean;
@@ -85,7 +105,10 @@ const RATE_EVENT = 'settings:playback-rate';
 
 /** The rack, in order. Slots are plain values; identity comes from `id`. */
 let dspChain = $state<ChainSlot[]>([]);
+/** User-saved EQ presets only — no factory defaults. */
 let customPresets = $state<EQPreset[]>([]);
+let filterPresets = $state<FilterPreset[]>([]);
+let limiterPresets = $state<LimiterPreset[]>([]);
 let playbackRate = $state(1.0);
 let pitchEnabled = $state(true);
 let downloadFolder = $state<string | null>(null);
@@ -150,6 +173,8 @@ function scheduleSave() {
         preamp_db: p.preamp_db,
         bands_db: [...p.bands_db],
       })),
+      filter_presets: filterPresets.map((p) => ({ ...p })),
+      limiter_presets: limiterPresets.map((p) => ({ ...p })),
       download_folder: downloadFolder,
       download_playlist_id: downloadPlaylistId,
       discord_rpc_enabled: discordRpcEnabled,
@@ -263,6 +288,23 @@ export function createSettingsStore(
           };
         });
       }
+      if (Array.isArray(data.filter_presets)) {
+        filterPresets = data.filter_presets.map((p) => ({
+          name: p.name,
+          lp_hz: p.lp_hz ?? 20000,
+          hp_hz: p.hp_hz ?? 20,
+          resonance: p.resonance ?? 0.707,
+        }));
+      }
+      if (Array.isArray(data.limiter_presets)) {
+        limiterPresets = data.limiter_presets.map((p) => ({
+          name: p.name,
+          gain_db: p.gain_db ?? 0,
+          ceiling_db: p.ceiling_db ?? -0.3,
+          release_ms: p.release_ms ?? 120,
+          clip: !!p.clip,
+        }));
+      }
       if (typeof data.playback_rate === 'number' && data.playback_rate > 0) {
         playbackRate = Math.max(0.25, Math.min(2, data.playback_rate));
       } else {
@@ -333,6 +375,18 @@ export function createSettingsStore(
     },
     get customPresets() {
       return [...customPresets];
+    },
+    get filterPresets() {
+      return [...filterPresets];
+    },
+    get limiterPresets() {
+      return [...limiterPresets];
+    },
+    /** User presets for a given effect kind. */
+    presetsFor(kind: EffectKind): EffectPreset[] {
+      if (kind === 'equalizer') return [...customPresets];
+      if (kind === 'filter') return [...filterPresets];
+      return [...limiterPresets];
     },
     get downloadFolder() {
       return downloadFolder;
@@ -454,37 +508,104 @@ export function createSettingsStore(
       }
     },
 
-    // ── EQ presets (global list, applied to whichever EQ slot is being edited) ──
+    // ── Per-effect user presets (no factory defaults) ──────────────────────────
     async applyPreset(slotId: string, name: string) {
-      const preset = customPresets.find((p) => p.name === name);
-      if (!preset) return;
-      dspChain = dspChain.map((slot) =>
-        slot.id === slotId && slot.kind === 'equalizer'
-          ? {
-              ...slot,
-              enabled: true,
-              settings: { enabled: true, preamp_db: preset.preamp_db, bands_db: [...preset.bands_db] },
-            }
-          : slot,
-      );
+      const slot = dspChain.find((s) => s.id === slotId);
+      if (!slot) return;
+      if (slot.kind === 'equalizer') {
+        const preset = customPresets.find((p) => p.name === name);
+        if (!preset) return;
+        dspChain = dspChain.map((s) =>
+          s.id === slotId && s.kind === 'equalizer'
+            ? {
+                ...s,
+                enabled: true,
+                settings: {
+                  enabled: true,
+                  preamp_db: preset.preamp_db,
+                  bands_db: [...preset.bands_db],
+                },
+              }
+            : s,
+        );
+      } else if (slot.kind === 'filter') {
+        const preset = filterPresets.find((p) => p.name === name);
+        if (!preset) return;
+        dspChain = dspChain.map((s) =>
+          s.id === slotId && s.kind === 'filter'
+            ? {
+                ...s,
+                enabled: true,
+                settings: {
+                  enabled: true,
+                  lp_hz: preset.lp_hz,
+                  hp_hz: preset.hp_hz,
+                  resonance: preset.resonance,
+                },
+              }
+            : s,
+        );
+      } else {
+        const preset = limiterPresets.find((p) => p.name === name);
+        if (!preset) return;
+        dspChain = dspChain.map((s) =>
+          s.id === slotId && s.kind === 'limiter'
+            ? {
+                ...s,
+                enabled: true,
+                settings: {
+                  enabled: true,
+                  gain_db: preset.gain_db,
+                  ceiling_db: preset.ceiling_db,
+                  release_ms: preset.release_ms,
+                  clip: preset.clip,
+                },
+              }
+            : s,
+        );
+      }
       await applyChain();
     },
     async savePreset(slotId: string, name: string) {
       const trimmed = name.trim();
       if (!trimmed) return;
       const slot = dspChain.find((s) => s.id === slotId);
-      if (slot?.kind !== 'equalizer') return;
-      const newPreset: EQPreset = {
-        name: trimmed,
-        preamp_db: slot.settings.preamp_db,
-        bands_db: [...slot.settings.bands_db],
-      };
-      // Overwrite if same name exists (put at end to indicate recently saved)
-      customPresets = [...customPresets.filter((p) => p.name !== trimmed), newPreset];
+      if (!slot) return;
+      if (slot.kind === 'equalizer') {
+        const newPreset: EQPreset = {
+          name: trimmed,
+          preamp_db: slot.settings.preamp_db,
+          bands_db: [...slot.settings.bands_db],
+        };
+        customPresets = [...customPresets.filter((p) => p.name !== trimmed), newPreset];
+      } else if (slot.kind === 'filter') {
+        const newPreset: FilterPreset = {
+          name: trimmed,
+          lp_hz: slot.settings.lp_hz,
+          hp_hz: slot.settings.hp_hz,
+          resonance: slot.settings.resonance,
+        };
+        filterPresets = [...filterPresets.filter((p) => p.name !== trimmed), newPreset];
+      } else {
+        const newPreset: LimiterPreset = {
+          name: trimmed,
+          gain_db: slot.settings.gain_db,
+          ceiling_db: slot.settings.ceiling_db,
+          release_ms: slot.settings.release_ms,
+          clip: slot.settings.clip,
+        };
+        limiterPresets = [...limiterPresets.filter((p) => p.name !== trimmed), newPreset];
+      }
       scheduleSave();
     },
-    async deletePreset(name: string) {
-      customPresets = customPresets.filter((p) => p.name !== name);
+    async deletePreset(kind: EffectKind, name: string) {
+      if (kind === 'equalizer') {
+        customPresets = customPresets.filter((p) => p.name !== name);
+      } else if (kind === 'filter') {
+        filterPresets = filterPresets.filter((p) => p.name !== name);
+      } else {
+        limiterPresets = limiterPresets.filter((p) => p.name !== name);
+      }
       scheduleSave();
     },
 

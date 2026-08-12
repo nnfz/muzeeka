@@ -809,6 +809,15 @@ pub fn playlist_reorder(
     database.reorder_playlist(&playlist_id, &paths)
 }
 
+/// Persist the sidebar order of playlists (drag & drop reorder).
+#[tauri::command]
+pub fn playlists_reorder(
+    database: State<'_, LibraryDatabase>,
+    ids: Vec<String>,
+) -> Result<(), String> {
+    database.reorder_playlists(&ids)
+}
+
 #[tauri::command]
 pub fn library_reorder(
     database: State<'_, LibraryDatabase>,

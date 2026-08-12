@@ -2,6 +2,7 @@
   import { onDestroy } from 'svelte';
   import { LIMITER_MAX_GAIN_DB, getSettingsStore } from '$lib/stores/settings.svelte';
   import type { LimiterSettings } from '$lib/dsp/effects';
+  import EffectPresets from '$lib/components/EffectPresets.svelte';
 
   interface Props {
     /** Which rack slot this editor writes to. */
@@ -61,6 +62,13 @@
 </script>
 
 <div class="limiter-card">
+  <div class="effect-toolbar">
+    <button type="button" class="effect-reset" onclick={() => void settings.resetSlot(slotId)}>
+      Reset
+    </button>
+    <EffectPresets slotId={slotId} kind="limiter" value={value} />
+  </div>
+
   <div class="limiter-gain">
     <div class="limiter-row-head">
       <span class="limiter-row-label">Gain</span>
@@ -84,15 +92,18 @@
   </div>
 
   <label class="limiter-clip" class:on={value.clip}>
-    <input
-      type="checkbox"
-      checked={value.clip}
-      onchange={(e) => patch({ clip: (e.target as HTMLInputElement).checked })}
-    />
     <span class="clip-text">
       <span class="clip-label">Hard clip</span>
       <span class="clip-hint">Chop the peaks instead of holding them back — loud and dirty</span>
     </span>
+    <input
+      type="checkbox"
+      role="switch"
+      checked={value.clip}
+      aria-label="Hard clip"
+      onchange={(e) => patch({ clip: (e.target as HTMLInputElement).checked })}
+    />
+    <span class="clip-switch" aria-hidden="true"></span>
   </label>
 
   <div class="limiter-meter" class:idle={!active}>
@@ -142,29 +153,9 @@
       />
     </div>
   </div>
-
-  <div class="limiter-presets">
-    {#each [
-      { label: 'Transparent', gain: 2, release: 200 },
-      { label: 'Loud', gain: 6, release: 120 },
-      { label: 'Hard', gain: 9, release: 60 },
-      { label: 'Ебашит', gain: 12, release: 30 },
-    ] as p (p.label)}
-      <button
-        type="button"
-        class="preset-btn"
-        class:active={Math.abs(value.gain_db - p.gain) < 0.01}
-        onclick={() => patch({ gain_db: p.gain, release_ms: p.release })}
-      >
-        {p.label}
-      </button>
-    {/each}
-    <button type="button" class="preset-btn reset" onclick={() => void settings.resetSlot(slotId)}>
-      Reset
-    </button>
-  </div>
 </div>
 
 <style>
   @import './Limiter.css';
+  @import './EffectPresets.css';
 </style>
