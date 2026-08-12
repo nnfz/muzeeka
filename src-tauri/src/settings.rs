@@ -35,6 +35,14 @@ pub struct LimiterPreset {
     pub clip: bool,
 }
 
+/// Full rack snapshot — ordered slots with bypass + settings (ids reminted on apply).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ChainPreset {
+    pub name: String,
+    #[serde(default)]
+    pub slots: Vec<ChainSlotSettings>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WindowState {
     pub x: i32,
@@ -80,6 +88,9 @@ pub struct AppSettings {
     /// User-saved limiter presets (no factory defaults).
     #[serde(default)]
     pub limiter_presets: Vec<LimiterPreset>,
+    /// User-saved full DSP chain presets (no factory defaults).
+    #[serde(default)]
+    pub chain_presets: Vec<ChainPreset>,
     /// Playback rate multiplier. 1.0 = normal. Persisted so it survives restarts.
     #[serde(default = "default_playback_rate")]
     pub playback_rate: f32,
@@ -121,6 +132,7 @@ impl Default for AppSettings {
             custom_presets: Vec::new(),
             filter_presets: Vec::new(),
             limiter_presets: Vec::new(),
+            chain_presets: Vec::new(),
             playback_rate: default_playback_rate(),
             pitch_enabled: default_pitch_enabled(),
             download_folder: None,
@@ -237,6 +249,15 @@ fn normalize_settings(mut settings: AppSettings) -> AppSettings {
         preset.gain_db = preset.gain_db.clamp(0.0, 12.0);
         preset.ceiling_db = preset.ceiling_db.clamp(-6.0, 0.0);
         preset.release_ms = preset.release_ms.clamp(10.0, 1000.0);
+    }
+    for preset in &mut settings.chain_presets {
+        preset.slots.truncate(crate::dsp_chain::MAX_SLOTS);
+        for (i, slot) in preset.slots.iter_mut().enumerate() {
+            slot.effect = slot.effect.clone().clamp();
+            if slot.id.trim().is_empty() {
+                slot.id = format!("preset-slot-{i}");
+            }
+        }
     }
     settings
 }

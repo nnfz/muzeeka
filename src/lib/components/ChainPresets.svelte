@@ -1,29 +1,11 @@
 <script lang="ts">
   import {
+    chainsMatch,
     getSettingsStore,
-    type EQPreset,
-    type FilterPreset,
-    type LimiterPreset,
   } from '$lib/stores/settings.svelte';
-  import type {
-    EffectKind,
-    EqualizerSettings,
-    FilterSettings,
-    LimiterSettings,
-  } from '$lib/dsp/effects';
   import Dropdown from '$lib/components/Dropdown.svelte';
-  // Unscoped — same pattern as Dropdown.css so trigger always paints.
+  // Global (unscoped) so trigger styles always apply — same pattern as Dropdown.css.
   import './EffectPresets.css';
-
-  interface Props {
-    slotId: string;
-    kind: EffectKind;
-    value: EqualizerSettings | FilterSettings | LimiterSettings;
-    /** Fired after a preset is applied (EQ uses this for slider animation). */
-    onApply?: (name: string) => void;
-  }
-
-  let { slotId, kind, value, onApply }: Props = $props();
 
   const settings = getSettingsStore();
 
@@ -31,45 +13,12 @@
   let saveMode = $state(false);
   let newPresetName = $state('');
 
-  const list = $derived(settings.presetsFor(kind));
+  const list = $derived(settings.chainPresets);
 
   const currentPresetName = $derived.by(() => {
-    if (kind === 'equalizer') {
-      const v = value as EqualizerSettings;
-      for (const p of list as EQPreset[]) {
-        if (
-          Math.abs(p.preamp_db - v.preamp_db) < 0.05 &&
-          p.bands_db.length === v.bands_db.length &&
-          p.bands_db.every((g, i) => Math.abs(g - (v.bands_db[i] ?? 0)) < 0.05)
-        ) {
-          return p.name;
-        }
-      }
-      return null;
-    }
-    if (kind === 'filter') {
-      const v = value as FilterSettings;
-      for (const p of list as FilterPreset[]) {
-        if (
-          Math.abs(p.lp_hz - v.lp_hz) < 1 &&
-          Math.abs(p.hp_hz - v.hp_hz) < 1 &&
-          Math.abs(p.resonance - v.resonance) < 0.02
-        ) {
-          return p.name;
-        }
-      }
-      return null;
-    }
-    const v = value as LimiterSettings;
-    for (const p of list as LimiterPreset[]) {
-      if (
-        Math.abs(p.gain_db - v.gain_db) < 0.05 &&
-        Math.abs(p.ceiling_db - v.ceiling_db) < 0.05 &&
-        Math.abs(p.release_ms - v.release_ms) < 1 &&
-        p.clip === v.clip
-      ) {
-        return p.name;
-      }
+    const chain = settings.dspChain;
+    for (const p of list) {
+      if (chainsMatch(chain, p.slots)) return p.name;
     }
     return null;
   });
@@ -78,7 +27,7 @@
     dropdownOpen = false;
     saveMode = false;
     newPresetName = '';
-    void settings.applyPreset(slotId, name).then(() => onApply?.(name));
+    void settings.applyChainPreset(name);
   }
 
   function startSaveMode(e?: Event) {
@@ -87,7 +36,7 @@
     newPresetName = '';
     setTimeout(() => {
       const input = document.querySelector(
-        '.effect-presets .preset-save-input',
+        '.chain-presets .preset-save-input',
       ) as HTMLInputElement | null;
       input?.focus();
       input?.select();
@@ -98,7 +47,7 @@
     e?.stopPropagation?.();
     const name = newPresetName.trim();
     if (!name) return;
-    await settings.savePreset(slotId, name);
+    await settings.saveChainPreset(name);
     dropdownOpen = false;
     saveMode = false;
     newPresetName = '';
@@ -120,21 +69,22 @@
 
   function handleDeletePreset(e: MouseEvent | KeyboardEvent, name: string) {
     e.stopPropagation();
-    void settings.deletePreset(kind, name);
+    void settings.deleteChainPreset(name);
   }
 </script>
 
-<div class="effect-presets">
+<div class="effect-presets chain-presets">
   <span class="effect-presets-label">Preset:</span>
   <Dropdown class="preset-dropdown" bind:open={dropdownOpen} align="right">
     {#snippet trigger({ toggle })}
       <button
         type="button"
-        class="preset-trigger"
+        class="preset-trigger chain-preset-trigger"
         class:custom={!currentPresetName && list.length > 0}
         onclick={toggle}
         aria-haspopup="listbox"
         aria-expanded={dropdownOpen}
+        title="Save or load the whole effect chain"
       >
         <span class="preset-label">
           {currentPresetName || (list.length ? 'Custom' : 'None')}
@@ -161,7 +111,7 @@
         </div>
       {:else}
         <button type="button" class="dropdown-item accent" onclick={startSaveMode}>
-          <span class="dropdown-item-label">+ Save current as...</span>
+          <span class="dropdown-item-label">+ Save current chain as...</span>
         </button>
 
         {#if list.length > 0}
@@ -171,6 +121,7 @@
             <button
               type="button"
               class="dropdown-item"
+              class:active={currentPresetName === preset.name}
               onclick={() => applyPresetAndClose(preset.name)}
             >
               <span class="dropdown-item-label">{preset.name}</span>
@@ -195,3 +146,20 @@
     {/snippet}
   </Dropdown>
 </div>
+
+<style>
+  .dropdown-item-meta {
+    flex-shrink: 0;
+    margin-right: 18px;
+    font-size: 10px;
+    font-variant-numeric: tabular-nums;
+    color: var(--text-muted);
+  }
+
+  :global(.chain-preset-trigger) {
+    min-width: 96px;
+    height: 26px;
+    padding: 0 10px;
+    font-size: 11px;
+  }
+</style>

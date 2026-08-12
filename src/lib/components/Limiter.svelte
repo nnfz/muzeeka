@@ -1,8 +1,11 @@
 <script lang="ts">
-  import { onDestroy } from 'svelte';
-  import { LIMITER_MAX_GAIN_DB, getSettingsStore } from '$lib/stores/settings.svelte';
-  import type { LimiterSettings } from '$lib/dsp/effects';
-  import EffectPresets from '$lib/components/EffectPresets.svelte';
+  import { onDestroy } from "svelte";
+  import {
+    LIMITER_MAX_GAIN_DB,
+    getSettingsStore,
+  } from "$lib/stores/settings.svelte";
+  import type { LimiterSettings } from "$lib/dsp/effects";
+  import EffectPresets from "$lib/components/EffectPresets.svelte";
 
   interface Props {
     /** Which rack slot this editor writes to. */
@@ -24,7 +27,9 @@
   let reductionDb = $state(0);
   let meterTimer: ReturnType<typeof setInterval> | null = null;
 
-  const meterPct = $derived(Math.min(100, (reductionDb / METER_RANGE_DB) * 100));
+  const meterPct = $derived(
+    Math.min(100, (reductionDb / METER_RANGE_DB) * 100),
+  );
 
   function fillPct(v: number, min: number, max: number): number {
     if (max <= min) return 0;
@@ -54,7 +59,8 @@
       const status = await settings.fetchChainStatus();
       const next = status?.slots.find((s) => s.id === slotId)?.meter_db ?? 0;
       // Decay towards the reading so short peaks stay readable instead of flickering.
-      reductionDb = next > reductionDb ? next : reductionDb + (next - reductionDb) * 0.35;
+      reductionDb =
+        next > reductionDb ? next : reductionDb + (next - reductionDb) * 0.35;
     }, METER_POLL_MS);
   });
 
@@ -63,99 +69,117 @@
 
 <div class="limiter-card">
   <div class="effect-toolbar">
-    <button type="button" class="effect-reset" onclick={() => void settings.resetSlot(slotId)}>
+    <button
+      type="button"
+      class="effect-reset"
+      onclick={() => void settings.resetSlot(slotId)}
+    >
       Reset
     </button>
-    <EffectPresets slotId={slotId} kind="limiter" value={value} />
+    <EffectPresets {slotId} kind="limiter" {value} />
   </div>
-
-  <div class="limiter-gain">
-    <div class="limiter-row-head">
-      <span class="limiter-row-label">Gain</span>
-      <span class="limiter-row-value">+{value.gain_db.toFixed(1)} dB</span>
-    </div>
-    <input
-      type="range"
-      class="limiter-slider gain"
-      min="0"
-      max={LIMITER_MAX_GAIN_DB}
-      step="0.5"
-      value={value.gain_db}
-      style={`--fill: ${fillPct(value.gain_db, 0, LIMITER_MAX_GAIN_DB)}%`}
-      oninput={(e) => patch({ gain_db: Number((e.target as HTMLInputElement).value) })}
-      aria-label="Limiter gain"
-    />
-    <div class="limiter-bounds">
-      <span>0 dB</span>
-      <span>+{LIMITER_MAX_GAIN_DB} dB</span>
-    </div>
-  </div>
-
-  <label class="limiter-clip" class:on={value.clip}>
-    <span class="clip-text">
-      <span class="clip-label">Hard clip</span>
-      <span class="clip-hint">Chop the peaks instead of holding them back — loud and dirty</span>
-    </span>
-    <input
-      type="checkbox"
-      role="switch"
-      checked={value.clip}
-      aria-label="Hard clip"
-      onchange={(e) => patch({ clip: (e.target as HTMLInputElement).checked })}
-    />
-    <span class="clip-switch" aria-hidden="true"></span>
-  </label>
-
-  <div class="limiter-meter" class:idle={!active}>
-    <div class="limiter-row-head">
-      <span class="limiter-row-label">{value.clip ? 'Clipped' : 'Gain reduction'}</span>
-      <span class="limiter-row-value">−{reductionDb.toFixed(1)} dB</span>
-    </div>
-    <div class="meter-track">
-      <div class="meter-fill" class:clipping={value.clip} style={`width: ${meterPct}%`}></div>
-    </div>
-  </div>
-
-  <div class="limiter-grid">
-    <div class="limiter-field">
+  <div class="limiter-content">
+    <div class="limiter-gain">
       <div class="limiter-row-head">
-        <span class="limiter-row-label">Ceiling</span>
-        <span class="limiter-row-value">{value.ceiling_db.toFixed(1)} dBFS</span>
+        <span class="limiter-row-label">Gain</span>
+        <span class="limiter-row-value">+{value.gain_db.toFixed(1)} dB</span>
       </div>
       <input
         type="range"
-        class="limiter-slider"
-        min="-6"
-        max="0"
-        step="0.1"
-        value={value.ceiling_db}
-        style={`--fill: ${fillPct(value.ceiling_db, -6, 0)}%`}
-        oninput={(e) => patch({ ceiling_db: Number((e.target as HTMLInputElement).value) })}
-        aria-label="Limiter ceiling"
+        class="limiter-slider gain"
+        min="0"
+        max={LIMITER_MAX_GAIN_DB}
+        step="0.5"
+        value={value.gain_db}
+        style={`--fill: ${fillPct(value.gain_db, 0, LIMITER_MAX_GAIN_DB)}%`}
+        oninput={(e) =>
+          patch({ gain_db: Number((e.target as HTMLInputElement).value) })}
+        aria-label="Limiter gain"
       />
+      <div class="limiter-bounds">
+        <span>0 dB</span>
+        <span>+{LIMITER_MAX_GAIN_DB} dB</span>
+      </div>
     </div>
 
-    <div class="limiter-field">
-      <div class="limiter-row-head">
-        <span class="limiter-row-label">Release</span>
-        <span class="limiter-row-value">{Math.round(value.release_ms)} ms</span>
-      </div>
+    <label class="limiter-clip" class:on={value.clip}>
+      <span class="clip-text">
+        <span class="clip-label">Hard clip</span>
+      </span>
       <input
-        type="range"
-        class="limiter-slider"
-        min="10"
-        max="1000"
-        step="5"
-        value={value.release_ms}
-        style={`--fill: ${fillPct(value.release_ms, 10, 1000)}%`}
-        oninput={(e) => patch({ release_ms: Number((e.target as HTMLInputElement).value) })}
-        aria-label="Limiter release"
+        type="checkbox"
+        role="switch"
+        checked={value.clip}
+        aria-label="Hard clip"
+        onchange={(e) =>
+          patch({ clip: (e.target as HTMLInputElement).checked })}
       />
+      <span class="clip-switch" aria-hidden="true"></span>
+    </label>
+
+    <div class="limiter-meter" class:idle={!active}>
+      <div class="limiter-row-head">
+        <span class="limiter-row-label"
+          >{value.clip ? "Clipped" : "Gain reduction"}</span
+        >
+        <span class="limiter-row-value">−{reductionDb.toFixed(1)} dB</span>
+      </div>
+      <div class="meter-track">
+        <div
+          class="meter-fill"
+          class:clipping={value.clip}
+          style={`width: ${meterPct}%`}
+        ></div>
+      </div>
+    </div>
+
+    <div class="limiter-grid">
+      <div class="limiter-field">
+        <div class="limiter-row-head">
+          <span class="limiter-row-label">Ceiling</span>
+          <span class="limiter-row-value"
+            >{value.ceiling_db.toFixed(1)} dBFS</span
+          >
+        </div>
+        <input
+          type="range"
+          class="limiter-slider"
+          min="-6"
+          max="0"
+          step="0.1"
+          value={value.ceiling_db}
+          style={`--fill: ${fillPct(value.ceiling_db, -6, 0)}%`}
+          oninput={(e) =>
+            patch({ ceiling_db: Number((e.target as HTMLInputElement).value) })}
+          aria-label="Limiter ceiling"
+        />
+      </div>
+
+      <div class="limiter-field">
+        <div class="limiter-row-head">
+          <span class="limiter-row-label">Release</span>
+          <span class="limiter-row-value"
+            >{Math.round(value.release_ms)} ms</span
+          >
+        </div>
+        <input
+          type="range"
+          class="limiter-slider"
+          min="10"
+          max="1000"
+          step="5"
+          value={value.release_ms}
+          style={`--fill: ${fillPct(value.release_ms, 10, 1000)}%`}
+          oninput={(e) =>
+            patch({ release_ms: Number((e.target as HTMLInputElement).value) })}
+          aria-label="Limiter release"
+        />
+      </div>
     </div>
   </div>
 </div>
 
 <style>
-  @import './Limiter.css';
-  @import './EffectPresets.css';
+  @import "./Limiter.css";
+  @import "./EffectPresets.css";
 </style>

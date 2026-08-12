@@ -8,6 +8,13 @@
   flex-direction: column;
 }
 
+.limiter-content {
+  background: var(--bg-elevated);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-subtle);
+  padding: 12px;
+}
+
 .limiter-row-head {
   display: flex;
   align-items: baseline;
@@ -95,7 +102,7 @@
   justify-content: space-between;
   font-size: 10px;
   color: var(--text-muted);
-  margin-top: 4px;
+  margin-top: 8px;
 }
 
 .limiter-clip {
@@ -223,7 +230,7 @@
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 14px;
-  margin-top: 16px;
+  margin-top: 26px;
 }
 
 .limiter-card .effect-toolbar {

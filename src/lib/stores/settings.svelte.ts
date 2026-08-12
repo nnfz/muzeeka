@@ -9,6 +9,7 @@ import {
   clampSlot,
   defaultSettings,
   makeSlot,
+  mintSlotId,
   type ChainSlot,
   type DspChainStatus,
   type EffectKind,
@@ -57,6 +58,7 @@ export interface AppSettings {
   custom_presets?: EQPreset[];
   filter_presets?: FilterPreset[];
   limiter_presets?: LimiterPreset[];
+  chain_presets?: ChainPreset[];
   download_folder?: string | null;
   download_playlist_id?: string | null;
   discord_rpc_enabled?: boolean;
@@ -86,6 +88,12 @@ export interface LimiterPreset {
   clip: boolean;
 }
 
+/** Full rack snapshot. Slot ids are reminted when the preset is applied. */
+export interface ChainPreset {
+  name: string;
+  slots: ChainSlot[];
+}
+
 export type EffectPreset = EQPreset | FilterPreset | LimiterPreset;
 
 export interface RemoteStatus {
@@ -109,6 +117,7 @@ let dspChain = $state<ChainSlot[]>([]);
 let customPresets = $state<EQPreset[]>([]);
 let filterPresets = $state<FilterPreset[]>([]);
 let limiterPresets = $state<LimiterPreset[]>([]);
+let chainPresets = $state<ChainPreset[]>([]);
 let playbackRate = $state(1.0);
 let pitchEnabled = $state(true);
 let downloadFolder = $state<string | null>(null);
@@ -175,6 +184,10 @@ function scheduleSave() {
       })),
       filter_presets: filterPresets.map((p) => ({ ...p })),
       limiter_presets: limiterPresets.map((p) => ({ ...p })),
+      chain_presets: chainPresets.map((p) => ({
+        name: p.name,
+        slots: p.slots.map((s) => clampSlot(s)),
+      })),
       download_folder: downloadFolder,
       download_playlist_id: downloadPlaylistId,
       discord_rpc_enabled: discordRpcEnabled,
@@ -305,6 +318,14 @@ export function createSettingsStore(
           clip: !!p.clip,
         }));
       }
+      if (Array.isArray(data.chain_presets)) {
+        chainPresets = data.chain_presets.map((p) => ({
+          name: p.name,
+          slots: Array.isArray(p.slots)
+            ? p.slots.slice(0, MAX_SLOTS).map((s) => clampSlot(s as ChainSlot))
+            : [],
+        }));
+      }
       if (typeof data.playback_rate === 'number' && data.playback_rate > 0) {
         playbackRate = Math.max(0.25, Math.min(2, data.playback_rate));
       } else {
@@ -381,6 +402,12 @@ export function createSettingsStore(
     },
     get limiterPresets() {
       return [...limiterPresets];
+    },
+    get chainPresets() {
+      return chainPresets.map((p) => ({
+        name: p.name,
+        slots: p.slots.map((s) => clampSlot(s)),
+      }));
     },
     /** User presets for a given effect kind. */
     presetsFor(kind: EffectKind): EffectPreset[] {
@@ -609,6 +636,35 @@ export function createSettingsStore(
       scheduleSave();
     },
 
+    // ── Full chain presets ─────────────────────────────────────────────────────
+    async applyChainPreset(name: string) {
+      const preset = chainPresets.find((p) => p.name === name);
+      if (!preset) return;
+      // Remint ids so applying a preset always builds fresh nodes rather than
+      // colliding with whatever is currently in the rack.
+      dspChain = preset.slots.slice(0, MAX_SLOTS).map((slot) =>
+        clampSlot({
+          ...slot,
+          id: mintSlotId(slot.kind),
+        } as ChainSlot),
+      );
+      await applyChain();
+    },
+    async saveChainPreset(name: string) {
+      const trimmed = name.trim();
+      if (!trimmed) return;
+      const newPreset: ChainPreset = {
+        name: trimmed,
+        slots: dspChain.map((slot) => clampSlot(slot)),
+      };
+      chainPresets = [...chainPresets.filter((p) => p.name !== trimmed), newPreset];
+      scheduleSave();
+    },
+    async deleteChainPreset(name: string) {
+      chainPresets = chainPresets.filter((p) => p.name !== name);
+      scheduleSave();
+    },
+
     async setPlaybackRate(rate: number, opts?: { immediate?: boolean }) {
       await applyPlaybackRate(rate, opts);
     },
@@ -616,6 +672,35 @@ export function createSettingsStore(
       await applyPitchEnabled(enabled);
     },
   };
+}
+
+/** Compare two chains for preset matching — order, kinds, bypass, settings (not ids). */
+export function chainsMatch(a: ChainSlot[], b: ChainSlot[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    const x = a[i]!;
+    const y = b[i]!;
+    if (x.kind !== y.kind || x.enabled !== y.enabled) return false;
+    if (x.kind === 'equalizer' && y.kind === 'equalizer') {
+      if (Math.abs(x.settings.preamp_db - y.settings.preamp_db) >= 0.05) return false;
+      if (x.settings.bands_db.length !== y.settings.bands_db.length) return false;
+      if (!x.settings.bands_db.every((g, j) => Math.abs(g - (y.settings.bands_db[j] ?? 0)) < 0.05)) {
+        return false;
+      }
+    } else if (x.kind === 'filter' && y.kind === 'filter') {
+      if (Math.abs(x.settings.lp_hz - y.settings.lp_hz) >= 1) return false;
+      if (Math.abs(x.settings.hp_hz - y.settings.hp_hz) >= 1) return false;
+      if (Math.abs(x.settings.resonance - y.settings.resonance) >= 0.02) return false;
+    } else if (x.kind === 'limiter' && y.kind === 'limiter') {
+      if (Math.abs(x.settings.gain_db - y.settings.gain_db) >= 0.05) return false;
+      if (Math.abs(x.settings.ceiling_db - y.settings.ceiling_db) >= 0.05) return false;
+      if (Math.abs(x.settings.release_ms - y.settings.release_ms) >= 1) return false;
+      if (x.settings.clip !== y.settings.clip) return false;
+    } else {
+      return false;
+    }
+  }
+  return true;
 }
 
 const SETTINGS_KEY = Symbol('settings');

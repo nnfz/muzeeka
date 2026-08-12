@@ -361,13 +361,13 @@ button.playlist-select:hover {
 .about-header {
   display: flex;
   align-items: center;
-  gap: 14px;
+  gap: 20px;
   margin-bottom: 14px;
 }
 
 .about-logo {
-  width: 52px;
-  height: 52px;
+  width: 100px;
+  height: 100px;
   flex-shrink: 0;
   overflow: hidden;
   border-radius: var(--radius-md);

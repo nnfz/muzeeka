@@ -12,6 +12,7 @@
   import Equalizer from './Equalizer.svelte';
   import Filter from './Filter.svelte';
   import Limiter from './Limiter.svelte';
+  import ChainPresets from './ChainPresets.svelte';
 
   const settings = getSettingsStore();
 
@@ -49,6 +50,18 @@
 
   const chain = $derived(settings.dspChain);
   const full = $derived(chain.length >= MAX_SLOTS);
+
+  // Drop expanded state for rows that left the rack (clear / chain preset apply).
+  $effect(() => {
+    const ids = new Set(chain.map((s) => s.id));
+    let changed = false;
+    const next = new Set<string>();
+    for (const id of expanded) {
+      if (ids.has(id)) next.add(id);
+      else changed = true;
+    }
+    if (changed) expanded = next;
+  });
 
   function toggle(id: string) {
     // A drag ends with a click on the header it started from — that must not
@@ -192,11 +205,14 @@
     <div class="rack-head">
       <span class="rack-title">Chain</span>
       <span class="rack-count">{chain.length}/{MAX_SLOTS}</span>
-      {#if chain.length}
-        <button type="button" class="rack-clear" onclick={() => void settings.clearChain()}>
-          Clear
-        </button>
-      {/if}
+      <div class="rack-head-actions">
+        {#if chain.length}
+          <button type="button" class="rack-clear" onclick={() => void settings.clearChain()}>
+            Clear
+          </button>
+        {/if}
+        <ChainPresets />
+      </div>
     </div>
 
     <div class="chain-list" class:dragging={drag?.active} bind:this={chainEl} role="list">
@@ -285,7 +301,7 @@
           <span class="chain-empty-title">The chain is empty</span>
           <span class="chain-empty-hint">
             Drag an effect in from the right, or click it. Audio runs through the chain top to
-            bottom, so the order changes the sound.
+            bottom.
           </span>
         </div>
       {/if}

@@ -10,7 +10,7 @@
 
 .rack-chain {
   flex: 1;
-  gap: 4px;
+  gap: 10px;
   min-width: 0;
   display: flex;
   flex-direction: column;
@@ -21,7 +21,7 @@
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 10px;
 }
 
 .rack-head {
@@ -29,7 +29,8 @@
   line-height: 1;
   align-items: center;
   gap: 8px;
-  margin-bottom: 8px;
+  min-height: 28px;
+  flex-wrap: wrap;
 }
 
 .rack-title {
@@ -46,8 +47,16 @@
   color: var(--text-muted);
 }
 
-.rack-clear {
+.rack-head-actions {
   margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+.rack-clear {
+  padding: 4px 8px;
   font-size: 11px;
   color: var(--text-muted);
   border-radius: var(--radius-mini);
@@ -79,7 +88,7 @@
 
 .drop-line {
   height: 2px;
-  margin: -2px 4px 0;
+  margin: 2px;
   border-radius: var(--radius-full);
   background: var(--accent);
 }

@@ -154,7 +154,6 @@
   aspect-ratio: 1;
   border-radius: 50%;
   background: #fff;
-  box-shadow: 0 0 8px var(--accent-glow), 0 2px 4px rgba(0, 0, 0, 0.3);
   opacity: 0;
   pointer-events: none;
   transition: opacity var(--transition-fast);
