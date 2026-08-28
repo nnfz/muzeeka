@@ -10,21 +10,25 @@ use lofty::probe::Probe;
 use lofty::read_from_path;
 use lofty::tag::{Accessor, Tag, TagType};
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 use id3::TagLike;
 
 static COVER_CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();
 static PLAYLIST_COVER_DIR: OnceLock<PathBuf> = OnceLock::new();
 /// Bundled ffmpeg binary (for GIF → animated WebP). Set once at app startup.
 static FFMPEG_BIN: OnceLock<Option<PathBuf>> = OnceLock::new();
-/// Unique suffix for parallel ffmpeg temp inputs (same APIC content_id across tracks).
+/// Unique suffix for parallel ffmpeg / atomic-write temp files (same content_id across tracks).
 static COVER_FFMPEG_TMP_SEQ: AtomicU64 = AtomicU64::new(1);
+/// Serialize encode for a given content-addressed cover. Album art is shared by many
+/// tracks; without this, rayon import races leave empty/truncated thumbs that
+/// `is_file()` happily accepts forever.
+static COVER_ENCODE_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
 
 const PLAYLIST_COVER_SIZE: u32 = 256;
 const MAX_PLAYLIST_GIF_BYTES: u64 = 20 * 1024 * 1024;
@@ -316,6 +320,43 @@ fn content_full_candidates(content_id: &str) -> Vec<PathBuf> {
     ]
 }
 
+fn cover_encode_lock(content_id: &str) -> Arc<Mutex<()>> {
+    let map = COVER_ENCODE_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .entry(content_id.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+/// Replace `dest` with `tmp` (same volume). Cleans up `tmp` on failure.
+fn replace_file_atomic(tmp: &Path, dest: &Path) -> bool {
+    if dest.exists() {
+        let _ = fs::remove_file(dest);
+    }
+    if fs::rename(tmp, dest).is_ok() {
+        return true;
+    }
+    // Last resort: copy then remove tmp (rename can fail across volumes / locks).
+    let ok = fs::copy(tmp, dest).is_ok();
+    let _ = fs::remove_file(tmp);
+    ok && dest.is_file()
+}
+
+/// Unique sibling path used for atomic cover writes (never the final name).
+fn cover_write_tmp(dest: &Path) -> PathBuf {
+    let seq = COVER_FFMPEG_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let name = dest
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("cover");
+    dest.with_file_name(format!(
+        ".{name}.tmp-{}-{}",
+        std::process::id(),
+        seq
+    ))
+}
+
 fn find_ok_full(content_id: &str) -> Option<PathBuf> {
     content_full_candidates(content_id)
         .into_iter()
@@ -325,7 +366,7 @@ fn find_ok_full(content_id: &str) -> Option<PathBuf> {
 fn find_any_full(content_id: &str) -> Option<PathBuf> {
     content_full_candidates(content_id)
         .into_iter()
-        .find(|p| p.is_file() && fs::metadata(p).map(|m| m.len() > 0).unwrap_or(false))
+        .find(|p| full_cache_is_ok(p) || image_file_magic_ok(p))
 }
 
 fn remove_other_fulls(content_id: &str, keep: &Path) {
@@ -336,10 +377,73 @@ fn remove_other_fulls(content_id: &str, keep: &Path) {
     }
 }
 
+/// Quick header check so we never treat a truncated race-write as valid art.
+fn image_file_magic_ok(path: &Path) -> bool {
+    let mut hdr = [0u8; 12];
+    let Ok(mut f) = fs::File::open(path) else {
+        return false;
+    };
+    let Ok(n) = f.read(&mut hdr) else {
+        return false;
+    };
+    if n >= 3 && hdr[0] == 0xFF && hdr[1] == 0xD8 && hdr[2] == 0xFF {
+        return true; // JPEG
+    }
+    if n >= 12 && &hdr[0..4] == b"RIFF" && &hdr[8..12] == b"WEBP" {
+        return true; // WebP
+    }
+    if n >= 8 && hdr[0..8] == [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A] {
+        return true; // PNG
+    }
+    false
+}
+
 fn full_cache_is_ok(path: &Path) -> bool {
     match fs::metadata(path) {
-        Ok(m) => m.is_file() && m.len() > 0 && m.len() <= MAX_FULL_CACHE_BYTES,
-        Err(_) => false,
+        Ok(m) if m.is_file() && m.len() > 64 && m.len() <= MAX_FULL_CACHE_BYTES => {
+            image_file_magic_ok(path)
+        }
+        _ => false,
+    }
+}
+
+/// List thumbs: cheap header check only. Never `image::open` here — this runs
+/// on every virtualized-list resolve. Atomic write + per-id lock prevent the
+/// empty/truncated race leftovers; a structurally valid but pixel-garbage
+/// WebP is handled by rewriting that one file, not by decoding the whole cache.
+fn thumb_cache_is_ok(path: &Path) -> bool {
+    match fs::metadata(path) {
+        // Smallest valid 96px VP8L thumbs are a few hundred bytes; 32 rejects empties.
+        Ok(m) if m.is_file() && m.len() >= 32 && m.len() <= 512 * 1024 => {
+            let mut hdr = [0u8; 12];
+            let Ok(mut f) = fs::File::open(path) else {
+                return false;
+            };
+            matches!(f.read(&mut hdr), Ok(n) if n >= 12)
+                && hdr[0..4] == *b"RIFF"
+                && hdr[8..12] == *b"WEBP"
+        }
+        _ => false,
+    }
+}
+
+/// Public check used by DB cover resolution: reject empty/truncated cache files.
+pub fn cached_cover_file_ok(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if name.contains("-thumb.") {
+        return thumb_cache_is_ok(path);
+    }
+    if name.contains("-full.") {
+        return full_cache_is_ok(path) || image_file_magic_ok(path);
+    }
+    // Playlist covers / arbitrary paths: non-empty + known image magic.
+    match fs::metadata(path) {
+        Ok(m) if m.is_file() && m.len() > 0 => image_file_magic_ok(path),
+        _ => false,
     }
 }
 
@@ -352,7 +456,11 @@ fn ensure_content_cover_files(data: &[u8], _mime: &str) -> Option<(String, Cover
     let content_id = cover_content_id(data);
     let thumb_path = content_thumb_path(&content_id)?;
 
-    let thumb_ok = thumb_path.is_file();
+    // One writer per content_id — album folder Cover.jpg is shared by every track.
+    let lock = cover_encode_lock(&content_id);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+
+    let thumb_ok = thumb_cache_is_ok(&thumb_path);
     let full_ok = find_ok_full(&content_id).is_some();
 
     // Shared by every track with this APIC — only when both are usable.
@@ -382,7 +490,11 @@ fn ensure_content_cover_files(data: &[u8], _mime: &str) -> Option<(String, Cover
         }
     }
 
-    if !thumb_path.is_file() {
+    if !thumb_cache_is_ok(&thumb_path) {
+        // Drop a known-bad leftover so we don't keep returning it.
+        if thumb_path.is_file() {
+            let _ = fs::remove_file(&thumb_path);
+        }
         // Prefer cheap path: scale from the full we just wrote when present.
         let wrote_thumb = find_any_full(&content_id)
             .and_then(|full| image::open(full).ok())
@@ -396,7 +508,7 @@ fn ensure_content_cover_files(data: &[u8], _mime: &str) -> Option<(String, Cover
         }
     }
 
-    if !thumb_path.is_file() {
+    if !thumb_cache_is_ok(&thumb_path) {
         return None;
     }
 
@@ -474,18 +586,24 @@ fn write_jpeg(image: &image::DynamicImage, dest: &Path, quality: u8) -> bool {
     }
 
     let rgb = image.to_rgb8();
-    let Ok(file) = fs::File::create(dest) else {
+    let tmp = cover_write_tmp(dest);
+    let Ok(file) = fs::File::create(&tmp) else {
         return false;
     };
     let mut encoder = JpegEncoder::new_with_quality(BufWriter::new(file), quality);
-    encoder
+    let encoded = encoder
         .encode(
             rgb.as_raw(),
             rgb.width(),
             rgb.height(),
             image::ExtendedColorType::Rgb8,
         )
-        .is_ok()
+        .is_ok();
+    if !encoded {
+        let _ = fs::remove_file(&tmp);
+        return false;
+    }
+    replace_file_atomic(&tmp, dest)
 }
 
 fn encode_full_cover_ffmpeg(data: &[u8], dest: &Path, ffmpeg: &Path) -> bool {
@@ -493,10 +611,15 @@ fn encode_full_cover_ffmpeg(data: &[u8], dest: &Path, ffmpeg: &Path) -> bool {
         let _ = fs::create_dir_all(parent);
     }
 
-    // Must be unique per call: same album APIC → same content_id → same `dest`,
-    // and rayon can encode many tracks in parallel on first library scan.
+    // Unique temps: same album APIC → same content_id → same `dest`, and rayon
+    // used to encode many tracks in parallel before the per-id lock existed.
     let seq = COVER_FFMPEG_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp_in = dest.with_extension(format!("src-tmp-{}-{}", std::process::id(), seq));
+    let tmp_in = dest.with_file_name(format!(
+        ".full-src-tmp-{}-{}",
+        std::process::id(),
+        seq
+    ));
+    let tmp_out = cover_write_tmp(dest);
     if fs::write(&tmp_in, data).is_err() {
         return false;
     }
@@ -518,13 +641,17 @@ fn encode_full_cover_ffmpeg(data: &[u8], dest: &Path, ffmpeg: &Path) -> bool {
         ])
         .arg(&tmp_in)
         .args(["-vf", &vf, "-frames:v", "1", "-q:v", "3"])
-        .arg(dest)
+        .arg(&tmp_out)
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
 
     let _ = fs::remove_file(&tmp_in);
-    ok && dest.is_file()
+    if !ok || !tmp_out.is_file() {
+        let _ = fs::remove_file(&tmp_out);
+        return false;
+    }
+    replace_file_atomic(&tmp_out, dest)
 }
 
 #[allow(dead_code)]
@@ -543,8 +670,18 @@ fn write_webp(image: &image::DynamicImage, dest: &Path) -> bool {
     if let Some(parent) = dest.parent() {
         let _ = fs::create_dir_all(parent);
     }
+    // Atomic write: never leave a truncated `*-thumb.webp` that `is_file()` would
+    // treat as done (parallel album import used to race on the final path).
+    let tmp = cover_write_tmp(dest);
     // image crate WebP encoder is lossless (VP8L) — smaller than PNG, no extra deps.
-    image.save_with_format(dest, ImageFormat::WebP).is_ok()
+    if image.save_with_format(&tmp, ImageFormat::WebP).is_err() {
+        let _ = fs::remove_file(&tmp);
+        return false;
+    }
+    if !replace_file_atomic(&tmp, dest) {
+        return false;
+    }
+    thumb_cache_is_ok(dest) || image_file_magic_ok(dest)
 }
 
 fn write_resized_webp(image: &image::DynamicImage, dest: &Path, max_size: u32) -> bool {
@@ -1160,7 +1297,7 @@ pub fn cover_paths_for_id(cover_id: &str) -> CoverPaths {
     if id.len() != 16 || !id.chars().all(|c| c.is_ascii_hexdigit()) {
         return CoverPaths::default();
     }
-    let thumb = content_thumb_path(&id).filter(|p| p.is_file());
+    let thumb = content_thumb_path(&id).filter(|p| thumb_cache_is_ok(p));
     let full = find_ok_full(&id).or_else(|| find_any_full(&id));
     CoverPaths {
         thumb: thumb.map(|p| p.to_string_lossy().to_string()),
@@ -1169,6 +1306,32 @@ pub fn cover_paths_for_id(cover_id: &str) -> CoverPaths {
             .map(|p| p.to_string_lossy().to_string()),
         id: Some(id),
     }
+}
+
+/// Rebuild the 96px WebP list thumb from an existing full cover.
+/// Cheap path for a missing thumb: no audio I/O, no FLAC parse.
+pub fn rebuild_list_thumb_from_full(cover_id: &str) -> Option<String> {
+    let id = cover_id.trim().to_ascii_lowercase();
+    if id.len() != 16 || !id.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let dest = content_thumb_path(&id)?;
+    if thumb_cache_is_ok(&dest) {
+        return Some(dest.to_string_lossy().into_owned());
+    }
+
+    let lock = cover_encode_lock(&id);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    if thumb_cache_is_ok(&dest) {
+        return Some(dest.to_string_lossy().into_owned());
+    }
+
+    let full = find_any_full(&id)?;
+    let img = image::open(full).ok()?;
+    if !write_thumbnail_from_image(&img, &dest) {
+        return None;
+    }
+    Some(dest.to_string_lossy().into_owned())
 }
 
 fn cache_cover_file(source: &Path) -> CoverPaths {
@@ -2160,6 +2323,80 @@ mod tests {
 
         let cover = find_nearby_cover(&audio).expect("folder cover");
         assert_eq!(cover.file_name().unwrap().to_str().unwrap(), "folder.jpg");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn thumb_cache_rejects_empty_and_truncated_race_files() {
+        let base = std::env::temp_dir().join(format!("muzeeka-thumb-ok-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).expect("create dir");
+
+        let empty = base.join("empty-thumb.webp");
+        write_bytes(&empty, &[]);
+        assert!(!thumb_cache_is_ok(&empty), "empty file must not count as thumb");
+
+        let partial = base.join("partial-thumb.webp");
+        write_bytes(&partial, b"RIFF\x00\x00\x00\x00");
+        assert!(!thumb_cache_is_ok(&partial), "truncated RIFF must not count as thumb");
+
+        let junk = base.join("junk-thumb.webp");
+        write_bytes(&junk, &[0u8; 64]);
+        assert!(!thumb_cache_is_ok(&junk), "non-webp payload must not count as thumb");
+
+        let mut webp = Vec::from(&b"RIFF"[..]);
+        webp.extend_from_slice(&30u32.to_le_bytes());
+        webp.extend_from_slice(b"WEBP");
+        webp.extend_from_slice(b"VP8L");
+        webp.extend_from_slice(&18u32.to_le_bytes());
+        webp.extend_from_slice(&[0u8; 18]);
+        let ok = base.join("ok-thumb.webp");
+        write_bytes(&ok, &webp);
+        assert!(thumb_cache_is_ok(&ok), "RIFF/WEBP with payload must pass header check");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn write_webp_is_atomic_and_validates() {
+        let base = std::env::temp_dir().join(format!("muzeeka-webp-atomic-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).expect("create dir");
+
+        let dest = base.join("c-test-thumb.webp");
+        write_bytes(&dest, &[]);
+        assert!(dest.is_file());
+        assert!(!thumb_cache_is_ok(&dest));
+
+        let img = image::RgbImage::from_fn(32, 32, |x, y| {
+            image::Rgb([(x * 8) as u8, (y * 8) as u8, 128])
+        });
+        assert!(write_webp(&image::DynamicImage::ImageRgb8(img), &dest));
+        assert!(thumb_cache_is_ok(&dest));
+        assert!(image::open(&dest).is_ok());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn write_thumbnail_is_96px_webp() {
+        let base = std::env::temp_dir().join(format!("muzeeka-webp-thumb-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).expect("create dir");
+
+        let dest = base.join("c-test-thumb.webp");
+        let img = image::RgbImage::from_fn(200, 200, |x, y| {
+            image::Rgb([40, (x % 256) as u8, (y % 256) as u8])
+        });
+        assert!(write_thumbnail_from_image(
+            &image::DynamicImage::ImageRgb8(img),
+            &dest
+        ));
+        assert!(thumb_cache_is_ok(&dest));
+        let opened = image::open(&dest).expect("decode webp thumb");
+        assert_eq!(opened.width(), THUMB_SIZE);
+        assert_eq!(opened.height(), THUMB_SIZE);
 
         let _ = fs::remove_dir_all(&base);
     }

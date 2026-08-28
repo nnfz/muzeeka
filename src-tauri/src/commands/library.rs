@@ -550,7 +550,15 @@ fn cover_audio_path(path: &str) -> String {
 }
 
 fn cover_file_ok(path: &str) -> bool {
-    !path.is_empty() && std::path::Path::new(path).is_file()
+    if path.is_empty() {
+        return false;
+    }
+    let p = std::path::Path::new(path);
+    if !p.is_file() {
+        return false;
+    }
+    // Reject empty/truncated race leftovers so we re-extract instead of serving them.
+    crate::metadata::cached_cover_file_ok(p)
 }
 
 /// Prefer SQLite cover paths; extract from the audio file only on miss / stale / missing full.
@@ -576,6 +584,16 @@ fn resolve_covers_via_db(
             if full.is_none() {
                 full = db_full
                     .filter(|p| cover_file_ok(p) && !crate::metadata::is_thumb_cache_path(p));
+            }
+        }
+    }
+
+    // Missing 96px WebP: rebuild from the cached full JPEG. Never serve the
+    // 720px full as a list thumb (that is what made the UI hitch).
+    if thumb.is_none() {
+        if let Some(full_path) = full.as_deref() {
+            if let Some(id) = crate::metadata::cover_id_from_cache_path(full_path) {
+                thumb = crate::metadata::rebuild_list_thumb_from_full(&id);
             }
         }
     }
@@ -619,8 +637,8 @@ pub async fn library_resolve_cover(
 ) -> Result<Option<String>, String> {
     let database = database.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let (thumb, full) = resolve_covers_via_db(&database, &path, false);
-        Ok(thumb.or(full))
+        let (thumb, _full) = resolve_covers_via_db(&database, &path, false);
+        Ok(thumb)
     })
     .await
     .map_err(|e| format!("Cover resolve task failed: {e}"))?
