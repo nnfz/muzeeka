@@ -106,15 +106,18 @@ pub struct AppSettings {
     /// Show the current track in Discord Rich Presence.
     #[serde(default = "default_discord_rpc_enabled")]
     pub discord_rpc_enabled: bool,
-    /// Local phone/browser remote control HTTP server.
-    #[serde(default = "default_remote_enabled")]
-    pub remote_enabled: bool,
-    /// Port for the remote control server (default 8765).
-    #[serde(default = "default_remote_port")]
-    pub remote_port: u16,
+    /// Old settings.json key. Migrated into the `muzeeka.remote` plugin once.
+    #[serde(rename = "remote_enabled", default = "default_legacy_remote_enabled", skip_serializing)]
+    pub legacy_remote_enabled: bool,
+    /// Old settings.json key. Migrated into the `muzeeka.remote` plugin once.
+    #[serde(rename = "remote_port", default = "default_legacy_remote_port", skip_serializing)]
+    pub legacy_remote_port: u16,
     /// Shuffle algorithm: normal random vs smart no-repeat-until-exhausted.
     #[serde(default)]
     pub shuffle_mode: ShuffleMode,
+    /// Show the Development settings tab and in-app console.
+    #[serde(default)]
+    pub developer_mode: bool,
     /// Last main window position and size.
     #[serde(default)]
     pub window_state: Option<WindowState>,
@@ -138,9 +141,10 @@ impl Default for AppSettings {
             download_folder: None,
             download_playlist_id: None,
             discord_rpc_enabled: default_discord_rpc_enabled(),
-            remote_enabled: default_remote_enabled(),
-            remote_port: default_remote_port(),
+            legacy_remote_enabled: default_legacy_remote_enabled(),
+            legacy_remote_port: default_legacy_remote_port(),
             shuffle_mode: ShuffleMode::default(),
+            developer_mode: false,
             window_state: None,
         }
     }
@@ -158,12 +162,12 @@ fn default_discord_rpc_enabled() -> bool {
     true
 }
 
-fn default_remote_enabled() -> bool {
+fn default_legacy_remote_enabled() -> bool {
     true
 }
 
-fn default_remote_port() -> u16 {
-    crate::remote_server::DEFAULT_REMOTE_PORT
+fn default_legacy_remote_port() -> u16 {
+    crate::plugins::http_server::DEFAULT_HTTP_PORT
 }
 
 fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -233,7 +237,8 @@ fn normalize_settings(mut settings: AppSettings) -> AppSettings {
         }
     }
     settings.playback_rate = settings.playback_rate.clamp(0.25, 2.0);
-    settings.remote_port = crate::remote_server::sanitize_port(settings.remote_port);
+    settings.legacy_remote_port =
+        crate::plugins::http_server::sanitize_port(settings.legacy_remote_port);
     for preset in &mut settings.custom_presets {
         preset.preamp_db = preset.preamp_db.clamp(-15.0, 15.0);
         for gain in &mut preset.bands_db {

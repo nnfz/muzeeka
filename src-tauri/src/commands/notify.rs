@@ -1,4 +1,4 @@
-// Coalesced playback notifications for Discord RPC + remote UI.
+// Coalesced playback notifications for Discord RPC and plugin hosts.
 //
 // A single long-lived worker processes the latest snapshot instead of spawning
 // a new OS thread on every play/pause/seek IPC call.
@@ -9,12 +9,12 @@ use std::time::Duration;
 
 use crate::discord_rpc::DiscordPresence;
 use crate::player::Player;
-use crate::remote_control::RemoteController;
+use crate::session::PlaybackSession;
 
 struct Pending {
     player: Player,
     discord: DiscordPresence,
-    controller: Arc<RemoteController>,
+    controller: Arc<PlaybackSession>,
     /// Seek-style updates wait for a quiet period so drag doesn't flood Discord IPC.
     debounce: bool,
 }
@@ -80,7 +80,7 @@ fn notify_worker(hub: Arc<NotifyHub>, rx: mpsc::Receiver<()>) {
 fn enqueue(
     player: &Player,
     discord: &DiscordPresence,
-    controller: &Arc<RemoteController>,
+    controller: &Arc<PlaybackSession>,
     debounce: bool,
 ) {
     let (hub, wake) = hub();
@@ -101,11 +101,11 @@ fn enqueue(
     let _ = wake.try_send(());
 }
 
-/// Notify Discord + remote UI after play / pause / resume / stop.
+/// Notify Discord and plugin hosts after play / pause / resume / stop.
 pub fn notify_playback_change(
     player: &Player,
     discord: &DiscordPresence,
-    controller: &Arc<RemoteController>,
+    controller: &Arc<PlaybackSession>,
 ) {
     enqueue(player, discord, controller, false);
 }
@@ -114,7 +114,7 @@ pub fn notify_playback_change(
 pub fn notify_playback_seek(
     player: &Player,
     discord: &DiscordPresence,
-    controller: &Arc<RemoteController>,
+    controller: &Arc<PlaybackSession>,
 ) {
     enqueue(player, discord, controller, true);
 }

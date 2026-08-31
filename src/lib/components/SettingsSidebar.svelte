@@ -1,17 +1,26 @@
 <script lang="ts">
-  export type Section = 'general' | 'downloads' | 'remote' | 'audio' | 'about';
+  export type Section = 'general' | 'downloads' | 'plugins' | 'audio' | 'developer' | 'about';
 
-  let { activeSection = $bindable<Section>('general') }: {
+  let {
+    activeSection = $bindable<Section>('general'),
+    showDeveloper = false,
+  }: {
     activeSection?: Section;
+    showDeveloper?: boolean;
   } = $props();
 
-  const sections: { id: Section; label: string; icon: 'general' | 'downloads' | 'remote' | 'audio' | 'about' }[] = [
+  const allSections: { id: Section; label: string; icon: Section }[] = [
     { id: 'general', label: 'General', icon: 'general' },
     { id: 'downloads', label: 'Downloads', icon: 'downloads' },
-    { id: 'remote', label: 'Remote', icon: 'remote' },
+    { id: 'plugins', label: 'Plugins', icon: 'plugins' },
     { id: 'audio', label: 'Audio', icon: 'audio' },
+    { id: 'developer', label: 'Development', icon: 'developer' },
     { id: 'about', label: 'About', icon: 'about' },
   ];
+
+  const sections = $derived(
+    showDeveloper ? allSections : allSections.filter((s) => s.id !== 'developer'),
+  );
 
   function select(id: Section) {
     activeSection = id;
@@ -39,15 +48,25 @@
               <path d="M7 10l5 5 5-5" />
               <path d="M5 21h14" />
             </svg>
-          {:else if section.icon === 'remote'}
+          {:else if section.icon === 'plugins'}
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
-              <rect x="7" y="2" width="10" height="20" rx="2" />
-              <path d="M11 18h2" />
-              <path d="M9 6h6" />
+              <path d="M12 2v4" />
+              <path d="M12 18v4" />
+              <path d="M4.93 4.93l2.83 2.83" />
+              <path d="M16.24 16.24l2.83 2.83" />
+              <path d="M2 12h4" />
+              <path d="M18 12h4" />
+              <path d="M4.93 19.07l2.83-2.83" />
+              <path d="M16.24 7.76l2.83-2.83" />
             </svg>
           {:else if section.icon === 'audio'}
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
               <path d="M4 10v4M8 7v10M12 4v16M16 7v10M20 10v4" />
+            </svg>
+          {:else if section.icon === 'developer'}
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="4 17 10 11 4 5" />
+              <line x1="12" y1="19" x2="20" y2="19" />
             </svg>
           {:else}
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">

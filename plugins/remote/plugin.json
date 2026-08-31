@@ -1,0 +1,26 @@
+{
+  "id": "muzeeka.remote",
+  "name": "Remote control",
+  "version": "1.0.0",
+  "author": "nnfz",
+  "description": "Control playback from a phone or browser on the same network.",
+  "main": "index.js",
+  "enabled_by_default": true,
+  "permissions": [
+    "player:read",
+    "player:control",
+    "library:read",
+    "http:listen"
+  ],
+  "settings": [
+    {
+      "key": "port",
+      "type": "number",
+      "label": "Port",
+      "description": "1024–65535",
+      "min": 1024,
+      "max": 65535,
+      "default": 8765
+    }
+  ]
+}

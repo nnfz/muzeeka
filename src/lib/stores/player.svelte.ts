@@ -2936,7 +2936,7 @@ function toggleRepeat() {
 function applyStoreSync(payload: StoreSyncPayload) {
   applyingExternalSync = true;
   try {
-    // Remote sync updates the playback queue only — not the playlist shown in the UI.
+    // Plugin/HTTP sync updates the playback queue only — not the playlist shown in the UI.
     if (payload.playingPlaylistId !== undefined) {
       playingPlaylistId = payload.playingPlaylistId;
     }

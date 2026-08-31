@@ -62,9 +62,8 @@ export interface AppSettings {
   download_folder?: string | null;
   download_playlist_id?: string | null;
   discord_rpc_enabled?: boolean;
-  remote_enabled?: boolean;
-  remote_port?: number;
   shuffle_mode?: ShuffleMode;
+  developer_mode?: boolean;
 }
 
 export interface EQPreset {
@@ -96,18 +95,6 @@ export interface ChainPreset {
 
 export type EffectPreset = EQPreset | FilterPreset | LimiterPreset;
 
-export interface RemoteStatus {
-  enabled: boolean;
-  running: boolean;
-  port: number;
-  local_ip: string | null;
-  local_ips: string[];
-  urls: string[];
-  last_error: string | null;
-}
-
-const DEFAULT_REMOTE_PORT = 8765;
-
 /** Global playback rate changed — every window mirrors it (see `bindGlobalRateSync`). */
 const RATE_EVENT = 'settings:playback-rate';
 
@@ -123,10 +110,9 @@ let pitchEnabled = $state(true);
 let downloadFolder = $state<string | null>(null);
 let downloadPlaylistId = $state<string | null>(null);
 let discordRpcEnabled = $state(true);
-let remoteEnabled = $state(true);
-let remotePort = $state(DEFAULT_REMOTE_PORT);
 /** Default smart: avoid replaying tracks until the playlist cycle is complete. */
 let shuffleMode = $state<ShuffleMode>('smart');
+let developerMode = $state(false);
 let defaultDownloadFolder = $state<string | null>(null);
 let isReady = $state(false);
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -158,12 +144,6 @@ function bindGlobalRateSync() {
   });
 }
 
-function clampRemotePort(port: number): number {
-  const n = Math.round(Number(port));
-  if (!Number.isFinite(n) || n < 1024 || n > 65535) return DEFAULT_REMOTE_PORT;
-  return n;
-}
-
 function parseShuffleMode(value: unknown): ShuffleMode {
   return value === 'normal' ? 'normal' : 'smart';
 }
@@ -191,9 +171,8 @@ function scheduleSave() {
       download_folder: downloadFolder,
       download_playlist_id: downloadPlaylistId,
       discord_rpc_enabled: discordRpcEnabled,
-      remote_enabled: remoteEnabled,
-      remote_port: clampRemotePort(remotePort),
       shuffle_mode: shuffleMode,
+      developer_mode: developerMode,
     };
     invoke('settings_save', { data: payload }).catch((e) => {
       console.error('Failed to save settings:', e);
@@ -344,10 +323,8 @@ export function createSettingsStore(
         downloadPlaylistId = null;
       }
       discordRpcEnabled = data.discord_rpc_enabled !== false;
-      remoteEnabled = data.remote_enabled !== false;
-      remotePort =
-        typeof data.remote_port === 'number' ? clampRemotePort(data.remote_port) : DEFAULT_REMOTE_PORT;
       shuffleMode = parseShuffleMode(data.shuffle_mode);
+      developerMode = data.developer_mode === true;
       try {
         defaultDownloadFolder = await invoke<string>('ytdlp_default_download_dir');
       } catch {
@@ -424,14 +401,11 @@ export function createSettingsStore(
     get discordRpcEnabled() {
       return discordRpcEnabled;
     },
-    get remoteEnabled() {
-      return remoteEnabled;
-    },
-    get remotePort() {
-      return remotePort;
-    },
     get shuffleMode() {
       return shuffleMode;
+    },
+    get developerMode() {
+      return developerMode;
     },
     get effectiveDownloadFolder() {
       return downloadFolder ?? defaultDownloadFolder ?? '';
@@ -448,25 +422,13 @@ export function createSettingsStore(
       discordRpcEnabled = enabled;
       scheduleSave();
     },
-    setRemoteEnabled(enabled: boolean) {
-      remoteEnabled = enabled;
-      scheduleSave();
-    },
-    setRemotePort(port: number) {
-      remotePort = clampRemotePort(port);
-      scheduleSave();
-    },
     setShuffleMode(mode: ShuffleMode) {
       shuffleMode = parseShuffleMode(mode);
       scheduleSave();
     },
-    async fetchRemoteStatus(): Promise<RemoteStatus | null> {
-      try {
-        return await invoke<RemoteStatus>('remote_status');
-      } catch (e) {
-        console.error('Failed to fetch remote status:', e);
-        return null;
-      }
+    setDeveloperMode(enabled: boolean) {
+      developerMode = enabled;
+      scheduleSave();
     },
     // ── Effect rack ────────────────────────────────────────────────────────────
     /** Insert a fresh effect at `atIndex` (default: append). Returns its slot id. */

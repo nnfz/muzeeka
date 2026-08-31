@@ -22,3 +22,10 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 /.vscode
+/plugins/native-probe/target/
+/plugins/native-probe/*.dll
+/plugins/native-probe/*.pdb
+/plugins/native-probe/*.exp
+/plugins/native-probe/*.lib
+/plugins/native-probe/*.so
+/plugins/native-probe/*.dylib

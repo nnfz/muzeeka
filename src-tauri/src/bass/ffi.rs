@@ -11,6 +11,16 @@ use std::path::Path;
 use std::ptr;
 
 use super::types::*;
+use std::ffi::CStr;
+
+fn cstr(ptr: *const i8) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    unsafe { CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .into_owned()
+}
 
 /// Holds the loaded bass.dll and its resolved function pointers.
 pub struct BassLibrary {
@@ -79,6 +89,12 @@ pub struct BassLibrary {
     bass_plugin_load:
         unsafe extern "system" fn(file: *const u16, flags: DWORD) -> HPLUGIN,
 
+    bass_get_device_info:
+        unsafe extern "system" fn(device: DWORD, info: *mut BassDeviceInfo) -> BOOL,
+    bass_set_device: unsafe extern "system" fn(device: DWORD) -> BOOL,
+    bass_get_device: unsafe extern "system" fn() -> DWORD,
+    bass_channel_set_device: unsafe extern "system" fn(handle: DWORD, device: DWORD) -> BOOL,
+
     // ── Mixer (bassmix) — None when bassmix.dll is missing ──────────────────
     _mixer_lib: Option<Library>,
     bass_mixer_stream_create:
@@ -93,6 +109,8 @@ pub struct BassLibrary {
     #[allow(dead_code)] // used by mixer_channel_flags
     bass_mixer_channel_flags:
         Option<unsafe extern "system" fn(channel: DWORD, flags: DWORD, mask: DWORD) -> DWORD>,
+    bass_split_stream_create:
+        Option<unsafe extern "system" fn(channel: DWORD, flags: DWORD, chanmap: *const i32) -> HSTREAM>,
 
     // ── FX (bass_fx.dll) — None until enable_fx_from_plugin succeeds ────────
     _fx_lib: Option<Library>,
@@ -172,7 +190,7 @@ impl BassLibrary {
 
         // Load bassmix for proper gapless (BASS_Mixer_*)
         let mixer_lib = unsafe { Library::new(bass_dir.join("bassmix.dll")).ok() };
-        let (mixer_create, mixer_add, mixer_remove, mixer_set_pos, mixer_get_pos, mixer_flags) =
+        let (mixer_create, mixer_add, mixer_remove, mixer_set_pos, mixer_get_pos, mixer_flags, split_create) =
             if let Some(ref mlib) = mixer_lib {
                 unsafe {
                     (
@@ -182,10 +200,11 @@ impl BassLibrary {
                         Some(load_fn!(mlib, b"BASS_Mixer_ChannelSetPosition\0")),
                         Some(load_fn!(mlib, b"BASS_Mixer_ChannelGetPosition\0")),
                         Some(load_fn!(mlib, b"BASS_Mixer_ChannelFlags\0")),
+                        try_load_fn!(mlib, b"BASS_Split_StreamCreate\0"),
                     )
                 }
             } else {
-                (None, None, None, None, None, None)
+                (None, None, None, None, None, None, None)
             };
 
         unsafe {
@@ -217,6 +236,10 @@ impl BassLibrary {
                 bass_channel_set_dsp_ex: load_fn!(lib, b"BASS_ChannelSetDSPEx\0"),
                 bass_channel_remove_dsp: load_fn!(lib, b"BASS_ChannelRemoveDSP\0"),
                 bass_plugin_load: load_fn!(lib, b"BASS_PluginLoad\0"),
+                bass_get_device_info: load_fn!(lib, b"BASS_GetDeviceInfo\0"),
+                bass_set_device: load_fn!(lib, b"BASS_SetDevice\0"),
+                bass_get_device: load_fn!(lib, b"BASS_GetDevice\0"),
+                bass_channel_set_device: load_fn!(lib, b"BASS_ChannelSetDevice\0"),
                 _lib: lib,
                 _mixer_lib: mixer_lib,
                 bass_mixer_stream_create: mixer_create,
@@ -225,6 +248,7 @@ impl BassLibrary {
                 bass_mixer_channel_set_position: mixer_set_pos,
                 bass_mixer_channel_get_position: mixer_get_pos,
                 bass_mixer_channel_flags: mixer_flags,
+                bass_split_stream_create: split_create,
                 _fx_lib: None,
                 bass_fx_tempo_create: None,
                 bass_fx_tempo_get_source: None,
@@ -572,6 +596,71 @@ impl BassLibrary {
             Some(f) => unsafe { f(channel, flags, mask) },
             None => 0,
         }
+    }
+
+    pub fn split_stream_create(&self, channel: DWORD, flags: DWORD) -> Result<HSTREAM, String> {
+        let f = self
+            .bass_split_stream_create
+            .as_ref()
+            .ok_or_else(|| "BASS_Split_StreamCreate is not available (old bassmix.dll?)".to_string())?;
+        let handle = unsafe { f(channel, flags, std::ptr::null()) };
+        if handle == 0 {
+            Err(self.last_error_string())
+        } else {
+            Ok(handle)
+        }
+    }
+
+    pub fn get_device_info(&self, device: u32) -> Option<(String, String, DWORD)> {
+        let mut info = BassDeviceInfo {
+            name: std::ptr::null(),
+            driver: std::ptr::null(),
+            flags: 0,
+        };
+        let ok = unsafe { (self.bass_get_device_info)(device, &mut info) };
+        if ok == 0 {
+            return None;
+        }
+        Some((cstr(info.name), cstr(info.driver), info.flags))
+    }
+
+    pub fn get_device(&self) -> i32 {
+        unsafe { (self.bass_get_device)() as i32 }
+    }
+
+    pub fn set_device(&self, device: i32) -> Result<(), String> {
+        if device < 0 {
+            return Err("Invalid output device".into());
+        }
+        let ok = unsafe { (self.bass_set_device)(device as DWORD) };
+        self.check(ok)
+    }
+
+    pub fn channel_set_device(&self, handle: DWORD, device: i32) -> Result<(), String> {
+        if device < 0 {
+            return Err("Invalid output device".into());
+        }
+        let ok = unsafe { (self.bass_channel_set_device)(handle, device as DWORD) };
+        self.check(ok)
+    }
+
+    pub fn list_devices(&self) -> Vec<OutputDeviceInfo> {
+        let mut devices = Vec::new();
+        for index in 1..=64u32 {
+            let Some((name, driver, flags)) = self.get_device_info(index) else {
+                break;
+            };
+            if name.is_empty() {
+                continue;
+            }
+            devices.push(OutputDeviceInfo {
+                id: index as i32,
+                name,
+                driver,
+                flags,
+            });
+        }
+        devices
     }
 
     pub fn fx_tempo_create(&self, chan: DWORD, flags: DWORD) -> Result<HSTREAM, String> {

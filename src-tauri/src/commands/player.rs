@@ -10,7 +10,7 @@ use crate::dsp_chain::{ChainSlotSettings, DspChainStatus};
 use crate::player::{
     ArmedMix, GaplessTrack, MixVolSegment, Player, PlayerStateSnapshot,
 };
-use crate::remote_control::RemoteController;
+use crate::session::PlaybackSession;
 
 use super::notify::{notify_playback_change, notify_playback_seek};
 
@@ -59,7 +59,7 @@ pub fn player_init(player: State<'_, Player>) -> Result<(), String> {
 pub fn player_play(
     player: State<'_, Player>,
     discord: State<'_, DiscordPresence>,
-    controller: State<'_, Arc<RemoteController>>,
+    controller: State<'_, Arc<PlaybackSession>>,
     file_path: String,
     audio_path: Option<String>,
     cue_start: Option<f64>,
@@ -92,7 +92,7 @@ pub fn player_prepare_next(
 pub fn player_mix_crossfade(
     player: State<'_, Player>,
     discord: State<'_, DiscordPresence>,
-    controller: State<'_, Arc<RemoteController>>,
+    controller: State<'_, Arc<PlaybackSession>>,
     from_path: String,
     from_audio_path: Option<String>,
     from_cue_start: Option<f64>,
@@ -154,7 +154,7 @@ pub fn player_disarm_mix(player: State<'_, Player>) -> Result<(), String> {
 pub fn player_pause(
     player: State<'_, Player>,
     discord: State<'_, DiscordPresence>,
-    controller: State<'_, Arc<RemoteController>>,
+    controller: State<'_, Arc<PlaybackSession>>,
 ) -> Result<(), String> {
     player.pause()?;
     notify_playback_change(&player, &discord, controller.inner());
@@ -166,7 +166,7 @@ pub fn player_pause(
 pub fn player_resume(
     player: State<'_, Player>,
     discord: State<'_, DiscordPresence>,
-    controller: State<'_, Arc<RemoteController>>,
+    controller: State<'_, Arc<PlaybackSession>>,
 ) -> Result<(), String> {
     player.resume()?;
     notify_playback_change(&player, &discord, controller.inner());
@@ -178,7 +178,7 @@ pub fn player_resume(
 pub fn player_stop(
     player: State<'_, Player>,
     discord: State<'_, DiscordPresence>,
-    controller: State<'_, Arc<RemoteController>>,
+    controller: State<'_, Arc<PlaybackSession>>,
 ) -> Result<(), String> {
     player.stop()?;
     notify_playback_change(&player, &discord, controller.inner());
@@ -190,7 +190,7 @@ pub fn player_stop(
 pub fn player_seek(
     player: State<'_, Player>,
     discord: State<'_, DiscordPresence>,
-    controller: State<'_, Arc<RemoteController>>,
+    controller: State<'_, Arc<PlaybackSession>>,
     position: f64,
 ) -> Result<(), String> {
     player.seek(position)?;

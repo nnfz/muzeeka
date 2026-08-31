@@ -5,21 +5,31 @@
   import SettingsSidebar from "./SettingsSidebar.svelte";
   import DspChain from "./DspChain.svelte";
   import Dropdown from "$lib/components/Dropdown.svelte";
-  import {
-    getSettingsStore,
-    type RemoteStatus,
-  } from "$lib/stores/settings.svelte";
+  import { getSettingsStore } from "$lib/stores/settings.svelte";
   import {
     applyAccentPalette,
     hydrateAccentFromStorage,
     type AccentPalette,
   } from "$lib/coverAccent";
-  type Section = "general" | "downloads" | "remote" | "audio" | "about";
+  import {
+    createPluginsStore,
+    type HttpStatus,
+  } from "$lib/stores/plugins.svelte";
   import { getVersion, getName } from "@tauri-apps/api/app";
   import { invoke } from "@tauri-apps/api/core";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { open } from "@tauri-apps/plugin-dialog";
+  import { revealItemInDir } from "@tauri-apps/plugin-opener";
   import { onMount } from "svelte";
+
+  type Section = "general" | "downloads" | "plugins" | "audio" | "developer" | "about";
+
+  interface DevLogLine {
+    ts: number;
+    level: string;
+    source: string;
+    message: string;
+  }
 
   interface VkAuthStatus {
     logged_in: boolean;
@@ -32,6 +42,7 @@
   }
 
   const settings = getSettingsStore();
+  const plugins = createPluginsStore();
 
   let clearAllBusy = $state(false);
   let clearAllConfirm = $state(false);
@@ -57,8 +68,12 @@
   let coverRebuildMsg = $state<string | null>(null);
   let coverRebuildError = $state<string | null>(null);
 
-  let remoteStatus = $state<RemoteStatus | null>(null);
-  let portDraft = $state(String(settings.remotePort));
+  let pluginError = $state<string | null>(null);
+  let logLines = $state<DevLogLine[]>([]);
+  let consoleEl = $state<HTMLDivElement | null>(null);
+  let consoleStick = $state(true);
+  let pluginBusyId = $state<string | null>(null);
+  let settingDrafts = $state<Record<string, string>>({});
 
   /** Visual playback rate (animated on presets; instant on drag). */
   let displayRate = $state(settings.playbackRate);
@@ -111,18 +126,12 @@
     }
   }
 
-  async function refreshRemoteStatus() {
-    remoteStatus = await settings.fetchRemoteStatus();
-    if (remoteStatus) {
-      portDraft = String(remoteStatus.port);
-    }
-  }
-
   onMount(() => {
     let unlistenVk: UnlistenFn | null = null;
     let unlistenYoutube: UnlistenFn | null = null;
     let unlistenAccent: UnlistenFn | null = null;
-    let remotePoll: ReturnType<typeof setInterval> | null = null;
+    let unlistenLog: UnlistenFn | null = null;
+    let pluginPoll: ReturnType<typeof setInterval> | null = null;
 
     hydrateAccentFromStorage();
 
@@ -146,8 +155,21 @@
 
       await refreshVkAuth();
       await refreshYoutubeAuth();
-      await refreshRemoteStatus();
-      portDraft = String(settings.remotePort);
+      await plugins.refresh();
+
+      try {
+        logLines = await invoke<DevLogLine[]>("dev_log_lines");
+      } catch {
+        logLines = [];
+      }
+
+      try {
+        unlistenLog = await listen<DevLogLine>("dev:log", (event) => {
+          logLines = [...logLines, event.payload].slice(-500);
+        });
+      } catch {
+        // non-fatal
+      }
 
       try {
         unlistenVk = await listen<VkAuthStatus>("vk:auth-changed", (event) => {
@@ -181,9 +203,9 @@
         // non-fatal
       }
 
-      remotePoll = setInterval(() => {
-        if (activeSection === "remote") {
-          void refreshRemoteStatus();
+      pluginPoll = setInterval(() => {
+        if (activeSection === "plugins") {
+          void plugins.refresh();
         }
       }, 2000);
     })();
@@ -192,7 +214,8 @@
       unlistenVk?.();
       unlistenYoutube?.();
       unlistenAccent?.();
-      if (remotePoll) clearInterval(remotePoll);
+      unlistenLog?.();
+      if (pluginPoll) clearInterval(pluginPoll);
       cancelRateAnim();
     };
   });
@@ -317,35 +340,125 @@
     }
   }
 
-  function onRemoteEnabledChange(checked: boolean) {
-    settings.setRemoteEnabled(checked);
-    // Refresh after save debounce + server restart
-    setTimeout(() => void refreshRemoteStatus(), 450);
-  }
-
-  function commitRemotePort() {
-    const parsed = parseInt(portDraft, 10);
-    if (!Number.isFinite(parsed)) {
-      portDraft = String(settings.remotePort);
-      return;
+  async function togglePlugin(id: string, enabled: boolean) {
+    pluginError = null;
+    pluginBusyId = id;
+    try {
+      await plugins.setEnabled(id, enabled);
+    } catch (e) {
+      pluginError = typeof e === "string" ? e : String(e);
+    } finally {
+      pluginBusyId = null;
     }
-    settings.setRemotePort(parsed);
-    portDraft = String(settings.remotePort);
-    setTimeout(() => void refreshRemoteStatus(), 450);
   }
 
-  function remoteStatusBadge(status: RemoteStatus | null): {
-    text: string;
-    kind: "ok" | "warn" | "muted";
-  } {
-    if (!status) return { text: "…", kind: "muted" };
-    if (!status.enabled) return { text: "Off", kind: "muted" };
+  function settingDraftKey(pluginId: string, key: string) {
+    return `${pluginId}:${key}`;
+  }
+
+  function settingText(pluginId: string, key: string, fallback: unknown) {
+    const draftKey = settingDraftKey(pluginId, key);
+    if (Object.prototype.hasOwnProperty.call(settingDrafts, draftKey)) {
+      return settingDrafts[draftKey];
+    }
+    return fallback == null ? "" : String(fallback);
+  }
+
+  async function commitPluginSetting(
+    pluginId: string,
+    spec: { key: string; type: string; min?: number | null; max?: number | null },
+  ) {
+    pluginError = null;
+    const draftKey = settingDraftKey(pluginId, spec.key);
+    const plugin = plugins.list.find((p) => p.id === pluginId);
+    const raw = settingDrafts[draftKey] ?? String(plugin?.config?.[spec.key] ?? "");
+    let value: unknown = raw;
+    if (spec.type === "number") {
+      let n = Number(raw);
+      if (!Number.isFinite(n)) {
+        const next = { ...settingDrafts };
+        delete next[draftKey];
+        settingDrafts = next;
+        return;
+      }
+      if (typeof spec.min === "number") n = Math.max(spec.min, n);
+      if (typeof spec.max === "number") n = Math.min(spec.max, n);
+      const integer =
+        (spec.min == null || Number.isInteger(spec.min)) &&
+        (spec.max == null || Number.isInteger(spec.max));
+      if (integer) n = Math.round(n);
+      value = n;
+    }
+    try {
+      await plugins.setConfig(pluginId, { [spec.key]: value });
+      const next = { ...settingDrafts };
+      delete next[draftKey];
+      settingDrafts = next;
+      await plugins.refresh();
+    } catch (e) {
+      pluginError = typeof e === "string" ? e : String(e);
+    }
+  }
+
+  async function setPluginBool(pluginId: string, key: string, value: boolean) {
+    pluginError = null;
+    try {
+      await plugins.setConfig(pluginId, { [key]: value });
+    } catch (e) {
+      pluginError = typeof e === "string" ? e : String(e);
+    }
+  }
+
+  async function openPluginsFolder() {
+    if (!plugins.dir) return;
+    try {
+      await revealItemInDir(plugins.dir);
+    } catch (e) {
+      pluginError = typeof e === "string" ? e : String(e);
+    }
+  }
+
+  $effect(() => {
+    if (!settings.developerMode && activeSection === "developer") {
+      activeSection = "about";
+    }
+  });
+
+  $effect(() => {
+    logLines;
+    if (!consoleStick || !consoleEl) return;
+    queueMicrotask(() => {
+      if (consoleEl) consoleEl.scrollTop = consoleEl.scrollHeight;
+    });
+  });
+
+  function onConsoleScroll() {
+    if (!consoleEl) return;
+    consoleStick =
+      consoleEl.scrollHeight - consoleEl.scrollTop - consoleEl.clientHeight < 48;
+  }
+
+  function formatLogTime(ts: number): string {
+    const d = new Date(ts);
+    const pad = (n: number, w = 2) => String(n).padStart(w, "0");
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`;
+  }
+
+  async function clearDevLog() {
+    try {
+      await invoke("dev_log_clear");
+    } catch {
+      // still clear the view
+    }
+    logLines = [];
+  }
+
+  function httpBadge(status: HttpStatus): { text: string; kind: "ok" | "warn" | "muted" } | null {
     if (status.running) return { text: "Running", kind: "ok" };
     if (status.last_error) return { text: "Error", kind: "warn" };
-    return { text: "Starting…", kind: "warn" };
+    if (status.enabled) return { text: "Starting…", kind: "warn" };
+    return null;
   }
-
-  let remoteBadge = $derived(remoteStatusBadge(remoteStatus));
 
   function rateFillPct(rate: number): number {
     return Math.max(0, Math.min(100, ((rate - 0.25) / (2 - 0.25)) * 100));
@@ -405,7 +518,10 @@
   </header>
 
   <div class="settings-layout">
-    <SettingsSidebar bind:activeSection />
+    <SettingsSidebar
+      bind:activeSection
+      showDeveloper={settings.developerMode}
+    />
 
     <div class="settings-content">
       {#if activeSection === "general"}
@@ -706,118 +822,167 @@
             </div>
           </div>
         </div>
-      {:else if activeSection === "remote"}
+      {:else if activeSection === "plugins"}
         <div class="settings-section">
           <div class="settings-section-header">
-            <h2 class="section-title">Remote control</h2>
-            <p class="section-desc">
-              Control playback from a phone or browser on the same network.
-            </p>
+            <h2 class="section-title">Plugins</h2>
           </div>
 
           <div class="settings-card">
             <div class="card-row">
               <div>
-                <div class="card-label">Remote server</div>
-                <div class="card-value">
-                  HTTP control panel on your local network
+                <div class="card-label">Folder</div>
+                <div class="card-value card-value-mono">
+                  {plugins.dir || "—"}
                 </div>
               </div>
               <div class="card-actions">
-                <div class="card-badge {remoteBadge.kind}">
-                  {remoteBadge.text}
-                </div>
-                <label class="settings-toggle">
-                  <input
-                    type="checkbox"
-                    role="switch"
-                    checked={settings.remoteEnabled}
-                    aria-label="Remote server"
-                    onchange={(e) =>
-                      onRemoteEnabledChange(
-                        (e.target as HTMLInputElement).checked,
-                      )}
-                  />
-                  <span class="settings-switch" aria-hidden="true"></span>
-                </label>
+                <button
+                  type="button"
+                  class="action-btn"
+                  disabled={!plugins.dir}
+                  onclick={() => void openPluginsFolder()}
+                >
+                  Open
+                </button>
               </div>
             </div>
-
-            <div class="card-row card-row-stack">
-              <div>
-                <div class="card-label">Computer IP</div>
-                <div class="card-value card-value-mono">
-                  {remoteStatus?.local_ip ?? "—"}
-                </div>
-                {#if remoteStatus?.local_ips?.length}
-                  <div class="card-value">
-                    Also:
-                    {#each remoteStatus.local_ips as ip, i (ip)}
-                      <span class="card-value-mono">{ip}</span>{i <
-                      remoteStatus.local_ips.length - 1
-                        ? ", "
-                        : ""}
-                    {/each}
-                  </div>
-                {/if}
-              </div>
-            </div>
-
-            <div class="card-row">
-              <div>
-                <div class="card-label">Port</div>
-                <div class="card-value">1024–65535 (default 8765)</div>
-              </div>
-              <input
-                class="port-input"
-                type="number"
-                min="1024"
-                max="65535"
-                step="1"
-                disabled={!settings.remoteEnabled}
-                bind:value={portDraft}
-                onchange={commitRemotePort}
-                onkeydown={(e) => {
-                  if (e.key === "Enter") {
-                    (e.target as HTMLInputElement).blur();
-                    commitRemotePort();
-                  }
-                }}
-              />
-            </div>
-
-            {#if settings.remoteEnabled && remoteStatus?.urls?.length}
-              <div class="card-row card-row-stack">
-                <div>
-                  <div class="card-label">Open on phone</div>
-                  <div class="card-value">Same Wi‑Fi as this PC</div>
-                  <div class="remote-urls">
-                    {#each remoteStatus.urls as url (url)}
-                      <a
-                        class="remote-url"
-                        href={url}
-                        target="_blank"
-                        rel="noreferrer">{url}</a
-                      >
-                    {/each}
-                  </div>
-                </div>
-              </div>
-            {/if}
-
-            {#if remoteStatus?.last_error}
+            {#if pluginError}
               <div class="card-row">
-                <div class="card-value card-value-error">
-                  {remoteStatus.last_error}
-                </div>
+                <div class="card-value card-value-error">{pluginError}</div>
               </div>
             {/if}
           </div>
 
-          <div class="settings-info">
-            Open the URL on your phone. If it doesn’t load, check firewall rules
-            for the chosen port.
-          </div>
+          {#each plugins.list as plugin (plugin.id)}
+            {@const badge = httpBadge(plugin.http)}
+            <div class="settings-card">
+              <div class="card-row">
+                <div>
+                  <div class="card-label">{plugin.name}</div>
+                  <div class="card-value">
+                    {plugin.id}
+                    {#if plugin.version}
+                      · {plugin.version}
+                    {/if}
+                    {#if plugin.author}
+                      · {plugin.author}
+                    {/if}
+                    · {plugin.runtime === "native" ? "native" : "js"}
+                  </div>
+                  {#if plugin.description}
+                    <div class="card-value">{plugin.description}</div>
+                  {/if}
+                  {#if plugin.error}
+                    <div class="card-value card-value-error">{plugin.error}</div>
+                  {/if}
+                </div>
+                <div class="card-actions">
+                  {#if badge}
+                    <div class="card-badge {badge.kind}">{badge.text}</div>
+                  {/if}
+                  <label class="settings-toggle">
+                    <input
+                      type="checkbox"
+                      role="switch"
+                      checked={plugin.enabled}
+                      aria-label={plugin.name}
+                      disabled={pluginBusyId === plugin.id}
+                      onchange={(e) =>
+                        void togglePlugin(
+                          plugin.id,
+                          (e.target as HTMLInputElement).checked,
+                        )}
+                    />
+                    <span class="settings-switch" aria-hidden="true"></span>
+                  </label>
+                </div>
+              </div>
+              {#each plugin.settings as spec (spec.key)}
+                <div class="card-row">
+                  <div>
+                    <div class="card-label">{spec.label || spec.key}</div>
+                    {#if spec.description}
+                      <div class="card-value">{spec.description}</div>
+                    {/if}
+                  </div>
+                  <div class="card-actions">
+                    {#if spec.type === "boolean"}
+                      <label class="settings-toggle">
+                        <input
+                          type="checkbox"
+                          role="switch"
+                          checked={plugin.config?.[spec.key] === true}
+                          aria-label={spec.label || spec.key}
+                          onchange={(e) =>
+                            void setPluginBool(
+                              plugin.id,
+                              spec.key,
+                              (e.target as HTMLInputElement).checked,
+                            )}
+                        />
+                        <span class="settings-switch" aria-hidden="true"></span>
+                      </label>
+                    {:else}
+                      <input
+                        class="port-input"
+                        type={spec.type === "number" ? "number" : "text"}
+                        min={spec.min ?? undefined}
+                        max={spec.max ?? undefined}
+                        step={spec.type === "number" ? "1" : undefined}
+                        value={settingText(
+                          plugin.id,
+                          spec.key,
+                          plugin.config?.[spec.key],
+                        )}
+                        oninput={(e) => {
+                          settingDrafts = {
+                            ...settingDrafts,
+                            [settingDraftKey(plugin.id, spec.key)]: (
+                              e.target as HTMLInputElement
+                            ).value,
+                          };
+                        }}
+                        onchange={() =>
+                          void commitPluginSetting(plugin.id, spec)}
+                        onkeydown={(e) => {
+                          if (e.key === "Enter") {
+                            (e.target as HTMLInputElement).blur();
+                          }
+                        }}
+                      />
+                    {/if}
+                  </div>
+                </div>
+              {/each}
+              {#if plugin.http?.urls?.length}
+                <div class="card-row card-row-stack">
+                  <div>
+                    <div class="card-label">URL</div>
+                    <div class="plugin-http-urls">
+                      {#each plugin.http.urls as url (url)}
+                        <a
+                          class="plugin-http-url"
+                          href={url}
+                          target="_blank"
+                          rel="noreferrer">{url}</a
+                        >
+                      {/each}
+                    </div>
+                  </div>
+                </div>
+              {/if}
+              {#if plugin.http?.last_error}
+                <div class="card-row">
+                  <div class="card-value card-value-error">
+                    {plugin.http.last_error}
+                  </div>
+                </div>
+              {/if}
+            </div>
+          {:else}
+            <div class="settings-info">No plugins found.</div>
+          {/each}
         </div>
       {:else if activeSection === "audio"}
         <div class="settings-section">
@@ -923,8 +1088,78 @@
             </div>
           </div>
 
+          <div class="settings-card">
+            <div class="card-row">
+              <div>
+                <div class="card-label">Developer mode</div>
+                <div class="card-value">
+                  Show the Development tab and in-app console
+                </div>
+              </div>
+              <label class="settings-toggle">
+                <input
+                  type="checkbox"
+                  role="switch"
+                  checked={settings.developerMode}
+                  aria-label="Developer mode"
+                  onchange={(e) =>
+                    settings.setDeveloperMode(
+                      (e.target as HTMLInputElement).checked,
+                    )}
+                />
+                <span class="settings-switch" aria-hidden="true"></span>
+              </label>
+            </div>
+          </div>
+
           <div class="about-footer">
             Settings and user data are stored in your system app data directory.
+          </div>
+        </div>
+      {:else if activeSection === "developer"}
+        <div class="settings-section">
+          <div class="settings-section-header">
+            <h2 class="section-title">Development</h2>
+            <p class="section-desc">
+              Plugin and host logs. Native probe writes here when enabled.
+            </p>
+          </div>
+
+          <div class="settings-card">
+            <div class="card-row">
+              <div>
+                <div class="card-label">Console</div>
+                <div class="card-value">{logLines.length} lines</div>
+              </div>
+              <div class="card-actions">
+                <button
+                  type="button"
+                  class="action-btn"
+                  disabled={!logLines.length}
+                  onclick={() => void clearDevLog()}
+                >
+                  Clear
+                </button>
+              </div>
+            </div>
+            <div
+              class="dev-console"
+              bind:this={consoleEl}
+              onscroll={onConsoleScroll}
+            >
+              {#each logLines as line, i (line.ts + ":" + i)}
+                <div
+                  class="dev-log-line"
+                  class:is-error={line.level === "error"}
+                >
+                  <span class="dev-log-time">{formatLogTime(line.ts)}</span>
+                  <span class="dev-log-src">{line.source}</span>
+                  <span class="dev-log-msg">{line.message}</span>
+                </div>
+              {:else}
+                <div class="dev-log-empty">No log lines yet.</div>
+              {/each}
+            </div>
           </div>
         </div>
       {/if}

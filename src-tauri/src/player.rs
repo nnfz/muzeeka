@@ -180,6 +180,35 @@ struct PlayerInner {
     mix_preview_active: bool,
     /// Saved transition waiting for the playhead to reach its start (playlist mix mode).
     armed_mix: Option<ArmedMix>,
+    extra_outputs: Vec<ExtraOutput>,
+    extra_devices_inited: Vec<i32>,
+    next_extra_id: u64,
+}
+
+struct ExtraOutput {
+    id: String,
+    device: i32,
+    name: String,
+    split_handle: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutputDevice {
+    pub id: i32,
+    pub name: String,
+    pub driver: String,
+    pub enabled: bool,
+    pub is_default: bool,
+    pub initialized: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtraOutputInfo {
+    pub id: String,
+    pub device_id: i32,
+    pub name: String,
 }
 
 /// Automation point: `t` in 0..1 of the segment, `v` gain 0..1.
@@ -415,6 +444,9 @@ impl Player {
                 mix_vol_follow: None,
                 mix_preview_active: false,
                 armed_mix: None,
+                extra_outputs: Vec::new(),
+                extra_devices_inited: Vec::new(),
+                next_extra_id: 1,
             })),
             ops: Arc::new(Mutex::new(())),
             app: Arc::new(RwLock::new(None)),
@@ -808,7 +840,197 @@ impl Player {
         // Set initial volume on mixer
         bass.channel_set_attribute(mixer, bass::BASS_ATTRIB_VOL, inner.volume)?;
         inner.mixer_handle = mixer;
+        Self::reattach_extra_outputs(inner);
         Ok(())
+    }
+
+    pub fn list_output_devices(&self) -> Result<Vec<OutputDevice>, String> {
+        self.run_on_bass_thread(|inner| {
+            let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
+            Ok(bass
+                .list_devices()
+                .into_iter()
+                .map(|d| OutputDevice {
+                    id: d.id,
+                    name: d.name,
+                    driver: d.driver,
+                    enabled: d.flags & bass::BASS_DEVICE_ENABLED != 0,
+                    is_default: d.flags & bass::BASS_DEVICE_DEFAULT != 0,
+                    initialized: d.flags & bass::BASS_DEVICE_INIT != 0,
+                })
+                .collect())
+        })
+    }
+
+    pub fn extra_outputs(&self) -> Result<Vec<ExtraOutputInfo>, String> {
+        self.run_on_bass_thread(|inner| {
+            Ok(inner
+                .extra_outputs
+                .iter()
+                .map(|o| ExtraOutputInfo {
+                    id: o.id.clone(),
+                    device_id: o.device,
+                    name: o.name.clone(),
+                })
+                .collect())
+        })
+    }
+
+    pub fn add_extra_output(&self, device_id: i32) -> Result<ExtraOutputInfo, String> {
+        self.run_on_bass_thread(move |inner| Self::add_extra_output_inner(inner, device_id))
+    }
+
+    pub fn remove_extra_output(&self, output_id: &str) -> Result<(), String> {
+        let output_id = output_id.to_string();
+        self.run_on_bass_thread(move |inner| Self::remove_extra_output_inner(inner, &output_id))
+    }
+
+    fn add_extra_output_inner(
+        inner: &mut PlayerInner,
+        device_id: i32,
+    ) -> Result<ExtraOutputInfo, String> {
+        if device_id <= 0 {
+            return Err("Invalid output device".into());
+        }
+        if inner.mixer_handle == 0 {
+            Self::create_mixer(inner)?;
+        }
+        let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
+        let default_device = bass.get_device();
+        if device_id == default_device {
+            return Err(
+                "That is already the main output. Pick a different device (VB-Cable, VoiceMeeter, another DAC)."
+                    .into(),
+            );
+        }
+        if inner.extra_outputs.iter().any(|o| o.device == device_id) {
+            let existing = inner
+                .extra_outputs
+                .iter()
+                .find(|o| o.device == device_id)
+                .expect("checked");
+            return Ok(ExtraOutputInfo {
+                id: existing.id.clone(),
+                device_id: existing.device,
+                name: existing.name.clone(),
+            });
+        }
+
+        let devices = bass.list_devices();
+        let info = devices
+            .iter()
+            .find(|d| d.id == device_id)
+            .ok_or_else(|| format!("Output device {device_id} not found"))?;
+        if info.flags & bass::BASS_DEVICE_ENABLED == 0 {
+            return Err(format!("Output device '{}' is disabled", info.name));
+        }
+
+        Self::ensure_device_inited(inner, device_id)?;
+        let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
+        let split = bass.split_stream_create(inner.mixer_handle, 0)?;
+        if let Err(err) = bass.channel_set_device(split, device_id) {
+            let _ = bass.channel_free(split);
+            return Err(err);
+        }
+        if let Err(err) = bass.channel_play(split, false) {
+            let _ = bass.channel_free(split);
+            return Err(err);
+        }
+
+        let id = format!("out-{}", inner.next_extra_id);
+        inner.next_extra_id += 1;
+        let extra = ExtraOutput {
+            id: id.clone(),
+            device: device_id,
+            name: info.name.clone(),
+            split_handle: split,
+        };
+        inner.extra_outputs.push(extra);
+        Ok(ExtraOutputInfo {
+            id,
+            device_id,
+            name: info.name.clone(),
+        })
+    }
+
+    fn remove_extra_output_inner(inner: &mut PlayerInner, output_id: &str) -> Result<(), String> {
+        let Some(index) = inner.extra_outputs.iter().position(|o| o.id == output_id) else {
+            return Err(format!("Unknown extra output {output_id}"));
+        };
+        let extra = inner.extra_outputs.remove(index);
+        if let Some(bass) = inner.bass.as_ref() {
+            if extra.split_handle != 0 {
+                let _ = bass.channel_stop(extra.split_handle);
+                let _ = bass.channel_free(extra.split_handle);
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_device_inited(inner: &mut PlayerInner, device_id: i32) -> Result<(), String> {
+        let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
+        if inner.extra_devices_inited.contains(&device_id) {
+            return Ok(());
+        }
+        let current = bass.get_device();
+        match bass.init(device_id, 44100) {
+            Ok(()) => {}
+            Err(err) => {
+                if bass.last_error() != bass::BassError::Already {
+                    let _ = bass.set_device(current);
+                    return Err(err);
+                }
+            }
+        }
+        let _ = bass.set_device(current);
+        if !inner.extra_devices_inited.contains(&device_id) {
+            inner.extra_devices_inited.push(device_id);
+        }
+        Ok(())
+    }
+
+    fn reattach_extra_outputs(inner: &mut PlayerInner) {
+        let devices: Vec<(String, i32)> = inner
+            .extra_outputs
+            .iter()
+            .map(|o| (o.id.clone(), o.device))
+            .collect();
+        for extra in inner.extra_outputs.drain(..) {
+            if extra.split_handle != 0 {
+                if let Some(bass) = inner.bass.as_ref() {
+                    let _ = bass.channel_free(extra.split_handle);
+                }
+            }
+        }
+        for (_id, device) in devices {
+            if let Err(err) = Self::add_extra_output_inner(inner, device) {
+                eprintln!("[audio] reattach extra output {device}: {err}");
+            }
+        }
+    }
+
+    fn teardown_extra_outputs(inner: &mut PlayerInner) {
+        if let Some(bass) = inner.bass.as_ref() {
+            for extra in inner.extra_outputs.drain(..) {
+                if extra.split_handle != 0 {
+                    let _ = bass.channel_stop(extra.split_handle);
+                    let _ = bass.channel_free(extra.split_handle);
+                }
+            }
+            let current = bass.get_device();
+            for device in inner.extra_devices_inited.drain(..) {
+                if device == current {
+                    continue;
+                }
+                if bass.set_device(device).is_ok() {
+                    let _ = bass.free();
+                }
+            }
+            let _ = bass.set_device(current);
+        } else {
+            inner.extra_outputs.clear();
+            inner.extra_devices_inited.clear();
+        }
     }
 
     pub fn get_dsp_chain(&self) -> Vec<ChainSlotSettings> {
@@ -1000,7 +1222,7 @@ impl Player {
         }
         // Wake the position poller out of idle sleep for gapless + seekbar.
         self.set_source_active(true);
-        // Count after BASS open succeeds (manual play / remote / next-prev).
+        // Count after BASS open succeeds (manual play / plugin / next-prev).
         self.record_play_stat(&track_path_for_stats);
         Ok(())
     }
@@ -3692,6 +3914,7 @@ impl Player {
         self.run_on_bass_thread(|inner| {
             Self::teardown_current(inner);
             Self::clear_preload(inner);
+            Self::teardown_extra_outputs(inner);
             if let Some(bass) = inner.bass.as_ref() {
                 if inner.mixer_handle != 0 {
                     let _ = bass.channel_stop(inner.mixer_handle);

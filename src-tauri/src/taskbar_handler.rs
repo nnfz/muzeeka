@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Listener, Manager};
 use tauri_plugin_taskbar::TaskbarExt;
 
-use crate::remote_control::RemoteController;
+use crate::session::PlaybackSession;
 
 const TOGGLE_DEBOUNCE_MS: u64 = 120;
 const NAV_DEBOUNCE_MS: u64 = 120;
@@ -38,7 +38,7 @@ fn claim_debounce(slot: &AtomicU64, debounce_ms: u64) -> bool {
 }
 
 /// Refresh play/pause and prev/next enabled state on the taskbar preview.
-pub fn sync_taskbar(controller: &RemoteController) {
+pub fn sync_taskbar(controller: &PlaybackSession) {
     #[cfg(windows)]
     {
         let app = controller.app_handle();
@@ -60,9 +60,9 @@ pub fn sync_taskbar(controller: &RemoteController) {
     }
 }
 
-fn spawn_action<F>(controller: Arc<RemoteController>, action: F)
+fn spawn_action<F>(controller: Arc<PlaybackSession>, action: F)
 where
-    F: FnOnce(&RemoteController) -> Result<(), String> + Send + 'static,
+    F: FnOnce(&PlaybackSession) -> Result<(), String> + Send + 'static,
 {
     std::thread::spawn(move || {
         if let Err(error) = action(&controller) {
@@ -72,28 +72,28 @@ where
     });
 }
 
-fn toggle_action(controller: &RemoteController) -> Result<(), String> {
+fn toggle_action(controller: &PlaybackSession) -> Result<(), String> {
     if !claim_debounce(&LAST_TOGGLE_MS, TOGGLE_DEBOUNCE_MS) {
         return Ok(());
     }
     controller.toggle()
 }
 
-fn prev_action(controller: &RemoteController) -> Result<(), String> {
+fn prev_action(controller: &PlaybackSession) -> Result<(), String> {
     if !claim_debounce(&LAST_NAV_MS, NAV_DEBOUNCE_MS) {
         return Ok(());
     }
     controller.prev()
 }
 
-fn next_action(controller: &RemoteController) -> Result<(), String> {
+fn next_action(controller: &PlaybackSession) -> Result<(), String> {
     if !claim_debounce(&LAST_NAV_MS, NAV_DEBOUNCE_MS) {
         return Ok(());
     }
     controller.next()
 }
 
-pub fn setup(app: &AppHandle, controller: Arc<RemoteController>) {
+pub fn setup(app: &AppHandle, controller: Arc<PlaybackSession>) {
     #[cfg(windows)]
     {
         let ctrl = controller.clone();

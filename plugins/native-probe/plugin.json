@@ -1,0 +1,22 @@
+{
+  "id": "muzeeka.native-probe",
+  "name": "Native probe",
+  "version": "0.1.0",
+  "author": "nnfz",
+  "description": "Test native DLL plugin. Logs the current track every few seconds.",
+  "main": "native_probe.dll",
+  "runtime": "native",
+  "enabled_by_default": false,
+  "permissions": ["player:read"],
+  "settings": [
+    {
+      "key": "interval_ms",
+      "type": "number",
+      "label": "Log interval (ms)",
+      "description": "How often to print playback state",
+      "min": 500,
+      "max": 60000,
+      "default": 3000
+    }
+  ]
+}

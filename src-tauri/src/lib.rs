@@ -6,6 +6,7 @@ mod bass;
 mod bpm;
 mod commands;
 mod cue;
+mod dev_log;
 mod discord_rpc;
 mod drop_handler;
 mod drag_float;
@@ -33,8 +34,8 @@ mod player;
 mod path_store;
 mod playlists;
 mod process_util;
-mod remote_control;
-mod remote_server;
+mod session;
+mod plugins;
 mod settings;
 mod taskbar_handler;
 mod vk_audio;
@@ -46,8 +47,7 @@ use drop_handler::{handle_window_event, DropState, ExportDragState};
 
 use parking_lot::Mutex;
 use player::Player;
-use remote_control::RemoteController;
-use remote_server::RemoteServer;
+use session::PlaybackSession;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -260,6 +260,9 @@ pub fn run() {
                     // Ensure audio is stopped and BASS device is freed when the main player window closes.
                     // Without this, sound could continue after the app exits.
                     discord_for_close.shutdown();
+                    if let Some(reg) = app.try_state::<Arc<plugins::PluginRegistry>>() {
+                        reg.shutdown();
+                    }
                     let _ = player_for_close.shutdown();
                     process_util::set_background_mode(false);
                 }
@@ -291,7 +294,7 @@ pub fn run() {
             }
             metadata::set_ffmpeg_bin(ffmpeg);
 
-            // One settings load for window geometry, EQ, Discord, and remote server.
+            // One settings load for window geometry, EQ, and Discord.
             let app_settings = settings::load_settings(app.handle()).ok();
 
             if let Some(window) = app.get_webview_window("main") {
@@ -323,22 +326,24 @@ pub fn run() {
 
             player.start_position_emitter(app.handle().clone());
 
-            let remote_controller = Arc::new(RemoteController::new(
+            let session = Arc::new(PlaybackSession::new(
                 player.clone(),
                 discord_presence.clone(),
                 app.handle().clone(),
                 library_database,
             ));
-            app.manage(remote_controller.clone());
-            taskbar_handler::setup(app.handle(), remote_controller.clone());
+            app.manage(session.clone());
+            taskbar_handler::setup(app.handle(), session.clone());
 
-            let (remote_enabled, remote_port) = app_settings
-                .as_ref()
-                .map(|s| (s.remote_enabled, s.remote_port))
-                .unwrap_or((true, remote_server::DEFAULT_REMOTE_PORT));
-            let remote_http =
-                RemoteServer::new(remote_controller, remote_enabled, remote_port);
-            app.manage(remote_http);
+            let plugin_host = plugins::host::PluginHost {
+                app: app.handle().clone(),
+                session: session.clone(),
+                player: player.clone(),
+                http: plugins::http::HttpHub::new(session),
+            };
+            let plugins = plugins::PluginRegistry::boot(app.handle().clone(), plugin_host)
+                .map_err(std::io::Error::other)?;
+            app.manage(plugins);
             app.manage(drag_float::DragFloatState::new());
             // Never leave a leftover always-on-top overlay from a previous crash.
             if let Some(win) = app.get_webview_window(drag_float::DRAG_FLOAT_LABEL) {
@@ -368,10 +373,16 @@ pub fn run() {
             commands::player_get_dsp_chain_status,
             commands::player_set_dsp_chain,
             commands::load_addon,
-            // Settings / remote / input
+            // Settings / plugins / input
             commands::settings_load,
             commands::settings_save,
-            commands::remote_status,
+            commands::plugins_list,
+            commands::plugins_dir,
+            commands::plugins_set_enabled,
+            commands::plugin_settings_set,
+            commands::plugin_http_status,
+            commands::dev_log_lines,
+            commands::dev_log_clear,
             commands::input_is_ctrl_held,
             // Library + playlists + covers
             commands::library_scan,

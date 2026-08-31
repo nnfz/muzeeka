@@ -299,6 +299,27 @@ pub const BASS_ATTRIB_TEMPO_FREQ: DWORD = 0x10002;
 /// SoundTouch option: reduce clicks when tempo changes (TRUE/FALSE as 1.0/0.0).
 pub const BASS_ATTRIB_TEMPO_OPTION_PREVENT_CLICK: DWORD = 0x10016;
 
+// ── Output devices ──────────────────────────────────────────────────────────
+pub const BASS_DEVICE_ENABLED: DWORD = 1;
+pub const BASS_DEVICE_DEFAULT: DWORD = 2;
+pub const BASS_DEVICE_INIT: DWORD = 4;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BassDeviceInfo {
+    pub name: *const i8,
+    pub driver: *const i8,
+    pub flags: DWORD,
+}
+
+#[derive(Debug, Clone)]
+pub struct OutputDeviceInfo {
+    pub id: i32,
+    pub name: String,
+    pub driver: String,
+    pub flags: DWORD,
+}
+
 // ── Mixer (bassmix) ─────────────────────────────────────────────────────────
 pub const BASS_MIXER_END: DWORD = 0x10000;
 pub const BASS_MIXER_NONSTOP: DWORD = 0x200;

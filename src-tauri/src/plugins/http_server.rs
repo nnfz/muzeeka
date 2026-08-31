@@ -1,8 +1,8 @@
-// Local HTTP server for phone/browser remote control + external app API.
-// REST for control, SSE/NDJSON stream for live state. Can be rebound from settings.
+// Plugin HTTP listener — static files + optional player REST/SSE API.
 
 use std::convert::Infallible;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,7 +12,7 @@ use axum::{
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
-        Html, IntoResponse, Response,
+        IntoResponse, Response,
     },
     routing::{get, post},
     Json, Router,
@@ -23,21 +23,28 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::services::{ServeDir, ServeFile};
 
-use crate::remote_control::RemoteController;
+use crate::session::PlaybackSession;
 
-pub const DEFAULT_REMOTE_PORT: u16 = 8765;
+pub const DEFAULT_HTTP_PORT: u16 = 8765;
 const DEFAULT_STREAM_INTERVAL_MS: u64 = 250;
 const MIN_STREAM_INTERVAL_MS: u64 = 50;
 const MAX_STREAM_INTERVAL_MS: u64 = 2000;
-const REMOTE_UI: &str = include_str!("remote/index.html");
+
+#[derive(Debug, Clone, Default)]
+pub struct ServeOpts {
+    pub port: u16,
+    pub static_dir: Option<PathBuf>,
+    pub mount_player_api: bool,
+}
 
 #[derive(Debug, Clone, Serialize)]
-pub struct RemoteStatus {
+pub struct HttpStatus {
     pub enabled: bool,
     pub running: bool,
     pub port: u16,
-    /// Best-guess LAN address for phone/remote on the same network.
+    /// Best-guess LAN address on the same network.
     pub local_ip: Option<String>,
     /// Other usable IPv4 addresses (VPN/virtual/etc), ranked after `local_ip`.
     pub local_ips: Vec<String>,
@@ -51,45 +58,63 @@ struct Inner {
     running: bool,
     last_error: Option<String>,
     shutdown_tx: Option<oneshot::Sender<()>>,
+    static_dir: Option<PathBuf>,
+    mount_player_api: bool,
 }
 
-/// Controllable remote HTTP server (managed Tauri state).
-pub struct RemoteServer {
-    controller: Arc<RemoteController>,
+/// Controllable HTTP server used by plugins.
+pub struct HttpServer {
+    controller: Arc<PlaybackSession>,
     inner: Mutex<Inner>,
 }
 
-impl RemoteServer {
-    pub fn new(controller: Arc<RemoteController>, enabled: bool, port: u16) -> Arc<Self> {
-        let port = sanitize_port(port);
-        let server = Arc::new(Self {
+impl HttpStatus {
+    pub fn stopped() -> Self {
+        Self {
+            enabled: false,
+            running: false,
+            port: DEFAULT_HTTP_PORT,
+            local_ip: None,
+            local_ips: Vec::new(),
+            urls: Vec::new(),
+            last_error: None,
+        }
+    }
+}
+
+impl HttpServer {
+    pub fn new(controller: Arc<PlaybackSession>) -> Arc<Self> {
+        Arc::new(Self {
             controller,
             inner: Mutex::new(Inner {
-                enabled,
-                port,
+                enabled: false,
+                port: DEFAULT_HTTP_PORT,
                 running: false,
                 last_error: None,
                 shutdown_tx: None,
+                static_dir: None,
+                mount_player_api: true,
             }),
-        });
-        if enabled {
-            server.spawn(port);
-        }
-        server
+        })
     }
 
-    pub fn status(&self) -> RemoteStatus {
+    pub fn status(&self) -> HttpStatus {
         let g = self.inner.lock();
         build_status(&g)
     }
 
-    /// Apply config from settings. Restarts the server when needed.
-    pub fn apply(self: &Arc<Self>, enabled: bool, port: u16) -> RemoteStatus {
-        let port = sanitize_port(port);
+    pub fn apply(self: &Arc<Self>, opts: ServeOpts) -> HttpStatus {
+        let port = sanitize_port(opts.port);
+        let enabled = true;
+        let static_dir = opts.static_dir.clone();
+        let mount_player_api = opts.mount_player_api;
 
         let (should_stop, should_start) = {
             let mut g = self.inner.lock();
-            let same = g.enabled == enabled && g.port == port;
+            let same = g.enabled == enabled
+                && g.port == port
+                && g.static_dir == static_dir
+                && g.mount_player_api == mount_player_api;
             let failed = enabled && !g.running && g.last_error.is_some();
 
             if same && !failed {
@@ -99,6 +124,8 @@ impl RemoteServer {
             let was_active = g.running || g.shutdown_tx.is_some();
             g.enabled = enabled;
             g.port = port;
+            g.static_dir = static_dir.clone();
+            g.mount_player_api = mount_player_api;
             g.last_error = None;
             (was_active, enabled)
         };
@@ -110,7 +137,7 @@ impl RemoteServer {
         }
 
         if should_start {
-            self.spawn(port);
+            self.spawn(port, static_dir, mount_player_api);
             // Wait briefly for bind result so UI shows accurate running/error state.
             for _ in 0..20 {
                 std::thread::sleep(Duration::from_millis(25));
@@ -124,7 +151,7 @@ impl RemoteServer {
         self.status()
     }
 
-    fn stop(&self) {
+    pub fn stop(&self) {
         let tx = {
             let mut g = self.inner.lock();
             g.running = false;
@@ -135,11 +162,13 @@ impl RemoteServer {
         }
     }
 
-    fn spawn(self: &Arc<Self>, port: u16) {
+    fn spawn(self: &Arc<Self>, port: u16, static_dir: Option<PathBuf>, mount_player_api: bool) {
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         {
             let mut g = self.inner.lock();
             g.port = port;
+            g.static_dir = static_dir.clone();
+            g.mount_player_api = mount_player_api;
             g.shutdown_tx = Some(shutdown_tx);
             g.running = false;
             g.last_error = None;
@@ -149,7 +178,7 @@ impl RemoteServer {
         let controller = Arc::clone(&self.controller);
 
         std::thread::Builder::new()
-            .name("muzeeka-remote".into())
+            .name("muzeeka-http".into())
             .spawn(move || {
                 let rt = match tokio::runtime::Builder::new_multi_thread()
                     .enable_all()
@@ -160,13 +189,21 @@ impl RemoteServer {
                         let mut g = server.inner.lock();
                         g.running = false;
                         g.shutdown_tx = None;
-                        g.last_error = Some(format!("Failed to start remote runtime: {e}"));
+                        g.last_error = Some(format!("Failed to start HTTP runtime: {e}"));
                         return;
                     }
                 };
 
                 rt.block_on(async {
-                    match run_server(controller, port, shutdown_rx, &server).await {
+                    match run_server(
+                        controller,
+                        port,
+                        static_dir,
+                        mount_player_api,
+                        shutdown_rx,
+                        &server,
+                    )
+                    .await {
                         Ok(()) => {
                             let mut g = server.inner.lock();
                             g.running = false;
@@ -181,11 +218,11 @@ impl RemoteServer {
                     }
                 });
             })
-            .expect("spawn remote server thread");
+            .expect("spawn plugin HTTP thread");
     }
 }
 
-fn build_status(g: &Inner) -> RemoteStatus {
+fn build_status(g: &Inner) -> HttpStatus {
     let port = g.port;
     let ips = lan_ipv4_candidates();
     let local_ip = ips.first().cloned();
@@ -199,7 +236,7 @@ fn build_status(g: &Inner) -> RemoteStatus {
     } else {
         Vec::new()
     };
-    RemoteStatus {
+    HttpStatus {
         enabled: g.enabled,
         running: g.running,
         port,
@@ -211,10 +248,12 @@ fn build_status(g: &Inner) -> RemoteStatus {
 }
 
 async fn run_server(
-    controller: Arc<RemoteController>,
+    controller: Arc<PlaybackSession>,
     port: u16,
+    static_dir: Option<PathBuf>,
+    mount_player_api: bool,
     shutdown_rx: oneshot::Receiver<()>,
-    server: &RemoteServer,
+    server: &HttpServer,
 ) -> Result<(), String> {
     let state = AppState { controller, port };
 
@@ -224,34 +263,46 @@ async fn run_server(
         .allow_methods(Any)
         .allow_headers(Any);
 
-    let app = Router::new()
-        .route("/", get(index))
-        .route("/api", get(api_info))
-        .route("/api/info", get(api_info))
-        .route("/api/state", get(api_state))
-        .route("/api/stream", get(api_stream))
-        .route("/api/events", get(api_stream))
-        .route("/api/playlists", get(api_playlists))
-        .route("/api/playlist", get(api_playlist))
-        .route("/api/play", post(api_play))
-        .route("/api/toggle", post(api_toggle))
-        .route("/api/pause", post(api_pause))
-        .route("/api/resume", post(api_resume))
-        .route("/api/next", post(api_next))
-        .route("/api/prev", post(api_prev))
-        .route("/api/seek", post(api_seek))
-        .route("/api/volume", post(api_volume))
-        .route("/api/playlist/select", post(api_select_playlist))
-        .route("/api/shuffle/toggle", post(api_toggle_shuffle))
-        .route("/api/repeat/toggle", post(api_toggle_repeat))
-        .route("/api/cover", get(api_cover))
-        .layer(cors)
-        .with_state(state);
+    let mut app = Router::new();
+    if mount_player_api {
+        app = app
+            .route("/api", get(api_info))
+            .route("/api/info", get(api_info))
+            .route("/api/state", get(api_state))
+            .route("/api/stream", get(api_stream))
+            .route("/api/events", get(api_stream))
+            .route("/api/playlists", get(api_playlists))
+            .route("/api/playlist", get(api_playlist))
+            .route("/api/play", post(api_play))
+            .route("/api/toggle", post(api_toggle))
+            .route("/api/pause", post(api_pause))
+            .route("/api/resume", post(api_resume))
+            .route("/api/next", post(api_next))
+            .route("/api/prev", post(api_prev))
+            .route("/api/seek", post(api_seek))
+            .route("/api/volume", post(api_volume))
+            .route("/api/playlist/select", post(api_select_playlist))
+            .route("/api/shuffle/toggle", post(api_toggle_shuffle))
+            .route("/api/repeat/toggle", post(api_toggle_repeat))
+            .route("/api/cover", get(api_cover));
+    }
+
+    let app = if let Some(dir) = static_dir {
+        let index = dir.join("index.html");
+        let files = ServeDir::new(&dir)
+            .append_index_html_on_directories(true)
+            .fallback(ServeFile::new(index));
+        app.fallback_service(files)
+    } else {
+        app.route("/", get(index_missing))
+    };
+
+    let app = app.layer(cors).with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = tokio::net::TcpListener::bind(addr)
         .await
-        .map_err(|e| format!("Failed to bind remote server on port {port}: {e}"))?;
+        .map_err(|e| format!("Failed to bind HTTP server on port {port}: {e}"))?;
 
     {
         let mut g = server.inner.lock();
@@ -260,7 +311,7 @@ async fn run_server(
     }
 
     eprintln!(
-        "Remote control: http://localhost:{port}  |  API stream: http://localhost:{port}/api/stream"
+        "Plugin HTTP: http://localhost:{port}  |  API stream: http://localhost:{port}/api/stream"
     );
 
     axum::serve(listener, app)
@@ -268,12 +319,12 @@ async fn run_server(
             let _ = shutdown_rx.await;
         })
         .await
-        .map_err(|e| format!("Remote server error: {e}"))
+        .map_err(|e| format!("HTTP server error: {e}"))
 }
 
 #[derive(Clone)]
 struct AppState {
-    controller: Arc<RemoteController>,
+    controller: Arc<PlaybackSession>,
     port: u16,
 }
 
@@ -363,13 +414,16 @@ struct ToggleRepeatResponse {
     repeat_mode: String,
 }
 
-async fn index() -> Html<&'static str> {
-    Html(REMOTE_UI)
+async fn index_missing() -> impl IntoResponse {
+    (
+        StatusCode::NOT_FOUND,
+        "Plugin did not provide a static UI directory",
+    )
 }
 
 async fn api_info(State(state): State<AppState>) -> Json<InfoResponse> {
     Json(InfoResponse {
-        name: "muzeeka-remote",
+        name: "muzeeka",
         version: env!("CARGO_PKG_VERSION"),
         port: state.port,
         urls: public_urls(state.port, &lan_ipv4_candidates()),
@@ -481,7 +535,7 @@ fn json_value<T: Serialize>(value: T) -> Result<Json<serde_json::Value>, AppErro
         .map_err(|error| AppError(format!("Failed to serialize response: {error}")))
 }
 
-fn snapshot_state_json(controller: &RemoteController) -> Result<String, String> {
+fn snapshot_state_json(controller: &PlaybackSession) -> Result<String, String> {
     let state = controller.get_state()?;
     serde_json::to_string(&state).map_err(|e| format!("Failed to serialize state: {e}"))
 }
@@ -515,14 +569,14 @@ async fn api_stream(
 
 enum StreamPhase {
     Active {
-        controller: Arc<RemoteController>,
+        controller: Arc<PlaybackSession>,
         first: bool,
     },
     Done,
 }
 
 fn sse_stream_response(
-    controller: Arc<RemoteController>,
+    controller: Arc<PlaybackSession>,
     interval_ms: u64,
 ) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>> + Send + 'static> {
     let stream = stream::unfold(
@@ -564,7 +618,7 @@ fn sse_stream_response(
 }
 
 fn ndjson_stream_response(
-    controller: Arc<RemoteController>,
+    controller: Arc<PlaybackSession>,
     interval_ms: u64,
 ) -> Response {
     let stream = stream::unfold(
@@ -724,13 +778,13 @@ async fn api_cover(
 
 pub fn sanitize_port(port: u16) -> u16 {
     if port < 1024 {
-        DEFAULT_REMOTE_PORT
+        DEFAULT_HTTP_PORT
     } else {
         port
     }
 }
 
-/// Ranked IPv4 candidates for LAN remote control (best first).
+/// Ranked IPv4 candidates for LAN access (best first).
 ///
 /// Avoids the classic "UDP to 8.8.8.8" trap that picks Clash/Mihomo fake-IP
 /// (198.18.x), VPN tunnels, or VMware host-only adapters instead of Ethernet/Wi‑Fi.
@@ -781,7 +835,7 @@ fn is_usable_lan_v4(ip: Ipv4Addr) -> bool {
     if ip.is_loopback() || ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() {
         return false;
     }
-    // 169.254.0.0/16 link-local — useless for phone remote.
+    // 169.254.0.0/16 link-local — not useful on a LAN.
     if ip.is_link_local() {
         return false;
     }

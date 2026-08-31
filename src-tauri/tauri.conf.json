@@ -55,7 +55,8 @@
     "resources": {
       "bass/": "bass",
       "bin/": "bin",
-      "icons/taskbar/": "icons/taskbar"
+      "icons/taskbar/": "icons/taskbar",
+      "../plugins/": "plugins"
     },
     "icon": [
       "icons/32x32.png",

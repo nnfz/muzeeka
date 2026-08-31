@@ -1,4 +1,5 @@
-// Remote playback controller — mirrors frontend queue logic for the HTTP API.
+// Playback session — queue, shuffle, next/prev. Core of the player, not a plugin.
+// HTTP player API, taskbar, and plugin host APIs all talk to this.
 
 use std::path::Path;
 
@@ -54,7 +55,7 @@ impl RepeatMode {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RemoteTrackInfo {
+pub struct TrackInfo {
     pub path: String,
     pub title: String,
     pub artist: String,
@@ -65,7 +66,7 @@ pub struct RemoteTrackInfo {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RemoteState {
+pub struct PlayerView {
     pub is_playing: bool,
     pub is_paused: bool,
     pub position: f64,
@@ -73,13 +74,13 @@ pub struct RemoteState {
     pub volume: f32,
     pub shuffle_enabled: bool,
     pub repeat_mode: String,
-    pub track: Option<RemoteTrackInfo>,
+    pub track: Option<TrackInfo>,
     pub active_playlist_id: Option<String>,
     pub active_playlist_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct RemotePlaylistSummary {
+pub struct PlaylistSummary {
     pub id: String,
     pub name: String,
     pub track_count: usize,
@@ -87,10 +88,10 @@ pub struct RemotePlaylistSummary {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RemotePlaylistView {
+pub struct PlaylistView {
     pub id: String,
     pub name: String,
-    pub tracks: Vec<RemoteTrackInfo>,
+    pub tracks: Vec<TrackInfo>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -120,7 +121,7 @@ struct PlaylistsCache {
     revision: u64,
 }
 
-pub struct RemoteController {
+pub struct PlaybackSession {
     player: Player,
     discord: DiscordPresence,
     app: AppHandle,
@@ -133,7 +134,7 @@ pub struct RemoteController {
     playlists_cache: Mutex<Option<PlaylistsCache>>,
 }
 
-impl RemoteController {
+impl PlaybackSession {
     pub fn new(
         player: Player,
         discord: DiscordPresence,
@@ -459,8 +460,8 @@ impl RemoteController {
         ))
     }
 
-    fn to_remote_track(track: &MusicFile) -> RemoteTrackInfo {
-        RemoteTrackInfo {
+    fn to_track_info(track: &MusicFile) -> TrackInfo {
+        TrackInfo {
             path: track.path.clone(),
             title: Self::track_display_title(track),
             artist: Self::track_display_artist(track),
@@ -798,7 +799,7 @@ impl RemoteController {
         Ok(())
     }
 
-    pub fn get_state(&self) -> Result<RemoteState, String> {
+    pub fn get_state(&self) -> Result<PlayerView, String> {
         let data = self.load_data()?;
         let snapshot = self.player.get_state();
         let active_id = Self::playing_id_from_data(&data).or_else(|| {
@@ -810,10 +811,10 @@ impl RemoteController {
         let track = snapshot.current_file.as_ref().and_then(|path| {
             Self::track_map(&data)
                 .get(path)
-                .map(Self::to_remote_track)
+                .map(Self::to_track_info)
         });
 
-        Ok(RemoteState {
+        Ok(PlayerView {
             is_playing: snapshot.is_playing,
             is_paused: snapshot.is_paused,
             position: snapshot.position,
@@ -827,15 +828,15 @@ impl RemoteController {
         })
     }
 
-    pub fn get_playlists(&self) -> Result<Vec<RemotePlaylistSummary>, String> {
+    pub fn get_playlists(&self) -> Result<Vec<PlaylistSummary>, String> {
         let data = self.load_data()?;
         let mut result = vec![
-            RemotePlaylistSummary {
+            PlaylistSummary {
                 id: VIRTUAL_ALL_ID.to_string(),
                 name: "All tracks".to_string(),
                 track_count: Self::all_tracks(&data).len(),
             },
-            RemotePlaylistSummary {
+            PlaylistSummary {
                 id: VIRTUAL_LIKED_ID.to_string(),
                 name: "Liked".to_string(),
                 track_count: Self::liked_tracks(&data).len(),
@@ -843,7 +844,7 @@ impl RemoteController {
         ];
 
         for playlist in &data.playlists {
-            result.push(RemotePlaylistSummary {
+            result.push(PlaylistSummary {
                 id: playlist.id.clone(),
                 name: playlist.name.clone(),
                 track_count: playlist.tracks.len(),
@@ -853,16 +854,16 @@ impl RemoteController {
         Ok(result)
     }
 
-    pub fn get_playlist_view(&self, playlist_id: &str) -> Result<RemotePlaylistView, String> {
+    pub fn get_playlist_view(&self, playlist_id: &str) -> Result<PlaylistView, String> {
         let data = self.load_data()?;
         let tracks = Self::playing_tracks(&data, Some(playlist_id));
         let name = Self::playlist_name(&data, Some(playlist_id))
             .unwrap_or_else(|| "Playlist".to_string());
 
-        Ok(RemotePlaylistView {
+        Ok(PlaylistView {
             id: playlist_id.to_string(),
             name,
-            tracks: tracks.iter().map(Self::to_remote_track).collect(),
+            tracks: tracks.iter().map(Self::to_track_info).collect(),
         })
     }
 
@@ -1018,7 +1019,7 @@ impl RemoteController {
         {
             return Err("Playlist not found".to_string());
         }
-        // Remote queue only — do not change the desktop app's viewed playlist.
+        // Plugin/HTTP queue only — do not change the desktop app's viewed playlist.
         data.playing_playlist_id = Some(playlist_id.to_string());
         self.save_data(&data)?;
         self.notify_store_sync(&data);

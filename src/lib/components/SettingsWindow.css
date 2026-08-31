@@ -320,6 +320,13 @@ button.playlist-select:hover {
   min-width: 96px;
   width: 96px;
   font-variant-numeric: tabular-nums;
+  appearance: textfield;
+}
+
+.port-input::-webkit-outer-spin-button,
+.port-input::-webkit-inner-spin-button {
+  appearance: none;
+  margin: 0;
 }
 
 .playlist-select:focus,
@@ -332,7 +339,7 @@ button.playlist-select:hover {
   opacity: 0.5;
 }
 
-.remote-url {
+.plugin-http-url {
   display: block;
   margin-top: 2px;
   color: var(--accent);
@@ -342,12 +349,12 @@ button.playlist-select:hover {
   word-break: break-all;
 }
 
-.remote-url:hover {
+.plugin-http-url:hover {
   text-decoration: underline;
 }
 
-.remote-urls {
-  margin-top: 8px;
+.plugin-http-urls {
+  margin-top: 4px;
   display: flex;
   flex-direction: column;
   gap: 2px;
@@ -428,6 +435,51 @@ button.playlist-select:hover {
   opacity: 0.8;
   padding-top: 10px;
   border-top: 1px solid var(--border-subtle);
+}
+
+.dev-console {
+  max-height: min(52vh, 440px);
+  min-height: 240px;
+  overflow: auto;
+  padding: 10px 12px 12px;
+  background: rgba(0, 0, 0, 0.35);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.45;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.dev-log-line {
+  display: grid;
+  grid-template-columns: 96px minmax(80px, 150px) 1fr;
+  gap: 10px;
+}
+
+.dev-log-line.is-error {
+  color: #f07178;
+}
+
+.dev-log-time {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.dev-log-src {
+  color: var(--accent);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dev-log-msg {
+  color: var(--text-primary);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.dev-log-empty {
+  color: var(--text-muted);
+  padding: 16px 0;
 }
 
 /* --- Playback Rate in Audio settings (same surface as EQ panel) --- */
