@@ -38,6 +38,7 @@ mod remote_server;
 mod settings;
 mod taskbar_handler;
 mod vk_audio;
+mod youtube_auth;
 mod ytdlp;
 
 use discord_rpc::DiscordPresence;
@@ -178,9 +179,31 @@ fn load_dotenv() {
     }
 }
 
+fn prepare_webview2_for_google_login() {
+    #[cfg(windows)]
+    {
+        // Must be set before the first WebView2 environment is created.
+        // Google/YouTube serve a blank page to Edge WebView2 client hints.
+        const ARGS: &str =
+            "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,UserAgentClientHint";
+        match std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS") {
+            Ok(existing) if !existing.is_empty() => {
+                if !existing.contains("UserAgentClientHint") {
+                    std::env::set_var(
+                        "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
+                        format!("{existing} {ARGS}"),
+                    );
+                }
+            }
+            _ => std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", ARGS),
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     load_dotenv();
+    prepare_webview2_for_google_login();
 
     let player = Player::new();
     let player_for_close = player.clone();
@@ -405,6 +428,9 @@ pub fn run() {
             commands::ytdlp_download,
             commands::ytdlp_cancel,
             commands::ytdlp_default_download_dir,
+            commands::ytdlp_youtube_auth_status,
+            commands::ytdlp_youtube_login,
+            commands::ytdlp_youtube_logout,
             // VK
             commands::vk_auth_status,
             commands::vk_login,

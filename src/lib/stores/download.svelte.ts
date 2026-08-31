@@ -5,7 +5,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { WebviewWindow } from '@tauri-apps/api/webviewWindow';
 import { readDownloadSettings } from '$lib/stores/settings.svelte';
-import { normalizeMediaUrl } from '$lib/urlUtils';
+import { normalizeMediaUrl, needsYoutubeSignIn } from '$lib/urlUtils';
 import type { MusicFile } from '$lib/stores/player.svelte';
 
 export interface YtdlpProbeResult {
@@ -329,7 +329,19 @@ export function createDownloadStore() {
       try {
         probe = await invoke<YtdlpProbeResult>('ytdlp_probe', { url: normalized });
       } catch (e) {
-        error = typeof e === 'string' ? e : String(e);
+        const message = typeof e === 'string' ? e : String(e);
+        if (needsYoutubeSignIn(message, normalized)) {
+          try {
+            error = null;
+            await invoke('ytdlp_youtube_login', { force: true });
+            probe = await invoke<YtdlpProbeResult>('ytdlp_probe', { url: normalized });
+            return;
+          } catch (loginErr) {
+            error = typeof loginErr === 'string' ? loginErr : message;
+            return;
+          }
+        }
+        error = message;
       } finally {
         isProbing = false;
       }
@@ -347,20 +359,46 @@ export function createDownloadStore() {
       downloadPercent = 0;
       progress = { status: 'Starting…', percent: 0, url: normalized };
 
-      try {
-        const { downloadPlaylistId } = readDownloadSettings();
-        // Same name for disk folder + library playlist (albums/playlists/sets).
-        const named =
-          resolveNamedDownload(normalized) ??
-          null;
+      const { downloadPlaylistId } = readDownloadSettings();
+      // Same name for disk folder + library playlist (albums/playlists/sets).
+      const named = resolveNamedDownload(normalized) ?? null;
 
+      const runDownload = async () => {
         const outputDir = await resolveDownloadOutputDir(named);
-
-        const result = await invoke<{ files: MusicFile[] }>('ytdlp_download', {
+        return invoke<{ files: MusicFile[] }>('ytdlp_download', {
           url: normalized,
           outputDir,
           allowPlaylist: probe?.is_playlist ?? looksLikePlaylistOrAlbumUrl(normalized),
         });
+      };
+
+      try {
+        let result: { files: MusicFile[] };
+        try {
+          result = await runDownload();
+        } catch (e) {
+          const first = typeof e === 'string' ? e : String(e);
+          if (!isDownloading) return 0;
+          if (!needsYoutubeSignIn(first, normalized)) {
+            throw e;
+          }
+          progress = { status: 'Waiting for YouTube sign-in…', percent: null, url: normalized };
+          downloadPercent = null;
+          try {
+            await invoke('ytdlp_youtube_login', { force: true });
+          } catch (loginErr) {
+            if (!isDownloading) return 0;
+            error = typeof loginErr === 'string'
+              ? loginErr
+              : 'YouTube sign-in was cancelled';
+            progress = null;
+            return 0;
+          }
+          if (!isDownloading) return 0;
+          progress = { status: 'Retrying download…', percent: 0, url: normalized };
+          downloadPercent = 0;
+          result = await runDownload();
+        }
 
         // Multi-file fallback: if we didn't know the name before download, still
         // create a library playlist when several tracks arrived from a set URL.

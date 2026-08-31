@@ -27,6 +27,10 @@
     user_name: string | null;
   }
 
+  interface YoutubeAuthStatus {
+    logged_in: boolean;
+  }
+
   const settings = getSettingsStore();
 
   let clearAllBusy = $state(false);
@@ -45,6 +49,9 @@
   });
   let vkAuthBusy = $state(false);
   let vkAuthError = $state<string | null>(null);
+  let youtubeAuth = $state<YoutubeAuthStatus>({ logged_in: false });
+  let youtubeAuthBusy = $state(false);
+  let youtubeAuthError = $state<string | null>(null);
 
   let coverRebuildBusy = $state(false);
   let coverRebuildMsg = $state<string | null>(null);
@@ -94,6 +101,16 @@
     }
   }
 
+  async function refreshYoutubeAuth() {
+    try {
+      youtubeAuth = await invoke<YoutubeAuthStatus>("ytdlp_youtube_auth_status");
+      youtubeAuthError = null;
+    } catch (e) {
+      youtubeAuth = { logged_in: false };
+      youtubeAuthError = typeof e === "string" ? e : String(e);
+    }
+  }
+
   async function refreshRemoteStatus() {
     remoteStatus = await settings.fetchRemoteStatus();
     if (remoteStatus) {
@@ -103,6 +120,7 @@
 
   onMount(() => {
     let unlistenVk: UnlistenFn | null = null;
+    let unlistenYoutube: UnlistenFn | null = null;
     let unlistenAccent: UnlistenFn | null = null;
     let remotePoll: ReturnType<typeof setInterval> | null = null;
 
@@ -127,6 +145,7 @@
       }
 
       await refreshVkAuth();
+      await refreshYoutubeAuth();
       await refreshRemoteStatus();
       portDraft = String(settings.remotePort);
 
@@ -135,6 +154,18 @@
           vkAuth = event.payload;
           vkAuthError = null;
         });
+      } catch {
+        // non-fatal
+      }
+
+      try {
+        unlistenYoutube = await listen<YoutubeAuthStatus>(
+          "youtube:auth-changed",
+          (event) => {
+            youtubeAuth = event.payload;
+            youtubeAuthError = null;
+          },
+        );
       } catch {
         // non-fatal
       }
@@ -159,6 +190,7 @@
 
     return () => {
       unlistenVk?.();
+      unlistenYoutube?.();
       unlistenAccent?.();
       if (remotePoll) clearInterval(remotePoll);
       cancelRateAnim();
@@ -174,6 +206,34 @@
 
   function clearDownloadFolder() {
     settings.setDownloadFolder(null);
+  }
+
+  async function youtubeLogin() {
+    if (youtubeAuthBusy) return;
+    youtubeAuthBusy = true;
+    youtubeAuthError = null;
+    try {
+      youtubeAuth = await invoke<YoutubeAuthStatus>("ytdlp_youtube_login");
+    } catch (e) {
+      youtubeAuthError = typeof e === "string" ? e : String(e);
+      await refreshYoutubeAuth();
+    } finally {
+      youtubeAuthBusy = false;
+    }
+  }
+
+  async function youtubeLogout() {
+    if (youtubeAuthBusy) return;
+    youtubeAuthBusy = true;
+    youtubeAuthError = null;
+    try {
+      youtubeAuth = await invoke<YoutubeAuthStatus>("ytdlp_youtube_logout");
+    } catch (e) {
+      youtubeAuthError = typeof e === "string" ? e : String(e);
+      await refreshYoutubeAuth();
+    } finally {
+      youtubeAuthBusy = false;
+    }
   }
 
   async function vkLogin() {
@@ -559,6 +619,48 @@
                   {/if}
                 {/snippet}
               </Dropdown>
+            </div>
+          </div>
+          <div class="settings-section-header">
+            <h2 class="section-title section-title-spaced">YouTube</h2>
+            <p class="section-desc">
+              Log in to download from YouTube when it asks to confirm you are
+              not a bot. Session stays on this device.
+            </p>
+          </div>
+
+          <div class="settings-card">
+            <div class="card-row card-row-stack">
+              <div>
+                <div class="card-label">Account</div>
+                <div class="card-value">
+                  {youtubeAuth.logged_in ? "Logged in" : "Not logged in"}
+                </div>
+                {#if youtubeAuthError}
+                  <div class="card-value card-value-error">{youtubeAuthError}</div>
+                {/if}
+              </div>
+              <div class="card-actions">
+                {#if youtubeAuth.logged_in}
+                  <button
+                    type="button"
+                    class="action-btn"
+                    disabled={youtubeAuthBusy}
+                    onclick={() => void youtubeLogout()}
+                  >
+                    {youtubeAuthBusy ? "Working…" : "Log out"}
+                  </button>
+                {:else}
+                  <button
+                    type="button"
+                    class="action-btn action-btn-primary"
+                    disabled={youtubeAuthBusy}
+                    onclick={() => void youtubeLogin()}
+                  >
+                    {youtubeAuthBusy ? "Waiting…" : "Log in with YouTube"}
+                  </button>
+                {/if}
+              </div>
             </div>
           </div>
           <div class="settings-section-header">

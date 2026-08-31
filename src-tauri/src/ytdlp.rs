@@ -1,6 +1,7 @@
 // yt-dlp integration — download audio from supported URLs via external binary.
 
 use std::collections::HashSet;
+use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -104,6 +105,7 @@ static ACTIVE_CHILD: Mutex<Option<Child>> = Mutex::new(None);
 pub fn cancel_download() {
     DOWNLOAD_CANCELLED.store(true, Ordering::SeqCst);
     crate::vk_audio::cancel();
+    crate::youtube_auth::cancel_login();
     if let Ok(mut guard) = ACTIVE_CHILD.lock() {
         if let Some(mut child) = guard.take() {
             let _ = child.kill();
@@ -184,18 +186,142 @@ pub fn ffmpeg_available(app: &AppHandle) -> bool {
     resolve_ffmpeg_location(app).is_some()
 }
 
+fn deno_binary_name() -> &'static str {
+    if cfg!(windows) {
+        "deno.exe"
+    } else {
+        "deno"
+    }
+}
+
+fn find_on_path(name: &str) -> Option<PathBuf> {
+    let exe_name = if cfg!(windows) && !name.ends_with(".exe") {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    };
+    let paths = env::var_os("PATH")?;
+    for dir in env::split_paths(&paths) {
+        let candidate = dir.join(&exe_name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn node_major_version(path: &Path) -> Option<u32> {
+    let mut cmd = Command::new(path);
+    cmd.arg("-v")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    process_util::hide_console(&mut cmd);
+    let output = cmd.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let text = text.trim().trim_start_matches('v');
+    text.split('.').next()?.parse().ok()
+}
+
+/// YouTube extraction now needs an external JS runtime (Deno preferred, Node 20+).
+fn resolve_js_runtime(app: &AppHandle) -> Option<(String, PathBuf)> {
+    let bundled_deno = resolve_ytdlp_dir(Some(app)).join(deno_binary_name());
+    if bundled_deno.is_file() {
+        return Some(("deno".to_string(), bundled_deno));
+    }
+    if let Some(deno) = find_on_path("deno") {
+        return Some(("deno".to_string(), deno));
+    }
+    if let Some(node) = find_on_path("node") {
+        if node_major_version(&node).is_some_and(|major| major >= 20) {
+            return Some(("node".to_string(), node));
+        }
+    }
+    None
+}
+
 fn build_ytdlp_args(app: &AppHandle, args: &[&str]) -> Vec<String> {
-    let mut out = Vec::with_capacity(args.len() + 4);
-    
+    let mut out = Vec::with_capacity(args.len() + 10);
+
     out.push("--encoding".to_string());
     out.push("utf-8".to_string());
-    
+
     if let Some(dir) = resolve_ffmpeg_location(app) {
         out.push("--ffmpeg-location".to_string());
         out.push(dir.to_string_lossy().to_string());
     }
+
+    match resolve_js_runtime(app) {
+        Some((runtime, path)) => {
+            out.push("--js-runtimes".to_string());
+            out.push(format!("{}:{}", runtime, path.display()));
+        }
+        None => {
+            eprintln!(
+                "[yt-dlp] no JS runtime found (bundled deno / PATH deno / Node 20+). YouTube downloads may fail."
+            );
+        }
+    }
+
+    if let Some(cookies) = crate::youtube_auth::cookies_arg(app) {
+        out.push("--cookies".to_string());
+        out.push(cookies);
+        // Match a real Chrome TLS fingerprint so the WebView2 session is accepted.
+        out.push("--impersonate".to_string());
+        out.push("chrome".to_string());
+    }
+
     out.extend(args.iter().map(|s| (*s).to_string()));
     out
+}
+
+pub fn summarize_ytdlp_failure<'a, I>(lines: I) -> String
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut last_error: Option<String> = None;
+    let mut bot_check = false;
+    let mut no_js = false;
+
+    for line in lines {
+        let line = strip_ansi(line);
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("sign in to confirm") || lower.contains("not a bot") {
+            bot_check = true;
+        }
+        if lower.contains("no supported javascript runtime") {
+            no_js = true;
+        }
+        if let Some(rest) = line.trim().strip_prefix("ERROR:") {
+            let rest = rest.trim();
+            if !rest.is_empty() {
+                last_error = Some(rest.to_string());
+            }
+        }
+    }
+
+    if bot_check {
+        return "YouTube blocked the download (bot check). Sign in to YouTube and try again."
+            .to_string();
+    }
+    if no_js {
+        return "YouTube requires Deno or Node.js to download. Muzeeka could not find either."
+            .to_string();
+    }
+    last_error
+        .map(|err| {
+            let cut = err.split(" See  http").next().unwrap_or(&err).trim();
+            if cut.len() > 220 {
+                format!("{}…", &cut[..220])
+            } else if cut.is_empty() {
+                "yt-dlp download failed".to_string()
+            } else {
+                cut.to_string()
+            }
+        })
+        .unwrap_or_else(|| "yt-dlp download failed".to_string())
 }
 
 /// Default download folder: `{app_data}/downloads`.
@@ -502,7 +628,7 @@ pub fn probe(app: &AppHandle, url: &str) -> Result<YtdlpProbeResult, String> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("yt-dlp probe failed: {}", stderr.trim()));
+        return Err(summarize_ytdlp_failure(stderr.lines()));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -927,7 +1053,11 @@ pub fn download(
 
     if !status.success() {
         dump_stderr_summary(app, "yt-dlp download FAILED");
-        return Err("yt-dlp download failed".to_string());
+        let lines = collected_stderr
+            .lock()
+            .map(|v| v.clone())
+            .unwrap_or_default();
+        return Err(summarize_ytdlp_failure(lines.iter().map(|s| s.as_str())));
     }
 
     let mut downloaded_paths = stdout_handle
@@ -1078,4 +1208,30 @@ fn enrich_downloaded_file(file: &mut MusicFile) {
 
 fn enrich_downloaded_metadata(files: &mut [MusicFile]) {
     files.par_iter_mut().for_each(enrich_downloaded_file);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::summarize_ytdlp_failure;
+
+    #[test]
+    fn maps_bot_check_to_short_message() {
+        let lines = [
+            "WARNING: [youtube] No supported JavaScript runtime could be found.",
+            "ERROR: [youtube] CRWaJZo4WnE: Sign in to confirm you’re not a bot. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ",
+        ];
+        let msg = summarize_ytdlp_failure(lines);
+        assert!(msg.contains("bot check"), "{msg}");
+        assert!(!msg.contains("http"), "{msg}");
+    }
+
+    #[test]
+    fn maps_missing_js_runtime() {
+        let lines = [
+            "WARNING: [youtube] No supported JavaScript runtime could be found. Only deno is enabled by default",
+            "ERROR: [youtube] abc: Requested format is not available",
+        ];
+        let msg = summarize_ytdlp_failure(lines);
+        assert!(msg.contains("Deno or Node"), "{msg}");
+    }
 }

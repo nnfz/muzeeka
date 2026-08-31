@@ -73,3 +73,24 @@ pub fn ytdlp_cancel() {
 pub fn ytdlp_default_download_dir(app: AppHandle) -> Result<String, String> {
     ytdlp::default_download_dir(&app).map(|p| p.to_string_lossy().to_string())
 }
+
+#[tauri::command]
+pub fn ytdlp_youtube_auth_status(app: AppHandle) -> crate::youtube_auth::YoutubeAuthStatus {
+    crate::youtube_auth::auth_status(&app)
+}
+
+/// Open a YouTube login window and wait until login cookies are saved.
+#[tauri::command]
+pub async fn ytdlp_youtube_login(
+    app: AppHandle,
+    force: Option<bool>,
+) -> Result<crate::youtube_auth::YoutubeAuthStatus, String> {
+    crate::youtube_auth::login(app, force.unwrap_or(false)).await
+}
+
+#[tauri::command]
+pub async fn ytdlp_youtube_logout(
+    app: AppHandle,
+) -> Result<crate::youtube_auth::YoutubeAuthStatus, String> {
+    crate::youtube_auth::logout(app).await
+}

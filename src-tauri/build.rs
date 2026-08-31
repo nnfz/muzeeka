@@ -23,6 +23,8 @@ const TOOL_DOWNLOADS: &[(&str, &str)] = &[
 ];
 
 const FFMPEG_URL: &str = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip";
+const DENO_ZIP_URL: &str =
+    "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip";
 
 fn run_powershell(script: &str) -> Result<(), String> {
     let status = Command::new("powershell.exe")
@@ -161,6 +163,16 @@ fn ensure_native_assets(manifest_dir: &Path) -> Result<(), String> {
             &bin_dir,
             &["ffmpeg.exe", "ffprobe.exe", "ffplay.exe"],
         )?;
+    }
+
+    // YouTube extraction needs a JS runtime; Deno is the one yt-dlp enables by default.
+    if !bin_dir.join("deno.exe").is_file() {
+        let temp_dir = env::temp_dir().join("muzeeka-tools");
+        fs::create_dir_all(&temp_dir)
+            .map_err(|error| format!("Failed to create {}: {error}", temp_dir.display()))?;
+        let deno_zip = temp_dir.join("deno-x86_64-pc-windows-msvc.zip");
+        ensure_download(DENO_ZIP_URL, &deno_zip)?;
+        extract_selected(&deno_zip, &bin_dir, &["deno.exe"])?;
     }
 
     Ok(())

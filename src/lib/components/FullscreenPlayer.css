@@ -559,17 +559,6 @@
       132px;
   }
 
-  /* No lyrics: big cover centered */
-  .fullscreen-side {
-    top: 50%;
-    left: 0;
-    width: min(78vw, 400px);
-    max-width: min(92vw, 420px);
-    flex-direction: column;
-    padding: 0 12px;
-    transform: translate3d(calc(50vw - 50%), -50%, 0);
-  }
-
   /* With lyrics: top strip (size changes — no transform tween on mobile) */
   .fullscreen-layout:not(.lyrics-hidden) .fullscreen-side {
     top: calc(var(--header-height) + 8px);

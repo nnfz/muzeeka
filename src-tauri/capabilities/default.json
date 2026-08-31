@@ -11,6 +11,7 @@
     "mix-transition",
     "vk-login",
     "vk-session",
+    "youtube-login",
     "drag-float"
   ],
   "permissions": [

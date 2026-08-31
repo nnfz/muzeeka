@@ -60,6 +60,32 @@ export function normalizeMediaUrl(text: string): string | null {
   return null;
 }
 
+/** YouTube / YouTube Music / youtu.be — needs a JS runtime and often a signed-in session. */
+export function isYoutubeMediaUrl(text: string): boolean {
+  const url = normalizeMediaUrl(text) ?? text.trim();
+  try {
+    const host = new URL(url).hostname.toLowerCase().replace(/^www\./, '');
+    return host === 'youtu.be' || host === 'youtube.com' || host.endsWith('.youtube.com');
+  } catch {
+    const lower = url.toLowerCase();
+    return lower.includes('youtube.com') || lower.includes('youtu.be');
+  }
+}
+
+function isYoutubeAuthErrorMessage(message: string): boolean {
+  const lower = message.toLowerCase();
+  return (
+    lower.includes('bot check')
+    || lower.includes('not a bot')
+    || lower.includes('sign in to youtube')
+    || lower.includes('youtube sign-in')
+  );
+}
+
+export function needsYoutubeSignIn(message: string, url: string): boolean {
+  return isYoutubeMediaUrl(url) && isYoutubeAuthErrorMessage(message);
+}
+
 /** Quick client-side check before calling the backend. */
 export function looksLikeMediaUrl(text: string): boolean {
   const trimmed = text.trim();
