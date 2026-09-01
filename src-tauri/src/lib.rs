@@ -37,6 +37,8 @@ mod process_util;
 mod session;
 mod plugins;
 mod settings;
+mod icy_tap;
+mod stream_debug;
 mod taskbar_handler;
 mod vk_audio;
 mod youtube_auth;
@@ -312,7 +314,9 @@ pub fn run() {
             player.set_bass_dir(resolve_bass_dir(Some(app.handle())));
             player.set_app_handle(app.handle().clone());
             player.set_discord_presence(discord_presence.clone());
-            player.mark_bass_thread();
+            // BASS lives on its own thread (started in Player::new). Do not mark
+            // the UI/main thread as the BASS thread — StreamCreateURL on main
+            // freezes the app, and overlapping it with mixer calls deadlocks.
             player.init().map_err(|e| {
                 std::io::Error::other(e)
             })?;
@@ -392,6 +396,7 @@ pub fn run() {
             commands::library_audio_tech_info,
             commands::library_get_tag_table,
             commands::library_set_tag_table,
+            commands::library_add_stream,
             commands::library_set_track_cover,
             commands::library_resolve_cover,
             commands::library_resolve_full_cover,

@@ -307,6 +307,15 @@
         </div>
       </div>
     </div>
+  {:else if player.currentIsStream}
+    <!-- Radio / web streams have no finite length: no scrubbing, just a live marker. -->
+    <span class="slider-time current">{player.formattedPosition}</span>
+
+    <div class="slider-track is-live" aria-label="Live stream" role="img">
+      <div class="slider-fill"></div>
+    </div>
+
+    <span class="slider-time duration live-badge">LIVE</span>
   {:else}
     <span class="slider-time current">{displayTime}</span>
 

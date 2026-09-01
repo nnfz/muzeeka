@@ -139,6 +139,28 @@ fn tag_write_path(track_path: &str, audio_path_hint: Option<&str>) -> Result<std
     Ok(p)
 }
 
+/// Create a library entry for a pasted radio-stream URL. Returns the built track
+/// so the frontend can insert it into a playlist like any scanned file.
+#[tauri::command]
+pub async fn library_add_stream(
+    database: State<'_, LibraryDatabase>,
+    url: String,
+    title: Option<String>,
+) -> Result<library::MusicFile, String> {
+    let url = url.trim().to_string();
+    if !crate::cue::is_stream_url(&url) {
+        return Err("Enter a valid http:// or https:// stream URL".to_string());
+    }
+    let database = database.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let track = library::stream_music_file(&url, title);
+        database.upsert_tracks(&[track.clone()])?;
+        Ok(track)
+    })
+    .await
+    .map_err(|e| format!("Add stream failed: {e}"))?
+}
+
 /// Probe bitrate / sample rate for the Properties window (CUE → audio image).
 #[tauri::command]
 pub async fn library_audio_tech_info(
@@ -168,9 +190,22 @@ pub async fn library_audio_tech_info(
 pub async fn library_get_tag_table(
     path: String,
     audio_path: Option<String>,
+    snapshot: Option<library::MusicFile>,
 ) -> Result<Vec<crate::tag_table::TagTableRow>, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let write_path = tag_write_path(path.trim(), audio_path.as_deref())?;
+        let track_path = path.trim();
+        if crate::cue::is_stream_url(track_path) {
+            let track = snapshot.unwrap_or_else(|| library::stream_music_file(track_path, None));
+            return Ok(crate::tag_table::tag_table_from_core_fields(
+                track.title.as_deref(),
+                track.artist.as_deref(),
+                track.album.as_deref(),
+                track.genre.as_deref(),
+                track.year,
+                track.track_number,
+            ));
+        }
+        let write_path = tag_write_path(track_path, audio_path.as_deref())?;
         crate::tag_table::read_tag_table(&write_path)
     })
     .await
@@ -193,6 +228,36 @@ pub async fn library_set_tag_table(
         if track_path.is_empty() {
             return Err("Empty track path".to_string());
         }
+
+        // Radio / web streams have no on-disk file to write tags into. Persist the
+        // edited fields (station name lives in `title`) straight to the DB row and
+        // notify the UI — skip the file tag-write path entirely.
+        if crate::cue::is_stream_url(&track_path) {
+            let fields = crate::tag_table::track_fields_from_table(&rows);
+            let snap = snapshot.unwrap_or_else(|| library::stream_music_file(&track_path, None));
+            let title = fields.title.or(snap.title.clone());
+            let artist = fields.artist.or(snap.artist.clone());
+            let file_name = title
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(snap.file_name);
+            let track = library::MusicFile {
+                file_name,
+                title,
+                artist,
+                album: fields.album.or(snap.album),
+                genre: fields.genre.or(snap.genre),
+                year: fields.year.or(snap.year),
+                track_number: fields.track_number.or(snap.track_number),
+                ..snap
+            };
+            database.upsert_tracks(&[track.clone()])?;
+            if let Err(e) = app.emit("track:metadata-updated", &track) {
+                eprintln!("[library_set_tag_table] stream emit failed: {e}");
+            }
+            return Ok(track);
+        }
+
         let write_path = tag_write_path(&track_path, audio_path.as_deref())?;
         crate::tag_table::write_tag_table(&write_path, &rows)?;
 

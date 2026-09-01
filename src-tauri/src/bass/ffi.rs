@@ -11,6 +11,7 @@ use std::path::Path;
 use std::ptr;
 
 use super::types::*;
+use super::types::{BASS_STREAM_STATUS, BASS_TAG_META};
 use std::ffi::CStr;
 
 fn cstr(ptr: *const i8) -> String {
@@ -37,6 +38,28 @@ pub struct BassLibrary {
     bass_stream_create_file:
         unsafe extern "system" fn(mem: BOOL, file: *const u16, offset: QWORD, length: QWORD, flags: DWORD) -> HSTREAM,
     bass_stream_free: unsafe extern "system" fn(handle: HSTREAM) -> BOOL,
+    // Internet streams: URL is always a narrow string (no UNICODE form).
+    // Real signature: (url, DWORD offset, DWORD flags, DOWNLOADPROC*, user)
+    // — there is NO length argument (that is StreamCreateFile). Passing a dummy
+    // length put `flags` in the DOWNLOADPROC slot; bass_aac then called it → AV.
+    bass_stream_create_url: unsafe extern "system" fn(
+        url: *const i8,
+        offset: DWORD,
+        flags: DWORD,
+        proc: *mut std::ffi::c_void,
+        user: *mut std::ffi::c_void,
+    ) -> HSTREAM,
+    bass_stream_get_file_position:
+        unsafe extern "system" fn(handle: HSTREAM, mode: DWORD) -> QWORD,
+    bass_stream_create: unsafe extern "system" fn(
+        freq: DWORD,
+        chans: DWORD,
+        flags: DWORD,
+        proc: *const std::ffi::c_void,
+        user: *mut std::ffi::c_void,
+    ) -> HSTREAM,
+    bass_stream_put_data:
+        unsafe extern "system" fn(handle: HSTREAM, buffer: *const std::ffi::c_void, length: DWORD) -> DWORD,
 
     // Music / tracker modules (MOD, XM, IT, S3M etc.)
     bass_music_load:
@@ -70,9 +93,23 @@ pub struct BassLibrary {
     bass_channel_get_level: unsafe extern "system" fn(handle: DWORD) -> DWORD,
     bass_channel_get_data:
         unsafe extern "system" fn(handle: DWORD, buffer: *mut std::ffi::c_void, length: DWORD) -> DWORD,
+    bass_channel_get_tags:
+        unsafe extern "system" fn(handle: DWORD, tags: DWORD) -> *const std::ffi::c_void,
+    bass_channel_set_sync: unsafe extern "system" fn(
+        handle: DWORD,
+        synctype: DWORD,
+        param: QWORD,
+        proc: unsafe extern "system" fn(DWORD, DWORD, *mut std::ffi::c_void, *mut std::ffi::c_void),
+        user: *mut std::ffi::c_void,
+    ) -> DWORD,
+    bass_channel_remove_sync: unsafe extern "system" fn(handle: DWORD, sync: DWORD) -> BOOL,
 
     // ── Config / DSP ──────────────────────────────────────────────────────────
-    bass_set_config: unsafe extern "system" fn(option: DWORD, value: f32) -> BOOL,
+    // DWORD value — BASS_SetConfig is not a float API. Passing f32 10000.0 as the
+    // timeout used to send the *bit pattern* (~13 days) instead of 10000 ms.
+    bass_set_config: unsafe extern "system" fn(option: DWORD, value: DWORD) -> BOOL,
+    bass_set_config_ptr:
+        unsafe extern "system" fn(option: DWORD, value: *const std::ffi::c_void) -> BOOL,
     bass_channel_set_dsp:
         unsafe extern "system" fn(handle: DWORD, proc: DspProc, priority: i32, user: *mut std::ffi::c_void) -> HDSP,
     bass_channel_set_dsp_ex:
@@ -214,6 +251,10 @@ impl BassLibrary {
                 bass_error_get_code: load_fn!(lib, b"BASS_ErrorGetCode\0"),
                 bass_stream_create_file: load_fn!(lib, b"BASS_StreamCreateFile\0"),
                 bass_stream_free: load_fn!(lib, b"BASS_StreamFree\0"),
+                bass_stream_create_url: load_fn!(lib, b"BASS_StreamCreateURL\0"),
+                bass_stream_get_file_position: load_fn!(lib, b"BASS_StreamGetFilePosition\0"),
+                bass_stream_create: load_fn!(lib, b"BASS_StreamCreate\0"),
+                bass_stream_put_data: load_fn!(lib, b"BASS_StreamPutData\0"),
                 bass_music_load: load_fn!(lib, b"BASS_MusicLoad\0"),
                 bass_music_free: load_fn!(lib, b"BASS_MusicFree\0"),
                 bass_channel_play: load_fn!(lib, b"BASS_ChannelPlay\0"),
@@ -231,7 +272,11 @@ impl BassLibrary {
                 bass_channel_is_active: load_fn!(lib, b"BASS_ChannelIsActive\0"),
                 bass_channel_get_level: load_fn!(lib, b"BASS_ChannelGetLevel\0"),
                 bass_channel_get_data: load_fn!(lib, b"BASS_ChannelGetData\0"),
+                bass_channel_get_tags: load_fn!(lib, b"BASS_ChannelGetTags\0"),
+                bass_channel_set_sync: load_fn!(lib, b"BASS_ChannelSetSync\0"),
+                bass_channel_remove_sync: load_fn!(lib, b"BASS_ChannelRemoveSync\0"),
                 bass_set_config: load_fn!(lib, b"BASS_SetConfig\0"),
+                bass_set_config_ptr: load_fn!(lib, b"BASS_SetConfigPtr\0"),
                 bass_channel_set_dsp: load_fn!(lib, b"BASS_ChannelSetDSP\0"),
                 bass_channel_set_dsp_ex: load_fn!(lib, b"BASS_ChannelSetDSPEx\0"),
                 bass_channel_remove_dsp: load_fn!(lib, b"BASS_ChannelRemoveDSP\0"),
@@ -329,10 +374,163 @@ impl BassLibrary {
         }
     }
 
+    /// Create a decode stream from an internet URL (HTTP/HTTPS radio).
+    /// BLOCK keeps memory bounded for endless streams; the caller must add the
+    /// stream to the mixer and free it via ChannelFree like any decode source.
+    pub fn stream_create_url(&self, url: &str, flags: DWORD) -> Result<HSTREAM, String> {
+        self.url_opener().open(url, flags)
+    }
+
+    /// Decode push stream — mixer reads this, a worker feeds it with `stream_put_data`.
+    /// Never add an internet URL stream to the mixer directly: `ChannelGetData` on a
+    /// URL decode source blocks BASS's update thread (silence + pause/Ctrl+R hang).
+    pub fn stream_create_push(&self, freq: u32, chans: u32, flags: DWORD) -> Result<HSTREAM, String> {
+        let handle = unsafe {
+            (self.bass_stream_create)(
+                freq,
+                chans,
+                flags,
+                STREAMPROC_PUSH,
+                ptr::null_mut(),
+            )
+        };
+        if handle == 0 {
+            Err(self.last_error_string())
+        } else {
+            Ok(handle)
+        }
+    }
+
+    pub fn stream_put_data(&self, handle: DWORD, data: &[u8]) -> Result<u32, String> {
+        if data.is_empty() {
+            return Ok(0);
+        }
+        let wrote = unsafe {
+            (self.bass_stream_put_data)(handle, data.as_ptr().cast(), data.len() as DWORD)
+        };
+        if wrote == DWORD::MAX {
+            Err(self.last_error_string())
+        } else {
+            Ok(wrote)
+        }
+    }
+
+    /// Bytes already waiting in a decode/internet stream (does not block).
+    pub fn channel_data_available(&self, handle: DWORD) -> u32 {
+        let got = unsafe {
+            (self.bass_channel_get_data)(handle, ptr::null_mut(), BASS_DATA_AVAILABLE)
+        };
+        if got == DWORD::MAX {
+            0
+        } else {
+            got
+        }
+    }
+
+    pub fn data_pump(&self) -> DataPump {
+        DataPump {
+            get_data: self.bass_channel_get_data,
+            put_data: self.bass_stream_put_data,
+        }
+    }
+
+    /// A tiny, `Send + Copy` handle to just the raw entry points needed to open a
+    /// URL stream. `BASS_StreamCreateURL` blocks during the network connect and must
+    /// run on the BASS thread (never overlapping mixer/poll calls).
+    pub fn url_opener(&self) -> UrlStreamOpener {
+        UrlStreamOpener {
+            create: self.bass_stream_create_url,
+            error_get_code: self.bass_error_get_code,
+        }
+    }
+
+    /// Raw ICY/HTTP tag block for a URL stream. `tags` is one of
+    /// [`types::BASS_TAG_META`], [`types::BASS_TAG_ICY`], [`types::BASS_TAG_HTTP`].
+    ///
+    /// # Safety
+    /// Must be called on the BASS thread while `handle` is a live URL stream.
+    pub unsafe fn channel_get_tags_raw(&self, handle: DWORD, tags: DWORD) -> Option<String> {
+        let ptr = (self.bass_channel_get_tags)(handle, tags);
+        if ptr.is_null() {
+            return None;
+        }
+        // BASS returns a NUL-terminated narrow string for META and a
+        // NUL-NUL-terminated list of lines for ICY/HTTP/OGG/MP4.
+        let mut len = 0usize;
+        let mut p = ptr as *const u8;
+        let list = tags != BASS_TAG_META;
+        loop {
+            if *p == 0 {
+                if !list || *(p.add(1)) == 0 {
+                    break;
+                }
+            }
+            len += 1;
+            p = p.add(1);
+            if len > 64 * 1024 {
+                break; // pathological header block — bail out
+            }
+        }
+        let bytes = std::slice::from_raw_parts(ptr as *const u8, len);
+        Some(String::from_utf8_lossy(bytes).into_owned())
+    }
+
+    /// Copy a BASS tag block from a raw `BASS_ChannelGetTags` pointer.
+    /// Safe to call from a mixtime SYNCPROC.
+    pub unsafe fn copy_tag_ptr(ptr: *const std::ffi::c_void, list: bool) -> Option<String> {
+        if ptr.is_null() {
+            return None;
+        }
+        let mut len = 0usize;
+        let mut p = ptr as *const u8;
+        loop {
+            if *p == 0 {
+                if !list || *(p.add(1)) == 0 {
+                    break;
+                }
+            }
+            len += 1;
+            p = p.add(1);
+            if len > 64 * 1024 {
+                break;
+            }
+        }
+        if len == 0 {
+            return None;
+        }
+        let bytes = std::slice::from_raw_parts(ptr as *const u8, len);
+        Some(String::from_utf8_lossy(bytes).into_owned())
+    }
+
+    pub fn channel_set_sync(
+        &self,
+        handle: DWORD,
+        synctype: DWORD,
+        proc: unsafe extern "system" fn(DWORD, DWORD, *mut std::ffi::c_void, *mut std::ffi::c_void),
+        user: *mut std::ffi::c_void,
+    ) -> Result<DWORD, String> {
+        let sync = unsafe { (self.bass_channel_set_sync)(handle, synctype, 0, proc, user) };
+        if sync == 0 {
+            Err(self.last_error_string())
+        } else {
+            Ok(sync)
+        }
+    }
+
+    pub fn tags_fn(
+        &self,
+    ) -> unsafe extern "system" fn(DWORD, DWORD) -> *const std::ffi::c_void {
+        self.bass_channel_get_tags
+    }
+
+    pub fn channel_remove_sync(&self, handle: DWORD, sync: DWORD) -> Result<(), String> {
+        let ok = unsafe { (self.bass_channel_remove_sync)(handle, sync) };
+        self.check(ok)
+    }
+
     /// Load a tracker/module (e.g. .it, .xm, .mod, .s3m) using BASS_MusicLoad.
     /// Many tracker plugins work best (or only) through the music API.
-    pub fn music_load(&self, path: &str, flags: DWORD) -> Result<HSTREAM, String> {
-        let wide = to_wide(path);
+    pub fn music_load(&self, path: &str, flags: DWORD) -> Result<HSTREAM, String> {        let wide = to_wide(path);
         let handle = unsafe {
             (self.bass_music_load)(
                 0, // mem = FALSE
@@ -511,9 +709,20 @@ impl BassLibrary {
         Ok((got as usize) / std::mem::size_of::<i16>())
     }
 
-    pub fn set_config(&self, option: DWORD, value: f32) -> Result<(), String> {
+    pub fn set_config(&self, option: DWORD, value: DWORD) -> Result<(), String> {
         let ok = unsafe { (self.bass_set_config)(option, value) };
         self.check(ok)
+    }
+
+    pub fn set_config_ptr(&self, option: DWORD, value: *const std::ffi::c_void) -> Result<(), String> {
+        let ok = unsafe { (self.bass_set_config_ptr)(option, value) };
+        self.check(ok)
+    }
+
+    /// Internet-stream download/buffer state. `u64::MAX` means the call failed
+    /// (not a file stream, or BASS error).
+    pub fn stream_get_file_position(&self, handle: DWORD, mode: DWORD) -> u64 {
+        unsafe { (self.bass_stream_get_file_position)(handle, mode) }
     }
 
     pub fn channel_set_dsp(
@@ -690,5 +899,119 @@ impl BassLibrary {
 
     pub fn last_error_string(&self) -> String {
         self.last_error().to_string()
+    }
+}
+
+/// Copyable GetData/PutData entry points for the live-radio feeder thread.
+/// Mixer never calls GetData on the URL handle; this worker does, then pushes
+/// into a `STREAMPROC_PUSH` stream the mixer *does* read.
+#[derive(Clone, Copy)]
+pub struct DataPump {
+    get_data: unsafe extern "system" fn(
+        handle: DWORD,
+        buffer: *mut std::ffi::c_void,
+        length: DWORD,
+    ) -> DWORD,
+    put_data: unsafe extern "system" fn(
+        handle: HSTREAM,
+        buffer: *const std::ffi::c_void,
+        length: DWORD,
+    ) -> DWORD,
+}
+
+unsafe impl Send for DataPump {}
+
+impl DataPump {
+    pub fn available(&self, handle: DWORD) -> u32 {
+        let got = unsafe { (self.get_data)(handle, ptr::null_mut(), BASS_DATA_AVAILABLE) };
+        if got == DWORD::MAX {
+            0
+        } else {
+            got
+        }
+    }
+
+    /// Pull up to `buf.len()` bytes. `float` ORs `BASS_DATA_FLOAT`.
+    /// Never pass an empty `buf`. Returns 0 if nothing is ready / error.
+    pub fn pull(&self, handle: DWORD, buf: &mut [u8], float: bool) -> u32 {
+        if buf.is_empty() {
+            return 0;
+        }
+        let mut length = buf.len() as DWORD;
+        if float {
+            length |= BASS_DATA_FLOAT;
+        }
+        let got = unsafe { (self.get_data)(handle, buf.as_mut_ptr().cast(), length) };
+        if got == DWORD::MAX {
+            0
+        } else {
+            got
+        }
+    }
+
+    pub fn push(&self, handle: DWORD, data: &[u8]) -> u32 {
+        if data.is_empty() {
+            return 0;
+        }
+        let wrote = unsafe { (self.put_data)(handle, data.as_ptr().cast(), data.len() as DWORD) };
+        if wrote == DWORD::MAX {
+            0
+        } else {
+            wrote
+        }
+    }
+}
+
+/// A copyable, `Send` bundle of just the entry points needed to open a URL stream.
+/// See [`BassLibrary::url_opener`]. Must still be invoked on the BASS thread —
+/// `BASS_StreamCreateURL` is not safe to overlap with mixer/poll calls.
+#[derive(Clone, Copy)]
+pub struct UrlStreamOpener {
+    create: unsafe extern "system" fn(
+        url: *const i8,
+        offset: DWORD,
+        flags: DWORD,
+        proc: *mut std::ffi::c_void,
+        user: *mut std::ffi::c_void,
+    ) -> HSTREAM,
+    error_get_code: unsafe extern "system" fn() -> i32,
+}
+
+// Only raw fn pointers into an already-loaded, still-alive DLL. Safe to move to
+// another thread; BASS itself is process-global.
+unsafe impl Send for UrlStreamOpener {}
+
+impl UrlStreamOpener {
+    /// Open a URL decode stream. BLOCK keeps memory bounded for endless radio;
+    /// STATUS exposes ICY/HTTP headers. Blocks during the network connect — call
+    /// only on the BASS thread.
+    pub fn open(&self, url: &str, flags: DWORD) -> Result<HSTREAM, String> {
+        self.open_proc(url, flags, ptr::null_mut(), ptr::null_mut())
+    }
+
+    pub fn open_proc(
+        &self,
+        url: &str,
+        flags: DWORD,
+        proc: *mut std::ffi::c_void,
+        user: *mut std::ffi::c_void,
+    ) -> Result<HSTREAM, String> {
+        let narrow = std::ffi::CString::new(url)
+            .map_err(|_| "Stream URL contains a NUL byte".to_string())?;
+        let handle = unsafe {
+            (self.create)(
+                narrow.as_ptr(),
+                0,
+                flags | BASS_STREAM_STATUS,
+                proc,
+                user,
+            )
+        };
+        if handle == 0 {
+            let code = unsafe { (self.error_get_code)() };
+            Err(BassError::from(code).to_string())
+        } else {
+            Ok(handle)
+        }
     }
 }

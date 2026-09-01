@@ -16,8 +16,22 @@ fn strip_extended_path_prefix(path: &str) -> &str {
         .unwrap_or(trimmed)
 }
 
+/// True for HTTP(S) stream URLs (internet radio). Kept local so this module has no
+/// dependency on `cue`; must stay in sync with `cue::is_stream_url`.
+pub fn is_stream_url(path: &str) -> bool {
+    let p = path.trim();
+    p.len() > 8
+        && (p.as_bytes()[..7].eq_ignore_ascii_case(b"http://")
+            || p.as_bytes()[..8].eq_ignore_ascii_case(b"https://"))
+}
+
 /// Normalize for equality / DB keys (Windows: strip `\\?\`, `\` separators, lowercase).
 pub fn path_key(path: &str) -> String {
+    // Stream URLs are identity-keyed verbatim (lowercased). Never run `/`→`\`
+    // replacement on them — that would corrupt `http://` into `http:\\`.
+    if is_stream_url(path) {
+        return path.trim().to_lowercase();
+    }
     let without_prefix = strip_extended_path_prefix(path);
     if cfg!(windows) {
         without_prefix.replace('/', "\\").to_lowercase()
@@ -103,6 +117,11 @@ pub fn to_relative(root: &str, absolute: &str) -> Option<String> {
 
 /// Collapse `.` / `..` and normalize separators (best-effort, no filesystem access).
 pub fn normalize_display_path(path: &str) -> String {
+    // A stream URL is already its canonical display form. Running it through
+    // `Path::components()` on Windows collapses `http://` → `http:/` — corruption.
+    if is_stream_url(path) {
+        return path.trim().to_string();
+    }
     let (base, cue) = split_cue_suffix(path);
     let stripped = strip_extended_path_prefix(base);
     let path = Path::new(stripped);
@@ -174,5 +193,18 @@ mod tests {
         let k1 = storage_path_key(Some(1), r"Album\a.flac");
         let k2 = storage_path_key(Some(1), r"album/a.flac");
         assert_eq!(k1, k2);
+    }
+
+    #[test]
+    fn stream_urls_are_not_corrupted() {
+        let url = "https://stream.example.com/live.mp3";
+        // Display normalization must leave the URL untouched (no `//` collapse).
+        assert_eq!(normalize_display_path(url), url);
+        // The key stays URL-shaped (no `/`→`\`), just lowercased.
+        assert_eq!(path_key(url), "https://stream.example.com/live.mp3");
+        assert!(!path_key(url).contains('\\'));
+        assert!(is_stream_url(url));
+        assert!(is_stream_url("http://a.b/c"));
+        assert!(!is_stream_url(r"Z:\music\a.mp3"));
     }
 }

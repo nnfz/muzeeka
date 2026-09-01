@@ -79,6 +79,14 @@
   );
   let addMenu = $state<{ x: number; y: number } | null>(null);
 
+  // "Add radio stream" dialog: paste a URL + optional station name.
+  let streamDialogOpen = $state(false);
+  let streamUrl = $state("");
+  let streamName = $state("");
+  let streamError = $state<string | null>(null);
+  let streamBusy = $state(false);
+  let streamUrlInput = $state<HTMLInputElement | null>(null);
+
   type PlaylistDragState = {
     id: string;
     startX: number;
@@ -164,6 +172,12 @@
 
     return [
       {
+        id: "new-playlist",
+        label: "New playlist",
+        icon: "playlist",
+        onSelect: () => player.createPlaylist(),
+      },
+      {
         id: "add-files-to-current",
         label: "Add files to current playlist",
         icon: "file",
@@ -188,6 +202,13 @@
         label: "Add M3U playlist",
         icon: "import",
         onSelect: () => void addM3uPlaylists(),
+      },
+      {
+        id: "add-stream",
+        label: "Add radio stream (URL)",
+        icon: "import",
+        disabled: !canAddToCurrent,
+        onSelect: () => openStreamDialog(),
       },
     ];
   });
@@ -250,7 +271,7 @@
 
   function openAddMenu(e: MouseEvent) {
     closeContextMenu();
-    const position = openContextMenuFromEvent(e, { width: 260, height: 160 });
+    const position = openContextMenuFromEvent(e, { width: 260, height: 240 });
     addMenu = position;
   }
 
@@ -324,6 +345,59 @@
     );
     if (paths.length === 0) return;
     await player.importM3uPlaylists(paths);
+  }
+
+  function openStreamDialog() {
+    if (!isEditablePlaylist(player.activePlaylistId)) return;
+    streamUrl = "";
+    streamName = "";
+    streamError = null;
+    streamBusy = false;
+    streamDialogOpen = true;
+    // Focus the URL field once the dialog has rendered.
+    queueMicrotask(() => streamUrlInput?.focus());
+  }
+
+  function closeStreamDialog() {
+    streamDialogOpen = false;
+    streamError = null;
+    streamBusy = false;
+  }
+
+  function isValidStreamUrl(url: string): boolean {
+    const trimmed = url.trim().toLowerCase();
+    return trimmed.startsWith("http://") || trimmed.startsWith("https://");
+  }
+
+  async function confirmAddStream() {
+    const url = streamUrl.trim();
+    if (!isValidStreamUrl(url)) {
+      streamError = "Enter a valid http:// or https:// stream URL";
+      return;
+    }
+    streamBusy = true;
+    streamError = null;
+    const ok = await player.addStream(
+      url,
+      streamName.trim() || null,
+      player.activePlaylistId,
+    );
+    streamBusy = false;
+    if (ok) {
+      closeStreamDialog();
+    } else {
+      streamError = "Couldn't add that stream. Check the URL and try again.";
+    }
+  }
+
+  function onStreamDialogKeydown(e: KeyboardEvent) {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      closeStreamDialog();
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      if (!streamBusy) void confirmAddStream();
+    }
   }
 
   function playPlaylist(playlistId: string, firstTrackPath?: string | null) {
@@ -618,10 +692,10 @@
     <div class="section-label">Library</div>
     <button
       class="icon-btn"
-      onclick={() => player.createPlaylist()}
+      onclick={openAddMenu}
       oncontextmenu={openAddMenu}
-      aria-label="New playlist"
-      title="New playlist — right-click to import"
+      aria-label="Add / import"
+      title="Add files, folder, M3U, or radio stream"
     >
       <svg
         width="16"
@@ -875,6 +949,79 @@
   items={addMenuItems}
   onclose={closeAddMenu}
 />
+
+{#if streamDialogOpen}
+  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <div
+    class="stream-dialog-backdrop"
+    role="presentation"
+    onclick={closeStreamDialog}
+    onkeydown={onStreamDialogKeydown}
+  >
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <div
+      class="stream-dialog"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Add radio stream"
+      onclick={(e) => e.stopPropagation()}
+      onkeydown={onStreamDialogKeydown}
+    >
+      <h2 class="stream-dialog-title">Add radio stream</h2>
+      <p class="stream-dialog-hint">
+        Paste a stream URL (Icecast/SHOUTcast, .mp3/.aac/.ogg endpoint, or .pls/.m3u
+        stream). The station name updates automatically once it starts playing.
+      </p>
+
+      <label class="stream-field">
+        <span class="stream-label">Stream URL</span>
+        <input
+          bind:this={streamUrlInput}
+          bind:value={streamUrl}
+          class="stream-input"
+          type="url"
+          placeholder="https://stream.example.com/radio"
+          spellcheck="false"
+          autocomplete="off"
+        />
+      </label>
+
+      <label class="stream-field">
+        <span class="stream-label">Station name <em>(optional)</em></span>
+        <input
+          bind:value={streamName}
+          class="stream-input"
+          type="text"
+          placeholder="Leave blank to detect automatically"
+          autocomplete="off"
+        />
+      </label>
+
+      {#if streamError}
+        <p class="stream-error" role="alert">{streamError}</p>
+      {/if}
+
+      <div class="stream-actions">
+        <button
+          type="button"
+          class="stream-btn stream-btn-ghost"
+          onclick={closeStreamDialog}
+          disabled={streamBusy}
+        >
+          Cancel
+        </button>
+        <button
+          type="button"
+          class="stream-btn stream-btn-primary"
+          onclick={() => void confirmAddStream()}
+          disabled={streamBusy || !streamUrl.trim()}
+        >
+          {streamBusy ? "Adding…" : "Add stream"}
+        </button>
+      </div>
+    </div>
+  </div>
+{/if}
 
 <style>
   @import "./PlaylistSidebar.css";

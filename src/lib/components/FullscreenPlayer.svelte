@@ -723,14 +723,14 @@
           <div class="fullscreen-meta">
             <div class="fullscreen-meta-text">
               <h2 class="fullscreen-title">
-                {player.currentTrack
-                  ? trackDisplayTitle(player.currentTrack)
-                  : (player.currentFileName ?? "")}
+                {player.currentIsStream
+                  ? (player.nowPlayingTitle ?? player.currentFileName ?? "")
+                  : player.currentTrack
+                    ? trackDisplayTitle(player.currentTrack)
+                    : (player.currentFileName ?? "")}
               </h2>
-              {#if player.currentTrack}
-                <p class="fullscreen-artist">
-                  {trackDisplayArtist(player.currentTrack)}
-                </p>
+              {#if player.nowPlayingArtist}
+                <p class="fullscreen-artist">{player.nowPlayingArtist}</p>
               {/if}
             </div>
             {#if player.hasTrack && player.currentFile}

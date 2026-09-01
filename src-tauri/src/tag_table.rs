@@ -344,6 +344,43 @@ pub fn read_bpm(path: &Path) -> Option<f32> {
         .or_else(|| tag.get_string(ItemKey::IntegerBpm).and_then(parse))
 }
 
+/// Core foobar columns filled from a library row (radio streams have no on-disk tags).
+pub fn tag_table_from_core_fields(
+    title: Option<&str>,
+    artist: Option<&str>,
+    album: Option<&str>,
+    genre: Option<&str>,
+    year: Option<u32>,
+    track_number: Option<u32>,
+) -> Vec<TagTableRow> {
+    let mut values: HashMap<ItemKey, String> = HashMap::new();
+    let put = |map: &mut HashMap<ItemKey, String>, key: ItemKey, value: Option<&str>| {
+        if let Some(s) = value.map(str::trim).filter(|s| !s.is_empty()) {
+            map.insert(key, s.to_string());
+        }
+    };
+    put(&mut values, ItemKey::TrackTitle, title);
+    put(&mut values, ItemKey::TrackArtist, artist);
+    put(&mut values, ItemKey::AlbumTitle, album);
+    put(&mut values, ItemKey::Genre, genre);
+    if let Some(y) = year.filter(|&y| y > 0) {
+        values.insert(ItemKey::RecordingDate, y.to_string());
+    }
+    if let Some(n) = track_number.filter(|&n| n > 0) {
+        values.insert(ItemKey::TrackNumber, n.to_string());
+    }
+
+    CORE_FIELDS
+        .iter()
+        .map(|(key, name)| TagTableRow {
+            id: item_key_id(*key),
+            name: (*name).to_string(),
+            value: values.get(key).cloned().unwrap_or_default(),
+            read_only: false,
+        })
+        .collect()
+}
+
 /// Pull common library fields out of a saved table for SQLite / UI.
 pub fn track_fields_from_table(rows: &[TagTableRow]) -> TrackFieldsFromTable {
     let get = |id: &str| -> Option<String> {

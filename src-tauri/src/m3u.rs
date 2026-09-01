@@ -155,6 +155,65 @@ fn resolve_entry(base_dir: &Path, raw: &str) -> Option<PathBuf> {
     fs::canonicalize(&absolute).ok().or(Some(absolute))
 }
 
+/// One remote stream entry from a playlist: the URL and its `#EXTINF` display
+/// name (station name) when present.
+#[derive(Debug, Clone, PartialEq)]
+pub struct M3uStream {
+    pub url: String,
+    pub name: Option<String>,
+}
+
+/// Extract remote HTTP(S) stream entries (internet radio) from a playlist,
+/// pairing each URL with the display name from its preceding `#EXTINF` line.
+/// Local file entries are ignored here (see [`expand_m3u_paths`] for those).
+pub fn expand_m3u_streams(m3u_path: &Path) -> Vec<M3uStream> {
+    let text = match read_m3u_text(m3u_path) {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
+
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    // Pending display name carried from the most recent `#EXTINF:secs,Name` line.
+    let mut pending_name: Option<String> = None;
+
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("#EXTINF:") {
+            // Format: `#EXTINF:<seconds>,<display name>`.
+            pending_name = rest
+                .splitn(2, ',')
+                .nth(1)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            continue;
+        }
+        if line.starts_with('#') {
+            continue;
+        }
+
+        let entry = strip_quotes(line).trim();
+        let name = pending_name.take();
+        if !(entry.to_ascii_lowercase().starts_with("http://")
+            || entry.to_ascii_lowercase().starts_with("https://"))
+        {
+            continue;
+        }
+        if seen.insert(entry.to_lowercase()) {
+            out.push(M3uStream {
+                url: entry.to_string(),
+                name,
+            });
+        }
+    }
+
+    out
+}
+
 /// Ordered local path entries from an M3U playlist (audio / cue paths).
 /// Remote URLs and blank/comment lines are skipped.
 pub fn expand_m3u_paths(m3u_path: &Path) -> Vec<PathBuf> {

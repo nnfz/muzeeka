@@ -246,14 +246,40 @@ pub fn bass_error_to_string(code: i32) -> &'static str {
 pub const BASS_STREAM_PRESCAN: DWORD = 0x20000;
 pub const BASS_STREAM_AUTOFREE: DWORD = 0x40000;
 pub const BASS_STREAM_DECODE: DWORD = 0x200000;
+/// Internet stream: download in blocks instead of the whole file.
+pub const BASS_STREAM_BLOCK: DWORD = 0x100000;
+/// Internet stream: retrieve extra HTTP/ICY status headers.
+pub const BASS_STREAM_STATUS: DWORD = 0x800000;
 pub const BASS_UNICODE: DWORD = 0x80000000;
 pub const BASS_SAMPLE_FLOAT: DWORD = 256;
 /// Downmix to mono when creating a stream (good for analysis).
 pub const BASS_SAMPLE_MONO: DWORD = 2;
 
+/// ICY (SHOUTcast) metadata tag: `StreamTitle='...';StreamUrl='...';`
+pub const BASS_TAG_META: DWORD = 0x10000;
+/// ICY (SHOUTcast) response headers: null-separated `name: value` lines.
+pub const BASS_TAG_ICY: DWORD = 0x14000;
+/// HTTP response headers (same layout as ICY).
+pub const BASS_TAG_HTTP: DWORD = 0x15000;
+/// OGG comments (`TITLE=...` NUL-separated).
+pub const BASS_TAG_OGG: DWORD = 2;
+/// MP4/iTunes tags (`©nam=...` NUL-separated).
+pub const BASS_TAG_MP4: DWORD = 7;
+
+/// Shoutcast metadata received.
+pub const BASS_SYNC_META: DWORD = 4;
+/// OGG bitstream info changed.
+pub const BASS_SYNC_OGG_CHANGE: DWORD = 12;
+
 // ── ChannelGetData flags ─────────────────────────────────────────────────────
 /// Request floating-point PCM (OR with byte length).
 pub const BASS_DATA_FLOAT: DWORD = 0x4000_0000;
+/// Query how many bytes are already decoded/buffered (`buffer` is ignored).
+pub const BASS_DATA_AVAILABLE: DWORD = 0;
+
+/// `BASS_StreamCreate` proc: push stream, fed via `BASS_StreamPutData`.
+/// (`(STREAMPROC*)-1` in bass.h.)
+pub const STREAMPROC_PUSH: *const std::ffi::c_void = -1isize as *const std::ffi::c_void;
 
 // ── Position mode ─────────────────────────────────────────────────────────────
 pub const BASS_POS_BYTE: DWORD = 0;
@@ -275,6 +301,25 @@ pub const BASS_ATTRIB_BUFFER: DWORD = 13;
 pub const BASS_CONFIG_FLOATDSP: DWORD = 46;
 pub const BASS_CONFIG_BUFFER: DWORD = 0;
 pub const BASS_CONFIG_UPDATEPERIOD: DWORD = 1;
+/// Enable ICY metadata on internet streams (default 1).
+pub const BASS_CONFIG_NET_META: DWORD = 29;
+/// Internet connection timeout in milliseconds.
+pub const BASS_CONFIG_NET_TIMEOUT: DWORD = 8;
+/// Download buffer length for internet streams, in milliseconds (default 5000).
+pub const BASS_CONFIG_NET_BUFFER: DWORD = 9;
+/// HTTP User-Agent string (via `BASS_SetConfigPtr`).
+pub const BASS_CONFIG_NET_AGENT: DWORD = 10;
+/// How many playlist entries `StreamCreateURL` should follow (1 = first URL).
+pub const BASS_CONFIG_NET_PLAYLIST: DWORD = 21;
+/// Percent of [`BASS_CONFIG_NET_BUFFER`] to pre-buffer before `StreamCreateURL` returns (default 75).
+pub const BASS_CONFIG_NET_PREBUF: DWORD = 6;
+/// Stall timeout while reading an internet stream, in milliseconds (0 = no timeout).
+pub const BASS_CONFIG_NET_READTIMEOUT: DWORD = 37;
+
+/// `BASS_StreamGetFilePosition` modes.
+pub const BASS_FILEPOS_DOWNLOAD: DWORD = 1;
+pub const BASS_FILEPOS_BUFFER: DWORD = 5;
+pub const BASS_FILEPOS_CONNECTED: DWORD = 4;
 
 // ── DSP ───────────────────────────────────────────────────────────────────────
 pub type HDSP = DWORD;
@@ -328,6 +373,8 @@ pub const BASS_MIXER_RESUME: DWORD = 0x1000;
 pub const BASS_MIXER_CHAN_NORAMPIN: DWORD = 0x800000;
 pub const BASS_MIXER_CHAN_BUFFER: DWORD = 0x2000;
 pub const BASS_MIXER_CHAN_PAUSE: DWORD = 0x20000;
+/// Downmix surround sources to the mixer's channel count.
+pub const BASS_MIXER_CHAN_DOWNMIX: DWORD = 0x400000;
 
 // ── Music (modules / trackers) ────────────────────────────────────────────────
 pub const BASS_MUSIC_DECODE: DWORD = 0x200000;

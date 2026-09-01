@@ -10,6 +10,7 @@
   import { open } from "@tauri-apps/plugin-dialog";
   import { onMount } from "svelte";
   import {
+    isStreamTrack,
     sameTrackPath,
     trackDisplayArtist,
     trackDisplayTitle,
@@ -129,6 +130,7 @@
   let loadGen = 0;
 
   let isCue = $derived(!!track?.path?.includes("#cue:"));
+  let isStream = $derived(isStreamTrack(track));
 
   let coverSrc = $derived.by(() => {
     if (!track || coverFailed) return null;
@@ -199,6 +201,7 @@
       const nextRows = await invoke<TagTableRow[]>("library_get_tag_table", {
         path: t.path,
         audioPath: t.audio_path ?? null,
+        snapshot: t,
       });
       if (!stillCurrent(t, gen)) return;
       rows = nextRows;
@@ -805,9 +808,11 @@
         cover_path_full: updated.cover_path_full ?? track.cover_path_full,
       };
       dirty = false;
-      success = isCue
-        ? "Tags written to audio image + library"
-        : "Tags written to file + library";
+      success = isStream
+        ? "Saved to library"
+        : isCue
+          ? "Tags written to audio image + library"
+          : "Tags written to file + library";
       await loadTagTable(track);
     } catch (e) {
       error = typeof e === "string" ? e : String(e);
@@ -1215,7 +1220,12 @@
               <p class="section-desc">
                 Core tags + any extra fields present in the file. Empty value
                 removes the field.
-                {#if isCue}
+                {#if isStream}
+                  Station name (Track Title) and artist are stored in the
+                  library — streams have no file tags. While the station is
+                  playing, the live track title replaces the station name in
+                  the player.
+                {:else if isCue}
                   CUE tracks write into the shared audio image.
                 {/if}
               </p>

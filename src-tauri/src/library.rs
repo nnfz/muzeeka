@@ -112,6 +112,42 @@ pub struct MusicFile {
     pub cue_end_secs: Option<f64>,
 }
 
+/// Build a library entry for an internet radio / web stream. `url` is the stream
+/// location (also the identity key); `title` is the user-facing station name.
+/// When no title is given, the host portion of the URL is used as a fallback.
+pub fn stream_music_file(url: &str, title: Option<String>) -> MusicFile {
+    let url = url.trim().to_string();
+    let fallback = url
+        .split("://")
+        .nth(1)
+        .and_then(|rest| rest.split(['/', '?']).next())
+        .filter(|host| !host.is_empty())
+        .map(|host| host.to_string())
+        .unwrap_or_else(|| url.clone());
+    let title = title
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .or(Some(fallback));
+    MusicFile {
+        path: url.clone(),
+        file_name: title.clone().unwrap_or(url),
+        extension: "stream".to_string(),
+        size: 0,
+        title,
+        artist: None,
+        album: None,
+        duration_secs: None,
+        year: None,
+        track_number: None,
+        genre: None,
+        cover_path: None,
+        cover_path_full: None,
+        audio_path: None,
+        cue_start_secs: None,
+        cue_end_secs: None,
+    }
+}
+
 fn clean_path_string(path_str: &str) -> String {
     path_str
         .trim()
@@ -478,7 +514,14 @@ fn scan_paths_impl(
         }
 
         if m3u::is_m3u_path(&path) {
-            // Expand entries, but never follow nested .m3u (avoids cycles).
+            // Radio / web streams inside the playlist become library stream entries.
+            for stream in m3u::expand_m3u_streams(&path) {
+                let key = path_key(&stream.url);
+                if seen.insert(key) {
+                    results.push(stream_music_file(&stream.url, stream.name));
+                }
+            }
+            // Expand local entries, but never follow nested .m3u (avoids cycles).
             let nested: Vec<String> = m3u::expand_m3u_paths(&path)
                 .into_iter()
                 .filter(|p| !m3u::is_m3u_path(p))

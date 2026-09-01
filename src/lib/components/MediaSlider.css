@@ -232,3 +232,41 @@
 .volume-icon-append.slide.visible {
   transform: translate(-50%, -50%);
 }
+
+/* --- Live radio / web stream: no scrubbing, steady bar + LIVE badge --- */
+.slider-track.is-live {
+  cursor: default;
+}
+
+.slider-track.is-live .slider-fill {
+  width: 100%;
+  opacity: 0.35;
+  background: linear-gradient(
+    90deg,
+    var(--accent) 0%,
+    color-mix(in srgb, var(--accent) 40%, transparent) 100%
+  );
+}
+
+.slider-time.live-badge {
+  color: var(--accent);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+}
+
+.slider-time.live-badge::before {
+  content: "";
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-right: 5px;
+  border-radius: 50%;
+  background: var(--accent);
+  vertical-align: middle;
+  animation: live-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes live-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}

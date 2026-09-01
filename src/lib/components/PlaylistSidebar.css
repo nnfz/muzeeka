@@ -372,3 +372,129 @@
 .playlist-row.virtual .playlist-count {
   font-size: 9px;
 }
+
+/* --- Add radio stream dialog --- */
+.stream-dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(2px);
+  padding: 20px;
+}
+
+.stream-dialog {
+  width: 100%;
+  max-width: 420px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg, 0 20px 60px rgba(0, 0, 0, 0.5));
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.stream-dialog-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.stream-dialog-hint {
+  margin: 0;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--text-secondary);
+}
+
+.stream-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.stream-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.stream-label em {
+  font-style: normal;
+  font-weight: 400;
+  opacity: 0.7;
+}
+
+.stream-input {
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  font-size: 12.5px;
+  outline: none;
+  transition: border-color var(--transition-fast);
+}
+
+.stream-input:focus {
+  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+}
+
+.stream-input::placeholder {
+  color: color-mix(in srgb, var(--text-secondary) 60%, transparent);
+}
+
+.stream-error {
+  margin: 0;
+  font-size: 11.5px;
+  color: #e25555;
+}
+
+.stream-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+.stream-btn {
+  padding: 7px 16px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  font-weight: 600;
+  transition: all var(--transition-fast);
+  cursor: pointer;
+}
+
+.stream-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.stream-btn-ghost {
+  background: transparent;
+  color: var(--text-secondary);
+  border: 1px solid var(--border-subtle);
+}
+
+.stream-btn-ghost:not(:disabled):hover {
+  color: var(--text-primary);
+  background: var(--bg-glass-hover);
+}
+
+.stream-btn-primary {
+  background: var(--accent);
+  color: #fff;
+  border: 1px solid var(--accent);
+}
+
+.stream-btn-primary:not(:disabled):hover {
+  transform: translateY(-1px);
+}

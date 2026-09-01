@@ -3,9 +3,10 @@
 // Wraps BASS in a higher-level API that tracks the current track, volume,
 // playback state, and emits Tauri events for position updates.
 
+use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex as StdMutex};
+use std::sync::{mpsc, Arc, Mutex as StdMutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -17,6 +18,7 @@ use crate::bass::{self, BassLibrary};
 use crate::cue::{self, PlaybackTarget};
 use crate::discord_rpc::DiscordPresence;
 use crate::dsp_chain::{chain_dsp_callback, ChainSlotSettings, DspChain, DspChainStatus};
+use crate::icy_tap::{self, LiveMetaInbox};
 use crate::mix_filter::{self, MixFilterCtx};
 
 /// Next track queued for gapless transition.
@@ -31,6 +33,17 @@ pub struct GaplessTrack {
 #[derive(Debug, Clone, Serialize)]
 pub struct TrackChangedPayload {
     pub path: String,
+}
+
+/// ICY now-playing update pushed to the UI while a live radio stream plays.
+/// `path` identifies the station; `title` is the currently announced track
+/// (empty when the station sends none); `station` is the ICY station name.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamMetadataPayload {
+    pub path: String,
+    pub title: Option<String>,
+    pub station: Option<String>,
 }
 
 // Spotify-like short musical fades (not on track changes)
@@ -183,6 +196,104 @@ struct PlayerInner {
     extra_outputs: Vec<ExtraOutput>,
     extra_devices_inited: Vec<i32>,
     next_extra_id: u64,
+    /// The active source is an internet radio stream (URL). Live sources have
+    /// no length, never auto-advance and ignore seeks.
+    live_source: Option<LiveStreamState>,
+    /// Bytes pushed into the live mixer source since open (diagnostics).
+    live_bytes_fed: u64,
+    live_last_pump_log_ms: u64,
+    live_zero_pulls: u32,
+    live_pcm_rate: u32,
+    live_pcm_chans: u32,
+    live_reconnect_after_ms: u64,
+    live_meta_sync: u32,
+    /// ICY text copied inside BASS_SYNC_META (GetTags is empty after the callback).
+    live_meta_inbox: Arc<StdMutex<LiveMetaInbox>>,
+    live_meta_user: usize,
+    /// Sidecar HTTP ICY tap (BASS mixer DECODE never surfaces StreamTitle).
+    icy_tap_stop: Option<Arc<AtomicBool>>,
+    icy_tap_join: Option<thread::JoinHandle<()>>,
+}
+
+/// Owned by DOWNLOADPROC + META sync `user` until teardown.
+struct LiveMetaUser {
+    get_tags: unsafe extern "system" fn(u32, u32) -> *const std::ffi::c_void,
+    inbox: Arc<StdMutex<LiveMetaInbox>>,
+    icy: StdMutex<IcyParse>,
+}
+
+#[derive(Default)]
+struct IcyParse {
+    metaint: u32,
+    audio_left: u32,
+    meta_left: u32,
+    meta: Vec<u8>,
+}
+
+/// Per-live-stream bookkeeping (ICY now-playing, station name, position base).
+#[derive(Debug, Clone)]
+struct LiveStreamState {
+    /// Stream URL (`current_audio_path` while live).
+    url: String,
+    /// Wall-clock ms when playback of this stream started (position base).
+    started_ms: u64,
+    /// Wall-clock ms accumulated while paused (excluded from position).
+    paused_ms: u64,
+    /// Wall-clock ms when the current pause began (0 = not paused).
+    pause_started_ms: u64,
+    /// Last ICY `StreamTitle` reported to the UI.
+    last_title: Option<String>,
+    /// Last station name (ICY `name` header) reported to the UI.
+    last_station: Option<String>,
+    /// Bytes BASS had buffered last time ICY was checked — change ⇒ new metadata.
+    last_probe_bytes: u64,
+    /// Wall ms of the last ICY probe (rate limit).
+    last_probe_ms: u64,
+}
+
+impl LiveStreamState {
+    fn new(url: String) -> Self {
+        Self {
+            url,
+            started_ms: Player::now_millis(),
+            paused_ms: 0,
+            pause_started_ms: 0,
+            last_title: None,
+            last_station: None,
+            last_probe_bytes: 0,
+            last_probe_ms: 0,
+        }
+    }
+
+    /// Seconds of audio played so far: wall-clock since start minus time spent paused.
+    fn elapsed_secs(&self, now_ms: u64) -> f64 {
+        let gross = now_ms.saturating_sub(self.started_ms);
+        // Include the in-progress pause so the clock freezes while paused.
+        let live_pause = if self.pause_started_ms != 0 {
+            now_ms.saturating_sub(self.pause_started_ms)
+        } else {
+            0
+        };
+        let net = gross.saturating_sub(self.paused_ms).saturating_sub(live_pause);
+        net as f64 / 1000.0
+    }
+
+    /// Mark the beginning of a pause (idempotent).
+    fn mark_paused(&mut self, now_ms: u64) {
+        if self.pause_started_ms == 0 {
+            self.pause_started_ms = now_ms;
+        }
+    }
+
+    /// Accumulate the just-finished pause into `paused_ms` (idempotent).
+    fn mark_resumed(&mut self, now_ms: u64) {
+        if self.pause_started_ms != 0 {
+            self.paused_ms = self
+                .paused_ms
+                .saturating_add(now_ms.saturating_sub(self.pause_started_ms));
+            self.pause_started_ms = 0;
+        }
+    }
 }
 
 struct ExtraOutput {
@@ -365,6 +476,7 @@ pub struct ArmedMix {
 /// Third-party plugins (e.g. basszxtune.dll or other tracker/chiptune addons)
 /// placed in the bass/ folder will also be auto-detected and attempted.
 const BASS_FORMAT_PLUGINS: &[&str] = &[
+    "bass_aac.dll",
     "bassflac.dll",
     "bassape.dll",
     "basswv.dll",
@@ -385,6 +497,9 @@ const NON_FORMAT_BASS_DLLS: &[&str] = &[
     "basswasapi.dll",
 ];
 
+/// Work item executed serially on the dedicated BASS thread.
+type BassJob = Box<dyn FnOnce() + Send>;
+
 // ── Public player handle ──────────────────────────────────────────────────────
 #[derive(Clone)]
 pub struct Player {
@@ -393,12 +508,19 @@ pub struct Player {
     ops: Arc<Mutex<()>>,
     app: Arc<RwLock<Option<AppHandle>>>,
     bass_thread: Arc<RwLock<Option<thread::ThreadId>>>,
+    /// Jobs for the dedicated BASS thread. All `BASS_*` calls (including the
+    /// blocking `StreamCreateURL` connect) run there — never on the UI thread
+    /// and never overlapping from a Tauri worker.
+    bass_jobs: mpsc::Sender<BassJob>,
     discord: Arc<RwLock<Option<DiscordPresence>>>,
     /// True while the main window is focused — drives UI event rate (games-friendly when false).
     ui_hot: Arc<AtomicBool>,
     /// True while a decode source is loaded. Position-poll sleeps long and skips
-    /// main-thread hops when false (idle app / stopped).
+    /// BASS hops when false (idle app / stopped).
     source_active: Arc<AtomicBool>,
+    /// Set after the first successful `BASS_Init`. Ctrl+R re-calls `player_init`
+    /// and must not hop to the BASS thread (it may be connecting a URL).
+    bass_ready: Arc<AtomicBool>,
     /// Same leaked rack as `PlayerInner::chain`, held here so the settings UI can
     /// read its atomics without taking the player lock or hopping to the BASS
     /// thread ten times a second.
@@ -410,6 +532,18 @@ impl Player {
         // Leaked exactly once: BASS holds a raw `user` pointer to this for the
         // process lifetime. Individual effects inside it are plain `Arc`s.
         let chain: &'static DspChain = Box::leak(Box::new(DspChain::new()));
+        let bass_thread = Arc::new(RwLock::new(None));
+        let (bass_jobs, bass_rx) = mpsc::channel::<BassJob>();
+        let bass_thread_for_spawn = Arc::clone(&bass_thread);
+        let _ = thread::Builder::new()
+            .name("muzeeka-bass".into())
+            .spawn(move || {
+                *bass_thread_for_spawn.write() = Some(thread::current().id());
+                crate::process_util::register_audio_thread();
+                while let Ok(job) = bass_rx.recv() {
+                    job();
+                }
+            });
         Self {
             inner: Arc::new(Mutex::new(PlayerInner {
                 bass: None,
@@ -447,13 +581,27 @@ impl Player {
                 extra_outputs: Vec::new(),
                 extra_devices_inited: Vec::new(),
                 next_extra_id: 1,
+                live_source: None,
+                live_bytes_fed: 0,
+                live_last_pump_log_ms: 0,
+                live_zero_pulls: 0,
+                live_pcm_rate: 44100,
+                live_pcm_chans: 2,
+                live_reconnect_after_ms: 0,
+                live_meta_sync: 0,
+                live_meta_inbox: Arc::new(StdMutex::new(LiveMetaInbox::default())),
+                live_meta_user: 0,
+                icy_tap_stop: None,
+                icy_tap_join: None,
             })),
             ops: Arc::new(Mutex::new(())),
             app: Arc::new(RwLock::new(None)),
-            bass_thread: Arc::new(RwLock::new(None)),
+            bass_thread,
+            bass_jobs,
             discord: Arc::new(RwLock::new(None)),
             ui_hot: Arc::new(AtomicBool::new(true)),
             source_active: Arc::new(AtomicBool::new(false)),
+            bass_ready: Arc::new(AtomicBool::new(false)),
             chain,
         }
     }
@@ -606,6 +754,11 @@ impl Player {
     }
 
     pub fn set_app_handle(&self, app: AppHandle) {
+        crate::stream_debug::set_app(app.clone());
+        crate::stream_debug::log(format!(
+            "stream log → {}",
+            crate::stream_debug::log_path().display()
+        ));
         *self.app.write() = Some(app);
     }
 
@@ -641,19 +794,14 @@ impl Player {
             return f(&mut self.inner.lock());
         }
 
-        let app = self
-            .app
-            .read()
-            .clone()
-            .ok_or("Player is not ready")?;
         let inner = Arc::clone(&self.inner);
         let (tx, rx) = mpsc::sync_channel(1);
-
-        app.run_on_main_thread(move || {
-            let mut guard = inner.lock();
-            let _ = tx.send(f(&mut guard));
-        })
-        .map_err(|e| format!("Failed to dispatch to BASS thread: {e}"))?;
+        self.bass_jobs
+            .send(Box::new(move || {
+                let mut guard = inner.lock();
+                let _ = tx.send(f(&mut guard));
+            }))
+            .map_err(|_| "BASS thread is gone".to_string())?;
 
         rx.recv()
             .map_err(|_| "BASS thread did not respond".to_string())?
@@ -661,7 +809,14 @@ impl Player {
 
     /// Initialize the BASS audio system. Must be called before any playback.
     pub fn init(&self) -> Result<(), String> {
-        self.run_on_bass_thread(Self::init_inner)
+        if self.bass_ready.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let result = self.run_on_bass_thread(Self::init_inner);
+        if result.is_ok() {
+            self.bass_ready.store(true, Ordering::Release);
+        }
+        result
     }
 
     /// Run a closure with the live `BassLibrary` on the BASS thread (for analysis etc.).
@@ -694,7 +849,7 @@ impl Player {
         let mut bass = BassLibrary::load(&inner.bass_dir)?;
 
         // FLOATDSP must be configured before BASS_Init.
-        let float_dsp_ok = bass.set_config(bass::BASS_CONFIG_FLOATDSP, 1.0).is_ok();
+        let float_dsp_ok = bass.set_config(bass::BASS_CONFIG_FLOATDSP, 1).is_ok();
 
         match bass.init(-1, 44100) {
             Ok(()) => {}
@@ -705,11 +860,32 @@ impl Player {
             }
         }
 
-        // Device playback buffer. 300ms absorbs short main-thread / decode stalls
+        // Device playback buffer. 300ms absorbs short decode stalls
         // (Ctrl+R bootstrap, metadata, Discord) without audible dropouts. Was 200ms
         // and could dip into silence under load. Update period 15ms keeps latency OK.
-        let _ = bass.set_config(bass::BASS_CONFIG_BUFFER, 300.0);
-        let _ = bass.set_config(bass::BASS_CONFIG_UPDATEPERIOD, 15.0);
+        let _ = bass.set_config(bass::BASS_CONFIG_BUFFER, 300);
+        let _ = bass.set_config(bass::BASS_CONFIG_UPDATEPERIOD, 15);
+
+        // Internet radio. Mixer never GetData's the URL (we pump on this thread),
+        // so a short READTIMEOUT is only a safety net if we pull with an empty
+        // download buffer — that used to EOF the live stream after ~0.5s.
+        let _ = bass.set_config(bass::BASS_CONFIG_NET_META, 1);
+        let _ = bass.set_config(bass::BASS_CONFIG_NET_TIMEOUT, 8000);
+        // 0 = wait for the next Icecast block instead of EOF'ing the decode
+        // stream. Mixer pulls at device rate, so this does not drain the buffer.
+        let _ = bass.set_config(bass::BASS_CONFIG_NET_READTIMEOUT, 0);
+        let _ = bass.set_config(bass::BASS_CONFIG_NET_BUFFER, 8000);
+        let _ = bass.set_config(bass::BASS_CONFIG_NET_PREBUF, 20);
+        let _ = bass.set_config(bass::BASS_CONFIG_NET_PLAYLIST, 1);
+        static NET_AGENT: OnceLock<CString> = OnceLock::new();
+        let agent = NET_AGENT.get_or_init(|| {
+            CString::new("Mozilla/5.0 (Windows NT 10.0; Win64; x64) Muzeeka/1.0")
+                .expect("user-agent")
+        });
+        let _ = bass.set_config_ptr(
+            bass::BASS_CONFIG_NET_AGENT,
+            agent.as_ptr().cast(),
+        );
 
         let fx_dll = inner.bass_dir.join("bass_fx.dll");
         if fx_dll.is_file() {
@@ -765,11 +941,15 @@ impl Player {
             match bass.plugin_load(&path_str) {
                 Ok(handle) => {
                     eprintln!("BASS plugin loaded: {plugin}");
+                    crate::stream_debug::log(format!("plugin loaded: {plugin}"));
                     inner._plugin_handles.push(handle);
                     attempted.insert(plugin.to_lowercase());
                 }
                 Err(error) => {
                     eprintln!("BASS plugin not loaded: {plugin} ({error})");
+                    crate::stream_debug::log(format!(
+                        "plugin {plugin} not loaded: {error}"
+                    ));
                     attempted.insert(plugin.to_lowercase());
                 }
             }
@@ -1189,6 +1369,11 @@ impl Player {
         let track_path = track_path.to_string();
         let track_path_for_stats = track_path.clone();
         let audio_path = audio_path.map(str::to_string);
+
+        // Internet radio: `BASS_StreamCreateURL` blocks during connect. That call
+        // runs inside `play_inner` on the dedicated BASS thread (not the UI thread),
+        // so the window stays alive while a slow/dead station times out.
+
         let cleared_mix = self.run_on_bass_thread(move |inner| {
             let was_mix = inner.mix_preview_active;
             inner.mix_preview_active = false;
@@ -1249,7 +1434,11 @@ impl Player {
             .get(inner.gapless_queue_index + 1)
             .cloned();
         if let Some(ref track) = inner.pending_next.clone() {
-            if let Err(error) = Self::preload_next(inner, track) {
+            // Never preload a live URL — StreamCreateURL would stall the BASS thread
+            // for a station that isn't playing yet.
+            if cue::is_stream_url(&track.audio_path) || cue::is_stream_url(&track.track_path) {
+                Self::clear_preload(inner);
+            } else if let Err(error) = Self::preload_next(inner, track) {
                 eprintln!("Gapless preload failed: {error}");
             }
         } else {
@@ -1344,6 +1533,10 @@ impl Player {
         if inner.mix_crossfade.is_some() {
             return false;
         }
+        // Live radio is not seekable — re-clicking a station must reconnect.
+        if inner.live_source.is_some() || cue::is_stream_url(audio_path) {
+            return false;
+        }
         inner.current_source != 0
             && inner
                 .current_audio_path
@@ -1409,6 +1602,24 @@ impl Player {
     }
 
     fn teardown_current(inner: &mut PlayerInner) {
+        Self::abort_icy_tap(inner);
+        inner.live_bytes_fed = 0;
+        inner.live_last_pump_log_ms = 0;
+        inner.live_zero_pulls = 0;
+        inner.live_reconnect_after_ms = 0;
+        let live_handle = if inner.current_decode != 0 {
+            inner.current_decode
+        } else {
+            inner.current_source
+        };
+        if inner.live_meta_sync != 0 {
+            if let Some(bass) = inner.bass.as_ref() {
+                if live_handle != 0 {
+                    let _ = bass.channel_remove_sync(live_handle, inner.live_meta_sync);
+                }
+            }
+            inner.live_meta_sync = 0;
+        }
         Self::clear_mix_crossfade(inner);
         if inner.current_source != 0 {
             if let Some(bass) = inner.bass.as_ref() {
@@ -1423,6 +1634,55 @@ impl Player {
         inner.cue_end = None;
         inner.cue_pos_relative = false;
         inner.current_decode = 0;
+        inner.live_source = None;
+        if inner.live_meta_user != 0 {
+            unsafe {
+                drop(Box::from_raw(inner.live_meta_user as *mut LiveMetaUser));
+            }
+            inner.live_meta_user = 0;
+        }
+    }
+
+    /// Signal the sidecar ICY tap to exit. Do not join — the BASS thread must
+    /// not block on a socket read. The tap notices `stop` on the next chunk.
+    fn abort_icy_tap(inner: &mut PlayerInner) {
+        if let Some(stop) = inner.icy_tap_stop.take() {
+            stop.store(true, Ordering::SeqCst);
+        }
+        let _ = inner.icy_tap_join.take();
+        if let Ok(mut inbox) = inner.live_meta_inbox.lock() {
+            inbox.gen = inbox.gen.wrapping_add(1);
+            inbox.meta = None;
+            inbox.icy = None;
+            inbox.http = None;
+        }
+    }
+
+    /// Start (or restart, if the previous thread exited) the ICY sidecar.
+    fn ensure_icy_tap(inner: &mut PlayerInner) {
+        let Some(url) = inner.live_source.as_ref().map(|l| l.url.clone()) else {
+            return;
+        };
+        if inner
+            .icy_tap_join
+            .as_ref()
+            .is_some_and(|h| !h.is_finished())
+        {
+            return;
+        }
+        let _ = inner.icy_tap_join.take();
+        if let Some(stop) = inner.icy_tap_stop.take() {
+            stop.store(true, Ordering::SeqCst);
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        inner.icy_tap_stop = Some(Arc::clone(&stop));
+        let inbox = Arc::clone(&inner.live_meta_inbox);
+        let gen = inner
+            .live_meta_inbox
+            .lock()
+            .map(|g| g.gen)
+            .unwrap_or(0);
+        inner.icy_tap_join = Some(icy_tap::spawn(url, inbox, stop, gen));
     }
 
     fn emit_mix_preview_active(&self, active: bool) {
@@ -2808,6 +3068,14 @@ impl Player {
         audio_path: &str,
         cue_start: Option<f64>,
     ) -> Result<u32, String> {
+        // Internet radio / web streams: open a URL decode stream. These have no
+        // finite length, never prescan and are never seeked — return early before
+        // the file-based path below (which waits for a length and honors cue_start).
+        // Runs on the dedicated BASS thread; connect is bounded by NET_TIMEOUT.
+        if cue::is_stream_url(audio_path) {
+            return Self::open_url_decode(inner, audio_path.trim());
+        }
+
         let ext = std::path::Path::new(audio_path)
             .extension()
             .and_then(|e| e.to_str())
@@ -2880,13 +3148,197 @@ impl Player {
         }
         // No AUTOFREE: rate/pitch rebuilds re-add the channel; AUTOFREE would free decode
         // and false-trigger end detection.
+        // DOWNMIX is a no-op for stereo sources and saves surround radio streams.
         let add_flags = if norampin {
-            bass::BASS_MIXER_CHAN_NORAMPIN
+            bass::BASS_MIXER_CHAN_NORAMPIN | bass::BASS_MIXER_CHAN_DOWNMIX
         } else {
-            0
+            bass::BASS_MIXER_CHAN_DOWNMIX
         };
         bass.mixer_stream_add_channel(inner.mixer_handle, source, add_flags)?;
         Ok(())
+    }
+
+    fn log_url_stream_state(bass: &BassLibrary, handle: u32, label: &str) {
+        crate::stream_debug::log(format!("--- {label} handle={handle} ---"));
+        match bass.channel_get_info(handle) {
+            Ok(info) => crate::stream_debug::log(format!(
+                "info freq={} chans={} flags=0x{:x} ctype=0x{:x} origres={}",
+                info.freq, info.chans, info.flags, info.ctype, info.origres
+            )),
+            Err(e) => crate::stream_debug::log(format!("info FAILED: {e}")),
+        }
+        let active = bass.channel_is_active(handle);
+        let avail = bass.channel_data_available(handle);
+        let buffer = bass.stream_get_file_position(handle, bass::BASS_FILEPOS_BUFFER);
+        let download = bass.stream_get_file_position(handle, bass::BASS_FILEPOS_DOWNLOAD);
+        let connected = bass.stream_get_file_position(handle, bass::BASS_FILEPOS_CONNECTED);
+        crate::stream_debug::log(format!(
+            "active={active} available={avail} filepos buffer={buffer} download={download} connected={connected}"
+        ));
+        unsafe {
+            match bass.channel_get_tags_raw(handle, bass::BASS_TAG_HTTP) {
+                Some(s) => crate::stream_debug::log(format!(
+                    "HTTP: {}",
+                    s.replace('\0', " | ")
+                )),
+                None => crate::stream_debug::log(format!(
+                    "HTTP tags: none ({})",
+                    bass.last_error_string()
+                )),
+            }
+            if let Some(s) = bass.channel_get_tags_raw(handle, bass::BASS_TAG_ICY) {
+                crate::stream_debug::log(format!("ICY: {}", s.replace('\0', " | ")));
+            }
+            if let Some(s) = bass.channel_get_tags_raw(handle, bass::BASS_TAG_META) {
+                crate::stream_debug::log(format!("META: {s}"));
+            }
+        }
+    }
+
+    /// Icecast/Shoutcast decode streams die if we GetData faster than the
+    /// download. Plug the URL into the mixer and let it pull at device rate.
+    fn maybe_reconnect_live_url(inner: &mut PlayerInner) {
+        if inner.user_paused {
+            return;
+        }
+        let Some(url) = inner.live_source.as_ref().map(|l| l.url.clone()) else {
+            return;
+        };
+        let handle = if inner.current_decode != 0 {
+            inner.current_decode
+        } else {
+            inner.current_source
+        };
+        if handle == 0 {
+            return;
+        }
+        let ended = inner.bass.as_ref().is_some_and(|bass| {
+            bass.channel_is_active(handle) == bass::BASS_ACTIVE_STOPPED
+        });
+        if !ended {
+            return;
+        }
+        let now = Self::now_millis();
+        if now < inner.live_reconnect_after_ms {
+            return;
+        }
+        inner.live_reconnect_after_ms = now.saturating_add(2500);
+        crate::stream_debug::log("live URL ended — reconnecting");
+        if let Some(bass) = inner.bass.as_ref() {
+            let _ = bass.mixer_channel_remove(handle);
+            let _ = bass.channel_free(handle);
+        }
+        inner.current_source = 0;
+        inner.current_decode = 0;
+        match Self::open_url_decode(inner, &url) {
+            Ok(new) => match Self::plug_live_url(inner, new, inner.playback_rate) {
+                Ok((src, dec)) => {
+                    inner.current_source = src;
+                    inner.current_decode = dec;
+                    crate::stream_debug::log(format!("reconnected handle={src}"));
+                }
+                Err(e) => crate::stream_debug::log(format!("reconnect plug failed: {e}")),
+            },
+            Err(e) => crate::stream_debug::log(format!("reconnect open failed: {e}")),
+        }
+    }
+
+    /// Add a live URL decode stream to the mixer. Do not GetData it ourselves —
+    /// draining the download buffer EOF's Icecast after a few seconds.
+    fn plug_live_url(
+        inner: &mut PlayerInner,
+        url_handle: u32,
+        rate: f32,
+    ) -> Result<(u32, u32), String> {
+        {
+            let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
+            Self::log_url_stream_state(bass, url_handle, "plug live URL");
+            if (rate - 1.0).abs() >= 0.001 {
+                Self::apply_freq_rate(bass, url_handle, rate);
+            }
+        }
+        Self::add_source_to_mixer(inner, url_handle, false).map_err(|e| {
+            crate::stream_debug::log(format!("mixer add URL FAILED: {e}"));
+            e
+        })?;
+        crate::stream_debug::log(format!("mixer add URL handle={url_handle} OK"));
+        Ok((url_handle, 0))
+    }
+
+    /// Open an internet radio / web stream as a decode source.
+    ///
+    /// Tries float first (matches the mixer), then integer if the server/codec
+    /// rejects it. After connect, wait briefly so headers/codec are parsed —
+    /// adding an unconfigured DECODE stream to the mixer makes ChannelGetData
+    /// stall the BASS update thread (no audio, Ctrl+R hangs).
+    fn open_url_decode(inner: &mut PlayerInner, url: &str) -> Result<u32, String> {
+        let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
+        crate::stream_debug::log(format!("StreamCreateURL begin {url}"));
+        let started = std::time::Instant::now();
+        let request = if url.contains("\r\n") {
+            url.to_string()
+        } else {
+            format!("{}\r\nIcy-MetaData: 1\r\n", url.trim())
+        };
+        if inner.live_meta_user != 0 {
+            unsafe {
+                drop(Box::from_raw(inner.live_meta_user as *mut LiveMetaUser));
+            }
+            inner.live_meta_user = 0;
+        }
+        let user = Box::into_raw(Box::new(LiveMetaUser {
+            get_tags: bass.tags_fn(),
+            inbox: Arc::clone(&inner.live_meta_inbox),
+            icy: StdMutex::new(IcyParse::default()),
+        }));
+        inner.live_meta_user = user as usize;
+        let proc = live_download_proc as *mut std::ffi::c_void;
+        let opener = bass.url_opener();
+        let float_flags = bass::BASS_SAMPLE_FLOAT | bass::BASS_STREAM_DECODE;
+        let source = match opener.open_proc(&request, float_flags, proc, user.cast()) {
+            Ok(handle) => {
+                crate::stream_debug::log(format!(
+                    "float URL handle={handle} in {} ms",
+                    started.elapsed().as_millis()
+                ));
+                handle
+            }
+            Err(error) => {
+                crate::stream_debug::log(format!(
+                    "float URL FAILED after {} ms: {error} — retry integer PCM",
+                    started.elapsed().as_millis()
+                ));
+                let retry_at = std::time::Instant::now();
+                opener
+                    .open_proc(&request, bass::BASS_STREAM_DECODE, proc, user.cast())
+                    .map_err(|e| {
+                        crate::stream_debug::log(format!(
+                            "integer URL FAILED after {} ms: {e} — {url}",
+                            retry_at.elapsed().as_millis()
+                        ));
+                        format!("{e} — url: {url}")
+                    })?
+            }
+        };
+        match bass.channel_set_sync(
+            source,
+            bass::BASS_SYNC_META,
+            live_meta_sync_proc,
+            user.cast(),
+        ) {
+            Ok(sync) => {
+                inner.live_meta_sync = sync;
+                crate::stream_debug::log("BASS_SYNC_META attached");
+            }
+            Err(e) => crate::stream_debug::log(format!("BASS_SYNC_META failed: {e}")),
+        }
+        let _ = bass.channel_set_sync(
+            source,
+            bass::BASS_SYNC_OGG_CHANGE,
+            live_meta_sync_proc,
+            user.cast(),
+        );
+        Ok(source)
     }
 
     fn open_stream(
@@ -2898,34 +3350,63 @@ impl Player {
         Self::teardown_current(inner);
         Self::clear_preload(inner);
 
+        let is_live = cue::is_stream_url(&playback.audio_path);
+        // Flush leftover file audio with silence *before* the URL connect so
+        // ChannelPlay(restart) is not waiting on a stream that has no data yet.
+        if is_live {
+            Self::flush_mixer_hard(inner);
+        }
+
         let decode = Self::create_decode_source(inner, &playback.audio_path, playback.cue_start)?;
         let rate = inner.playback_rate;
         let pitch_enabled = inner.pitch_enabled;
         let volume = inner.volume;
-        let (mixer_channel, tracked_decode) = {
+        let (mixer_channel, tracked_decode) = if is_live {
+            Self::plug_live_url(inner, decode, rate)?
+        } else {
             let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
-            Self::wrap_decode_for_rate(bass, decode, rate, pitch_enabled)?
+            let wrapped = Self::wrap_source_for_playback(bass, decode, rate, pitch_enabled, false)?;
+            Self::add_source_to_mixer(inner, wrapped.0, false)?;
+            wrapped
         };
 
-        // Soft channel ramp — manual open only (gapless uses activate_preloaded).
-        Self::add_source_to_mixer(inner, mixer_channel, false)?;
-
         if let Some(bass) = inner.bass.as_ref() {
-            // Stay silent through the flush, then ramp in — hard VOL restore after
-            // restart is the classic manual-switch click.
-            let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_VOL, 0.0);
-            Self::restart_mixer_with_buffer(bass, inner.mixer_handle);
-            Self::set_mixer_volume_from_silence(
-                bass,
-                inner.mixer_handle,
-                volume,
-                MANUAL_SWITCH_FADE_IN_MS,
-            );
+            if is_live {
+                // Do not linger at VOL=0: radio has no "first sample click" and a
+                // failed fade-in is indistinguishable from a dead stream.
+                if bass.channel_is_active(inner.mixer_handle) != bass::BASS_ACTIVE_PLAYING {
+                    let play_ok = bass.channel_play(inner.mixer_handle, false);
+                    crate::stream_debug::log(format!("mixer play(false) → {play_ok:?}"));
+                }
+                let vol_ok = bass.channel_set_attribute(
+                    inner.mixer_handle,
+                    bass::BASS_ATTRIB_VOL,
+                    volume.clamp(0.0, 1.0),
+                );
+                crate::stream_debug::log(format!(
+                    "mixer vol={} → {vol_ok:?} active={}",
+                    volume,
+                    bass.channel_is_active(inner.mixer_handle)
+                ));
+            } else {
+                let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_VOL, 0.0);
+                Self::restart_mixer_with_buffer(bass, inner.mixer_handle);
+                Self::set_mixer_volume_from_silence(
+                    bass,
+                    inner.mixer_handle,
+                    volume,
+                    MANUAL_SWITCH_FADE_IN_MS,
+                );
+            }
         }
 
         inner.current_source = mixer_channel;
         inner.current_decode = tracked_decode;
         inner.applied_playback_rate = rate;
+        Self::sync_live_source(inner, &playback.audio_path);
+        if is_live {
+            Self::ensure_icy_tap(inner);
+        }
         Self::apply_segment_metadata(inner, track_path, playback);
         Self::detect_cue_position_mode(inner);
 
@@ -2971,8 +3452,13 @@ impl Player {
         let rate = inner.playback_rate;
         let pitch_enabled = inner.pitch_enabled;
         let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
-        let (mixer_channel, tracked_decode) =
-            Self::wrap_decode_for_rate(bass, source, rate, pitch_enabled)?;
+        let (mixer_channel, tracked_decode) = Self::wrap_source_for_playback(
+            bass,
+            source,
+            rate,
+            pitch_enabled,
+            cue::is_stream_url(&playback.audio_path),
+        )?;
 
         inner.preloaded_source = mixer_channel;
         inner.preloaded_decode = tracked_decode;
@@ -2994,16 +3480,17 @@ impl Player {
             Self::create_decode_source(inner, &playback.audio_path, Some(join_start))?;
         let rate = inner.playback_rate;
         let pitch_enabled = inner.pitch_enabled;
-        let (mixer_channel, tracked_decode) = {
-            let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
-            Self::wrap_decode_for_rate(bass, decode, rate, pitch_enabled)?
-        };
-
+        let is_live = cue::is_stream_url(&playback.audio_path);
         let old_source = inner.current_source;
         let old_decode = inner.current_decode;
-
-        // Gapless: NORAMPIN for seamless file→file joins.
-        Self::add_source_to_mixer(inner, mixer_channel, true)?;
+        let (mixer_channel, tracked_decode) = if is_live {
+            Self::plug_live_url(inner, decode, rate)?
+        } else {
+            let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
+            let wrapped = Self::wrap_source_for_playback(bass, decode, rate, pitch_enabled, false)?;
+            Self::add_source_to_mixer(inner, wrapped.0, true)?;
+            wrapped
+        };
 
         if let Some(bass) = inner.bass.as_ref() {
             if old_source != 0 && old_source != mixer_channel {
@@ -3020,6 +3507,7 @@ impl Player {
         inner.current_source = mixer_channel;
         inner.current_decode = tracked_decode;
         inner.applied_playback_rate = rate;
+        Self::sync_live_source(inner, &playback.audio_path);
         Self::apply_segment_metadata(inner, track_path, playback);
         Self::detect_cue_position_mode(inner);
         Ok(())
@@ -3041,12 +3529,12 @@ impl Player {
 
         let old_source = inner.current_source;
         let old_decode = inner.current_decode;
-        let start =
-            Self::gapless_join_start_secs(&playback.audio_path, playback.cue_start);
         let preloaded_decode = inner.preloaded_decode;
 
         // Snap to segment start before plugging in (content timeline).
-        {
+        if !cue::is_stream_url(&playback.audio_path) {
+            let start =
+                Self::gapless_join_start_secs(&playback.audio_path, playback.cue_start);
             let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
             Self::seek_content_absolute(bass, preloaded, preloaded_decode, false, start.max(0.0));
         }
@@ -3074,6 +3562,7 @@ impl Player {
         inner.current_decode = preloaded_decode;
         inner.preloaded_decode = 0;
 
+        Self::sync_live_source(inner, &playback.audio_path);
         Self::apply_segment_metadata(inner, track_path, playback);
         Self::detect_cue_position_mode(inner);
         Ok(())
@@ -3370,6 +3859,34 @@ impl Player {
         }
     }
 
+    /// Mark (or clear) live-radio bookkeeping after a source is plugged in.
+    fn sync_live_source(inner: &mut PlayerInner, audio_path: &str) {
+        if cue::is_stream_url(audio_path) {
+            inner.live_source = Some(LiveStreamState::new(audio_path.to_string()));
+        } else {
+            inner.live_source = None;
+        }
+    }
+
+    /// Tempo wrappers read-ahead and can stall forever on an endless URL. Live
+    /// radio only ever gets a FREQ rate change, never BASS_FX tempo.
+    fn wrap_source_for_playback(
+        bass: &BassLibrary,
+        decode: u32,
+        rate: f32,
+        pitch_enabled: bool,
+        is_live: bool,
+    ) -> Result<(u32, u32), String> {
+        if is_live {
+            let _ = bass.channel_set_attribute(decode, bass::BASS_ATTRIB_FREQ, 0.0);
+            if (rate - 1.0).abs() >= 0.001 {
+                Self::apply_freq_rate(bass, decode, rate);
+            }
+            return Ok((decode, 0));
+        }
+        Self::wrap_decode_for_rate(bass, decode, rate, pitch_enabled)
+    }
+
     /// Build the channel that should be fed into the mixer for the given decode source.
     /// Returns `(mixer_channel, tracked_decode)` where `tracked_decode` is non-zero only
     /// when a tempo wrapper owns the underlying decode stream.
@@ -3412,6 +3929,115 @@ impl Player {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0)
+    }
+
+    /// Read ICY tags from the active live stream and, when the now-playing title
+    /// or the station name changes, return an update payload for the UI. Runs on
+    /// the BASS thread; internally rate-limited so tag reads don't spin every tick.
+    fn poll_live_metadata(inner: &mut PlayerInner) -> Option<StreamMetadataPayload> {
+        // Minimum gap between ICY tag reads. Stations announce every track (tens of
+        // seconds); 1s keeps changes near-instant without hammering the decoder.
+        const ICY_PROBE_INTERVAL_MS: u64 = 1000;
+
+        Self::ensure_icy_tap(inner);
+        let now = Self::now_millis();
+        let (dumped_meta, dumped_icy, dumped_http) = match inner.live_meta_inbox.lock() {
+            Ok(mut g) => (g.meta.take(), g.icy.take(), g.http.take()),
+            Err(_) => (None, None, None),
+        };
+        let from_sync = dumped_meta.is_some() || dumped_icy.is_some() || dumped_http.is_some();
+        {
+            let live = inner.live_source.as_ref()?;
+            if !from_sync && now.saturating_sub(live.last_probe_ms) < ICY_PROBE_INTERVAL_MS {
+                return None;
+            }
+        }
+        if inner.current_source == 0 {
+            return None;
+        }
+        let bass = inner.bass.as_ref()?;
+        let handle = if inner.current_decode != 0 {
+            inner.current_decode
+        } else {
+            inner.current_source
+        };
+
+        let meta = dumped_meta
+            .or_else(|| unsafe { bass.channel_get_tags_raw(handle, bass::BASS_TAG_META) });
+        let icy = dumped_icy
+            .or_else(|| unsafe { bass.channel_get_tags_raw(handle, bass::BASS_TAG_ICY) });
+        let http = dumped_http
+            .or_else(|| unsafe { bass.channel_get_tags_raw(handle, bass::BASS_TAG_HTTP) });
+        let ogg = unsafe { bass.channel_get_tags_raw(handle, bass::BASS_TAG_OGG) };
+        let mp4 = unsafe { bass.channel_get_tags_raw(handle, bass::BASS_TAG_MP4) };
+
+        if from_sync {
+            crate::stream_debug::log(format!(
+                "sync-tags META={:?} ICY={:?} HTTP={:?}",
+                meta.as_deref(),
+                icy.as_deref(),
+                http.as_deref()
+            ));
+        }
+
+        let title = meta
+            .as_deref()
+            .and_then(icy_tap::parse_icy_stream_title)
+            .or_else(|| ogg.as_deref().and_then(|r| parse_comment_tag(r, "TITLE")))
+            .or_else(|| mp4.as_deref().and_then(|r| parse_comment_tag(r, "©nam")))
+            .or_else(|| mp4.as_deref().and_then(|r| parse_comment_tag(r, "title")));
+        let title = match (
+            title,
+            ogg.as_deref().and_then(|r| parse_comment_tag(r, "ARTIST")),
+        ) {
+            (Some(t), Some(a)) if !t.contains(&a) => Some(format!("{a} - {t}")),
+            (t, _) => t,
+        };
+
+        let station = {
+            let have_station = inner
+                .live_source
+                .as_ref()
+                .map(|l| l.last_station.is_some())
+                .unwrap_or(false);
+            if have_station {
+                None
+            } else {
+                icy.as_deref()
+                    .and_then(|r| parse_icy_header(r, "icy-name"))
+                    .or_else(|| http.as_deref().and_then(|r| parse_icy_header(r, "icy-name")))
+                    .or_else(|| icy.as_deref().and_then(|r| parse_icy_header(r, "ice-name")))
+                    .or_else(|| http.as_deref().and_then(|r| parse_icy_header(r, "ice-name")))
+            }
+        };
+
+        let live = inner.live_source.as_mut()?;
+        live.last_probe_ms = now;
+
+        let title_changed = title.is_some() && title != live.last_title;
+        let station_changed = station.is_some() && station != live.last_station;
+        if !title_changed && !station_changed {
+            return None;
+        }
+        if title_changed {
+            live.last_title = title.clone();
+        }
+        if station_changed {
+            live.last_station = station.clone();
+        }
+        Some(StreamMetadataPayload {
+            path: live.url.clone(),
+            title: if title_changed {
+                live.last_title.clone()
+            } else {
+                None
+            },
+            station: if station_changed {
+                live.last_station.clone()
+            } else {
+                None
+            },
+        })
     }
 
     fn apply_rate_in_place(
@@ -3623,6 +4249,10 @@ impl Player {
         // with the current pitch_enabled / playback_rate.
         Self::open_stream(inner, &track_path, &playback)?;
 
+        if inner.live_source.is_some() {
+            return Ok(());
+        }
+
         if let Some(bass) = inner.bass.as_ref() {
             Self::seek_content_absolute(
                 bass,
@@ -3656,6 +4286,17 @@ impl Player {
     }
 
     fn reapply_at_rate_with_slide(inner: &mut PlayerInner, rate: f32, slide_ms: u32) {
+        // Live radio: FREQ only. Tempo wrap / reopen would stall on the URL.
+        if inner.live_source.is_some() {
+            if let Some(bass) = inner.bass.as_ref() {
+                if inner.current_source != 0 {
+                    Self::apply_freq_rate(bass, inner.current_source, rate);
+                }
+            }
+            inner.applied_playback_rate = rate;
+            return;
+        }
+
         let pitch_enabled = inner.pitch_enabled;
         let current_source = inner.current_source;
         let current_decode = inner.current_decode;
@@ -3816,6 +4457,9 @@ impl Player {
         let (fade_started, gen) = self.run_on_bass_thread(|inner| {
             if inner.mixer_handle != 0 {
                 inner.user_paused = true;
+                if let Some(live) = inner.live_source.as_mut() {
+                    live.mark_paused(Self::now_millis());
+                }
                 inner.pause_generation = inner.pause_generation.wrapping_add(1);
                 let gen = inner.pause_generation;
                 if let Some(bass) = inner.bass.as_ref() {
@@ -3859,6 +4503,9 @@ impl Player {
         let _ops = self.ops.lock();
         self.run_on_bass_thread(|inner| {
             Self::cancel_pending_pause(inner);
+            if let Some(live) = inner.live_source.as_mut() {
+                live.mark_resumed(Self::now_millis());
+            }
             let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
             if inner.mixer_handle != 0 {
                 let target = inner.volume;
@@ -3911,6 +4558,7 @@ impl Player {
     /// Stop playback and free the BASS audio device.
     /// Called on window close so that audio does not continue playing after the app has exited.
     pub fn shutdown(&self) -> Result<(), String> {
+        self.bass_ready.store(false, Ordering::Release);
         self.run_on_bass_thread(|inner| {
             Self::teardown_current(inner);
             Self::clear_preload(inner);
@@ -3944,6 +4592,10 @@ impl Player {
     pub fn seek(&self, position_secs: f64) -> Result<(), String> {
         let _ops = self.ops.lock();
         self.run_on_bass_thread(move |inner| {
+            if inner.live_source.is_some() {
+                // Live radio has no timeline to seek.
+                return Ok(());
+            }
             if inner.current_source == 0 || inner.mixer_handle == 0 {
                 return Err("Nothing is playing".into());
             }
@@ -4212,6 +4864,32 @@ impl Player {
             };
         }
 
+        // Live radio stream: no finite length or seek. Position is elapsed wall-clock
+        // since playback started (minus paused time); duration stays 0 so the UI
+        // renders a live indicator instead of a seekbar. A stalled stream still
+        // reports Playing (BASS is buffering) — never Stopped, which would advance.
+        if let Some(live) = inner.live_source.as_ref() {
+            if inner.current_source != 0 && inner.mixer_handle != 0 && inner.bass.is_some() {
+                let file_name = inner.current_file.as_ref().map(|f| f.clone());
+                let position = live.elapsed_secs(Self::now_millis());
+                let (state, is_playing, is_paused) = if inner.user_paused {
+                    (PlaybackState::Paused, false, true)
+                } else {
+                    (PlaybackState::Playing, true, false)
+                };
+                return PlayerStateSnapshot {
+                    state,
+                    is_playing,
+                    is_paused,
+                    volume: inner.volume,
+                    position,
+                    duration: 0.0,
+                    current_file: inner.current_file.clone(),
+                    current_file_name: file_name,
+                };
+            }
+        }
+
         if inner.current_source == 0 || inner.mixer_handle == 0 || inner.bass.is_none() {
             let file_name = inner.current_file.as_ref().map(|f| {
                 std::path::Path::new(f)
@@ -4325,20 +5003,15 @@ impl Player {
         })
     }
 
-    pub fn mark_bass_thread(&self) {
-        *self.bass_thread.write() = Some(thread::current().id());
-        // Keep this thread above BELOW_NORMAL process priority when unfocused.
-        crate::process_util::register_audio_thread();
-    }
-
-    /// Poll playback on the main thread and emit position / track-ended events.
+    /// Poll playback on the BASS thread and emit position / track-ended events.
     ///
-    /// BASS must only be called from the thread that invoked `BASS_Init`.
-    /// Uses one long-lived worker (not a new OS thread every tick).
+    /// BASS must only be called from the thread that invoked `BASS_Init` (the
+    /// dedicated `muzeeka-bass` thread). Uses one long-lived worker that hops
+    /// there — never the UI/main thread.
     ///
     /// While a source is active, gapless polls at [`POLL_INTERVAL_MS`]. When idle
-    /// (no source), the worker sleeps [`POLL_IDLE_MS`] and **skips** main-thread
-    /// hops so the WebView message loop is not poked 20×/s with an empty player.
+    /// (no source), the worker sleeps [`POLL_IDLE_MS`] and **skips** BASS hops
+    /// so the audio thread is not poked 20×/s with an empty player.
     /// UI position IPC is further throttled via [`UI_EMIT_HOT_MS`] / cold.
     pub fn start_position_emitter(&self, app: AppHandle) {
         let player = self.clone();
@@ -4380,21 +5053,14 @@ impl Player {
                     let rpc_for_main = last_rpc_state.clone();
                     let rpc_sync_for_main = last_rpc_sync.clone();
                     let ui_emit_for_main = last_ui_emit.clone();
-                    let (done_tx, done_rx) = mpsc::sync_channel::<()>(1);
-
-                    let _ = app.run_on_main_thread(move || {
-                        Self::position_poll_tick(
-                            &app_emit,
-                            &player_for_main,
-                            &was_for_main,
-                            &rpc_for_main,
-                            &rpc_sync_for_main,
-                            &ui_emit_for_main,
-                        );
-                        let _ = done_tx.send(());
-                    });
-                    // Bound wait so a stuck main thread cannot freeze the worker forever.
-                    let _ = done_rx.recv_timeout(Duration::from_secs(2));
+                    Self::position_poll_tick(
+                        &app_emit,
+                        &player_for_main,
+                        &was_for_main,
+                        &rpc_for_main,
+                        &rpc_sync_for_main,
+                        &ui_emit_for_main,
+                    );
                 }
             });
     }
@@ -4518,6 +5184,13 @@ impl Player {
             if inner.mix_vol_follow.is_some() {
                 Self::apply_mix_volume_automation(inner);
             }
+            // Live radio stream: never auto-advance, never tear down on transient
+            // stalls. ICY now-playing metadata is polled separately (below) so the
+            // emit can run with the AppHandle outside this BASS closure.
+            if inner.live_source.is_some() {
+                Self::maybe_reconnect_live_url(inner);
+                return Ok(None);
+            }
             // Pitch/rate topology rebuild and seeks can briefly look "ended".
             // Never advance or tear down during the suppress window.
             if now < inner.suppress_gapless_until {
@@ -4598,6 +5271,14 @@ impl Player {
                 None
             }
         };
+
+        // Live radio: read ICY tags on the BASS thread and, if the now-playing
+        // title or station name changed, push it to the UI. Rate-limited inside.
+        if let Ok(Some(update)) =
+            player_for_main.run_on_bass_thread(|inner| Ok(Self::poll_live_metadata(inner)))
+        {
+            let _ = app_emit.emit("player:stream-metadata", &update);
+        }
 
         if let Some(path) = advanced_path {
             // Gapless auto-advance is a new play start for the next track.
@@ -4798,6 +5479,221 @@ impl Player {
     }
 }
 
+unsafe extern "system" fn live_download_proc(
+    buffer: *const std::ffi::c_void,
+    length: u32,
+    user: *mut std::ffi::c_void,
+) {
+    if user.is_null() || buffer.is_null() {
+        return;
+    }
+    let cap = &*(user as *const LiveMetaUser);
+    if length == 0 {
+        if let Some(headers) =
+            crate::bass::ffi::BassLibrary::copy_tag_ptr(buffer, true)
+                .or_else(|| crate::bass::ffi::BassLibrary::copy_tag_ptr(buffer, false))
+        {
+            apply_download_headers(&headers, cap);
+        }
+        return;
+    }
+    let bytes = std::slice::from_raw_parts(buffer as *const u8, length as usize);
+    if let Some(title) = scan_stream_title(bytes) {
+        crate::stream_debug::log(format!("download StreamTitle='{title}'"));
+        if let Ok(mut g) = cap.inbox.lock() {
+            g.meta = Some(format!("StreamTitle='{title}';"));
+        }
+    }
+    if let Ok(mut icy) = cap.icy.lock() {
+        if icy.metaint == 0 {
+            let peek = String::from_utf8_lossy(bytes);
+            if peek.to_ascii_lowercase().contains("icy-metaint")
+                || peek.to_ascii_lowercase().contains("icy-name")
+            {
+                apply_download_headers(&peek, cap);
+            }
+            return;
+        }
+        feed_icy_bytes(&mut icy, bytes, &cap.inbox);
+    }
+}
+
+fn scan_stream_title(data: &[u8]) -> Option<String> {
+    for key in [b"StreamTitle='".as_slice(), b"StreamTitle=\"".as_slice()] {
+        let Some(pos) = data.windows(key.len()).position(|w| w == key) else {
+            continue;
+        };
+        let quote = *key.last()?;
+        let rest = &data[pos + key.len()..];
+        let end = rest.iter().position(|&b| b == quote).unwrap_or(rest.len().min(200));
+        if end == 0 {
+            continue;
+        }
+        let bytes = &rest[..end];
+        let title = if let Ok(s) = std::str::from_utf8(bytes) {
+            s.trim().to_string()
+        } else {
+            bytes.iter().map(|&b| b as char).collect::<String>().trim().to_string()
+        };
+        if !title.is_empty() {
+            return Some(title);
+        }
+    }
+    None
+}
+
+fn apply_download_headers(raw: &str, cap: &LiveMetaUser) {
+    crate::stream_debug::log(format!(
+        "download headers: {}",
+        raw.replace('\0', " | ").chars().take(400).collect::<String>()
+    ));
+    if let Some(v) = parse_icy_header(raw, "icy-metaint").or_else(|| parse_icy_header(raw, "ice-metaint"))
+    {
+        if let Ok(n) = v.trim().parse::<u32>() {
+            if n > 0 && n < 1_000_000 {
+                if let Ok(mut icy) = cap.icy.lock() {
+                    icy.metaint = n;
+                    icy.audio_left = n;
+                    icy.meta_left = 0;
+                    icy.meta.clear();
+                }
+                crate::stream_debug::log(format!("icy-metaint={n}"));
+            }
+        }
+    }
+    if let Some(name) = parse_icy_header(raw, "icy-name").or_else(|| parse_icy_header(raw, "ice-name"))
+    {
+        crate::stream_debug::log(format!("icy-name={name}"));
+        if let Ok(mut inbox) = cap.inbox.lock() {
+            inbox.icy = Some(format!("icy-name:{name}"));
+            inbox.http = Some(raw.to_string());
+        }
+    }
+}
+
+fn feed_icy_bytes(parse: &mut IcyParse, data: &[u8], inbox: &StdMutex<LiveMetaInbox>) {
+    let metaint = parse.metaint;
+    if metaint == 0 {
+        return;
+    }
+    let mut i = 0usize;
+    while i < data.len() {
+        if parse.meta_left > 0 {
+            let n = (parse.meta_left as usize).min(data.len() - i);
+            parse.meta.extend_from_slice(&data[i..i + n]);
+            parse.meta_left -= n as u32;
+            i += n;
+            if parse.meta_left == 0 {
+                let raw = String::from_utf8_lossy(&parse.meta).into_owned();
+                parse.meta.clear();
+                parse.audio_left = metaint;
+                if icy_tap::parse_icy_stream_title(&raw).is_some() {
+                    crate::stream_debug::log(format!("ICY in-band META={raw}"));
+                    if let Ok(mut g) = inbox.lock() {
+                        g.meta = Some(raw);
+                    }
+                }
+            }
+            continue;
+        }
+        if parse.audio_left == 0 {
+            let len = u32::from(data[i]) * 16;
+            i += 1;
+            if len == 0 {
+                parse.audio_left = metaint;
+            } else {
+                parse.meta_left = len;
+                parse.meta.clear();
+                parse.meta.reserve(len as usize);
+            }
+            continue;
+        }
+        let n = (parse.audio_left as usize).min(data.len() - i);
+        parse.audio_left -= n as u32;
+        i += n;
+    }
+}
+
+unsafe extern "system" fn live_meta_sync_proc(
+    _sync: u32,
+    channel: u32,
+    data: *mut std::ffi::c_void,
+    user: *mut std::ffi::c_void,
+) {
+    if user.is_null() {
+        return;
+    }
+    let cap = &*(user as *const LiveMetaUser);
+    // 64-bit BASS passes the metadata pointer in `data`; GetTags is often already empty.
+    let from_data = crate::bass::ffi::BassLibrary::copy_tag_ptr(data, false);
+    let meta = from_data
+        .or_else(|| copy_tag_via(cap.get_tags, channel, crate::bass::BASS_TAG_META, false));
+    let icy = copy_tag_via(cap.get_tags, channel, crate::bass::BASS_TAG_ICY, true);
+    let http = copy_tag_via(cap.get_tags, channel, crate::bass::BASS_TAG_HTTP, true);
+    crate::stream_debug::log(format!(
+        "BASS_SYNC_META data={data:?} META={:?} ICY={:?} HTTP={:?}",
+        meta.as_deref(),
+        icy.as_deref(),
+        http.as_deref()
+    ));
+    if let Ok(mut inbox) = cap.inbox.lock() {
+        if meta.is_some() {
+            inbox.meta = meta;
+        }
+        if icy.is_some() {
+            inbox.icy = icy;
+        }
+        if http.is_some() {
+            inbox.http = http;
+        }
+    }
+}
+
+unsafe fn copy_tag_via(
+    get_tags: unsafe extern "system" fn(u32, u32) -> *const std::ffi::c_void,
+    handle: u32,
+    tags: u32,
+    list: bool,
+) -> Option<String> {
+    crate::bass::ffi::BassLibrary::copy_tag_ptr(get_tags(handle, tags), list)
+}
+
+/// Pull a header value (case-insensitive key) out of an ICY header block.
+/// BASS returns lines like `icy-name:Some Station` separated by NULs — the FFI
+/// layer already joined them, so we scan line by line for `key:value`.
+fn parse_comment_tag(raw: &str, key: &str) -> Option<String> {
+    for line in raw.split(|c| c == '\n' || c == '\r' || c == '\0') {
+        let line = line.trim();
+        let Some(idx) = line.find('=') else {
+            continue;
+        };
+        let (name, value) = line.split_at(idx);
+        if name.trim().eq_ignore_ascii_case(key) {
+            let value = value[1..].trim().trim_matches('"');
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn parse_icy_header(raw: &str, key: &str) -> Option<String> {
+    for line in raw.split(|c| c == '\n' || c == '\r' || c == '\0') {
+        let line = line.trim();
+        if let Some(idx) = line.find(':') {
+            let (name, value) = line.split_at(idx);
+            if name.trim().eq_ignore_ascii_case(key) {
+                let value = value[1..].trim();
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::{GaplessTrack, Player};
@@ -4871,5 +5767,33 @@ mod tests {
             Some(180.0),
         ));
         assert!(!Player::cue_segments_are_contiguous(None, Some(180.0)));
+    }
+
+    #[test]
+    fn parses_icy_stream_title() {
+        use crate::icy_tap::parse_icy_stream_title;
+        assert_eq!(
+            parse_icy_stream_title("StreamTitle='Artist - Song';StreamUrl='http://x';"),
+            Some("Artist - Song".to_string())
+        );
+        assert_eq!(
+            parse_icy_stream_title("StreamTitle='Only Title';"),
+            Some("Only Title".to_string())
+        );
+        // Empty title between songs → None (don't clobber the last good title).
+        assert_eq!(parse_icy_stream_title("StreamTitle='';StreamUrl='';"), None);
+        assert_eq!(parse_icy_stream_title("NoTitleHere"), None);
+    }
+
+    #[test]
+    fn parses_icy_station_header() {
+        use super::parse_icy_header;
+        let raw = "ICY 200 OK\r\nicy-name:Cool Radio\r\nicy-genre:Jazz\r\n";
+        assert_eq!(
+            parse_icy_header(raw, "icy-name"),
+            Some("Cool Radio".to_string())
+        );
+        assert_eq!(parse_icy_header(raw, "icy-genre"), Some("Jazz".to_string()));
+        assert_eq!(parse_icy_header(raw, "icy-br"), None);
     }
 }

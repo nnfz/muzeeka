@@ -49,14 +49,22 @@ fn parse_gapless_queue(queue: Option<Vec<NextTrackInput>>) -> Vec<GaplessTrack> 
 }
 
 /// Initialize the BASS audio engine. Must be called once before playback.
+///
+/// `async` so Ctrl+R / settings bootstrap never run this on the UI thread.
+/// A live URL connect holds the BASS thread; a sync command would freeze the window.
 #[tauri::command]
-pub fn player_init(player: State<'_, Player>) -> Result<(), String> {
+pub async fn player_init(player: State<'_, Player>) -> Result<(), String> {
     player.init()
 }
 
 /// Start playing a file by its full path.
+///
+/// `async` is load-bearing: Tauri runs synchronous commands on the MAIN thread.
+/// `player.play()` may block for several seconds on a radio URL connect
+/// (`BASS_StreamCreateURL`). That work runs on the dedicated BASS thread, and
+/// this command waits for it on a Tauri worker — never the UI thread.
 #[tauri::command]
-pub fn player_play(
+pub async fn player_play(
     player: State<'_, Player>,
     discord: State<'_, DiscordPresence>,
     controller: State<'_, Arc<PlaybackSession>>,
@@ -151,7 +159,7 @@ pub fn player_disarm_mix(player: State<'_, Player>) -> Result<(), String> {
 
 /// Pause the current playback.
 #[tauri::command]
-pub fn player_pause(
+pub async fn player_pause(
     player: State<'_, Player>,
     discord: State<'_, DiscordPresence>,
     controller: State<'_, Arc<PlaybackSession>>,
@@ -163,7 +171,7 @@ pub fn player_pause(
 
 /// Resume the current playback.
 #[tauri::command]
-pub fn player_resume(
+pub async fn player_resume(
     player: State<'_, Player>,
     discord: State<'_, DiscordPresence>,
     controller: State<'_, Arc<PlaybackSession>>,
@@ -175,7 +183,7 @@ pub fn player_resume(
 
 /// Stop the current playback and discard the stream.
 #[tauri::command]
-pub fn player_stop(
+pub async fn player_stop(
     player: State<'_, Player>,
     discord: State<'_, DiscordPresence>,
     controller: State<'_, Arc<PlaybackSession>>,
@@ -187,7 +195,7 @@ pub fn player_stop(
 
 /// Seek to a position in seconds.
 #[tauri::command]
-pub fn player_seek(
+pub async fn player_seek(
     player: State<'_, Player>,
     discord: State<'_, DiscordPresence>,
     controller: State<'_, Arc<PlaybackSession>>,
@@ -200,26 +208,26 @@ pub fn player_seek(
 
 /// Set playback volume (0.0 to 1.0).
 #[tauri::command]
-pub fn player_set_volume(player: State<'_, Player>, volume: f32) -> Result<(), String> {
+pub async fn player_set_volume(player: State<'_, Player>, volume: f32) -> Result<(), String> {
     player.set_volume(volume)
 }
 
 /// Set playback rate multiplier (0.25 to 2.0).
 #[tauri::command]
-pub fn player_set_playback_rate(player: State<'_, Player>, rate: f32) -> Result<(), String> {
+pub async fn player_set_playback_rate(player: State<'_, Player>, rate: f32) -> Result<(), String> {
     player.set_playback_rate(rate)
 }
 
 /// Toggle pitch coupling with playback speed (off = preserve pitch via tempo FX).
 #[tauri::command]
-pub fn player_set_pitch_enabled(player: State<'_, Player>, enabled: bool) -> Result<(), String> {
+pub async fn player_set_pitch_enabled(player: State<'_, Player>, enabled: bool) -> Result<(), String> {
     player.set_pitch_enabled(enabled)
 }
 
 /// Get a snapshot of the current player state.
 #[tauri::command]
-pub fn player_get_state(player: State<'_, Player>) -> PlayerStateSnapshot {
-    player.get_state()
+pub async fn player_get_state(player: State<'_, Player>) -> Result<PlayerStateSnapshot, String> {
+    Ok(player.get_state())
 }
 
 /// Load a BASS addon DLL (e.g. "bassflac.dll" or a tracker plugin like "basszxtune.dll").
@@ -245,7 +253,7 @@ pub fn player_get_dsp_chain_status(player: State<'_, Player>) -> DspChainStatus 
 /// Replace the effect rack. Order is the list order; slots are matched to live
 /// nodes by `id`, so reordering keeps each effect's filter state.
 #[tauri::command]
-pub fn player_set_dsp_chain(
+pub async fn player_set_dsp_chain(
     player: State<'_, Player>,
     slots: Vec<ChainSlotSettings>,
 ) -> Result<(), String> {

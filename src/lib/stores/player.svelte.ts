@@ -117,6 +117,19 @@ export interface Playlist {
   mix_mode?: boolean;
 }
 
+/** True when a path is an internet radio / web stream (http/https URL). */
+export function isStreamPath(path: string | null | undefined): boolean {
+  if (!path) return false;
+  const trimmed = path.trim().toLowerCase();
+  return trimmed.startsWith('http://') || trimmed.startsWith('https://');
+}
+
+/** True when a track is a radio/web stream (no finite duration, URL path). */
+export function isStreamTrack(track: MusicFile | null | undefined): boolean {
+  if (!track) return false;
+  return track.extension === 'stream' || isStreamPath(track.path);
+}
+
 type RepeatMode = 'off' | 'all' | 'one';
 
 interface PlaylistsData {
@@ -176,6 +189,15 @@ let volume = $state(0.8);
 let volumeHydrated = false;
 let currentFile = $state<string | null>(null);
 let currentFileName = $state<string | null>(null);
+/**
+ * Live track title pushed by a radio/web stream via ICY metadata (`StreamTitle`).
+ * Only meaningful while a stream is actively playing; cleared on stop/restart so
+ * the UI falls back to the station name. Keyed by the stream path it belongs to,
+ * so a stale title from a previous station never leaks onto the next one.
+ */
+let liveStreamTitle = $state<string | null>(null);
+let liveStreamArtist = $state<string | null>(null);
+let liveStreamTitlePath = $state<string | null>(null);
 let playlists = $state<Playlist[]>([]);
 let libraryTracks = $state<MusicFile[]>([]);
 let activePlaylistId = $state<string | null>(null);
@@ -431,6 +453,52 @@ let currentTrack = $derived.by(() => {
   );
 });
 
+/** True when the currently loaded track is a radio / web stream. */
+let currentIsStream = $derived(isStreamTrack(currentTrack) || isStreamPath(currentFile));
+
+/**
+ * Now-playing title for the transport / window.
+ *
+ * For a live stream this is the ICY `StreamTitle` while one is being broadcast and
+ * playback is active; otherwise (no track title yet, or the stream is stopped) it
+ * falls back to the station name. For regular files it's just the file's display name.
+ */
+let liveNowPlaying = $derived.by<{ title: string; artist: string | null } | null>(
+  () => {
+    // Keep the last ICY track while this station is loaded. `stop()` and
+    // switching streams clear `liveStreamTitle`; a station rename must not.
+    if (
+      !currentIsStream ||
+      !liveStreamTitle ||
+      !liveStreamTitlePath ||
+      !currentFile ||
+      pathKey(liveStreamTitlePath) !== pathKey(currentFile)
+    ) {
+      return null;
+    }
+    return { title: liveStreamTitle, artist: liveStreamArtist };
+  }
+);
+
+let nowPlayingTitle = $derived.by<string | null>(() => {
+  if (currentIsStream) {
+    if (liveNowPlaying) return liveNowPlaying.title;
+    return (
+      (currentTrack ? trackDisplayTitle(currentTrack) : null) ??
+      currentFileName ??
+      null
+    );
+  }
+  return currentFileName;
+});
+
+/** Live ICY artist while a track is announced; otherwise the saved station/file artist. */
+let nowPlayingArtist = $derived.by<string | null>(() => {
+  if (liveNowPlaying?.artist) return liveNowPlaying.artist;
+  if (currentTrack) return trackDisplayArtist(currentTrack);
+  return null;
+});
+
 /**
  * Mix mode: the slice of the current track this set actually plays, or null when the
  * track runs in full and the raw position/duration already describe it.
@@ -537,16 +605,44 @@ export function trackDisplayArtist(track: MusicFile): string {
   return track.artist?.trim() || 'Unknown Artist';
 }
 
+/**
+ * Split an ICY `StreamTitle` like `SCOOTER - Fire (DONS rmx) [1997]` into
+ * artist + title. First ` - ` / en-dash / em-dash with spaces is the cut;
+ * no separator → the whole string is the title.
+ */
+export function splitIcyStreamTitle(raw: string): {
+  artist: string | null;
+  title: string;
+} {
+  const text = raw.trim();
+  if (!text) return { artist: null, title: '' };
+  const match = text.match(/\s+[-–—]\s+/);
+  if (!match || match.index == null) {
+    return { artist: null, title: text };
+  }
+  const artist = text.slice(0, match.index).trim();
+  const title = text.slice(match.index + match[0].length).trim();
+  if (!artist || !title) {
+    return { artist: null, title: text };
+  }
+  return { artist, title };
+}
+
 export const APP_TITLE = 'Muzeeka';
 
 export function formatWindowTitle(
   track: MusicFile | null,
-  fallbackFileName?: string | null
+  fallbackFileName?: string | null,
+  fallbackArtist?: string | null
 ): string {
   if (!track && !fallbackFileName) return APP_TITLE;
 
-  const title = track ? trackDisplayTitle(track) : (fallbackFileName ?? APP_TITLE);
-  const artist = track ? trackDisplayArtist(track) : 'Unknown Artist';
+  const title =
+    fallbackFileName?.trim() ||
+    (track ? trackDisplayTitle(track) : APP_TITLE);
+  const artist =
+    fallbackArtist?.trim() ||
+    (track ? trackDisplayArtist(track) : 'Unknown Artist');
 
   return `${title} - ${artist} | ${APP_TITLE}`;
 }
@@ -555,7 +651,11 @@ let lastWindowTitle = '';
 
 function syncWindowTitle() {
   const title = currentFile
-    ? formatWindowTitle(currentTrack, currentFileName)
+    ? formatWindowTitle(
+        currentTrack,
+        nowPlayingTitle ?? currentFileName,
+        nowPlayingArtist
+      )
     : APP_TITLE;
 
   if (title === lastWindowTitle) return;
@@ -660,7 +760,11 @@ function mergeMetadataIntoPlaylists(enriched: MusicFile[]) {
   const canonical = new Map(libraryTracks.map((track) => [pathKey(track.path), track]));
   playlists = playlists.map((playlist) => ({
     ...playlist,
-    tracks: playlist.tracks.map((track) => canonical.get(pathKey(track.path)) ?? track),
+    tracks: playlist.tracks.map((track) => {
+      const incoming = byPath.get(pathKey(track.path));
+      if (incoming) return mergeTrackMetadata(track, incoming);
+      return canonical.get(pathKey(track.path)) ?? track;
+    }),
   }));
 
   if (currentFile && byPath.has(pathKey(currentFile))) {
@@ -2060,6 +2164,33 @@ async function addDroppedPaths(paths: string[], playlistId?: string | null) {
   }
 }
 
+/**
+ * Add an internet radio / web stream (pasted URL) as a library entry and drop it
+ * into the target playlist like any scanned file. The backend derives a fallback
+ * station name from the URL host when no title is given; ICY metadata refines it live.
+ */
+async function addStream(
+  url: string,
+  title?: string | null,
+  playlistId?: string | null,
+): Promise<boolean> {
+  const trimmed = url.trim();
+  if (!trimmed) return false;
+
+  try {
+    const stationName = title?.trim() || null;
+    const track: MusicFile = await invoke('library_add_stream', {
+      url: trimmed,
+      title: stationName,
+    });
+    addScannedTracks([track], playlistId);
+    return true;
+  } catch (e) {
+    console.error('Failed to add stream:', e);
+    return false;
+  }
+}
+
 function m3uPlaylistName(path: string): string {
   const base = pathBasename(path);
   return base.replace(/\.m3u8?$/i, '').trim() || nextPlaylistName();
@@ -2766,6 +2897,11 @@ async function stop() {
     isPaused = false;
     lastPauseRequestAt = 0;
     position = 0;
+    // A stopped stream shows the station name again, not the last live track.
+    liveStreamTitle = null;
+    liveStreamArtist = null;
+    liveStreamTitlePath = null;
+    syncWindowTitle();
   } catch (e) {
     console.error('Failed to stop:', e);
   }
@@ -3114,6 +3250,12 @@ function setupListeners() {
     currentFile = track?.path ?? path;
     lastPlayedFile = currentFile ?? path;
     markSmartPlayed(currentFile ?? path);
+    // New source → drop any ICY track title from the previous stream.
+    if (!liveStreamTitlePath || pathKey(liveStreamTitlePath) !== pathKey(currentFile ?? path)) {
+      liveStreamTitle = null;
+      liveStreamArtist = null;
+      liveStreamTitlePath = null;
+    }
     currentFileName = track
       ? trackDisplayTitle(track)
       : path.split(/[\\/]/).pop()?.replace(/\.[^/.]+$/, '') ?? null;
@@ -3263,9 +3405,55 @@ function setupListeners() {
     };
     mergeMetadataIntoPlaylists([normalized]);
     if (currentFile && pathKey(currentFile) === pathKey(updated.path)) {
+      currentFileName = trackDisplayTitle(normalized);
       syncWindowTitle();
     }
   });
+
+  // Live ICY metadata from radio / web streams. `title` is the currently playing
+  // track (StreamTitle); `station` refines the station name (icy-name header).
+  listen<{ path: string; title?: string | null; station?: string | null }>(
+    'player:stream-metadata',
+    (event) => {
+      const { path, title, station } = event.payload;
+      if (!path) return;
+
+      // Only apply to the stream we're actually on.
+      if (!currentFile || pathKey(currentFile) !== pathKey(path)) return;
+
+      const trackTitle = title?.trim();
+      if (trackTitle) {
+        const split = splitIcyStreamTitle(trackTitle);
+        liveStreamTitle = split.title;
+        liveStreamArtist = split.artist;
+        liveStreamTitlePath = path;
+        syncWindowTitle();
+      }
+      // `title` omitted/null means "no change" (station-only update, rename).
+      // Do not drop the current ICY track — only stop / switching streams clears it.
+
+      // icy-name fills an empty / host-only station title. Never overwrite a
+      // name the user saved in Properties (live StreamTitle is display-only).
+      const stationName = station?.trim();
+      if (stationName) {
+        const track =
+          trackByPath.get(path) ??
+          [...trackByPath.values()].find((t) => sameTrackPath(t.path, path));
+        const currentStation = track?.title?.trim();
+        let hostFallback = '';
+        try {
+          hostFallback = new URL(path).hostname;
+        } catch {
+          hostFallback = '';
+        }
+        if (track && (!currentStation || currentStation === hostFallback)) {
+          mergeMetadataIntoPlaylists([{ ...track, title: stationName }]);
+        }
+      }
+
+      syncWindowTitle();
+    },
+  );
 
   listen<{
     files: MusicFile[];
@@ -3376,6 +3564,12 @@ export function createPlayerStore() {
     get volume() { return volume; },
     get currentFile() { return currentFile; },
     get currentFileName() { return currentFileName; },
+    /** Transport title: ICY stream title when live, station name otherwise. */
+    get nowPlayingTitle() { return nowPlayingTitle; },
+    /** Saved artist (station or file). Streams never hardcode "Radio". */
+    get nowPlayingArtist() { return nowPlayingArtist; },
+    /** True when the loaded track is a radio / web stream (no seekbar). */
+    get currentIsStream() { return currentIsStream; },
     get currentTrack() { return currentTrack; },
     get tracks() { return tracks; },
     get playlists() { return playlists; },
@@ -3421,6 +3615,7 @@ export function createPlayerStore() {
     moveTracksToPlaylist,
     addFolderToActivePlaylist,
     addDroppedPaths,
+    addStream,
     addScannedTracks,
     createPlaylistsFromDroppedPaths,
     createPlaylistsFromScannedTracks,

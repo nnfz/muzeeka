@@ -77,6 +77,15 @@ pub fn is_cue_sheet_path(path: &str) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("cue"))
 }
 
+/// True for network audio locations the BASS URL streamer can open
+/// (HTTP / HTTPS radio and web streams).
+pub fn is_stream_url(path: &str) -> bool {
+    let p = path.trim();
+    p.len() > 8
+        && (p.as_bytes()[..7].eq_ignore_ascii_case(b"http://")
+            || p.as_bytes()[..8].eq_ignore_ascii_case(b"https://"))
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlaybackTarget {
     pub audio_path: String,
@@ -304,6 +313,16 @@ pub fn resolve_playback(
     cue_start: Option<f64>,
     cue_end: Option<f64>,
 ) -> Result<PlaybackTarget, String> {
+    // Radio / web streams: the URL itself is the audio source — no file checks,
+    // no CUE expansion. Never attempt to seek inside a live stream.
+    if is_stream_url(track_path) {
+        return Ok(PlaybackTarget {
+            audio_path: track_path.trim().to_string(),
+            cue_start: None,
+            cue_end: None,
+        });
+    }
+
     if let Some((audio, track_no)) = parse_virtual_cue_path(track_path) {
         if !Path::new(&audio).is_file() {
             return Err(format!("Audio file not found for CUE track: {audio}"));

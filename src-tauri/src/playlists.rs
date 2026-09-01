@@ -1359,6 +1359,12 @@ fn split_for_storage(
     absolute: &str,
     roots: &[(i64, String)],
 ) -> Result<(Option<i64>, String, String), String> {
+    // Stream URLs are never under a library root — store verbatim, key verbatim.
+    if path_store::is_stream_url(absolute) {
+        let url = absolute.trim().to_string();
+        let key = path_store::path_key(&url);
+        return Ok((None, url, key));
+    }
     let abs = path_store::normalize_display_path(absolute);
     for (id, root) in roots {
         if let Some(rel) = to_relative(root, &abs) {

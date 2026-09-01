@@ -18,6 +18,11 @@ const BASS_DOWNLOADS: &[(&str, &str)] = &[
     ("basswv.dll", "https://www.un4seen.com/files/basswv24.zip"),
 ];
 
+/// Optional plugins — downloaded best-effort. Build succeeds even if they fail.
+const BASS_OPTIONAL_DOWNLOADS: &[(&str, &str)] = &[
+    ("bass_aac.dll", "https://www.un4seen.com/files/z/2/bass_aac24.zip"),
+];
+
 const TOOL_DOWNLOADS: &[(&str, &str)] = &[
     ("yt-dlp.exe", "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"),
 ];
@@ -77,8 +82,26 @@ fn ensure_download(url: &str, destination: &Path) -> Result<(), String> {
     run_powershell(&script)
 }
 
+fn pe_is_amd64(path: &Path) -> bool {
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+    if bytes.len() < 0x40 {
+        return false;
+    }
+    let pe_off = u32::from_le_bytes([bytes[0x3C], bytes[0x3D], bytes[0x3E], bytes[0x3F]]) as usize;
+    if bytes.len() < pe_off.saturating_add(6) {
+        return false;
+    }
+    let machine = u16::from_le_bytes([bytes[pe_off + 4], bytes[pe_off + 5]]);
+    machine == 0x8664
+}
+
 fn extract_selected(zip_path: &Path, destination: &Path, wanted_names: &[&str]) -> Result<(), String> {
-    if wanted_names.iter().all(|name| destination.join(name).is_file()) {
+    if wanted_names.iter().all(|name| {
+        let path = destination.join(name);
+        path.is_file() && pe_is_amd64(&path)
+    }) {
         return Ok(());
     }
 
@@ -93,6 +116,10 @@ fn extract_selected(zip_path: &Path, destination: &Path, wanted_names: &[&str]) 
         .collect::<Vec<_>>()
         .join(", ");
 
+    // Un4seen zips ship both 32-bit (root) and 64-bit (`x64/`) DLLs with the same
+    // filename. Copying every match used to leave 32-bit bass_aac.dll in a 64-bit
+    // app — PluginLoad then fails with "unsupported file format" and AAC+ radio
+    // (Radio Record .aacp) hangs forever in StreamCreateURL.
     let script = format!(
         r#"$ErrorActionPreference='Stop';
 $zip = '{zip_path}';
@@ -101,7 +128,13 @@ $tmp = Join-Path $env:TEMP ('muzeeka-' + [guid]::NewGuid().ToString());
 New-Item -ItemType Directory -Path $tmp | Out-Null;
 Expand-Archive -LiteralPath $zip -DestinationPath $tmp -Force;
 $wanted = @({wanted});
-Get-ChildItem -LiteralPath $tmp -Recurse -File | Where-Object {{ $wanted -contains $_.Name }} | ForEach-Object {{ Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $dest $_.Name) -Force }};
+$files = Get-ChildItem -LiteralPath $tmp -Recurse -File | Where-Object {{ $wanted -contains $_.Name }};
+foreach ($name in $wanted) {{
+  $cands = @($files | Where-Object {{ $_.Name -eq $name }});
+  $pick = $cands | Where-Object {{ $_.FullName -match '[\\/]x64[\\/]' }} | Select-Object -First 1;
+  if (-not $pick) {{ $pick = $cands | Select-Object -First 1 }};
+  if ($pick) {{ Copy-Item -LiteralPath $pick.FullName -Destination (Join-Path $dest $name) -Force }};
+}}
 Remove-Item -LiteralPath $tmp -Recurse -Force;"#
     );
 
@@ -141,6 +174,28 @@ fn ensure_native_assets(manifest_dir: &Path) -> Result<(), String> {
             let zip_path = temp_dir.join(file_name.replace(".dll", ".zip"));
             ensure_download(url, &zip_path)?;
             extract_selected(&zip_path, &bass_dir, &[*file_name])?;
+        }
+    }
+
+    // Optional plugins — best-effort, never fail the build.
+    {
+        let temp_dir = env::temp_dir().join("muzeeka-bass");
+        for (file_name, url) in BASS_OPTIONAL_DOWNLOADS {
+            let dest = bass_dir.join(file_name);
+            if dest.is_file() && pe_is_amd64(&dest) {
+                continue;
+            }
+            if dest.is_file() {
+                let _ = fs::remove_file(&dest);
+            }
+            let zip_path = temp_dir.join(file_name.replace(".dll", ".zip"));
+            if let Err(e) = ensure_download(url, &zip_path) {
+                eprintln!("cargo:warning=Optional BASS plugin {file_name} download failed: {e}");
+                continue;
+            }
+            if let Err(e) = extract_selected(&zip_path, &bass_dir, &[*file_name]) {
+                eprintln!("cargo:warning=Optional BASS plugin {file_name} extract failed: {e}");
+            }
         }
     }
 

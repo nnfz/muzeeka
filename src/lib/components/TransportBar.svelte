@@ -5,7 +5,6 @@
   import {
     getPlayerStore,
     isEditablePlaylist,
-    trackDisplayArtist,
     VIRTUAL_ALL_ID,
     VIRTUAL_LIKED_ID,
   } from "$lib/stores/player.svelte";
@@ -462,11 +461,11 @@
             onpointerdown={onTextPointerDown}
             title="Drag file to share"
           >
-            <span class="np-title">{player.currentFileName ?? ""}</span>
-            {#if player.currentTrack}
-              <span class="np-artist"
-                >{trackDisplayArtist(player.currentTrack)}</span
-              >
+            <span class="np-title"
+              >{player.nowPlayingTitle ?? player.currentFileName ?? ""}</span
+            >
+            {#if player.nowPlayingArtist}
+              <span class="np-artist">{player.nowPlayingArtist}</span>
             {/if}
           </div>
         </div>
