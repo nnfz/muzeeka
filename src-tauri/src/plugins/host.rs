@@ -129,7 +129,25 @@ impl PluginHost {
                     .get("deviceId")
                     .and_then(Value::as_i64)
                     .ok_or("addOutput: missing deviceId")? as i32;
-                let info = self.player.add_extra_output(device_id)?;
+                // Optional: gain for this output alone. Defaults to full volume so
+                // existing callers keep the old behaviour.
+                let volume = args
+                    .get("volume")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(1.0)
+                    .clamp(0.0, 1.0) as f32;
+                let info = self.player.add_extra_output(device_id, volume)?;
+                Ok(serde_json::to_value(info).unwrap_or(Value::Null))
+            }
+            "audio.setOutputVolume" => {
+                require(perms, AUDIO_OUTPUT)?;
+                let id = string_arg(args, "id")?;
+                let volume = args
+                    .get("volume")
+                    .and_then(Value::as_f64)
+                    .ok_or("setOutputVolume: missing volume")?
+                    .clamp(0.0, 1.0) as f32;
+                let info = self.player.set_extra_output_volume(&id, volume)?;
                 Ok(serde_json::to_value(info).unwrap_or(Value::Null))
             }
             "audio.removeOutput" => {

@@ -807,6 +807,9 @@ impl BassLibrary {
         }
     }
 
+    /// Requires a *decode* source channel. The player's mixer is a playing channel, so
+    /// this returns error 38 for it — extra outputs use [`crate::output_tap`] instead.
+    #[allow(dead_code)] // public BASS API surface; not usable on the playing mixer
     pub fn split_stream_create(&self, channel: DWORD, flags: DWORD) -> Result<HSTREAM, String> {
         let f = self
             .bass_split_stream_create
@@ -845,6 +848,8 @@ impl BassLibrary {
         self.check(ok)
     }
 
+    #[allow(dead_code)] // public BASS API surface; extra outputs create their stream on
+    // the target device directly (see `crate::output_tap`)
     pub fn channel_set_device(&self, handle: DWORD, device: i32) -> Result<(), String> {
         if device < 0 {
             return Err("Invalid output device".into());
@@ -922,6 +927,8 @@ pub struct DataPump {
 unsafe impl Send for DataPump {}
 
 impl DataPump {
+    #[allow(dead_code)] // pull/available are the feeder side of the pump; only push and
+    // queued are used since extra outputs became a DSP tap
     pub fn available(&self, handle: DWORD) -> u32 {
         let got = unsafe { (self.get_data)(handle, ptr::null_mut(), BASS_DATA_AVAILABLE) };
         if got == DWORD::MAX {
@@ -933,6 +940,7 @@ impl DataPump {
 
     /// Pull up to `buf.len()` bytes. `float` ORs `BASS_DATA_FLOAT`.
     /// Never pass an empty `buf`. Returns 0 if nothing is ready / error.
+    #[allow(dead_code)]
     pub fn pull(&self, handle: DWORD, buf: &mut [u8], float: bool) -> u32 {
         if buf.is_empty() {
             return 0;
@@ -942,6 +950,19 @@ impl DataPump {
             length |= BASS_DATA_FLOAT;
         }
         let got = unsafe { (self.get_data)(handle, buf.as_mut_ptr().cast(), length) };
+        if got == DWORD::MAX {
+            0
+        } else {
+            got
+        }
+    }
+
+    /// Bytes still queued in a `STREAMPROC_PUSH` stream. BASS documents
+    /// `BASS_StreamPutData` with a zero length as a queue-level query that adds nothing —
+    /// more reliable here than `GetData(BASS_DATA_AVAILABLE)`, which reports the playback
+    /// buffer rather than the push backlog.
+    pub fn queued(&self, handle: DWORD) -> u32 {
+        let got = unsafe { (self.put_data)(handle, ptr::null(), 0) };
         if got == DWORD::MAX {
             0
         } else {

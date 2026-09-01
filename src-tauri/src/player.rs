@@ -20,6 +20,7 @@ use crate::discord_rpc::DiscordPresence;
 use crate::dsp_chain::{chain_dsp_callback, ChainSlotSettings, DspChain, DspChainStatus};
 use crate::icy_tap::{self, LiveMetaInbox};
 use crate::mix_filter::{self, MixFilterCtx};
+use crate::output_tap::{self, OutputTap};
 
 /// Next track queued for gapless transition.
 #[derive(Debug, Clone)]
@@ -300,7 +301,12 @@ struct ExtraOutput {
     id: String,
     device: i32,
     name: String,
-    split_handle: u32,
+    /// Mixer DSP + push stream on the target device. See [`crate::output_tap`] for why
+    /// this is not a `BASS_Split_StreamCreate` splitter.
+    tap: OutputTap,
+    /// Gain on this output only, independent of the main mixer volume.
+    /// Kept here so a BASS restart can restore it in `reattach_extra_outputs`.
+    volume: f32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -320,6 +326,7 @@ pub struct ExtraOutputInfo {
     pub id: String,
     pub device_id: i32,
     pub name: String,
+    pub volume: f32,
 }
 
 /// Automation point: `t` in 0..1 of the segment, `v` gain 0..1.
@@ -1051,13 +1058,16 @@ impl Player {
                     id: o.id.clone(),
                     device_id: o.device,
                     name: o.name.clone(),
+                    volume: o.volume,
                 })
                 .collect())
         })
     }
 
-    pub fn add_extra_output(&self, device_id: i32) -> Result<ExtraOutputInfo, String> {
-        self.run_on_bass_thread(move |inner| Self::add_extra_output_inner(inner, device_id))
+    pub fn add_extra_output(&self, device_id: i32, volume: f32) -> Result<ExtraOutputInfo, String> {
+        self.run_on_bass_thread(move |inner| {
+            Self::add_extra_output_inner(inner, device_id, volume)
+        })
     }
 
     pub fn remove_extra_output(&self, output_id: &str) -> Result<(), String> {
@@ -1065,9 +1075,39 @@ impl Player {
         self.run_on_bass_thread(move |inner| Self::remove_extra_output_inner(inner, &output_id))
     }
 
+    /// Gain for one extra output only. The main output keeps the mixer volume,
+    /// so this never touches what the user hears in their own headphones.
+    pub fn set_extra_output_volume(
+        &self,
+        output_id: &str,
+        volume: f32,
+    ) -> Result<ExtraOutputInfo, String> {
+        let output_id = output_id.to_string();
+        self.run_on_bass_thread(move |inner| {
+            let volume = volume.clamp(0.0, 1.0);
+            let Some(extra) = inner.extra_outputs.iter_mut().find(|o| o.id == output_id) else {
+                return Err(format!("Unknown extra output {output_id}"));
+            };
+            extra.volume = volume;
+            let handle = extra.tap.push_handle;
+            let info = ExtraOutputInfo {
+                id: extra.id.clone(),
+                device_id: extra.device,
+                name: extra.name.clone(),
+                volume,
+            };
+            if handle != 0 {
+                let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
+                bass.channel_set_attribute(handle, bass::BASS_ATTRIB_VOL, volume)?;
+            }
+            Ok(info)
+        })
+    }
+
     fn add_extra_output_inner(
         inner: &mut PlayerInner,
         device_id: i32,
+        volume: f32,
     ) -> Result<ExtraOutputInfo, String> {
         if device_id <= 0 {
             return Err("Invalid output device".into());
@@ -1083,17 +1123,26 @@ impl Player {
                     .into(),
             );
         }
-        if inner.extra_outputs.iter().any(|o| o.device == device_id) {
-            let existing = inner
-                .extra_outputs
-                .iter()
-                .find(|o| o.device == device_id)
-                .expect("checked");
-            return Ok(ExtraOutputInfo {
+        let volume = volume.clamp(0.0, 1.0);
+        // Already attached: keep the output, just move it to the requested gain so a
+        // repeated add acts as "make sure this device plays at this volume".
+        if let Some(existing) = inner
+            .extra_outputs
+            .iter_mut()
+            .find(|o| o.device == device_id)
+        {
+            existing.volume = volume;
+            let handle = existing.tap.push_handle;
+            let info = ExtraOutputInfo {
                 id: existing.id.clone(),
                 device_id: existing.device,
                 name: existing.name.clone(),
-            });
+                volume,
+            };
+            if handle != 0 {
+                let _ = bass.channel_set_attribute(handle, bass::BASS_ATTRIB_VOL, volume);
+            }
+            return Ok(info);
         }
 
         let devices = bass.list_devices();
@@ -1107,15 +1156,10 @@ impl Player {
 
         Self::ensure_device_inited(inner, device_id)?;
         let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
-        let split = bass.split_stream_create(inner.mixer_handle, 0)?;
-        if let Err(err) = bass.channel_set_device(split, device_id) {
-            let _ = bass.channel_free(split);
-            return Err(err);
-        }
-        if let Err(err) = bass.channel_play(split, false) {
-            let _ = bass.channel_free(split);
-            return Err(err);
-        }
+        // A splitter would need a decode source, but the mixer is a playing channel
+        // (see `create_mixer`), so `BASS_Split_StreamCreate` fails with error 38.
+        // The tap copies the mixer buffer into a push stream instead.
+        let tap = output_tap::attach(bass, inner.mixer_handle, device_id, volume)?;
 
         let id = format!("out-{}", inner.next_extra_id);
         inner.next_extra_id += 1;
@@ -1123,13 +1167,15 @@ impl Player {
             id: id.clone(),
             device: device_id,
             name: info.name.clone(),
-            split_handle: split,
+            tap,
+            volume,
         };
         inner.extra_outputs.push(extra);
         Ok(ExtraOutputInfo {
             id,
             device_id,
             name: info.name.clone(),
+            volume,
         })
     }
 
@@ -1139,10 +1185,7 @@ impl Player {
         };
         let extra = inner.extra_outputs.remove(index);
         if let Some(bass) = inner.bass.as_ref() {
-            if extra.split_handle != 0 {
-                let _ = bass.channel_stop(extra.split_handle);
-                let _ = bass.channel_free(extra.split_handle);
-            }
+            output_tap::detach(bass, inner.mixer_handle, extra.tap);
         }
         Ok(())
     }
@@ -1170,32 +1213,41 @@ impl Player {
     }
 
     fn reattach_extra_outputs(inner: &mut PlayerInner) {
-        let devices: Vec<(String, i32)> = inner
+        // Carry the per-output gain across the restart, otherwise every extra output
+        // would come back at full volume after a device switch or Ctrl+R.
+        let devices: Vec<(i32, f32)> = inner
             .extra_outputs
             .iter()
-            .map(|o| (o.id.clone(), o.device))
+            .map(|o| (o.device, o.volume))
             .collect();
-        for extra in inner.extra_outputs.drain(..) {
-            if extra.split_handle != 0 {
-                if let Some(bass) = inner.bass.as_ref() {
-                    let _ = bass.channel_free(extra.split_handle);
-                }
+        // The old mixer is already gone here, so the DSP dies with it; only the push
+        // streams need freeing. Pass mixer 0 to skip the remove-DSP call.
+        let taps: Vec<OutputTap> = inner
+            .extra_outputs
+            .drain(..)
+            .map(|extra| extra.tap)
+            .collect();
+        if let Some(bass) = inner.bass.as_ref() {
+            for tap in taps {
+                output_tap::detach(bass, 0, tap);
             }
         }
-        for (_id, device) in devices {
-            if let Err(err) = Self::add_extra_output_inner(inner, device) {
+        for (device, volume) in devices {
+            if let Err(err) = Self::add_extra_output_inner(inner, device, volume) {
                 eprintln!("[audio] reattach extra output {device}: {err}");
             }
         }
     }
 
     fn teardown_extra_outputs(inner: &mut PlayerInner) {
+        let taps: Vec<OutputTap> = inner
+            .extra_outputs
+            .drain(..)
+            .map(|extra| extra.tap)
+            .collect();
         if let Some(bass) = inner.bass.as_ref() {
-            for extra in inner.extra_outputs.drain(..) {
-                if extra.split_handle != 0 {
-                    let _ = bass.channel_stop(extra.split_handle);
-                    let _ = bass.channel_free(extra.split_handle);
-                }
+            for tap in taps {
+                output_tap::detach(bass, inner.mixer_handle, tap);
             }
             let current = bass.get_device();
             for device in inner.extra_devices_inited.drain(..) {

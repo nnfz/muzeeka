@@ -72,7 +72,7 @@ REST/SSE API плеера).
 | `player:control` | `player.play / pause / resume / toggle / next / prev / seek / volume` |
 | `library:read` | `library.playlists`, `library.playlist` |
 | `audio:devices` | `audio.devices` |
-| `audio:output` | `audio.addOutput`, `audio.removeOutput`, `audio.outputs` |
+| `audio:output` | `audio.addOutput`, `audio.removeOutput`, `audio.setOutputVolume`, `audio.outputs` |
 | `http:listen` | `http.serve`, `http.stop`, `http.status` |
 | `fs:plugin-dir` | Зарезервировано, пока ничего не даёт. |
 
@@ -100,9 +100,10 @@ muzeeka.library
 
 muzeeka.audio
   .devices()                // устройства вывода
-  .addOutput(deviceId)      // добавить параллельный вывод
+  .addOutput(deviceId, volume?) // добавить параллельный вывод; volume 0.0–1.0, по умолч. 1.0
   .removeOutput(id)
-  .outputs()                // активные доп. выводы
+  .setOutputVolume(id, v)   // громкость одного доп. вывода, 0.0–1.0
+  .outputs()                // активные доп. выводы: [{ id, deviceId, name, volume }]
 
 muzeeka.http
   .serve({ port, staticDir, mount: ["player-api"] })
@@ -244,6 +245,29 @@ POST /api/repeat/toggle   → { "repeat_mode": "off|one|all" }
 Права: `player:read`, `player:control`, `library:read`, `http:listen`. Включён по
 умолчанию; при первом запуске настройки порта/вкл-выкл переносятся со старого встроенного
 remote-модуля.
+
+### muzeeka.micspam — нативный
+
+Микспам: дублирует выход плеера в виртуальный аудиокабель, чтобы Discord и игры видели
+музыку как микрофон. Фоновый поток раз в `poll_ms` (500–10000, по умолчанию 2000) ищет
+среди выходов устройство, чьё имя содержит `device_match` (по умолчанию `CABLE Input`),
+цепляет его через `audio.addOutput` и переподключает, если вывод отвалился после
+перезапуска BASS. На `stop` вывод снимается. Права: `audio:devices`, `audio:output`.
+Выключен по умолчанию. Пересборка: `cargo build --release` в `plugins/micspam`.
+
+Кабель — это kernel-mode драйвер, плагин его не создаёт и систему не трогает: поставь
+[VB-CABLE](https://vb-audio.com/Cable/) один раз вручную, затем выбери `CABLE Output`
+микрофоном в Discord. Пока устройства нет, плагин просто пишет об этом в лог и ждёт.
+
+Громкость в войс — отдельная: настройка `volume_percent` (0–100, по умолчанию 70) двигает
+только уровень кабеля через `audio.setOutputVolume` (`BASS_ATTRIB_VOL` на push-хэндле
+отвода). Громкость в наушниках живёт на мижере и не меняется. Ползунок применяется на
+живом выводе и переживает перезапуск BASS.
+
+Технически доп. вывод — не сплиттер, а отвод (`src-tauri/src/output_tap.rs`): DSP на
+мижере копирует буфер в push-поток на устройстве кабеля. `BASS_Split_StreamCreate` не
+подходит, ему нужен decode-источник, а мижер играющий — отсюда была ошибка 38.
+В войс уходит то же, что в уши: DSP стоит после рэка.
 
 ### muzeeka.native-probe — нативный
 

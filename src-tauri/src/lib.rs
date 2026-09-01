@@ -30,6 +30,7 @@ mod unison;
 mod metadata;
 mod tag_table;
 mod waveform;
+mod output_tap;
 mod player;
 mod path_store;
 mod playlists;

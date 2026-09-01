@@ -453,6 +453,7 @@ button.playlist-select:hover {
   display: grid;
   grid-template-columns: 96px minmax(80px, 150px) 1fr;
   gap: 10px;
+  user-select: text;
 }
 
 .dev-log-line.is-error {
