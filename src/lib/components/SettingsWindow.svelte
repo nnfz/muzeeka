@@ -17,7 +17,7 @@
   } from "$lib/stores/plugins.svelte";
   import { getVersion, getName } from "@tauri-apps/api/app";
   import { invoke } from "@tauri-apps/api/core";
-  import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+  import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { open } from "@tauri-apps/plugin-dialog";
   import { revealItemInDir } from "@tauri-apps/plugin-opener";
   import { onMount } from "svelte";
@@ -67,6 +67,10 @@
   let coverRebuildBusy = $state(false);
   let coverRebuildMsg = $state<string | null>(null);
   let coverRebuildError = $state<string | null>(null);
+
+  let tagRescanBusy = $state(false);
+  let tagRescanMsg = $state<string | null>(null);
+  let tagRescanError = $state<string | null>(null);
 
   let pluginError = $state<string | null>(null);
   let logLines = $state<DevLogLine[]>([]);
@@ -340,6 +344,56 @@
     }
   }
 
+  /**
+   * Ask the main window to re-read tags for every library row.
+   *
+   * The work happens there, not here: this window has its own store instance with no
+   * library rows in it. We subscribe before emitting so a fast reply cannot be missed,
+   * and give up after 60s so the button never stays stuck on "Rescanning…".
+   */
+  async function rescanTags() {
+    if (tagRescanBusy) return;
+    tagRescanBusy = true;
+    tagRescanMsg = null;
+    tagRescanError = null;
+
+    // Deferred, so the listener is attached (and its unlisten captured) before the
+    // request goes out. Assigning `unlisten` inside the executor instead would leave
+    // TypeScript thinking it is still null by the time `finally` runs.
+    let settle!: (result: { refreshed?: number; error?: string }) => void;
+    const reply = new Promise<{ refreshed?: number; error?: string }>((resolve) => {
+      settle = resolve;
+    });
+
+    let unlisten: UnlistenFn | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      unlisten = await listen<{ refreshed?: number; error?: string }>(
+        "library:tags-rescanned",
+        (event) => settle(event.payload ?? {}),
+      );
+      const timeout = new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error("Timed out waiting for the main window")),
+          60_000,
+        );
+      });
+
+      await emit("library:rescan-tags");
+      const payload = await Promise.race([reply, timeout]);
+      if (payload.error) throw new Error(payload.error);
+
+      const count = payload.refreshed ?? 0;
+      tagRescanMsg = `Done — re-read tags for ${count} ${count === 1 ? "track" : "tracks"}.`;
+    } catch (e) {
+      tagRescanError = e instanceof Error ? e.message : String(e);
+    } finally {
+      if (timer) clearTimeout(timer);
+      unlisten?.();
+      tagRescanBusy = false;
+    }
+  }
+
   async function togglePlugin(id: string, enabled: boolean) {
     pluginError = null;
     pluginBusyId = id;
@@ -606,6 +660,33 @@
                   onclick={() => void rebuildCovers()}
                 >
                   {coverRebuildBusy ? "Rebuilding…" : "Rebuild covers"}
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div class="settings-card">
+            <div class="card-row card-row-stack">
+              <div>
+                <div class="card-label">Track tags</div>
+                <div class="card-value">
+                  Re-read tags from disk for every track in the library
+                </div>
+                {#if tagRescanMsg}
+                  <div class="card-value card-value-ok">{tagRescanMsg}</div>
+                {/if}
+                {#if tagRescanError}
+                  <div class="card-value card-value-error">{tagRescanError}</div>
+                {/if}
+              </div>
+              <div class="card-actions">
+                <button
+                  type="button"
+                  class="action-btn"
+                  disabled={tagRescanBusy}
+                  onclick={() => void rescanTags()}
+                >
+                  {tagRescanBusy ? "Rescanning…" : "Rescan tags"}
                 </button>
               </div>
             </div>

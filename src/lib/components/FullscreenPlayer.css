@@ -544,7 +544,9 @@
 }
 
 .fullscreen-progress :global(.slider-time) {
-  font-size: 11px;
+  display: flex;
+  align-items: center;
+  font-size: 10px;
   flex-shrink: 0;
   color: var(--text-primary-md);
 }

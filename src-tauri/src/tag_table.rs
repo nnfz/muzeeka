@@ -4,7 +4,7 @@ use lofty::config::{ParseOptions, WriteOptions};
 use lofty::file::{AudioFile, TaggedFileExt};
 use lofty::probe::Probe;
 use lofty::read_from_path;
-use lofty::tag::{ItemKey, ItemValue, Tag, TagType};
+use lofty::tag::{ItemKey, ItemValue, Tag, TagItem, TagType};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -195,6 +195,62 @@ fn primary_or_insert(tagged: &mut lofty::file::TaggedFile) -> Result<&mut Tag, S
         .ok_or_else(|| "No writable tag slot".to_string())
 }
 
+/// Separator used when a field holds several values.
+///
+/// Artist-ish fields use the app-wide comma (`ARTIST_SEPARATOR`) so the properties
+/// table reads the same as the track list and transport. Everything else keeps
+/// foobar's `"; "`, which is what other taggers expect to parse back.
+fn separator_for(key: ItemKey) -> &'static str {
+    match key {
+        ItemKey::TrackArtist
+        | ItemKey::TrackArtists
+        | ItemKey::AlbumArtist
+        | ItemKey::AlbumArtists
+        | ItemKey::Performer
+        | ItemKey::OriginalArtist => crate::metadata::ARTIST_SEPARATOR,
+        _ => "; ",
+    }
+}
+
+/// Lyrics embedded in the audio file itself (`LYRICS` / `USLT`), if any.
+///
+/// This is a separate source from the lyrics cache: plenty of files ship with the text
+/// already in their tags, and the properties window has always fallen back to it. The
+/// fullscreen view had no such fallback, so a file whose only lyrics live in its tags
+/// showed text in properties and nothing on screen.
+pub fn read_embedded_lyrics(path: &Path) -> Result<Option<String>, String> {
+    let tagged = open_tagged_text_only(path)?;
+
+    // Primary tag first, then the rest: an MP3 may carry both ID3v2 and APE, and the
+    // primary one is what the properties table shows.
+    let primary_type = tagged.primary_tag().map(|tag| tag.tag_type());
+    let tags = tagged
+        .primary_tag()
+        .into_iter()
+        .chain(
+            tagged
+                .tags()
+                .iter()
+                .filter(|tag| Some(tag.tag_type()) != primary_type),
+        );
+
+    for tag in tags {
+        for key in [ItemKey::UnsyncLyrics, ItemKey::Lyrics] {
+            for item in tag.items().filter(|item| item.key() == key) {
+                let text = match item.value() {
+                    ItemValue::Text(s) | ItemValue::Locator(s) => s,
+                    ItemValue::Binary(_) => continue,
+                };
+                if !text.trim().is_empty() {
+                    return Ok(Some(text.to_string()));
+                }
+            }
+        }
+    }
+
+    Ok(None)
+}
+
 /// Read every text-ish tag into a foobar-ordered table.
 pub fn read_tag_table(path: &Path) -> Result<Vec<TagTableRow>, String> {
     let tagged = open_tagged_text_only(path)?;
@@ -211,11 +267,24 @@ pub fn read_tag_table(path: &Path) -> Result<Vec<TagTableRow>, String> {
                     if t.is_empty() {
                         continue;
                     }
-                    t.to_string()
+                    t
                 }
                 ItemValue::Binary(_) => continue,
             };
-            values.entry(item.key()).or_default().push(text);
+            let key = item.key();
+            let entry = values.entry(key).or_default();
+            if separator_for(key) == crate::metadata::ARTIST_SEPARATOR {
+                // Artist-ish fields get re-split so a NUL-packed ID3v2.4 frame, or a
+                // tagger that wrote `;` / ` / `, still renders one comma list.
+                for part in crate::metadata::split_tag_multi_values(text) {
+                    if entry.iter().any(|seen| seen.eq_ignore_ascii_case(part)) {
+                        continue;
+                    }
+                    entry.push(part.to_string());
+                }
+            } else {
+                entry.push(text.to_string());
+            }
         }
     }
 
@@ -227,7 +296,7 @@ pub fn read_tag_table(path: &Path) -> Result<Vec<TagTableRow>, String> {
         seen.insert(*key);
         let value = values
             .get(key)
-            .map(|v| v.join("; "))
+            .map(|v| v.join(separator_for(*key)))
             .unwrap_or_default();
         rows.push(TagTableRow {
             id: item_key_id(*key),
@@ -242,7 +311,10 @@ pub fn read_tag_table(path: &Path) -> Result<Vec<TagTableRow>, String> {
     let mut extras: Vec<(ItemKey, String)> = values
         .into_iter()
         .filter(|(k, v)| !seen.contains(k) && v.iter().any(|s| !s.trim().is_empty()))
-        .map(|(k, v)| (k, v.join("; ")))
+        .map(|(k, v)| {
+            let sep = separator_for(k);
+            (k, v.join(sep))
+        })
         .collect();
     extras.sort_by_key(|a| item_key_label(a.0));
 
@@ -286,10 +358,26 @@ pub fn write_tag_table(path: &Path, rows: &[TagTableRow]) -> Result<(), String> 
     for (key, value) in &desired {
         if value.is_empty() {
             tag.remove_key(*key);
-        } else {
-            // Multi-value joined with "; " becomes a single text field (foobar-like).
-            tag.insert_text(*key, value.clone());
+            continue;
         }
+
+        if separator_for(*key) == crate::metadata::ARTIST_SEPARATOR {
+            // Split the comma list back into repeated fields so collaborators survive
+            // a round-trip instead of collapsing into one glued "A, B" artist.
+            let parts: Vec<&str> = value
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            tag.remove_key(*key);
+            for part in parts {
+                tag.push(TagItem::new(*key, ItemValue::Text(part.to_string())));
+            }
+            continue;
+        }
+
+        // Multi-value joined with "; " becomes a single text field (foobar-like).
+        tag.insert_text(*key, value.clone());
     }
 
     // Also remove keys that existed and were in standard list but missing from payload

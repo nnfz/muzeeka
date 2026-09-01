@@ -411,10 +411,22 @@ fn fetch_uncached(
     Ok(None)
 }
 
+/// Split lyrics text into display lines across every newline convention.
+///
+/// Not `str::lines()`: that only breaks on `\n` (stripping a trailing `\r`), so text
+/// separated by bare `\r` — which plenty of ID3 `USLT` / `LYRICS` taggers write —
+/// collapses into a single line. It looked fine in the properties textarea, because CSS
+/// treats `\r` as a segment break, but the player got one giant paragraph and
+/// `parseTtml` then flattens all whitespace inside a paragraph to single spaces.
+fn split_lyrics_lines(text: &str) -> impl Iterator<Item = &str> {
+    // `\r\n` yields an empty middle entry; empty lines are dropped by the viewer anyway.
+    text.split(['\n', '\r']).filter(|line| !line.trim().is_empty())
+}
+
 /// Wrap plain (unsynced) lyrics into a minimal TTML document the player can parse.
 fn plain_text_to_ttml(text: &str) -> String {
     let mut body = String::new();
-    for line in text.lines() {
+    for line in split_lyrics_lines(text) {
         let escaped = line
             .replace('&', "&amp;")
             .replace('<', "&lt;")
@@ -507,11 +519,18 @@ fn invalidate_lyrics_cache(key: &str) {
 
 /// Drop all cache for a track and force a network search for lyrics.
 /// Returns the fetched TTML when found.
+/// `search_*` override only what is sent to the providers; the cache key stays
+/// derived from the track's own tags. That split lets the user retype a query
+/// ("Sammy Virji" instead of the full collab list) and still have the result land
+/// where the fullscreen player looks for it.
 pub fn refetch_lyrics_ttml(
     title: &str,
     artist: &str,
     album: Option<&str>,
     duration_secs: Option<u32>,
+    search_title: Option<&str>,
+    search_artist: Option<&str>,
+    search_album: Option<&str>,
 ) -> Result<Option<String>, String> {
     let title = title.trim();
     let artist = artist.trim();
@@ -523,7 +542,26 @@ pub fn refetch_lyrics_ttml(
     let key = cache_key(title, artist, album, duration_secs);
     invalidate_lyrics_cache(&key);
 
-    let fetched = fetch_uncached(title, artist, album, duration_secs)?;
+    let pick = |override_value: Option<&str>, fallback: &str| -> String {
+        override_value
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(fallback)
+            .to_string()
+    };
+    let query_title = pick(search_title, title);
+    let query_artist = pick(search_artist, artist);
+    let query_album = search_album
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or(album);
+
+    let fetched = fetch_uncached(
+        &query_title,
+        &query_artist,
+        query_album,
+        duration_secs,
+    )?;
     match fetched.as_deref() {
         Some(ttml) => {
             let _ = write_cached_hit(&key, ttml);
@@ -582,8 +620,27 @@ pub fn fetch_lyrics_ttml(
 mod tests {
     use super::{
         cache_key, duration_close_enough, fetch_lyrics_ttml, field_matches, normalize_match_text,
-        track_identity_matches,
+        plain_text_to_ttml, track_identity_matches,
     };
+
+    #[test]
+    fn plain_text_splits_on_every_newline_convention() {
+        // Bare `\r` is what several ID3 USLT/LYRICS taggers write; `str::lines()`
+        // would have collapsed these into one paragraph.
+        let ttml = plain_text_to_ttml("Ла-ла\rПесенка\r\nВместе\nЕщё");
+        assert_eq!(ttml.matches("<p ").count(), 4);
+        assert!(ttml.contains(">Ла-ла<"));
+        assert!(ttml.contains(">Песенка<"));
+        assert!(ttml.contains(">Вместе<"));
+        assert!(ttml.contains(">Ещё<"));
+    }
+
+    #[test]
+    fn plain_text_drops_blank_lines_and_escapes_markup() {
+        let ttml = plain_text_to_ttml("one\n\n\ntwo & <three>");
+        assert_eq!(ttml.matches("<p ").count(), 2);
+        assert!(ttml.contains(">two &amp; &lt;three&gt;<"));
+    }
 
     #[test]
     fn cache_key_is_stable_for_same_track() {

@@ -11,8 +11,8 @@
   import { onMount } from "svelte";
   import {
     isStreamTrack,
+    lyricsCacheParams,
     sameTrackPath,
-    trackDisplayArtist,
     trackDisplayTitle,
     type MusicFile,
   } from "$lib/stores/player.svelte";
@@ -126,6 +126,147 @@
   let lyricsError = $state<string | null>(null);
   let lyricsSuccess = $state<string | null>(null);
 
+  // Editable lyrics search terms. Empty = use the track's own tags. These only
+  // change what is sent to the providers, never the cache key, so a result found
+  // with a hand-tweaked query still shows up in the fullscreen player.
+  let searchTitle = $state("");
+  let searchArtist = $state("");
+  let searchAlbum = $state("");
+  let searchTermsOpen = $state(false);
+
+  let searchTermsEdited = $derived(
+    !!(searchTitle.trim() || searchArtist.trim() || searchAlbum.trim()),
+  );
+
+  /** What Find would send with no overrides — shown as input placeholders. */
+  let lyricsParamsPreview = $derived.by(() => {
+    if (!track) return { title: "—", artist: "—", album: null as string | null };
+    // Same builder as the actual search, so the placeholders never lie.
+    const params = lyricsCacheParams(track);
+    return { title: params.title, artist: params.artist, album: params.album };
+  });
+
+  function resetSearchTerms() {
+    searchTitle = "";
+    searchArtist = "";
+    searchAlbum = "";
+  }
+
+  /** Trailing "feat. X" / "(with X)" — providers index the base title without it. */
+  const FEAT_TAIL_RE =
+    /\s*[([]?\s*(?:feat|ft|featuring|with)\b\.?\s+[^)\]]*[)\]]?\s*$/i;
+  /** Any bracketed aside: "(Deluxe Edition)", "(2025)", "[Remastered]". */
+  const BRACKETED_RE = /\s*[([][^)\]]*[)\]]\s*/g;
+
+  function squash(value: string): string {
+    return value.replace(/\s+/g, " ").trim();
+  }
+
+  /**
+   * Build a suggestion list: trimmed and deduped case-insensitively.
+   *
+   * The value Find already uses by default is kept in the list on purpose — after
+   * trying an alternative it is the way back, and dropping it left the Title and
+   * Album menus empty for the common case of tags with no "feat." tail or bracketed
+   * suffix to strip.
+   */
+  function suggestionsFor(candidates: (string | null | undefined)[]): string[] {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const candidate of candidates) {
+      const value = squash(candidate ?? "");
+      if (!value) continue;
+      const key = value.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(value);
+      // Six is plenty — the menu scrolls past that anyway.
+      if (out.length >= 6) break;
+    }
+    return out;
+  }
+
+  /**
+   * Query options offered per search field, shown as a dropdown under the input.
+   *
+   * Providers index tracks under a plain "lead artist + base title" form, so the
+   * usual reason Find comes back empty is decoration in the tags: a collaborator
+   * list, a "feat." tail, or an edition suffix on the album. These options offer the
+   * stripped-down variants (and each individual artist) instead of making the user
+   * retype them.
+   */
+  let searchSuggestions = $derived.by(() => {
+    const empty = { title: [] as string[], artist: [] as string[], album: [] as string[] };
+    if (!track) return empty;
+
+    const preview = lyricsParamsPreview;
+    const fullTitle = squash(track.title ?? "");
+    const fullArtist = squash(track.artist ?? "");
+    const fullAlbum = squash(track.album ?? "");
+    // Tag rows may carry artists the library row does not (album artist, performer).
+    const rowsMatch = rowsForPath && sameTrackPath(rowsForPath, track.path);
+    const albumArtist = rowsMatch ? rowValue("AlbumArtist") : "";
+    const performer = rowsMatch ? rowValue("Performer") : "";
+
+    // Artist fields are comma lists app-wide (ARTIST_SEPARATOR).
+    const artistParts = [fullArtist, albumArtist, performer]
+      .flatMap((value) => value.split(","))
+      .map(squash)
+      .filter(Boolean);
+
+    // `preview.*` first: that is what Find sends with the field left empty, so it
+    // heads the menu and doubles as the way back after trying something else.
+    return {
+      title: suggestionsFor([
+        preview.title,
+        fullTitle,
+        fullTitle.replace(FEAT_TAIL_RE, ""),
+        fullTitle.replace(BRACKETED_RE, " "),
+        // Last resort for "Artist - Title" filenames that landed in the tag.
+        fullTitle.includes(" - ") ? fullTitle.split(" - ").slice(1).join(" - ") : "",
+      ]),
+      artist: suggestionsFor([preview.artist, ...artistParts, fullArtist]),
+      album: suggestionsFor([
+        preview.album ?? "",
+        fullAlbum,
+        fullAlbum.replace(BRACKETED_RE, " "),
+      ]),
+    };
+  });
+
+  /** Which field's suggestion menu is open (only one at a time). */
+  let searchMenuOpen = $state<"title" | "artist" | "album" | null>(null);
+
+  function toggleSearchMenu(field: "title" | "artist" | "album") {
+    searchMenuOpen = searchMenuOpen === field ? null : field;
+  }
+
+  function pickSearchTerm(field: "title" | "artist" | "album", value: string) {
+    if (field === "title") searchTitle = value;
+    else if (field === "artist") searchArtist = value;
+    else searchAlbum = value;
+    searchMenuOpen = null;
+  }
+
+  /**
+   * Close the open menu on any click outside the field it belongs to.
+   *
+   * Not the shared `Dropdown` component: its trigger is a snippet wrapping the whole
+   * control, and here the trigger must be the existing text input, which stays
+   * editable. So the outside-click and Escape handling is done here instead.
+   */
+  function handleSearchMenuWindowClick(event: MouseEvent) {
+    if (!searchMenuOpen) return;
+    const target = event.target;
+    if (
+      target instanceof Element &&
+      target.closest(`[data-search-field="${searchMenuOpen}"]`)
+    ) {
+      return;
+    }
+    searchMenuOpen = null;
+  }
+
   /** Bumps on every loadTrack so stale async tag/tech/lyrics results are dropped. */
   let loadGen = 0;
 
@@ -179,16 +320,10 @@
    * Tag-table edits must not change the cache key or we miss cached TTML.
    */
   function lyricsParams(t: MusicFile) {
-    return {
-      title: trackDisplayTitle(t),
-      artist: trackDisplayArtist(t),
-      album: t.album ?? null,
-      durationSecs:
-        t.duration_secs != null && t.duration_secs > 0
-          ? Math.round(t.duration_secs)
-          : null,
-      trackPath: t.path,
-    };
+    // Shared builder, same one FullscreenPlayer uses. Keep it that way: these four
+    // values become the Rust cache key, so a local variant here means the text
+    // found in this window is written under a key the player never reads.
+    return { ...lyricsCacheParams(t), trackPath: t.path };
   }
 
   function stillCurrent(t: MusicFile, gen: number): boolean {
@@ -241,6 +376,10 @@
         artist: params.artist,
         album: params.album,
         durationSecs: params.durationSecs,
+        // Deliberately no trackPath: the Rust embedded-tag fallback returns TTML, and
+        // this editor shows raw text. The rows fallback below reads the same tag as
+        // plain text, which is what belongs in the textarea.
+        trackPath: null,
       });
       if (!stillCurrent(t, gen)) return;
       let text = ttml?.trim() ?? "";
@@ -508,6 +647,10 @@
     lyricsDirty = false;
     lyricsError = null;
     lyricsSuccess = null;
+    searchTitle = "";
+    searchArtist = "";
+    searchAlbum = "";
+    searchTermsOpen = false;
     trackRateOverride = null;
     trackRateDraft = getCachedGlobalPlaybackRate();
     trackRateError = null;
@@ -878,6 +1021,10 @@
         album: params.album,
         durationSecs: params.durationSecs,
         trackPath: params.trackPath,
+        // Empty strings fall back to the tag values on the Rust side.
+        searchTitle: searchTitle.trim() || null,
+        searchArtist: searchArtist.trim() || null,
+        searchAlbum: searchAlbum.trim() || null,
       });
       if (found) {
         await loadLyricsFor(track);
@@ -980,6 +1127,12 @@
 
   function handleKeydown(e: KeyboardEvent) {
     if (e.key === "Escape") {
+      // An open suggestion menu swallows the first Escape — closing the whole
+      // window out from under a dropdown is never what the user meant.
+      if (searchMenuOpen) {
+        searchMenuOpen = null;
+        return;
+      }
       void closeWindow();
       return;
     }
@@ -1087,7 +1240,10 @@
   });
 </script>
 
-<svelte:window onkeydown={handleKeydown} />
+<svelte:window
+  onkeydown={handleKeydown}
+  onclick={searchMenuOpen ? handleSearchMenuWindowClick : undefined}
+/>
 
 <div class="props-window">
   <header class="app-header props-header">
@@ -1482,6 +1638,15 @@
               >
                 Clear
               </button>
+              <button
+                type="button"
+                class="action-btn"
+                class:action-btn-active={searchTermsOpen || searchTermsEdited}
+                aria-expanded={searchTermsOpen}
+                onclick={() => (searchTermsOpen = !searchTermsOpen)}
+              >
+                Search terms{searchTermsEdited ? " •" : ""}
+              </button>
               <div class="lyrics-toolbar-spacer"></div>
               <button
                 type="button"
@@ -1495,6 +1660,200 @@
                 {lyricsBusy ? "Saving…" : "Save lyrics"}
               </button>
             </div>
+
+            {#if searchTermsOpen}
+              <div class="lyrics-search-terms">
+                <p class="lyrics-search-hint muted">
+                  Overrides what Find sends to the lyrics providers. Empty fields
+                  use the track tags. Cached results stay tied to this track.
+                  Click a field for alternatives from the tags — providers index
+                  plain "lead artist + base title", so try those when Find comes
+                  up empty.
+                </p>
+                <div class="lyrics-search-grid">
+                  <!-- Not a wrapping <label>: it forwards clicks from anything inside
+                       it to the input, so picking an option would immediately re-open
+                       the menu via the input's own onclick. `for`/`id` avoids that. -->
+                  <div class="lyrics-search-field" data-search-field="title">
+                    <label for="lyrics-search-title">Title</label>
+                    <div class="lyrics-search-input-wrap">
+                      <input
+                        id="lyrics-search-title"
+                        type="text"
+                        placeholder={lyricsParamsPreview.title}
+                        bind:value={searchTitle}
+                        disabled={lyricsBusy || lyricsLoading}
+                        spellcheck="false"
+                        role="combobox"
+                        aria-expanded={searchMenuOpen === "title"}
+                        aria-controls="lyrics-search-menu-title"
+                        onclick={() => toggleSearchMenu("title")}
+                      />
+                      {#if searchSuggestions.title.length > 0}
+                        <button
+                          type="button"
+                          class="lyrics-search-caret"
+                          tabindex="-1"
+                          aria-label="Title suggestions"
+                          disabled={lyricsBusy || lyricsLoading}
+                          onclick={(e) => {
+                            e.preventDefault();
+                            toggleSearchMenu("title");
+                          }}
+                        >
+                          ▾
+                        </button>
+                      {/if}
+                      {#if searchMenuOpen === "title" && searchSuggestions.title.length > 0}
+                        <div
+                          class="lyrics-search-menu"
+                          id="lyrics-search-menu-title"
+                          role="listbox"
+                        >
+                          {#each searchSuggestions.title as suggestion (suggestion)}
+                            <button
+                              type="button"
+                              class="lyrics-search-option"
+                              class:is-active={searchTitle.trim() === suggestion}
+                              role="option"
+                              aria-selected={searchTitle.trim() === suggestion}
+                              title={suggestion}
+                              onclick={() => pickSearchTerm("title", suggestion)}
+                            >
+                              {suggestion}
+                            </button>
+                          {/each}
+                        </div>
+                      {/if}
+                    </div>
+                  </div>
+                  <div class="lyrics-search-field" data-search-field="artist">
+                    <label for="lyrics-search-artist">Artist</label>
+                    <div class="lyrics-search-input-wrap">
+                      <input
+                        id="lyrics-search-artist"
+                        type="text"
+                        placeholder={lyricsParamsPreview.artist}
+                        bind:value={searchArtist}
+                        disabled={lyricsBusy || lyricsLoading}
+                        spellcheck="false"
+                        role="combobox"
+                        aria-expanded={searchMenuOpen === "artist"}
+                        aria-controls="lyrics-search-menu-artist"
+                        onclick={() => toggleSearchMenu("artist")}
+                      />
+                      {#if searchSuggestions.artist.length > 0}
+                        <button
+                          type="button"
+                          class="lyrics-search-caret"
+                          tabindex="-1"
+                          aria-label="Artist suggestions"
+                          disabled={lyricsBusy || lyricsLoading}
+                          onclick={(e) => {
+                            e.preventDefault();
+                            toggleSearchMenu("artist");
+                          }}
+                        >
+                          ▾
+                        </button>
+                      {/if}
+                      {#if searchMenuOpen === "artist" && searchSuggestions.artist.length > 0}
+                        <div
+                          class="lyrics-search-menu"
+                          id="lyrics-search-menu-artist"
+                          role="listbox"
+                        >
+                          {#each searchSuggestions.artist as suggestion (suggestion)}
+                            <button
+                              type="button"
+                              class="lyrics-search-option"
+                              class:is-active={searchArtist.trim() === suggestion}
+                              role="option"
+                              aria-selected={searchArtist.trim() === suggestion}
+                              title={suggestion}
+                              onclick={() => pickSearchTerm("artist", suggestion)}
+                            >
+                              {suggestion}
+                            </button>
+                          {/each}
+                        </div>
+                      {/if}
+                    </div>
+                  </div>
+                  <div class="lyrics-search-field" data-search-field="album">
+                    <label for="lyrics-search-album">Album</label>
+                    <div class="lyrics-search-input-wrap">
+                      <input
+                        id="lyrics-search-album"
+                        type="text"
+                        placeholder={lyricsParamsPreview.album ?? "—"}
+                        bind:value={searchAlbum}
+                        disabled={lyricsBusy || lyricsLoading}
+                        spellcheck="false"
+                        role="combobox"
+                        aria-expanded={searchMenuOpen === "album"}
+                        aria-controls="lyrics-search-menu-album"
+                        onclick={() => toggleSearchMenu("album")}
+                      />
+                      {#if searchSuggestions.album.length > 0}
+                        <button
+                          type="button"
+                          class="lyrics-search-caret"
+                          tabindex="-1"
+                          aria-label="Album suggestions"
+                          disabled={lyricsBusy || lyricsLoading}
+                          onclick={(e) => {
+                            e.preventDefault();
+                            toggleSearchMenu("album");
+                          }}
+                        >
+                          ▾
+                        </button>
+                      {/if}
+                      {#if searchMenuOpen === "album" && searchSuggestions.album.length > 0}
+                        <div
+                          class="lyrics-search-menu"
+                          id="lyrics-search-menu-album"
+                          role="listbox"
+                        >
+                          {#each searchSuggestions.album as suggestion (suggestion)}
+                            <button
+                              type="button"
+                              class="lyrics-search-option"
+                              class:is-active={searchAlbum.trim() === suggestion}
+                              role="option"
+                              aria-selected={searchAlbum.trim() === suggestion}
+                              title={suggestion}
+                              onclick={() => pickSearchTerm("album", suggestion)}
+                            >
+                              {suggestion}
+                            </button>
+                          {/each}
+                        </div>
+                      {/if}
+                    </div>
+                  </div>
+                </div>
+                <div class="lyrics-search-actions">
+                  <button
+                    type="button"
+                    class="action-btn"
+                    disabled={!searchTermsEdited || lyricsBusy || lyricsLoading}
+                    onclick={resetSearchTerms}
+                  >
+                    Reset
+                  </button>
+                  <button
+                    type="button"
+                    class="action-btn action-btn-primary"
+                    disabled={lyricsBusy || lyricsLoading}
+                    onclick={() => void handleFindLyrics()}
+                  >
+                    {lyricsBusy ? "Searching…" : "Search"}
+                  </button>
+                </div>
+              </div>
+            {/if}
 
             <textarea
               class="lyrics-editor"

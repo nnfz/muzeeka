@@ -8,7 +8,7 @@ use lofty::file::{AudioFile, TaggedFile, TaggedFileExt};
 use lofty::picture::{MimeType, Picture, PictureType};
 use lofty::probe::Probe;
 use lofty::read_from_path;
-use lofty::tag::{Accessor, Tag, TagType};
+use lofty::tag::{Accessor, ItemKey, ItemValue, Tag, TagType};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -191,6 +191,83 @@ pub fn strip_redundant_artist_prefix(title: &str, artist: &str) -> Option<String
 
 fn non_empty(value: Option<String>) -> Option<String> {
     value.filter(|s| !s.is_empty())
+}
+
+/// Separator between multiple artists everywhere in the UI.
+///
+/// Deliberately a comma: this is the separator the app shows for artists, so the
+/// track list, transport and the properties tag table all read the same way.
+pub const ARTIST_SEPARATOR: &str = ", ";
+
+/// Split one tag field into the separate values a tagger packed into it.
+///
+/// Handles every shape seen in the wild: NUL (how ID3v2.4 packs multiple values into
+/// one frame), and literal `;` or `/` written by taggers that only support a single
+/// field.
+///
+/// A slash only separates when whitespace sits next to it (`"Sammy Virji / Skream"`).
+/// A bare slash is part of the name — `AC/DC`, `Above & Beyond`, `Hindi Zahra/2` —
+/// and splitting on it would invent artists that do not exist.
+pub fn split_tag_multi_values(text: &str) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::new();
+    for chunk in text.split(['\0', ';']) {
+        let mut rest = chunk;
+        loop {
+            // Find a slash that has whitespace on either side.
+            let cut = rest.char_indices().find(|(i, ch)| {
+                if *ch != '/' {
+                    return false;
+                }
+                let before_ws = rest[..*i].chars().next_back().is_some_and(char::is_whitespace);
+                let after_ws = rest[i + ch.len_utf8()..]
+                    .chars()
+                    .next()
+                    .is_some_and(char::is_whitespace);
+                before_ws || after_ws
+            });
+
+            match cut {
+                Some((i, ch)) => {
+                    out.push(&rest[..i]);
+                    rest = &rest[i + ch.len_utf8()..];
+                }
+                None => {
+                    out.push(rest);
+                    break;
+                }
+            }
+        }
+    }
+    out.into_iter().map(str::trim).filter(|s| !s.is_empty()).collect()
+}
+
+/// Collect every value stored under `key`, in tag order, as one display string.
+///
+/// A single `tag.artist()` only ever returns the *first* value, which silently
+/// drops collaborators: FLAC/Vorbis store multiple artists as repeated
+/// `ARTIST=` fields, and ID3v2.4 packs them into one frame separated by NUL.
+/// Both shapes are flattened here.
+pub fn joined_tag_values(tag: &Tag, key: ItemKey, separator: &str) -> Option<String> {
+    let mut out: Vec<String> = Vec::new();
+    for item in tag.items().filter(|item| item.key() == key) {
+        let text = match item.value() {
+            ItemValue::Text(s) | ItemValue::Locator(s) => s,
+            ItemValue::Binary(_) => continue,
+        };
+        for part in split_tag_multi_values(text) {
+            // Some taggers write both a repeated field and a combined one.
+            if out.iter().any(|seen| seen.eq_ignore_ascii_case(part)) {
+                continue;
+            }
+            out.push(part.to_string());
+        }
+    }
+
+    if out.is_empty() {
+        None
+    } else {
+        Some(out.join(separator))
+    }
 }
 
 fn filename_stem(path: &Path, fallback: &str) -> String {
@@ -1626,7 +1703,6 @@ pub fn read_audio_tech_info(path: &Path) -> AudioTechInfo {
         .primary_tag()
         .or_else(|| tagged_file.first_tag());
     if let Some(tag) = tag {
-        use lofty::tag::ItemKey;
         let tool = tag
             .get_string(ItemKey::EncoderSoftware)
             .or_else(|| tag.get_string(ItemKey::EncodedBy))
@@ -1713,7 +1789,10 @@ fn read_metadata_impl(path: &Path, file_name: &str, resolve_covers: bool) -> Tra
                     tag.title()
                         .map(|s| strip_ytdlp_id_suffix(&clean_tag_value(&s))),
                 );
-                meta.artist = non_empty(tag.artist().map(|s| clean_tag_value(&s)));
+                // Not `tag.artist()`: that returns only the first of several
+                // artists (repeated ARTIST= in FLAC, NUL-separated TPE1 in ID3v2.4).
+                meta.artist = joined_tag_values(tag, ItemKey::TrackArtist, ARTIST_SEPARATOR)
+                    .or_else(|| non_empty(tag.artist().map(|s| clean_tag_value(&s))));
                 meta.album = non_empty(tag.album().map(|s| clean_tag_value(&s)));
                 meta.genre = non_empty(tag.genre().map(|s| clean_tag_value(&s)));
                 meta.year = tag.date().map(|date| date.year as u32);
@@ -2242,6 +2321,7 @@ pub fn write_track_cover(path: &Path, data: &[u8], mime_hint: Option<&str>) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lofty::tag::TagItem;
     use std::io::Write;
 
     fn write_bytes(path: &Path, bytes: &[u8]) {
@@ -2292,6 +2372,88 @@ mod tests {
             strip_redundant_artist_prefix("The The - This Is The Day", "The The").as_deref(),
             Some("This Is The Day")
         );
+    }
+
+    fn artist_tag(tag_type: TagType, values: &[&str]) -> Tag {
+        let mut tag = Tag::new(tag_type);
+        for value in values {
+            tag.push(TagItem::new(
+                ItemKey::TrackArtist,
+                ItemValue::Text((*value).to_string()),
+            ));
+        }
+        tag
+    }
+
+    fn artists(tag: &Tag) -> Option<String> {
+        joined_tag_values(tag, ItemKey::TrackArtist, ARTIST_SEPARATOR)
+    }
+
+    #[test]
+    fn joined_tag_values_collects_every_artist() {
+        // FLAC/Vorbis shape: the same key repeated as separate items.
+        let flac = artist_tag(
+            TagType::VorbisComments,
+            &["Sammy Virji", "Interplanetary Criminal"],
+        );
+        assert_eq!(
+            artists(&flac).as_deref(),
+            Some("Sammy Virji, Interplanetary Criminal")
+        );
+
+        // ID3v2.4 shape: one item, values separated by NUL.
+        let id3 = artist_tag(TagType::Id3v2, &["Sammy Virji\0Skream"]);
+        assert_eq!(artists(&id3).as_deref(), Some("Sammy Virji, Skream"));
+
+        // A tagger that wrote one field with literal semicolons is re-split,
+        // so the app never shows a mix of `;` and `,`.
+        let semis = artist_tag(TagType::Id3v2, &["Sammy Virji; Skream;Hamdi"]);
+        assert_eq!(
+            artists(&semis).as_deref(),
+            Some("Sammy Virji, Skream, Hamdi")
+        );
+
+        // Duplicates (repeated field + combined field) collapse.
+        let dupes = artist_tag(TagType::VorbisComments, &["Sammy Virji", "sammy virji"]);
+        assert_eq!(artists(&dupes).as_deref(), Some("Sammy Virji"));
+
+        // A single artist is untouched — no trailing separator.
+        let solo = artist_tag(TagType::VorbisComments, &["Sammy Virji"]);
+        assert_eq!(artists(&solo).as_deref(), Some("Sammy Virji"));
+
+        // No artist at all stays None so the caller can fall back.
+        let empty = Tag::new(TagType::VorbisComments);
+        assert_eq!(artists(&empty), None);
+    }
+
+    #[test]
+    fn slash_separates_only_when_spaced() {
+        // ` / ` is a separator — some taggers use it instead of `;`.
+        let spaced = artist_tag(TagType::Id3v2, &["Sammy Virji / Skream"]);
+        assert_eq!(artists(&spaced).as_deref(), Some("Sammy Virji, Skream"));
+
+        // Whitespace on one side is enough (`A/ B`, `A /B`).
+        let half = artist_tag(TagType::Id3v2, &["Hamdi/ Skream"]);
+        assert_eq!(artists(&half).as_deref(), Some("Hamdi, Skream"));
+
+        // A bare slash belongs to the name and must survive intact.
+        let band = artist_tag(TagType::Id3v2, &["AC/DC"]);
+        assert_eq!(artists(&band).as_deref(), Some("AC/DC"));
+
+        // Mixed: one real separator, one part of a name.
+        let mixed = artist_tag(TagType::Id3v2, &["AC/DC / Sammy Virji"]);
+        assert_eq!(artists(&mixed).as_deref(), Some("AC/DC, Sammy Virji"));
+    }
+
+    #[test]
+    fn split_tag_multi_values_handles_every_shape() {
+        assert_eq!(split_tag_multi_values("A\0B"), vec!["A", "B"]);
+        assert_eq!(split_tag_multi_values("A; B"), vec!["A", "B"]);
+        assert_eq!(split_tag_multi_values(" A / B "), vec!["A", "B"]);
+        assert_eq!(split_tag_multi_values("AC/DC"), vec!["AC/DC"]);
+        assert!(split_tag_multi_values("  ").is_empty());
+        // A trailing separator must not produce an empty artist.
+        assert_eq!(split_tag_multi_values("A / "), vec!["A"]);
     }
 
     #[test]

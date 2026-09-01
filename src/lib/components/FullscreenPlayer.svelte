@@ -9,7 +9,8 @@
   import { COVER_PLACEHOLDER_SRC } from "$lib/coverPlaceholder";
   import {
     getPlayerStore,
-    trackDisplayArtist,
+    lyricsCacheParams,
+    sameTrackPath,
     trackDisplayTitle,
     type MusicFile,
   } from "$lib/stores/player.svelte";
@@ -133,21 +134,12 @@
   /** When layout was closed for a track switch (0 = no pending close wait). */
   let layoutClosedAt = 0;
 
-  function lyricsParamsForTrack(
-    track: MusicFile | null | undefined,
-    durationFallback?: number | null,
-  ) {
+  function lyricsParamsForTrack(track: MusicFile | null | undefined) {
     if (!track) return null;
-    return {
-      title: trackDisplayTitle(track),
-      artist: trackDisplayArtist(track),
-      album: track.album,
-      durationSecs:
-        track.duration_secs ??
-        (durationFallback != null && durationFallback > 0
-          ? durationFallback
-          : null),
-    };
+    // Shared builder — the properties window uses the same one. Do not inline a
+    // variant here: any difference changes the Rust cache key and the text
+    // found in properties stops resolving to a hit.
+    return lyricsCacheParams(track);
   }
 
   function clearLyricsReopenTimer() {
@@ -568,10 +560,17 @@
       const current = untrack(() => player.currentFile);
       if (changedPath) {
         invalidateLyricsCache(changedPath);
+        // The Map is keyed by the exact string the player stored, so drop that one
+        // too when it points at the same track under a different spelling.
+        if (current && current !== changedPath && sameTrackPath(changedPath, current)) {
+          invalidateLyricsCache(current);
+        }
       } else {
         invalidateLyricsCache();
       }
-      if (!changedPath || !current || changedPath === current) {
+      // sameTrackPath, not `===`: the properties window may hold a path that differs
+      // only in casing, slashes or a `\\?\` prefix, and CUE rows carry `#cue:N`.
+      if (!changedPath || !current || sameTrackPath(changedPath, current)) {
         lyricsSettledForFile = null;
         lyricsState = null;
       }
@@ -628,9 +627,7 @@
         return;
       }
 
-      const params = untrack(() =>
-        lyricsParamsForTrack(player.currentTrack, player.duration),
-      );
+      const params = untrack(() => lyricsParamsForTrack(player.currentTrack));
       if (!params) {
         retryTimer = setTimeout(run, 80);
         return;

@@ -1,11 +1,11 @@
-//! Micspam — дублирует выход плеера в виртуальный аудиокабель.
+//! Micspam — duplicates the player output into a virtual audio cable.
 //!
-//! Что делает: находит среди выходов устройство по имени (`device_match`), цепляет к нему
-//! параллельный вывод плеера и следит, чтобы вывод не отвалился. В Discord/игре микрофоном
-//! ставится парный вход кабеля (`CABLE Output`).
+//! What it does: finds an output device by name (`device_match`), attaches a parallel
+//! player output to it and keeps that output alive. In Discord or a game you then pick the
+//! cable's paired input (`CABLE Output`) as your microphone.
 //!
-//! Драйвер кабеля — kernel-mode, из плагина его не создать: VB-CABLE ставится один раз
-//! вручную. Если устройства нет, плагин просто пишет об этом в лог и ждёт.
+//! The cable driver is kernel-mode and cannot be created from a plugin: VB-CABLE is
+//! installed once by hand. If the device is missing, the plugin just logs that and waits.
 
 #[path = "../../sdk/muzeeka_plugin.rs"]
 mod muzeeka_plugin;
@@ -40,7 +40,7 @@ pub extern "C" fn muzeeka_plugin_start(host: *const MuzeekaHost) -> c_int {
     {
         Ok(h) => h,
         Err(err) => {
-            log(&host, "error", &format!("не удалось создать поток: {err}"));
+            log(&host, "error", &format!("could not spawn thread: {err}"));
             return 1;
         }
     };
@@ -51,21 +51,21 @@ pub extern "C" fn muzeeka_plugin_start(host: *const MuzeekaHost) -> c_int {
 #[no_mangle]
 pub extern "C" fn muzeeka_plugin_stop() {
     STOP.store(true, Ordering::SeqCst);
-    // Воркер сам снимает вывод перед выходом, поэтому join обязателен до возврата:
-    // после stop() указатель host больше не валиден.
+    // The worker removes the output itself before exiting, so joining before we return is
+    // mandatory: once stop() returns, the host pointer is no longer valid.
     if let Some(handle) = WORKER.lock().unwrap_or_else(|e| e.into_inner()).take() {
         let _ = handle.join();
     }
 }
 
-/// Состояние воркера между итерациями опроса.
+/// Worker state carried between poll iterations.
 struct State {
-    /// id активного дополнительного вывода (`out-N`), пока он подключён.
+    /// Id of the active extra output (`out-N`) while it is attached.
     output_id: Option<String>,
-    /// Последнее сообщение об ошибке — чтобы не засорять лог каждые две секунды.
+    /// Last error message, so the log is not flooded every couple of seconds.
     last_error: Option<String>,
-    /// Громкость, которую хост уже принял. Нужна, чтобы не дёргать setOutputVolume
-    /// на каждой итерации опроса.
+    /// Volume the host has already accepted. Keeps us from calling setOutputVolume on
+    /// every poll iteration.
     applied_volume: Option<f32>,
 }
 
@@ -76,7 +76,7 @@ fn worker(host: MuzeekaHost) {
         applied_volume: None,
     };
 
-    log(&host, "info", "micspam запущен");
+    log(&host, "info", "micspam started");
 
     while !STOP.load(Ordering::SeqCst) {
         let cfg = settings(&host);
@@ -85,13 +85,13 @@ fn worker(host: MuzeekaHost) {
     }
 
     detach(&host, &mut state);
-    log(&host, "info", "micspam остановлен");
+    log(&host, "info", "micspam stopped");
 }
 
 struct Config {
     device_match: String,
     poll_ms: u64,
-    /// Громкость только для кабеля, 0.0–1.0. В ушах ничего не меняется.
+    /// Cable-only volume, 0.0–1.0. Nothing changes in the headphones.
     volume: f32,
 }
 
@@ -112,7 +112,7 @@ fn settings(host: &MuzeekaHost) -> Config {
             .and_then(|x| x.as_u64())
             .unwrap_or(2000)
             .clamp(500, 10_000),
-        // Настройка в процентах — так ползунок в UI понятнее, чем 0.0–1.0.
+        // The setting is in whole percent: a nicer slider in the UI than 0.0–1.0.
         volume: (v
             .get("volume_percent")
             .and_then(|x| x.as_f64())
@@ -122,10 +122,10 @@ fn settings(host: &MuzeekaHost) -> Config {
     }
 }
 
-/// Одна итерация: убедиться, что кабель на месте и вывод к нему подключён.
+/// One iteration: make sure the cable is there and our output is attached to it.
 fn tick(host: &MuzeekaHost, state: &mut State, cfg: &Config) {
-    // Вывод уже подключён — проверяем, что хост о нём всё ещё знает. Перезапуск BASS
-    // (смена устройства, Ctrl+R) может его снять; тогда цепляем заново.
+    // Output already attached — check the host still knows about it. A BASS restart
+    // (device switch, Ctrl+R) can drop it; if so, attach again.
     if let Some(id) = state.output_id.clone() {
         match host.call("audio.outputs", "{}") {
             Ok(list) => {
@@ -142,7 +142,7 @@ fn tick(host: &MuzeekaHost, state: &mut State, cfg: &Config) {
                 }
                 state.output_id = None;
                 state.applied_volume = None;
-                log(host, "info", "вывод отвалился, подключаю заново");
+                log(host, "info", "output was dropped, reattaching");
             }
             Err(err) => {
                 report(host, state, &format!("audio.outputs: {err}"));
@@ -164,15 +164,15 @@ fn tick(host: &MuzeekaHost, state: &mut State, cfg: &Config) {
             host,
             state,
             &format!(
-                "устройство с именем «{}» не найдено. Установи VB-CABLE и выбери его вход в настройках плагина.",
+                "no device named '{}' found. Install VB-CABLE and pick its input in the plugin settings.",
                 cfg.device_match
             ),
         );
         return;
     };
 
-    // Громкость передаём сразу при подключении: хост выставит её до channel_play,
-    // чтобы кабель не выстрелил на полной громкости в первые миллисекунды.
+    // Pass the volume along with the attach: the host applies it before channel_play so
+    // the cable does not blast at full volume for the first few milliseconds.
     let payload =
         serde_json::json!({ "deviceId": device.0, "volume": cfg.volume }).to_string();
     match host.call("audio.addOutput", &payload) {
@@ -183,7 +183,7 @@ fn tick(host: &MuzeekaHost, state: &mut State, cfg: &Config) {
                 .unwrap_or_default()
                 .to_string();
             if id.is_empty() {
-                report(host, state, "addOutput вернул пустой id");
+                report(host, state, "addOutput returned an empty id");
                 return;
             }
             state.output_id = Some(id);
@@ -193,21 +193,21 @@ fn tick(host: &MuzeekaHost, state: &mut State, cfg: &Config) {
                 host,
                 "info",
                 &format!(
-                    "музыка идёт в «{}» на {}% — ставь парный вход микрофоном",
+                    "music is going to '{}' at {}% — set its paired input as your microphone",
                     device.1,
                     (cfg.volume * 100.0).round()
                 ),
             );
         }
-        Err(err) => report(host, state, &format!("addOutput «{}»: {err}", device.1)),
+        Err(err) => report(host, state, &format!("addOutput '{}': {err}", device.1)),
     }
 }
 
-/// Двигает громкость кабеля, если ползунок изменился. Основной выход не трогается —
-/// у него своя громкость на мижере.
+/// Moves the cable volume when the slider changed. The main output is untouched — it has
+/// its own volume on the mixer.
 fn apply_volume(host: &MuzeekaHost, state: &mut State, output_id: &str, volume: f32) {
-    // Настройка приходит из UI в целых процентах, так что сравнение на равенство
-    // здесь устойчиво: дробных дребезжаний быть не может.
+    // The setting arrives from the UI in whole percent, so comparing for equality is safe
+    // here: there is no float jitter to worry about.
     if state.applied_volume == Some(volume) {
         return;
     }
@@ -219,7 +219,7 @@ fn apply_volume(host: &MuzeekaHost, state: &mut State, output_id: &str, volume: 
             log(
                 host,
                 "info",
-                &format!("громкость микспама: {}%", (volume * 100.0).round()),
+                &format!("micspam volume: {}%", (volume * 100.0).round()),
             );
         }
         Err(err) => report(host, state, &format!("setOutputVolume: {err}")),
@@ -236,8 +236,8 @@ fn detach(host: &MuzeekaHost, state: &mut State) {
     }
 }
 
-/// Ищет включённое устройство, чьё имя содержит `needle` (без учёта регистра).
-/// Возвращает `(deviceId, name)`.
+/// Finds an enabled device whose name contains `needle` (case-insensitive).
+/// Returns `(deviceId, name)`.
 fn find_device(devices: &serde_json::Value, needle: &str) -> Option<(i64, String)> {
     let needle = needle.to_lowercase();
     devices.as_array()?.iter().find_map(|d| {
@@ -256,9 +256,9 @@ fn find_device(devices: &serde_json::Value, needle: &str) -> Option<(i64, String
     })
 }
 
-// ── Логирование ─────────────────────────────────────────────────────────────
+// ── Logging ─────────────────────────────────────────────────────────────────
 
-/// Пишет ошибку один раз, пока текст не изменится: опрос идёт каждые пару секунд.
+/// Logs an error once until its text changes: we poll every couple of seconds.
 fn report(host: &MuzeekaHost, state: &mut State, msg: &str) {
     if state.last_error.as_deref() == Some(msg) {
         return;

@@ -1,37 +1,38 @@
-//! Отвод звука мижера на второе устройство.
+//! Tapping the mixer output onto a second device.
 //!
-//! `BASS_Split_StreamCreate` здесь неприменим: сплиттер требует decode-источник, а мижер
-//! в плеере играющий (`create_mixer` не ставит `BASS_STREAM_DECODE` и сразу зовёт
-//! `channel_play`), поэтому сплит падал с ошибкой 38 «the channel is a decoding channel».
+//! `BASS_Split_StreamCreate` is not usable here: a splitter needs a decode source, but the
+//! player's mixer is a playing channel (`create_mixer` does not set `BASS_STREAM_DECODE`
+//! and calls `channel_play` right away), so the split failed with error 38 "the channel is
+//! a decoding channel".
 //!
-//! Вместо этого на мижер вешается DSP, который копирует сэмплы в push-поток, созданный на
-//! целевом устройстве. Буфер мижера при этом не изменяется, так что основной выход не
-//! затрагивается вообще.
+//! Instead a DSP is attached to the mixer, copying samples into a push stream created on
+//! the target device. The mixer buffer itself is left untouched, so the main output is not
+//! affected at all.
 
 use crate::bass::ffi::DataPump;
 use crate::bass::{self, BassLibrary};
 
-/// Отвод стоит последним в цепочке DSP: в войс уходит то же, что и в уши, — уже с рэком,
-/// эквалайзером и лимитером. `BASS_DSP_PRIORITY_FIRST` — это наибольший приоритет,
-/// то есть «первым»; нам нужен противоположный конец шкалы.
+/// The tap sits last in the DSP chain, so the copy leaves after the rack, the equalizer
+/// and the limiter — voice gets exactly what the headphones get. `BASS_DSP_PRIORITY_FIRST`
+/// is the highest priority, i.e. "first"; we want the opposite end of the scale.
 const TAP_DSP_PRIORITY: i32 = -1_000_000;
 
-/// Максимум неразобранного звука в push-потоке (44100 × 2ch × f32 ≈ 0.5 c).
-/// Если устройство отстаёт, лишнее выбрасывается — иначе задержка растёт бесконечно.
+/// Cap on unconsumed audio in the push stream (44100 × 2ch × f32 ≈ 0.5 s).
+/// If the device falls behind, the excess is dropped — otherwise latency grows forever.
 const MAX_BUFFERED_BYTES: u32 = 176_400;
 
-/// Живёт в `ExtraOutput`, указатель на неё передан в DSP как `user`.
-/// Снимать DSP нужно до дропа этой структуры.
+/// Lives in `ExtraOutput`; a pointer to it is handed to the DSP as `user`.
+/// The DSP must be removed before this struct is dropped.
 pub struct OutputTapCtx {
     pump: DataPump,
     push_handle: u32,
 }
 
-/// Копирует буфер мижера в push-поток. Сам буфер не трогает.
+/// Copies the mixer buffer into the push stream. Does not modify the buffer.
 ///
-/// Данные всегда float: мижер создан с `BASS_SAMPLE_FLOAT`, и `BASS_CONFIG_FLOATDSP`
-/// включён до `BASS_Init`, так что формат буфера совпадает с форматом push-потока
-/// независимо от того, прошёл ли `channel_set_dsp_ex` или сработал фолбэк.
+/// The data is always float: the mixer is created with `BASS_SAMPLE_FLOAT` and
+/// `BASS_CONFIG_FLOATDSP` is enabled before `BASS_Init`, so the buffer format matches the
+/// push stream format whether `channel_set_dsp_ex` succeeded or the fallback kicked in.
 unsafe extern "system" fn tap_dsp_callback(
     _handle: bass::DWORD,
     _channel: bass::DWORD,
@@ -46,7 +47,7 @@ unsafe extern "system" fn tap_dsp_callback(
     if ctx.push_handle == 0 {
         return;
     }
-    // Устройство не успевает — пропускаем порцию, чтобы не копить задержку.
+    // The device is not keeping up — skip this chunk instead of accumulating latency.
     if ctx.pump.queued(ctx.push_handle) > MAX_BUFFERED_BYTES {
         return;
     }
@@ -57,13 +58,13 @@ unsafe extern "system" fn tap_dsp_callback(
 pub struct OutputTap {
     pub push_handle: u32,
     pub dsp: u32,
-    /// Держится живым ради указателя, который лежит в DSP. Порядок дропа важен:
-    /// сначала снять DSP, потом отпустить контекст.
+    /// Kept alive for the pointer held by the DSP. Drop order matters: remove the DSP
+    /// first, then release the context.
     _ctx: Box<OutputTapCtx>,
 }
 
-/// Поднимает push-поток на `device` и цепляет к `mixer` копирующий DSP.
-/// `volume` (0.0–1.0) применяется к push-потоку, то есть только к этому устройству.
+/// Creates a push stream on `device` and attaches the copying DSP to `mixer`.
+/// `volume` (0.0–1.0) applies to the push stream, i.e. to this device only.
 pub fn attach(
     bass: &BassLibrary,
     mixer: u32,
@@ -74,14 +75,14 @@ pub fn attach(
         return Err("mixer is not running".into());
     }
 
-    // Push-поток принадлежит устройству, активному на момент создания, поэтому
-    // переключаемся, создаём и возвращаем устройство назад.
+    // A push stream belongs to whichever device is current when it is created, so switch
+    // over, create it, and switch back.
     let previous = bass.get_device();
     bass.set_device(device)?;
     let created = bass
         .stream_create_push(44100, 2, bass::BASS_SAMPLE_FLOAT)
         .and_then(|handle| {
-            // Громкость до play, иначе первые миллисекунды уйдут на полной.
+            // Volume before play, otherwise the first milliseconds go out at full level.
             bass.channel_set_attribute(handle, bass::BASS_ATTRIB_VOL, volume)
                 .and_then(|()| bass.channel_play(handle, false))
                 .map(|()| handle)
@@ -123,10 +124,10 @@ pub fn attach(
     }
 }
 
-/// Снимает DSP и освобождает push-поток. DSP убирается первым: после этого колбэк уже не
-/// может обратиться к освобождённому хэндлу и к контексту.
+/// Removes the DSP and frees the push stream. The DSP goes first: after that the callback
+/// can no longer touch the freed handle or the context.
 ///
-/// `mixer` можно передать 0, если мижер уже освобождён — DSP умер вместе с ним.
+/// Pass `mixer` as 0 if the mixer is already gone — the DSP died with it.
 pub fn detach(bass: &BassLibrary, mixer: u32, tap: OutputTap) {
     if mixer != 0 && tap.dsp != 0 {
         let _ = bass.channel_remove_dsp(mixer, tap.dsp);

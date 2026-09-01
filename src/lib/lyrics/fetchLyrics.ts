@@ -12,6 +12,13 @@ export interface FetchLyricsParams {
   artist: string;
   album?: string | null;
   durationSecs?: number | null;
+  /**
+   * Track path, so Rust can fall back to lyrics embedded in the file's own tags when
+   * no provider has anything. Not part of the cache key — purely a fallback source.
+   */
+  trackPath?: string | null;
+  /** CUE virtual tracks read tags from the container image. */
+  audioPath?: string | null;
 }
 
 function buildLyricsUrl(params: FetchLyricsParams, durationSecs: number | null): string {
@@ -68,6 +75,8 @@ async function fetchTtml(params: FetchLyricsParams, durationSecs: number | null)
       artist: params.artist.trim(),
       album: params.album?.trim() || null,
       durationSecs,
+      trackPath: params.trackPath?.trim() || null,
+      audioPath: params.audioPath?.trim() || null,
     });
     return ttml?.trim() ? ttml : null;
   } catch (rustError) {

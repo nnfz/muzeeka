@@ -3,7 +3,7 @@
   "name": "Micspam",
   "version": "0.1.0",
   "author": "nnfz",
-  "description": "Дублирует выход плеера в виртуальный аудиокабель, чтобы Discord и игры видели музыку как микрофон. Держит подключение живым сам.",
+  "description": "Duplicates the player output into a virtual audio cable so Discord and games see the music as a microphone. Keeps the connection alive on its own.",
   "main": "micspam.dll",
   "runtime": "native",
   "enabled_by_default": false,
@@ -12,15 +12,15 @@
     {
       "key": "device_match",
       "type": "string",
-      "label": "Имя устройства",
-      "description": "Подстрока имени выхода-кабеля. VB-CABLE — 'CABLE Input', VoiceMeeter — 'VoiceMeeter Input'.",
+      "label": "Device name",
+      "description": "Substring of the cable output name. VB-CABLE: 'CABLE Input'. VoiceMeeter: 'VoiceMeeter Input'.",
       "default": "CABLE Input"
     },
     {
       "key": "volume_percent",
       "type": "number",
-      "label": "Громкость в войс (%)",
-      "description": "Только для кабеля. Громкость в твоих ушах не меняется.",
+      "label": "Voice volume (%)",
+      "description": "Cable only. Does not change what you hear in your headphones.",
       "min": 0,
       "max": 100,
       "default": 70
@@ -28,8 +28,8 @@
     {
       "key": "poll_ms",
       "type": "number",
-      "label": "Интервал проверки (мс)",
-      "description": "Как часто убеждаться, что кабель ещё подключён",
+      "label": "Check interval (ms)",
+      "description": "How often to make sure the cable is still attached",
       "min": 500,
       "max": 10000,
       "default": 2000

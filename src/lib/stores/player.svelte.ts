@@ -1,8 +1,9 @@
 import { clearCoverSrcCache, prefetchCoverPaths } from '$lib/coverCache';
+import { invalidateLyricsCache } from '$lib/lyrics/lyricsCache';
 import { collectPlaylistCoverPaths } from '$lib/playlistCover';
 import { setupTaskbar } from '$lib/taskbar';
 import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
+import { emit, listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import {
   notifyTrackPropertiesCloseAll,
@@ -606,6 +607,48 @@ export function trackDisplayArtist(track: MusicFile): string {
 }
 
 /**
+ * First artist only, for lookups that break on a full collaborator list.
+ *
+ * `artist` may hold several names (`"Sammy Virji, Interplanetary Criminal"` —
+ * see ARTIST_SEPARATOR on the Rust side). Lyrics providers index tracks under
+ * the lead artist, so sending the whole list returns nothing.
+ */
+export function trackPrimaryArtist(track: MusicFile): string {
+  const first = trackDisplayArtist(track).split(',')[0]?.trim();
+  return first || 'Unknown Artist';
+}
+
+/**
+ * Canonical lyrics lookup params for a track — the ONE place that builds them.
+ *
+ * The Rust side hashes `title\0artist\0album\0duration` into the on-disk cache key
+ * (`lyrics.rs::cache_key`), so every window must derive these four values
+ * identically. When they diverge, lyrics found in the properties window land under
+ * one key while the fullscreen player reads another and gets the stale `miss`.
+ *
+ * Duration comes from the library row only — never from live playback position.
+ * A live value drifts by fractions of a second and is absent until decode starts,
+ * which is exactly how the two windows fell out of sync. CUE rows already carry
+ * their segment length in `duration_secs`.
+ */
+export function lyricsCacheParams(track: MusicFile) {
+  return {
+    title: trackDisplayTitle(track),
+    // Lead artist only: providers index by it, a full collaborator list misses.
+    artist: trackPrimaryArtist(track),
+    album: track.album?.trim() || null,
+    durationSecs:
+      track.duration_secs != null && track.duration_secs > 0
+        ? Math.round(track.duration_secs)
+        : null,
+    // Below are NOT part of the cache key — they only let Rust fall back to lyrics
+    // embedded in the file's own tags when no provider has anything.
+    trackPath: track.path,
+    audioPath: track.audio_path ?? null,
+  };
+}
+
+/**
  * Split an ICY `StreamTitle` like `SCOOTER - Fire (DONS rmx) [1997]` into
  * artist + title. First ` - ` / en-dash / em-dash with spaces is the cut;
  * no separator → the whole string is the title.
@@ -774,6 +817,43 @@ function mergeMetadataIntoPlaylists(enriched: MusicFile[]) {
     .map((track) => libraryTracks.find((item) => pathKey(item.path) === pathKey(track.path)))
     .filter((track): track is MusicFile => !!track);
   persistMutation('library_tracks_upsert', { tracks: updated });
+}
+
+/**
+ * Re-read tags from disk for every known track, ignoring `needsMetadata`.
+ *
+ * `enrichTrackMetadata` skips any row that already has a duration and a live cover
+ * — which is nearly every row — so a change in how Rust parses tags (a new
+ * multi-artist separator, say) never reaches rows imported before the change.
+ * Re-adding the folder does not help either: the directory walk is path-only by
+ * design and hands tag reading to this enrich pass, which then filters them out.
+ *
+ * Returns how many rows were refreshed. `mergeMetadataIntoPlaylists` persists them.
+ */
+async function rescanTags(): Promise<number> {
+  const paths = [
+    ...new Set([...libraryTracks, ...playlists.flatMap((p) => p.tracks)].map((t) => t.path)),
+  ];
+  if (paths.length === 0) return 0;
+
+  let refreshed = 0;
+  const CHUNK = 50;
+  for (let i = 0; i < paths.length; i += CHUNK) {
+    try {
+      const enriched = await invoke<MusicFile[]>('library_fetch_metadata', {
+        paths: paths.slice(i, i + CHUNK),
+      });
+      mergeMetadataIntoPlaylists(enriched);
+      refreshed += enriched.length;
+    } catch (e) {
+      console.error('Failed to rescan tags:', e);
+    }
+    // Chunked with a yield so a large library does not freeze the UI.
+    await yieldToUI();
+  }
+  // Let the queued upserts land before the caller reports success.
+  await persistenceChain;
+  return refreshed;
 }
 
 let enrichRunning = false;
@@ -3390,6 +3470,32 @@ function setupListeners() {
     void refreshCoversAfterRebuild();
   });
 
+  // Lyrics cache invalidation lives HERE, not only in FullscreenPlayer: that component
+  // is mounted only while fullscreen is open (`{#if fullscreenOpen}` in TransportBar),
+  // so lyrics found from the track list with fullscreen closed had no listener at all.
+  // The `byPath` Map in lyricsCache.ts is module state and outlives the component, so it
+  // kept serving the earlier settled `null` and no network call ever happened — the text
+  // only appeared after Ctrl+R re-created the module. FullscreenPlayer keeps its own
+  // listener for resetting on-screen state; invalidating twice is harmless.
+  for (const eventName of ['lyrics:imported', 'lyrics:cleared', 'lyrics:refetched'] as const) {
+    listen<string>(eventName, () => {
+      // Clear everything rather than one path: the cache is keyed by the exact string a
+      // window stored, which may differ in casing/slashes, and it holds at most 24
+      // entries backed by the on-disk cache — dropping them all is cheap.
+      invalidateLyricsCache();
+    });
+  }
+
+  // Settings is a separate window with its own store instance, so it cannot call
+  // `rescanTags` directly — it asks here, where the library rows actually live,
+  // and gets the count back on `library:tags-rescanned`.
+  listen('library:rescan-tags', () => {
+    void rescanTags().then(
+      (refreshed) => emit('library:tags-rescanned', { refreshed }),
+      (error) => emit('library:tags-rescanned', { error: String(error) }),
+    );
+  });
+
   listen<MusicFile>('track:metadata-updated', (event) => {
     const updated = event.payload;
     if (!updated?.path) return;
@@ -3640,6 +3746,7 @@ export function createPlayerStore() {
     isLiked,
     setViewPlayOrder,
     getUpcomingTracks,
+    rescanTags,
     init,
     ensureInit,
   };

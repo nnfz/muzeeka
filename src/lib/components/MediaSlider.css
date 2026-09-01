@@ -63,7 +63,7 @@
 
 .slider-time {
   font-size: 10px;
-  font-weight: 300;
+  font-weight: 400;
   color: var(--text-secondary);
   font-variant-numeric: tabular-nums;
   flex-shrink: 0;
@@ -250,15 +250,14 @@
 
 .slider-time.live-badge {
   color: var(--accent);
-  font-weight: 600;
   letter-spacing: 0.06em;
 }
 
 .slider-time.live-badge::before {
   content: "";
   display: inline-block;
-  width: 7px;
-  height: 7px;
+  width: 8px;
+  height: 8px;
   margin-right: 5px;
   border-radius: 50%;
   background: var(--accent);

@@ -115,7 +115,7 @@ pub struct TrackMetadataUpdateResult {
 
 /// Resolve the real audio file that should receive embedded tags.
 /// CUE virtual paths (`image.flac#cue:3`) map to the container audio image.
-fn tag_write_path(track_path: &str, audio_path_hint: Option<&str>) -> Result<std::path::PathBuf, String> {
+pub(crate) fn tag_write_path(track_path: &str, audio_path_hint: Option<&str>) -> Result<std::path::PathBuf, String> {
     if crate::cue::is_cue_track_path(track_path) {
         let audio = audio_path_hint
             .map(str::trim)

@@ -3,7 +3,9 @@
 // Each `#[tauri::command]` becomes callable from JS via `invoke("command_name", { args })`.
 
 mod dev;
-mod library;
+// `pub(crate)` so sibling command modules can reuse helpers like `tag_write_path`
+// instead of duplicating CUE/stream path resolution.
+pub(crate) mod library;
 mod lyrics;
 mod notify;
 mod player;

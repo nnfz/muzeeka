@@ -67,7 +67,14 @@
   let fillWordEl: HTMLElement | null = null;
   let fillWordId = '';
 
-  let activeLineIndex = $derived(findDisplayActiveLineIndex(lines, currentTime));
+  /**
+   * -1 when nothing is timed: with no usable timings every line would resolve to the
+   * same index and the rest would render as past (blurred + dimmed). A truly unsynced
+   * document should just show as flat, readable text.
+   */
+  let activeLineIndex = $derived(
+    syncType === 'none' ? -1 : findDisplayActiveLineIndex(lines, currentTime),
+  );
 
   function easeScroll(t: number): number {
     const u = 1 - t;
@@ -258,6 +265,8 @@
   }
 
   function seekToLine(line: LyricLine) {
+    // Untimed lines all sit at 0 — clicking one would rewind the track to the start.
+    if (syncType === 'none') return;
     onSeek?.(lineStartSec(line));
   }
 

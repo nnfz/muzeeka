@@ -233,6 +233,36 @@ function finalizeDurations(lines: LyricLine[], songDurationMs: number) {
   }
 }
 
+/**
+ * Pace an unsynced document evenly from the start of the track to its end.
+ *
+ * Plain text arrives as one `<p begin="0.0s" end="36000.0s">` per line (see
+ * `lyrics.rs::plain_text_to_ttml`), so every line claims the same start. That breaks
+ * the viewer: `lineEndSec` takes the next line's start as this line's end, so every
+ * line ends at 0 and only the last one is ever "active" — the rest render as past
+ * (blurred and dimmed). Giving each line an equal slice makes the text advance at a
+ * constant rate instead, which is all an unsynced document can honestly claim.
+ *
+ * Done here rather than in the Rust writer so already-cached plain TTML is fixed too.
+ */
+function spreadUnsyncedLines(lines: LyricLine[], songDurationMs: number) {
+  if (lines.length === 0) return;
+  // A real synced document has at least one line starting past zero.
+  if (!lines.every((line) => line.startTimeMs === 0)) return;
+  // Unknown duration (fetchLyrics floors it at 1ms) — leave it unsynced.
+  if (songDurationMs < lines.length) return;
+
+  const step = songDurationMs / lines.length;
+  for (let i = 0; i < lines.length; i++) {
+    const start = Math.round(i * step);
+    // End exactly where the next line starts: no gaps, so instrumental breaks
+    // are not invented between every line.
+    const end = i === lines.length - 1 ? songDurationMs : Math.round((i + 1) * step);
+    lines[i].startTimeMs = start;
+    lines[i].durationMs = Math.max(end - start, 0);
+  }
+}
+
 function insertInstrumentalBreaks(lines: LyricLine[], songDurationMs: number): LyricLine[] {
   if (lines.length === 0) return lines;
 
@@ -300,7 +330,11 @@ export function parseTtml(ttml: string, songDurationMs: number): LyricLine[] {
     });
   }
 
+  // Stable sort keeps plain-text line order intact (every `begin` is 0 there).
   lines.sort((a, b) => a.startTimeMs - b.startTimeMs);
+  // Before finalizeDurations: it derives each duration from the next line's start,
+  // which is only meaningful once the unsynced lines have distinct starts.
+  spreadUnsyncedLines(lines, songDurationMs);
   finalizeDurations(lines, songDurationMs);
 
   const lang =

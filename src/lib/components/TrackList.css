@@ -197,7 +197,6 @@
 
 .track-row.selected {
   background: color-mix(in srgb, var(--accent) 10%, transparent);
-  box-shadow: inset 2px 0 0 var(--accent);
 }
 
 .track-row.selected:hover {

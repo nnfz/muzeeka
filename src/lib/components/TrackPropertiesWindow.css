@@ -465,6 +465,172 @@
   min-width: 8px;
 }
 
+/* Toggle button reads as "on" while the search-terms panel is open or edited. */
+.action-btn-active {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-color: transparent;
+}
+
+/* --- Lyrics search term overrides --- */
+.lyrics-search-terms {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px 12px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+}
+
+.lyrics-search-hint {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.lyrics-search-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 8px;
+}
+
+.lyrics-search-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.lyrics-search-field > label {
+  font-size: 11px;
+  color: var(--text-muted, #7e7e7e);
+}
+
+/* Descendant, not child: the input sits inside .lyrics-search-input-wrap so the
+   suggestion menu can be positioned against it. */
+.lyrics-search-field input {
+  width: 100%;
+  height: 30px;
+  padding: 0 10px;
+  font-size: 12px;
+  font-family: var(--font-family);
+  color: var(--text-primary, #f0f0f5);
+  -webkit-text-fill-color: var(--text-primary, #f0f0f5);
+  caret-color: var(--text-primary, #f0f0f5);
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  outline: none;
+  transition: border-color var(--transition-fast);
+  box-sizing: border-box;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.lyrics-search-field input:focus {
+  border-color: var(--border-accent);
+}
+
+.lyrics-search-field input:disabled {
+  opacity: 0.55;
+}
+
+.lyrics-search-field input::placeholder {
+  color: var(--text-muted, #7e7e7e);
+  -webkit-text-fill-color: var(--text-muted, #7e7e7e);
+  opacity: 1;
+}
+
+.lyrics-search-input-wrap {
+  position: relative;
+  min-width: 0;
+}
+
+/* Room for the caret so long text never runs under it. */
+.lyrics-search-input-wrap > input {
+  padding-right: 26px;
+}
+
+.lyrics-search-caret {
+  position: absolute;
+  top: 0;
+  right: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 30px;
+  font-size: 10px;
+  line-height: 1;
+  color: var(--text-muted, #7e7e7e);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  transition: color var(--transition-fast);
+}
+
+.lyrics-search-caret:hover:not(:disabled) {
+  color: var(--text-primary, #f0f0f5);
+}
+
+.lyrics-search-caret:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.lyrics-search-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  z-index: 200;
+  max-height: 200px;
+  overflow-y: auto;
+  padding: 4px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-glass-hover-transp);
+  backdrop-filter: blur(16px) saturate(130%);
+  -webkit-backdrop-filter: blur(16px) saturate(130%);
+  border: 1px solid var(--border-subtle);
+  box-shadow: var(--shadow-md);
+}
+
+.lyrics-search-option {
+  display: block;
+  width: 100%;
+  padding: 6px 8px;
+  font-size: 12px;
+  font-family: var(--font-family);
+  text-align: left;
+  color: var(--text-primary, #f0f0f5);
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-mini);
+  cursor: pointer;
+  /* Long collaborator names must not stretch the panel. */
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  transition: background var(--transition-fast);
+}
+
+.lyrics-search-option:hover {
+  background: rgba(255, 255, 255, 0.07);
+}
+
+.lyrics-search-option.is-active {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.lyrics-search-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
 .lyrics-editor {
   flex: 1;
   min-height: 220px;
