@@ -3149,6 +3149,11 @@ function toggleShuffle() {
     shuffleOrder = [];
     shufflePosition = 0;
   }
+  // Rebuild the already-prepared next tracks so shuffle takes effect on this
+  // song, not only after the current one finishes.
+  if (currentFile && (isPlaying || isPaused)) {
+    void prepareGaplessNext(currentFile);
+  }
   scheduleSave();
 }
 
@@ -3294,11 +3299,16 @@ function setupListeners() {
     if (mixPreviewActive) return;
     const prevPlayingId = playingPlaylistId;
     const prevFile = currentFile;
+    const prevShuffle = shuffleEnabled;
+    const prevRepeat = repeatMode;
     applyStoreSync(event.payload);
     if (
       currentFile &&
       (isPlaying || isPaused) &&
-      (currentFile !== prevFile || playingPlaylistId !== prevPlayingId)
+      (currentFile !== prevFile ||
+        playingPlaylistId !== prevPlayingId ||
+        shuffleEnabled !== prevShuffle ||
+        repeatMode !== prevRepeat)
     ) {
       void prepareGaplessNext(currentFile);
     }

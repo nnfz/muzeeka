@@ -1036,6 +1036,10 @@ impl PlaybackSession {
             *self.shuffle_order.lock() = Vec::new();
             *self.shuffle_position.lock() = 0;
         }
+        if let Some(path) = self.player.get_state().current_file {
+            let queue = self.build_gapless_queue(&data, &path);
+            let _ = self.player.prepare_next(Some(&path), queue);
+        }
         let enabled = data.shuffle_enabled;
         self.save_data(&data)?;
         self.notify_store_sync(&data);
