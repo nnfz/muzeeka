@@ -12,6 +12,7 @@ import {
 import {
   applyEffectivePlaybackRate,
   setCachedGlobalPlaybackRate,
+  autoDownloadTrackVideoBg,
 } from '$lib/trackPrefs';
 import { reorderItemsAtBoundary } from '$lib/trackOrder';
 import { setImportProgress, resetImportProgress } from '$lib/stores/importProgress.svelte';
@@ -2901,6 +2902,17 @@ async function play(filePath: string) {
           if (requestId === playRequestId) {
             await applyResumeSeek(currentFile ?? filePath, resumeAt);
           }
+        }
+
+        // Trigger auto-download of video background if enabled
+        if (resolvedTrack?.title && resolvedTrack?.artist) {
+          void autoDownloadTrackVideoBg(
+            resolvedTrack.path,
+            resolvedTrack.title,
+            resolvedTrack.artist,
+          ).catch((e) => {
+            console.warn('[player] Auto video bg download failed:', e);
+          });
         }
       }
     } catch (e) {

@@ -1,6 +1,6 @@
 // Library, playlist, and cover-related Tauri commands.
 
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::library;
 use crate::player::Player;
@@ -950,6 +950,231 @@ pub fn track_prefs_set_playback_rate(
     rate: Option<f32>,
 ) -> Result<(), String> {
     database.set_track_playback_rate(&path, rate)
+}
+
+/// Video files accepted as a fullscreen background.
+const VIDEO_BG_EXTENSIONS: &[&str] = &["mp4", "webm", "mkv", "mov", "m4v"];
+
+/// Grant the asset protocol access to one video file.
+///
+/// `assetProtocol.scope` in tauri.conf.json only covers `$APPDATA`/`$APPLOCALDATA`,
+/// and a background video is an arbitrary path the user picked. Copying it into the
+/// app data dir would mean duplicating hundreds of MB per track, so the file is
+/// allowed in place instead. Scope grants are runtime-only, hence the re-allow on
+/// every get — a restart starts from the configured scope again.
+fn allow_video_bg_asset(app: &AppHandle, path: &str) {
+    use tauri::Manager;
+    let _ = app.asset_protocol_scope().allow_file(path);
+}
+
+fn validate_video_bg_path(path: &str) -> Result<String, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("Empty video path".into());
+    }
+    let candidate = std::path::Path::new(trimmed);
+    if !candidate.is_file() {
+        return Err(format!("Video file not found: {trimmed}"));
+    }
+    let extension = candidate
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if !VIDEO_BG_EXTENSIONS.contains(&extension.as_str()) {
+        return Err(format!(
+            "Unsupported video format .{extension} — use {}",
+            VIDEO_BG_EXTENSIONS.join(", ")
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Per-track fullscreen video background (`None` = use the cover background).
+#[tauri::command]
+pub fn track_prefs_get_video_bg(
+    app: AppHandle,
+    database: State<'_, LibraryDatabase>,
+    path: String,
+) -> Result<Option<String>, String> {
+    let stored = database.get_track_video_bg(&path)?;
+    let Some(video_path) = stored else {
+        return Ok(None);
+    };
+    // A background whose file was moved or deleted must not leave fullscreen with a
+    // dead <video> — report it as absent and drop the stale row.
+    if !std::path::Path::new(&video_path).is_file() {
+        if let Err(e) = database.set_track_video_bg(&path, None) {
+            eprintln!("[track_prefs_get_video_bg] clearing missing background failed: {e}");
+        }
+        return Ok(None);
+    }
+    allow_video_bg_asset(&app, &video_path);
+    Ok(Some(video_path))
+}
+
+/// Set or clear the per-track video background. Pass `null` to remove it.
+#[tauri::command]
+pub fn track_prefs_set_video_bg(
+    app: AppHandle,
+    database: State<'_, LibraryDatabase>,
+    path: String,
+    video_path: Option<String>,
+) -> Result<Option<String>, String> {
+    let validated = match video_path {
+        Some(raw) => Some(validate_video_bg_path(&raw)?),
+        None => None,
+    };
+    database.set_track_video_bg(&path, validated.as_deref())?;
+    if let Some(video) = validated.as_deref() {
+        allow_video_bg_asset(&app, video);
+    }
+    if let Err(e) = app.emit("track-bg:changed", &path) {
+        eprintln!("[track_prefs_set_video_bg] emit track-bg:changed failed: {e}");
+    }
+    Ok(validated)
+}
+
+/// Auto-download a 15-second video clip from YouTube for track background.
+///
+/// Checks if setting is enabled and track has no existing video, then:
+/// 1. Searches YouTube: `ytsearch1:{artist} {title} -topic`
+/// 2. Downloads video ≤720p
+/// 3. Extracts 15s from middle
+/// 4. Stores in app_data/video_backgrounds/{hash}.mp4
+/// 5. Links to track via set_track_video_bg
+#[tauri::command]
+pub async fn track_prefs_auto_download_video_bg(
+    app: AppHandle,
+    database: State<'_, LibraryDatabase>,
+    path: String,
+    title: String,
+    artist: String,
+) -> Result<Option<String>, String> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let app_clone = app.clone();
+    let database = database.inner().clone();
+    let path_clone = path.clone();
+
+    tauri::async_runtime::spawn_blocking(move || {
+        eprintln!("[auto_download_video_bg] Called for track: {}", path_clone);
+        eprintln!("[auto_download_video_bg] Title: {}, Artist: {}", title, artist);
+
+        // Check if setting is enabled
+        eprintln!("[auto_download_video_bg] Loading settings...");
+        let settings = crate::settings::load_settings(&app_clone)
+            .map_err(|e| {
+                eprintln!("[auto_download_video_bg] ERROR: Failed to load settings: {}", e);
+                format!("Failed to load settings: {}", e)
+            })?;
+
+        eprintln!("[auto_download_video_bg] Setting auto_video_bg_enabled: {}", settings.auto_video_bg_enabled);
+        if !settings.auto_video_bg_enabled {
+            eprintln!("[auto_download_video_bg] Setting disabled, skipping");
+            return Ok(None);
+        }
+
+        // Check if track already has video background
+        eprintln!("[auto_download_video_bg] Checking if track already has video...");
+        match database.get_track_video_bg(&path_clone) {
+            Ok(Some(existing)) => {
+                eprintln!("[auto_download_video_bg] Track already has video background: {}, skipping", existing);
+                return Ok(None);
+            }
+            Ok(None) => {
+                eprintln!("[auto_download_video_bg] No existing video");
+            }
+            Err(e) => {
+                eprintln!("[auto_download_video_bg] WARNING: Failed to check existing video: {}", e);
+            }
+        }
+
+        // Check if we already tried for this track
+        eprintln!("[auto_download_video_bg] Checking if already attempted...");
+        match database.get_track_video_bg_tried(&path_clone) {
+            Ok(true) => {
+                eprintln!("[auto_download_video_bg] Already attempted for this track, skipping");
+                return Ok(None);
+            }
+            Ok(false) => {
+                eprintln!("[auto_download_video_bg] First attempt for this track");
+            }
+            Err(e) => {
+                eprintln!("[auto_download_video_bg] WARNING: Failed to check tried flag: {}", e);
+            }
+        }
+
+        // Mark as tried before we even start
+        eprintln!("[auto_download_video_bg] Marking track as attempted...");
+        if let Err(e) = database.set_track_video_bg_tried(&path_clone) {
+            eprintln!("[auto_download_video_bg] WARNING: Failed to set tried flag: {}", e);
+        }
+
+        // Create video backgrounds directory
+        eprintln!("[auto_download_video_bg] Resolving app data directory...");
+        let app_data = app_clone
+            .path()
+            .app_data_dir()
+            .map_err(|e| {
+                eprintln!("[auto_download_video_bg] ERROR: Failed to resolve app data dir: {}", e);
+                format!("Failed to resolve app data dir: {}", e)
+            })?;
+        let video_bg_dir = app_data.join("video_backgrounds");
+        eprintln!("[auto_download_video_bg] Video backgrounds directory: {}", video_bg_dir.display());
+
+        std::fs::create_dir_all(&video_bg_dir)
+            .map_err(|e| {
+                eprintln!("[auto_download_video_bg] ERROR: Failed to create directory: {}", e);
+                format!("Failed to create video_backgrounds dir: {}", e)
+            })?;
+
+        // Generate deterministic filename from track path
+        let mut hasher = DefaultHasher::new();
+        path_clone.hash(&mut hasher);
+        let hash = hasher.finish();
+        let output_path = video_bg_dir.join(format!("{:016x}.mp4", hash));
+
+        eprintln!("[auto_download_video_bg] Target output file: {}", output_path.display());
+        eprintln!("[auto_download_video_bg] Starting download...");
+
+        // Download and extract 15s clip
+        match crate::ytdlp::download_video_bg_clip(&app_clone, &artist, &title, &output_path) {
+            Ok(()) => {
+                eprintln!("[auto_download_video_bg] Download completed successfully");
+            }
+            Err(e) => {
+                eprintln!("[auto_download_video_bg] Download failed (will not retry): {}", e);
+                // Still return Ok(None) — we tried, flag is set, don't retry
+                return Ok(None);
+            }
+        }
+
+        // Link to track
+        let video_path_str = output_path.to_string_lossy().to_string();
+        eprintln!("[auto_download_video_bg] Linking video to track in database...");
+        database.set_track_video_bg(&path_clone, Some(&video_path_str))
+            .map_err(|e| {
+                eprintln!("[auto_download_video_bg] ERROR: Failed to link video: {}", e);
+                e
+            })?;
+
+        eprintln!("[auto_download_video_bg] Granting asset protocol access...");
+        allow_video_bg_asset(&app_clone, &video_path_str);
+
+        eprintln!("[auto_download_video_bg] Emitting track-bg:changed event...");
+        if let Err(e) = app_clone.emit("track-bg:changed", &path_clone) {
+            eprintln!("[auto_download_video_bg] WARNING: emit track-bg:changed failed: {e}");
+        }
+
+        eprintln!("[auto_download_video_bg] SUCCESS: Video background set for track");
+        Ok(Some(video_path_str))
+    })
+    .await
+    .map_err(|e| {
+        eprintln!("[auto_download_video_bg] FATAL: Task panicked: {}", e);
+        format!("Auto download task failed: {}", e)
+    })?
 }
 
 /// Waveform peaks for the Mix transition editor (top/bottom track strips).

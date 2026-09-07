@@ -1210,6 +1210,185 @@ fn enrich_downloaded_metadata(files: &mut [MusicFile]) {
     files.par_iter_mut().for_each(enrich_downloaded_file);
 }
 
+/// Download a 15-second video clip from YouTube for use as a track background.
+///
+/// Flow:
+/// 1. Search YouTube: `ytsearch1:{artist} {title} -topic`
+/// 2. Download best video ≤720p as mp4
+/// 3. Probe duration with ffprobe
+/// 4. Extract 15s from middle with ffmpeg
+/// 5. Return path to final clip
+pub fn download_video_bg_clip(
+    app: &AppHandle,
+    artist: &str,
+    title: &str,
+    output_path: &Path,
+) -> Result<(), String> {
+    // Build search query - search without "-topic" exclusion first, then filter results
+    // ytsearch doesn't support negative filters, so we just search for the artist and title
+    let query = format!("ytsearch1:{} {}", artist.trim(), title.trim());
+
+    eprintln!("[video_bg] Starting download for: {} - {}", artist, title);
+    eprintln!("[video_bg] Search query: {}", query);
+
+    let temp_dir = std::env::temp_dir();
+    let temp_video = temp_dir.join(format!(
+        "muzeeka_bg_{}.mp4",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    ));
+    eprintln!("[video_bg] Temp file: {}", temp_video.display());
+
+    let binary = ytdlp_binary_path(app);
+    eprintln!("[video_bg] yt-dlp binary: {}", binary.display());
+    if !binary.is_file() {
+        eprintln!("[video_bg] ERROR: yt-dlp binary not found!");
+        return Err(format!("yt-dlp not found at {}", binary.display()));
+    }
+
+    let mut cmd_args = build_ytdlp_args(app, &[]);
+    cmd_args.extend([
+        "--format".to_string(),
+        "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]".to_string(),
+        "--merge-output-format".to_string(),
+        "mp4".to_string(),
+        "--no-playlist".to_string(),
+        "-o".to_string(),
+        temp_video.to_string_lossy().to_string(),
+        query.clone(),
+    ]);
+
+    eprintln!("[video_bg] Running yt-dlp...");
+
+    let mut cmd = Command::new(&binary);
+    cmd.args(&cmd_args)
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("PYTHONUTF8", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    process_util::hide_console(&mut cmd);
+
+    let output = cmd
+        .output()
+        .map_err(|e| {
+            eprintln!("[video_bg] ERROR: Failed to execute yt-dlp: {}", e);
+            format!("Failed to run yt-dlp: {}", e)
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!("[video_bg] ERROR: yt-dlp failed with status: {}", output.status);
+        eprintln!("[video_bg] yt-dlp stderr:\n{}", stderr);
+        let _ = fs::remove_file(&temp_video);
+        return Err(summarize_ytdlp_failure(stderr.lines()));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    eprintln!("[video_bg] yt-dlp stdout:\n{}", stdout);
+    eprintln!("[video_bg] yt-dlp completed successfully");
+
+    if !temp_video.is_file() {
+        eprintln!("[video_bg] ERROR: Downloaded file not found at {}", temp_video.display());
+        return Err("Video download succeeded but file not found".to_string());
+    }
+
+    let file_size = fs::metadata(&temp_video).map(|m| m.len()).unwrap_or(0);
+    eprintln!("[video_bg] Downloaded file size: {} bytes", file_size);
+
+    // Extract 15s from middle using ffmpeg
+    let ffmpeg_dir = resolve_ffmpeg_location(app)
+        .ok_or_else(|| {
+            eprintln!("[video_bg] ERROR: ffmpeg not found");
+            "ffmpeg not found".to_string()
+        })?;
+    let ffmpeg_bin = ffmpeg_dir.join(if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" });
+    let ffprobe_bin = ffmpeg_dir.join(if cfg!(windows) { "ffprobe.exe" } else { "ffprobe" });
+
+    eprintln!("[video_bg] ffmpeg: {}", ffmpeg_bin.display());
+    eprintln!("[video_bg] ffprobe: {}", ffprobe_bin.display());
+
+    if !ffprobe_bin.is_file() {
+        eprintln!("[video_bg] ERROR: ffprobe binary not found!");
+        let _ = fs::remove_file(&temp_video);
+        return Err("ffprobe not found".to_string());
+    }
+
+    // Probe duration
+    eprintln!("[video_bg] Probing video duration...");
+    let mut probe_cmd = Command::new(&ffprobe_bin);
+    probe_cmd
+        .args([
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+        ])
+        .arg(&temp_video)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    process_util::hide_console(&mut probe_cmd);
+
+    let probe_output = probe_cmd.output().map_err(|e| {
+        eprintln!("[video_bg] ERROR: Failed to run ffprobe: {}", e);
+        let _ = fs::remove_file(&temp_video);
+        format!("Failed to probe video duration: {}", e)
+    })?;
+
+    let duration_str = String::from_utf8_lossy(&probe_output.stdout);
+    let duration: f64 = duration_str.trim().parse().unwrap_or(0.0);
+    eprintln!("[video_bg] Video duration: {:.1}s", duration);
+
+    if duration < 15.0 {
+        eprintln!("[video_bg] ERROR: Video too short ({:.1}s)", duration);
+        let _ = fs::remove_file(&temp_video);
+        return Err(format!("Video too short: {:.1}s (need ≥15s)", duration));
+    }
+
+    // Calculate start time: middle 15s
+    let start = ((duration - 15.0) / 2.0).max(0.0);
+
+    eprintln!("[video_bg] Extracting 15s from {:.1}s (start: {:.1}s)", duration, start);
+    eprintln!("[video_bg] Output path: {}", output_path.display());
+
+    // Extract 15s clip
+    let mut extract_cmd = Command::new(&ffmpeg_bin);
+    extract_cmd
+        .args(["-y", "-ss"])
+        .arg(format!("{:.3}", start))
+        .args(["-i"])
+        .arg(&temp_video)
+        .args(["-t", "15", "-c", "copy", "-avoid_negative_ts", "make_zero"])
+        .arg(output_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    process_util::hide_console(&mut extract_cmd);
+
+    let extract_output = extract_cmd.output().map_err(|e| {
+        eprintln!("[video_bg] ERROR: Failed to run ffmpeg: {}", e);
+        let _ = fs::remove_file(&temp_video);
+        format!("Failed to extract video clip: {}", e)
+    })?;
+
+    let _ = fs::remove_file(&temp_video);
+
+    if !extract_output.status.success() {
+        let stderr = String::from_utf8_lossy(&extract_output.stderr);
+        eprintln!("[video_bg] ERROR: ffmpeg failed with status: {}", extract_output.status);
+        eprintln!("[video_bg] ffmpeg stderr:\n{}", stderr);
+        return Err("ffmpeg extraction failed".to_string());
+    }
+
+    if !output_path.is_file() {
+        eprintln!("[video_bg] ERROR: Output file not found after extraction!");
+        return Err("Extraction succeeded but output file not found".to_string());
+    }
+
+    let output_size = fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
+    eprintln!("[video_bg] SUCCESS: Saved {} ({} bytes)", output_path.display(), output_size);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::summarize_ytdlp_failure;

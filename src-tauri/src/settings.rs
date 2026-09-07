@@ -118,6 +118,9 @@ pub struct AppSettings {
     /// Show the Development settings tab and in-app console.
     #[serde(default)]
     pub developer_mode: bool,
+    /// Auto-download 15s video clips from YouTube for track backgrounds.
+    #[serde(default)]
+    pub auto_video_bg_enabled: bool,
     /// Last main window position and size.
     #[serde(default)]
     pub window_state: Option<WindowState>,
@@ -145,6 +148,7 @@ impl Default for AppSettings {
             legacy_remote_port: default_legacy_remote_port(),
             shuffle_mode: ShuffleMode::default(),
             developer_mode: false,
+            auto_video_bg_enabled: false,
             window_state: None,
         }
     }

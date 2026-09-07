@@ -45,6 +45,76 @@ export async function setTrackPlaybackRate(
   await invoke('track_prefs_set_playback_rate', { path, rate: payload });
 }
 
+/** Extensions the Rust side accepts for a video background. */
+export const VIDEO_BG_EXTENSIONS = ['mp4', 'webm', 'mkv', 'mov', 'm4v'] as const;
+
+/**
+ * Per-track fullscreen video background. `null` = none (cover background is used).
+ *
+ * Rust re-grants asset-protocol access on every get, so always read through this
+ * before building an asset URL — scope grants do not survive an app restart.
+ */
+export async function getTrackVideoBg(path: string): Promise<string | null> {
+  if (!path) return null;
+  try {
+    const video = await invoke<string | null>('track_prefs_get_video_bg', {
+      path,
+    });
+    return video?.trim() || null;
+  } catch (e) {
+    console.warn('[trackPrefs] get video bg failed', e);
+    return null;
+  }
+}
+
+/** Pass `null` to clear. Returns the stored path (validated by Rust). */
+export async function setTrackVideoBg(
+  path: string,
+  videoPath: string | null,
+): Promise<string | null> {
+  if (!path) return null;
+  const stored = await invoke<string | null>('track_prefs_set_video_bg', {
+    path,
+    videoPath: videoPath?.trim() || null,
+  });
+  return stored?.trim() || null;
+}
+
+/**
+ * Auto-download a 15-second video clip from YouTube for track background.
+ * Only runs if the setting is enabled and track has no existing video.
+ */
+export async function autoDownloadTrackVideoBg(
+  path: string,
+  title: string,
+  artist: string,
+): Promise<string | null> {
+  if (!path || !title || !artist) {
+    console.log('[trackPrefs] autoDownloadTrackVideoBg: Missing required params', { path, title, artist });
+    return null;
+  }
+
+  console.log('[trackPrefs] autoDownloadTrackVideoBg: Starting for', { path, title, artist });
+
+  try {
+    const result = await invoke<string | null>(
+      'track_prefs_auto_download_video_bg',
+      { path, title, artist },
+    );
+
+    if (result) {
+      console.log('[trackPrefs] autoDownloadTrackVideoBg: SUCCESS - Downloaded:', result);
+    } else {
+      console.log('[trackPrefs] autoDownloadTrackVideoBg: Skipped (setting disabled or video exists)');
+    }
+
+    return result?.trim() || null;
+  } catch (e) {
+    console.error('[trackPrefs] autoDownloadTrackVideoBg: FAILED -', e);
+    return null;
+  }
+}
+
 /** Effective rate for a path: track override or global Settings. */
 export async function getEffectivePlaybackRate(
   path: string | null | undefined,

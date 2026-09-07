@@ -14,7 +14,7 @@
     trackDisplayTitle,
     type MusicFile,
   } from "$lib/stores/player.svelte";
-  import { invoke } from "@tauri-apps/api/core";
+  import { convertFileSrc, invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import type { LyricsResult } from "$lib/lyrics/types";
   import {
@@ -26,6 +26,8 @@
   } from "$lib/lyrics/lyricsCache";
   import FullscreenLyrics from "./FullscreenLyrics.svelte";
   import KawarpBackground from "./KawarpBackground.svelte";
+  import VideoBackground from "./VideoBackground.svelte";
+  import { getTrackVideoBg } from "$lib/trackPrefs";
   import MediaSlider from "./MediaSlider.svelte";
   import { untrack } from "svelte";
   import LikeButton from "./LikeButton.svelte";
@@ -53,6 +55,18 @@
 
   /** Kawarp background URL. */
   let bgCoverSrc = $state<string | null>(null);
+
+  /**
+   * Per-track looping video background (Track properties → Muzeeka).
+   * When set it replaces Kawarp entirely — Kawarp unmounts so its WebGL context
+   * and rAF loop are not paying for a surface nobody can see.
+   */
+  let videoBgSrc = $state<string | null>(null);
+  /** File the current videoBgSrc belongs to — guards against late async results. */
+  let videoBgForFile = $state<string | null>(null);
+  let useVideoBg = $derived(
+    !!videoBgSrc && !!player.currentFile && videoBgForFile === player.currentFile,
+  );
 
   /** Front cover src — thumb first, then full when decoded. */
   let artSrc = $state(COVER_PLACEHOLDER_SRC);
@@ -449,7 +463,7 @@
     };
   });
 
-  // Track change: close layout fully, then load lyrics and reopen if present.
+  // Track change: close layout fully, load video background + lyrics, reopen if present.
   $effect(() => {
     const file = player.currentFile;
 
@@ -473,6 +487,8 @@
     lyricsState = null;
     lyricsSettledForFile = null;
     layoutClosedAt = wasOpen ? Date.now() : 0;
+    videoBgSrc = null;
+    videoBgForFile = null;
 
     let cancelled = false;
 
@@ -486,8 +502,44 @@
       })
       .catch(() => {});
 
+    void getTrackVideoBg(file).then((videoPath) => {
+      if (cancelled || !videoPath) return;
+      if (untrack(() => player.currentFile) !== file) return;
+      const src = convertFileSrc(videoPath);
+      videoBgSrc = src;
+      videoBgForFile = file;
+    });
+
     return () => {
       cancelled = true;
+    };
+  });
+
+  // Listen for video background changes during playback
+  $effect(() => {
+    const unlisten = listen<string>('track-bg:changed', (event) => {
+      const changedPath = event.payload;
+      const currentPath = untrack(() => player.currentFile);
+
+      if (currentPath && sameTrackPath(currentPath, changedPath)) {
+        console.log('[FullscreenPlayer] Video background changed for current track, reloading');
+        // Reload video background for current track
+        void getTrackVideoBg(currentPath).then((videoPath) => {
+          if (untrack(() => player.currentFile) !== currentPath) return;
+          if (videoPath) {
+            const src = convertFileSrc(videoPath);
+            videoBgSrc = src;
+            videoBgForFile = currentPath;
+          } else {
+            videoBgSrc = null;
+            videoBgForFile = null;
+          }
+        });
+      }
+    });
+
+    return () => {
+      void unlisten.then((fn) => fn());
     };
   });
 
@@ -676,13 +728,21 @@
   >
     <!-- Persistent Kawarp (no #key) so texture crossfade works between tracks -->
     <div class="fullscreen-backdrop" aria-hidden="true">
-      <KawarpBackground
-        src={bgCoverSrc}
-        active={open}
-        paused={player.isPaused}
-        switchKey={player.currentFile}
-        transitionDuration={700}
-      />
+      {#if useVideoBg}
+        <VideoBackground
+          src={videoBgSrc}
+          active={open}
+          paused={player.isPaused}
+        />
+      {:else}
+        <KawarpBackground
+          src={bgCoverSrc}
+          active={open}
+          paused={player.isPaused}
+          switchKey={player.currentFile}
+          transitionDuration={700}
+        />
+      {/if}
       <div class="fullscreen-backdrop-shade"></div>
     </div>
 

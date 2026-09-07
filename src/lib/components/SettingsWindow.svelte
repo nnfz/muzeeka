@@ -605,6 +605,27 @@
                 <span class="settings-switch" aria-hidden="true"></span>
               </label>
             </div>
+            <div class="card-row">
+              <div>
+                <div class="card-label">Auto video backgrounds</div>
+                <div class="card-value">
+                  Automatically download 15-second YouTube clips for track backgrounds
+                </div>
+              </div>
+              <label class="settings-toggle">
+                <input
+                  type="checkbox"
+                  role="switch"
+                  checked={settings.autoVideoBgEnabled}
+                  aria-label="Auto video backgrounds"
+                  onchange={(e) =>
+                    settings.setAutoVideoBgEnabled(
+                      (e.target as HTMLInputElement).checked,
+                    )}
+                />
+                <span class="settings-switch" aria-hidden="true"></span>
+              </label>
+            </div>
             <div class="card-row card-row-stack">
               <div>
                 <div class="card-label">Shuffle mode</div>

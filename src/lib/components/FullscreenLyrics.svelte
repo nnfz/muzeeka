@@ -331,11 +331,19 @@
     return clockPos + (performance.now() - clockWall) / 1000;
   }
 
-  /** Ease-in so word highlight doesn't pop at t=0. */
+  /**
+   * Apple Music-style ease for word fill.
+   * Smoother acceleration/deceleration than smootherstep.
+   */
   function easeInFill(p: number): number {
     const x = Math.min(1, Math.max(0, p));
-    // smootherstep-ish: slow start, natural finish
-    return x * x * (3 - 2 * x);
+    // Cubic bezier approximation: ease-in-out with gentler start
+    // Similar to cubic-bezier(0.33, 0, 0.2, 1)
+    if (x < 0.5) {
+      return 2 * x * x;
+    }
+    const t = 1 - x;
+    return 1 - 2 * t * t;
   }
 
   let smoothWordFill = 0;
@@ -414,8 +422,8 @@
     // Small lead so first glyph doesn't jump from dim→lit in one frame
     const raw = Math.min(Math.max((t - target.startSec) / safeDur, 0), 1);
     const eased = easeInFill(raw);
-    // Light EMA — kills micro-jitter from clock resync without lagging behind
-    smoothWordFill = smoothWordFill + (eased - smoothWordFill) * 0.6;
+    // Stronger smoothing to prevent jitter
+    smoothWordFill = smoothWordFill + (eased - smoothWordFill) * 0.7;
     if (raw >= 0.999) smoothWordFill = 1;
     setWordFill(target.el, smoothWordFill);
   }

@@ -4,7 +4,8 @@
   --lyric-line-height: 1.22;
   --lyric-gap: 0.52em;
   /* braccato-inspired line motion (word/char karaoke untouched below) */
-  --lyric-ease: cubic-bezier(0.25, 0.1, 0.25, 1);
+  /* Apple Music-style smooth ease */
+  --lyric-ease: cubic-bezier(0.33, 0, 0.2, 1);
   --lyric-duration: 0.5s;
   /* No scale-up on active — only opacity/blur for past (avoids grow-then-leave) */
   --lyric-scale: 1;
@@ -234,8 +235,8 @@
   transform: translate3d(0, 0, 0) scale(1);
   transform-origin: 50% 85%;
   cursor: pointer;
-  /* Smooth hover only — karaoke fill still drives --word-fill without CSS transition */
-  transition: color 240ms var(--lyric-ease);
+  /* Smoother, longer transitions for Apple Music feel */
+  transition: color 280ms var(--lyric-ease);
 }
 
 /* Word-synced: seek/hover on words, not the whole line row */
@@ -257,7 +258,7 @@
   color: inherit;
   transform: none;
   text-shadow: none;
-  transition: color 240ms var(--lyric-ease);
+  transition: color 280ms var(--lyric-ease);
 }
 
 /* Word hover on non-active lines — brighten; line blur cleared by line:hover */
@@ -274,11 +275,11 @@
 }
 
 .fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line.is-active .fs-lyrics-word.is-upcoming {
-  transition: color 240ms var(--lyric-ease);
+  transition: color 280ms var(--lyric-ease);
 }
 
 .fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line.is-active .fs-lyrics-word.is-upcoming .fs-lyrics-char {
-  transition: color 240ms var(--lyric-ease);
+  transition: color 280ms var(--lyric-ease);
 }
 
 .fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line.is-active .fs-lyrics-word.is-upcoming:hover {
@@ -294,7 +295,7 @@
   color: var(--lyric-color-active);
   --word-fill: 1;
   transform: translate3d(0, -0.04em, 0) scale(1);
-  transition: color 140ms var(--lyric-ease), transform 180ms var(--lyric-ease);
+  transition: color 160ms var(--lyric-ease), transform 220ms var(--lyric-ease);
 }
 
 .fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line.is-active .fs-lyrics-word.is-sung .fs-lyrics-char {
@@ -302,9 +303,9 @@
   transform: translate3d(0, -0.035em, 0) scale(1);
   text-shadow: none;
   transition:
-    transform 160ms var(--lyric-ease),
-    color 120ms var(--lyric-ease),
-    text-shadow 120ms var(--lyric-ease);
+    transform 200ms var(--lyric-ease),
+    color 140ms var(--lyric-ease),
+    text-shadow 140ms var(--lyric-ease);
 }
 
 /* Active line: upcoming words stay dim and flat */
@@ -321,19 +322,19 @@
 }
 
 /*
- * Currently singing word — gentler start (fill is ease-in from JS).
- * Keep motion small so class switch upcoming→animating doesn't pop.
+ * Currently singing word — smoother motion with Apple Music feel.
+ * Gentler scaling and movement for more natural animation.
  */
 .fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line.is-active .fs-lyrics-word.is-animating {
-  --word-pop: clamp(0, var(--word-fill) * 1.5, 1);
-  /* Fade pop as fill completes — stops micro-jitter near end */
-  --fade-pop: clamp(0, 4 * (1 - var(--word-fill)), 1);
+  --word-pop: clamp(0, var(--word-fill) * 1.4, 1);
+  /* Gentler fade to reduce jitter */
+  --fade-pop: clamp(0, 5 * (1 - var(--word-fill)), 1);
   color: var(--lyric-color-word-dim);
   background-image: none;
   -webkit-text-fill-color: unset;
   transform:
-    translate3d(0, calc(var(--word-pop) * var(--fade-pop) * -0.045em), 0)
-    scale(calc(1 + var(--word-pop) * var(--fade-pop) * 0.012));
+    translate3d(0, calc(var(--word-pop) * var(--fade-pop) * -0.042em), 0)
+    scale(calc(1 + var(--word-pop) * var(--fade-pop) * 0.01));
   transition: none;
 }
 
@@ -349,32 +350,32 @@
 
 .fs-lyrics-container[data-sync='richsync'] .fs-lyrics-line.is-active .fs-lyrics-word.is-animating .fs-lyrics-char {
   /*
-   * Wider, softer wave — no +0.5 bias (that made first glyphs flash half-lit).
-   * Fade wave out as fill completes — stops post-animation jitter.
+   * Smoother, wider wave with gentler transitions.
+   * Apple Music-style: softer gradient, less abrupt changes.
    */
   --char-n-safe: max(var(--char-n), 1);
   --char-pos: calc((var(--char-i) + 0.5) / var(--char-n-safe));
   --ahead: calc(var(--word-fill) - var(--char-pos));
-  /* Gentle ramp: need fill to reach glyph before full bright */
-  --lit: clamp(0, var(--ahead) * 1.65 + 0.15, 1);
-  /* Wide soft peak — less spike at the front */
-  --peak: max(0, 1 - abs(var(--ahead) * 1.7));
-  --hold: clamp(0, var(--ahead) * 0.85, 0.22);
-  /* Higher lift while singing; hold keeps letter up after the wave passes */
-  --lift: max(calc(var(--peak) * 0.85), var(--hold));
-  /* Fade wave out as fill completes — eliminates post-animation jitter */
-  --fade-wave: clamp(0, 4 * (1 - var(--word-fill)), 1);
+  /* Gentler ramp with earlier start for smoother appearance */
+  --lit: clamp(0, var(--ahead) * 1.5 + 0.2, 1);
+  /* Wider, softer peak — less spike, more gradual */
+  --peak: max(0, 1 - abs(var(--ahead) * 1.4));
+  --hold: clamp(0, var(--ahead) * 0.9, 0.25);
+  /* Smoother lift curve */
+  --lift: max(calc(var(--peak) * 0.8), var(--hold));
+  /* Gentler fade-out to reduce jitter */
+  --fade-wave: clamp(0, 5 * (1 - var(--word-fill)), 1);
   color: color-mix(
     in srgb,
     var(--lyric-color-active) calc(var(--lit) * 100%),
     var(--lyric-color-word-dim)
   );
   transform:
-    translate3d(0, calc(var(--lift) * var(--fade-wave) * -0.09em), 0)
-    scale(calc(1 + var(--lift) * var(--fade-wave) * 0.04));
+    translate3d(0, calc(var(--lift) * var(--fade-wave) * -0.085em), 0)
+    scale(calc(1 + var(--lift) * var(--fade-wave) * 0.038));
   text-shadow:
-    0 0 calc(var(--peak) * var(--fade-wave) * 7px) rgba(255, 255, 255, calc(var(--peak) * var(--fade-wave) * 0.3)),
-    0 0 calc(var(--peak) * var(--fade-wave) * 16px) rgba(255, 255, 255, calc(var(--peak) * var(--fade-wave) * 0.14));
+    0 0 calc(var(--peak) * var(--fade-wave) * 8px) rgba(255, 255, 255, calc(var(--peak) * var(--fade-wave) * 0.28)),
+    0 0 calc(var(--peak) * var(--fade-wave) * 18px) rgba(255, 255, 255, calc(var(--peak) * var(--fade-wave) * 0.12));
   transition: none;
 }
 

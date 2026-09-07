@@ -292,10 +292,28 @@ impl LibraryDatabase {
                  -- App-only per-track prefs (not written into file tags).
                  CREATE TABLE IF NOT EXISTS track_prefs (
                      path_key TEXT PRIMARY KEY,
-                     playback_rate REAL
+                     playback_rate REAL,
+                     video_bg_path TEXT,
+                     -- 1 once auto-download ran for this track, hit or miss.
+                     -- Keeps a track that has no clip on YouTube from re-searching every play.
+                     video_bg_tried INTEGER
                  );",
             )
             .map_err(db_error)?;
+
+        // Older installs created track_prefs before these columns existed.
+        // ALTER fails with "duplicate column" on fresh DBs — that is the success case.
+        for ddl in [
+            "ALTER TABLE track_prefs ADD COLUMN video_bg_path TEXT",
+            "ALTER TABLE track_prefs ADD COLUMN video_bg_tried INTEGER",
+        ] {
+            if let Err(e) = connection.execute(ddl, []) {
+                let msg = e.to_string();
+                if !msg.contains("duplicate column") {
+                    return Err(db_error(e));
+                }
+            }
+        }
 
         // Orphans if FK was ever off historically.
         connection
@@ -448,11 +466,119 @@ impl LibraryDatabase {
                     .map_err(db_error)?;
             }
             _ => {
+                // Null the column, not the row — the row may still hold a video background.
                 connection
-                    .execute("DELETE FROM track_prefs WHERE path_key = ?1", [&key])
+                    .execute(
+                        "UPDATE track_prefs SET playback_rate = NULL WHERE path_key = ?1",
+                        [&key],
+                    )
+                    .map_err(db_error)?;
+                connection
+                    .execute(
+                        "DELETE FROM track_prefs
+                           WHERE path_key = ?1 AND playback_rate IS NULL
+                             AND video_bg_path IS NULL AND video_bg_tried IS NULL",
+                        [&key],
+                    )
                     .map_err(db_error)?;
             }
         }
+        Ok(())
+    }
+
+    /// Per-track fullscreen video background. `None` → use the Kawarp cover background.
+    pub fn get_track_video_bg(&self, track_path: &str) -> Result<Option<String>, String> {
+        let key = path_key(track_path.trim());
+        if key.is_empty() {
+            return Ok(None);
+        }
+        let connection = self.inner.connection.lock();
+        let stored: Option<Option<String>> = connection
+            .query_row(
+                "SELECT video_bg_path FROM track_prefs WHERE path_key = ?1",
+                [&key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_error)?;
+        Ok(stored
+            .flatten()
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty()))
+    }
+
+    /// Set or clear the per-track video background. `None` removes it.
+    ///
+    /// Clearing only nulls the column: the row may still carry a playback_rate
+    /// override, so deleting it here would silently drop an unrelated pref.
+    pub fn set_track_video_bg(
+        &self,
+        track_path: &str,
+        video_path: Option<&str>,
+    ) -> Result<(), String> {
+        let key = path_key(track_path.trim());
+        if key.is_empty() {
+            return Err("Empty track path".into());
+        }
+        let value = video_path
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string);
+        let connection = self.inner.connection.lock();
+        connection
+            .execute(
+                "INSERT INTO track_prefs(path_key, video_bg_path) VALUES (?1, ?2)
+                 ON CONFLICT(path_key) DO UPDATE SET video_bg_path = excluded.video_bg_path",
+                params![key, value],
+            )
+            .map_err(db_error)?;
+        // Row with nothing left to remember — keep the table from growing forever.
+        connection
+            .execute(
+                "DELETE FROM track_prefs
+                   WHERE path_key = ?1 AND playback_rate IS NULL
+                     AND video_bg_path IS NULL AND video_bg_tried IS NULL",
+                [&key],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    /// True once auto-download has run for this track, whether or not it found a clip.
+    ///
+    /// The flag is what stops a track with no YouTube video from re-searching on
+    /// every play; a successful download is remembered by `video_bg_path` instead.
+    pub fn get_track_video_bg_tried(&self, track_path: &str) -> Result<bool, String> {
+        let key = path_key(track_path.trim());
+        if key.is_empty() {
+            return Ok(false);
+        }
+        let connection = self.inner.connection.lock();
+        let tried: Option<Option<i64>> = connection
+            .query_row(
+                "SELECT video_bg_tried FROM track_prefs WHERE path_key = ?1",
+                [&key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_error)?;
+        Ok(tried.flatten().unwrap_or(0) != 0)
+    }
+
+    /// Mark auto-download as attempted so it is never retried for this track.
+    pub fn set_track_video_bg_tried(&self, track_path: &str) -> Result<(), String> {
+        let key = path_key(track_path.trim());
+        if key.is_empty() {
+            return Err("Empty track path".into());
+        }
+        let connection = self.inner.connection.lock();
+        connection
+            .execute(
+                "INSERT INTO track_prefs(path_key, video_bg_tried) VALUES (?1, 1)
+                 ON CONFLICT(path_key) DO UPDATE SET video_bg_tried = 1",
+                [&key],
+            )
+            .map_err(db_error)?;
         Ok(())
     }
 

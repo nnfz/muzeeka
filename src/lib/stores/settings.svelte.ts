@@ -64,6 +64,7 @@ export interface AppSettings {
   discord_rpc_enabled?: boolean;
   shuffle_mode?: ShuffleMode;
   developer_mode?: boolean;
+  auto_video_bg_enabled?: boolean;
 }
 
 export interface EQPreset {
@@ -113,6 +114,7 @@ let discordRpcEnabled = $state(true);
 /** Default smart: avoid replaying tracks until the playlist cycle is complete. */
 let shuffleMode = $state<ShuffleMode>('smart');
 let developerMode = $state(false);
+let autoVideoBgEnabled = $state(false);
 let defaultDownloadFolder = $state<string | null>(null);
 let isReady = $state(false);
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -173,6 +175,7 @@ function scheduleSave() {
       discord_rpc_enabled: discordRpcEnabled,
       shuffle_mode: shuffleMode,
       developer_mode: developerMode,
+      auto_video_bg_enabled: autoVideoBgEnabled,
     };
     invoke('settings_save', { data: payload }).catch((e) => {
       console.error('Failed to save settings:', e);
@@ -325,6 +328,7 @@ export function createSettingsStore(
       discordRpcEnabled = data.discord_rpc_enabled !== false;
       shuffleMode = parseShuffleMode(data.shuffle_mode);
       developerMode = data.developer_mode === true;
+      autoVideoBgEnabled = data.auto_video_bg_enabled === true;
       try {
         defaultDownloadFolder = await invoke<string>('ytdlp_default_download_dir');
       } catch {
@@ -407,6 +411,9 @@ export function createSettingsStore(
     get developerMode() {
       return developerMode;
     },
+    get autoVideoBgEnabled() {
+      return autoVideoBgEnabled;
+    },
     get effectiveDownloadFolder() {
       return downloadFolder ?? defaultDownloadFolder ?? '';
     },
@@ -428,6 +435,10 @@ export function createSettingsStore(
     },
     setDeveloperMode(enabled: boolean) {
       developerMode = enabled;
+      scheduleSave();
+    },
+    setAutoVideoBgEnabled(enabled: boolean) {
+      autoVideoBgEnabled = enabled;
       scheduleSave();
     },
     // ── Effect rack ────────────────────────────────────────────────────────────

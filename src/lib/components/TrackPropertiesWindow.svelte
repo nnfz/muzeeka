@@ -34,6 +34,10 @@
     getCachedGlobalPlaybackRate,
     getTrackPlaybackRate,
     setTrackPlaybackRate,
+    getTrackVideoBg,
+    setTrackVideoBg,
+    autoDownloadTrackVideoBg,
+    VIDEO_BG_EXTENSIONS,
   } from "$lib/trackPrefs";
 
   /** This webview is bound to one track window label for life. */
@@ -106,6 +110,12 @@
   let bpmTapEstimate = $state<number | null>(null);
   let bpmTapFlash = $state(false);
   let bpmTapResetTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // Video background (fullscreen only, app-only)
+  let videoBgPath = $state<string | null>(null);
+  let videoBgBusy = $state(false);
+  let videoBgError = $state<string | null>(null);
+  let videoBgSuccess = $state<string | null>(null);
 
   let coverBusy = $state(false);
   let coverFailed = $state(false);
@@ -491,6 +501,8 @@
     trackRateSuccess = null;
     bpmError = null;
     bpmSuccess = null;
+    videoBgError = null;
+    videoBgSuccess = null;
     bpmTapTimes = [];
     bpmTapEstimate = null;
     clearBpmTapTimer();
@@ -506,6 +518,15 @@
       trackRateError = typeof e === "string" ? e : String(e);
     }
     await loadBpmFromFile(t, gen);
+    try {
+      const video = await getTrackVideoBg(t.path);
+      if (!stillCurrent(t, gen)) return;
+      videoBgPath = video;
+    } catch (e) {
+      if (!stillCurrent(t, gen)) return;
+      videoBgPath = null;
+      videoBgError = typeof e === "string" ? e : String(e);
+    }
   }
 
   async function handleDetectBpm() {
@@ -627,6 +648,90 @@
     void commitTrackRate(null);
   }
 
+  async function handlePickVideoBg() {
+    if (!track || videoBgBusy) return;
+    const selected = await open({
+      multiple: false,
+      filters: [
+        {
+          name: "Video",
+          extensions: VIDEO_BG_EXTENSIONS.slice(),
+        },
+        { name: "All files", extensions: ["*"] },
+      ],
+    });
+    const videoPath = typeof selected === "string" ? selected : null;
+    if (!videoPath) return;
+
+    videoBgBusy = true;
+    videoBgError = null;
+    videoBgSuccess = null;
+    try {
+      const stored = await setTrackVideoBg(track.path, videoPath);
+      videoBgPath = stored;
+      videoBgSuccess = stored
+        ? `Video background set — opens in fullscreen`
+        : "Video background removed";
+    } catch (e) {
+      const msg = typeof e === "string" ? e : String(e);
+      videoBgError = msg.replace(/^Error:\s*/i, "");
+    } finally {
+      videoBgBusy = false;
+    }
+  }
+
+  async function handleClearVideoBg() {
+    if (!track || videoBgBusy) return;
+    videoBgBusy = true;
+    videoBgError = null;
+    videoBgSuccess = null;
+    try {
+      await setTrackVideoBg(track.path, null);
+      videoBgPath = null;
+      videoBgSuccess = "Video background removed";
+    } catch (e) {
+      const msg = typeof e === "string" ? e : String(e);
+      videoBgError = msg.replace(/^Error:\s*/i, "");
+    } finally {
+      videoBgBusy = false;
+    }
+  }
+
+  async function handleSearchVideoBg() {
+    if (!track || videoBgBusy || !track.title || !track.artist) return;
+    videoBgBusy = true;
+    videoBgError = null;
+    videoBgSuccess = null;
+    try {
+      console.log('[TrackProperties] Manual search triggered for:', {
+        path: track.path,
+        title: track.title,
+        artist: track.artist,
+      });
+
+      const downloaded = await autoDownloadTrackVideoBg(
+        track.path,
+        track.title,
+        track.artist,
+      );
+
+      if (downloaded) {
+        console.log('[TrackProperties] Search successful:', downloaded);
+        videoBgPath = downloaded;
+        videoBgSuccess = "Video downloaded from YouTube";
+      } else {
+        console.log('[TrackProperties] Search returned null');
+        videoBgError = "No video found on YouTube or already attempted";
+      }
+    } catch (e) {
+      const msg = typeof e === "string" ? e : String(e);
+      console.error('[TrackProperties] Search failed:', msg);
+      videoBgError = msg.replace(/^Error:\s*/i, "");
+    } finally {
+      videoBgBusy = false;
+    }
+  }
+
   function loadTrack(next: MusicFile) {
     // Each window is one track — ignore foreign payloads.
     if (track && !sameTrackPath(track.path, next.path)) {
@@ -662,6 +767,9 @@
     bpmTapTimes = [];
     bpmTapEstimate = null;
     clearBpmTapTimer();
+    videoBgPath = null;
+    videoBgError = null;
+    videoBgSuccess = null;
 
     void loadTechFor(next, gen);
     void loadTrackPrefs(next, gen);
@@ -2046,29 +2154,93 @@
                 </button>
               </div>
             </div>
+
+            <div class="muzeeka-divider"></div>
+
+            <div class="muzeeka-feature">
+              <div class="muzeeka-feature-head">
+                <div>
+                  <div class="card-label">Video background</div>
+                  <div class="card-value">
+                    {#if videoBgPath}
+                      Set — plays looping in fullscreen (replaces cover background)
+                    {:else}
+                      Not set — fullscreen uses the Kawarp cover background
+                    {/if}
+                  </div>
+                </div>
+              </div>
+
+              {#if videoBgPath}
+                <div class="video-bg-preview">
+                  <div class="video-bg-path" title={videoBgPath}>
+                    {videoBgPath}
+                  </div>
+                </div>
+              {/if}
+
+              <div class="video-bg-toolbar">
+                <button
+                  type="button"
+                  class="action-btn"
+                  disabled={!track || videoBgBusy}
+                  onclick={() => void handlePickVideoBg()}
+                >
+                  {videoBgPath ? "Change…" : "Choose video…"}
+                </button>
+                <button
+                  type="button"
+                  class="action-btn"
+                  disabled={!track || videoBgBusy || !track.title || !track.artist}
+                  onclick={() => void handleSearchVideoBg()}
+                  title="Search and download from YouTube"
+                >
+                  {videoBgBusy ? "Searching…" : "Search YouTube"}
+                </button>
+                {#if videoBgPath}
+                  <button
+                    type="button"
+                    class="action-btn"
+                    disabled={!track || videoBgBusy}
+                    onclick={() => void handleClearVideoBg()}
+                  >
+                    Clear
+                  </button>
+                {/if}
+              </div>
+            </div>
           </div>
 
           <div class="props-actions-bar">
             <div
               class="props-status"
-              class:error={!!trackRateError || !!bpmError}
-              class:success={(!!trackRateSuccess || !!bpmSuccess) &&
-                !trackRateError &&
-                !bpmError}
-              class:muted={(trackRateOverride != null || bpmValue != null) &&
+              class:error={!!trackRateError || !!bpmError || !!videoBgError}
+              class:success={(!!trackRateSuccess || !!bpmSuccess || !!videoBgSuccess) &&
                 !trackRateError &&
                 !bpmError &&
+                !videoBgError}
+              class:muted={(trackRateOverride != null || bpmValue != null || videoBgPath != null) &&
+                !trackRateError &&
+                !bpmError &&
+                !videoBgError &&
                 !trackRateSuccess &&
-                !bpmSuccess}
+                !bpmSuccess &&
+                !videoBgSuccess}
             >
               {#if trackRateError}
                 {trackRateError}
               {:else if bpmError}
                 {bpmError}
+              {:else if videoBgError}
+                {videoBgError}
+              {:else if videoBgSuccess}
+                {videoBgSuccess}
               {:else if bpmSuccess}
                 {bpmSuccess}
               {:else if trackRateSuccess}
                 {trackRateSuccess}
+              {:else if videoBgPath}
+                Video background active
               {:else if trackRateOverride != null}
                 Speed override active
               {/if}
