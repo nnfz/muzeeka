@@ -54,7 +54,7 @@
 }
 
 .search-dropdown-hint {
-  font-size: 12px;
+  font-size: 10px;
   color: var(--text-muted);
   white-space: nowrap;
   flex-shrink: 0;

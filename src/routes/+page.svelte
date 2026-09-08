@@ -75,13 +75,28 @@
   let fullscreenOpen = $state(false);
   let nativeFullscreen = false;
   let fullscreenChanging = false;
+  let restoreMaximized = false;
 
   async function toggleNativeFullscreen() {
     if (fullscreenChanging) return;
     fullscreenChanging = true;
     try {
-      nativeFullscreen = !(await currentWin.isFullscreen());
-      await currentWin.setFullscreen(nativeFullscreen);
+      const entering = !(await currentWin.isFullscreen());
+      if (entering) {
+        // Chromium/WebView2 can leave a bottom gutter when fullscreen starts
+        // directly from a maximized frameless window. Unmaximize first.
+        restoreMaximized = await currentWin.isMaximized();
+        if (restoreMaximized) await currentWin.unmaximize();
+        await currentWin.setFullscreen(true);
+        nativeFullscreen = true;
+      } else {
+        await currentWin.setFullscreen(false);
+        nativeFullscreen = false;
+        if (restoreMaximized) {
+          restoreMaximized = false;
+          await currentWin.maximize();
+        }
+      }
     } catch (error) {
       console.error('Failed to toggle window fullscreen:', error);
     } finally {
@@ -125,7 +140,7 @@
           title: 'Settings',
           width: 960,
           height: 620,
-          minWidth: 760,
+          minWidth: 786,
           minHeight: 480,
           decorations: false,
           resizable: true,
@@ -159,7 +174,7 @@
         title: 'Settings',
         width: 960,
         height: 620,
-        minWidth: 760,
+        minWidth: 786,
         minHeight: 480,
         decorations: false,
         resizable: true,

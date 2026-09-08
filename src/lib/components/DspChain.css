@@ -431,7 +431,7 @@
   cursor: grabbing !important;
 }
 
-@media (max-width: 860px) {
+@media (max-width: 970px) {
   .rack {
     flex-direction: column;
   }
