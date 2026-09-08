@@ -70,6 +70,7 @@ const SNAP_INT_TOL: f32 = 0.4;
 const VOTE_CLUSTER_BPM: f32 = 1.25;
 
 // ── Cache ────────────────────────────────────────────────────────────────────
+#[allow(dead_code)]
 struct CacheKey {
     path: String,
     modified: SystemTime,

@@ -73,6 +73,8 @@
   let isResizing = $state(false);
   let editingId = $state<string | null>(null);
   let editingName = $state("");
+  let selectedPlaylistIds = $state<string[]>([]);
+  let selectionAnchor: string | null = null;
   let hoveredPlaylistId = $state<string | null>(null);
   let contextMenu = $state<{ playlist: Playlist; x: number; y: number } | null>(
     null,
@@ -112,7 +114,7 @@
     if (!drag?.active || drag.dropIndex === null) return player.playlists;
     return reorderItemsAtBoundary(
       player.playlists,
-      [drag.id],
+      selectedPlaylistIds.includes(drag.id) ? selectedPlaylistIds : [drag.id],
       drag.dropIndex,
       (playlist) => playlist.id,
     );
@@ -121,6 +123,10 @@
   let playlistMenuItems = $derived.by((): ContextMenuItem[] => {
     const target = contextMenu?.playlist;
     if (!target) return [];
+    if (selectedPlaylistIds.length > 1) return [{
+      id: 'delete-selected', label: 'Delete ' + selectedPlaylistIds.length + ' playlists', icon: 'delete', danger: true,
+      onSelect: () => { for (const id of selectedPlaylistIds) player.deletePlaylist(id); selectedPlaylistIds = []; },
+    }];
 
     const items: ContextMenuItem[] = [
       {
@@ -264,6 +270,7 @@
   }
 
   function openPlaylistContextMenu(e: MouseEvent, playlist: Playlist) {
+    if (!selectedPlaylistIds.includes(playlist.id)) selectedPlaylistIds = [playlist.id];
     closeAddMenu();
     const position = openContextMenuFromEvent(e);
     contextMenu = { playlist, ...position };
@@ -424,12 +431,27 @@
     if (e.key !== "Enter" && e.key !== " ") return;
 
     e.preventDefault();
+    selectedPlaylistIds = [];
+    selectionAnchor = playlistId;
     player.selectPlaylist(playlistId);
   }
 
-  function selectPlaylistFromClick(playlistId: string) {
+  function selectPlaylistFromClick(playlistId: string, event?: MouseEvent) {
     // Swallow the ghost click that ends a reorder drag.
     if (suppressPlaylistClick) return;
+    const ids = player.playlists.map(p => p.id);
+    if (event?.shiftKey && selectionAnchor && ids.includes(selectionAnchor)) {
+      const a = ids.indexOf(selectionAnchor), b = ids.indexOf(playlistId);
+      selectedPlaylistIds = ids.slice(Math.min(a, b), Math.max(a, b) + 1);
+      return;
+    }
+    selectionAnchor = playlistId;
+    if (event?.ctrlKey || event?.metaKey) {
+      selectedPlaylistIds = selectedPlaylistIds.includes(playlistId)
+        ? selectedPlaylistIds.filter(id => id !== playlistId) : [...selectedPlaylistIds, playlistId];
+      return;
+    }
+    selectedPlaylistIds = [];
     player.selectPlaylist(playlistId);
   }
 
@@ -597,7 +619,7 @@
     const current = player.playlists;
     const next = reorderItemsAtBoundary(
       current,
-      [id],
+      selectedPlaylistIds.includes(id) ? selectedPlaylistIds : [id],
       dropIndex,
       (playlist) => playlist.id,
     );
@@ -853,10 +875,11 @@
           >
             <div
               class="playlist-item"
+              class:selected={selectedPlaylistIds.includes(playlist.id)}
               role="button"
               tabindex="0"
               onpointerdown={(e) => onPlaylistPointerDown(e, playlist)}
-              onclick={() => selectPlaylistFromClick(playlist.id)}
+              onclick={(e) => selectPlaylistFromClick(playlist.id, e)}
               onkeydown={(e) => handlePlaylistItemKeydown(e, playlist.id)}
               oncontextmenu={(e) => openPlaylistContextMenu(e, playlist)}
               title={playlist.name}

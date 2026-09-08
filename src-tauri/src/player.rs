@@ -3,6 +3,7 @@
 // Wraps BASS in a higher-level API that tracks the current track, volume,
 // playback state, and emits Tauri events for position updates.
 
+use std::cell::Cell;
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -63,9 +64,20 @@ const SEEK_FADE_IN_MS: u32 = 28;
 /// this because content continues and the dip is very short.
 const MANUAL_SWITCH_FADE_OUT_MS: u32 = 55;
 const MANUAL_SWITCH_FADE_IN_MS: u32 = 50;
-/// Mixer playback buffer. Slightly larger than the device period stack so brief
-/// main-thread stalls (UI reload, SQLite, Discord) do not underrun into silence.
-const MIXER_BUFFER_SECS: f32 = 0.35;
+/// Mixer playback buffer. Larger than the WASAPI period stack so brief
+/// decode/DSP stalls (and Windows scheduling under load) do not underrun.
+const MIXER_BUFFER_SECS: f32 = 0.5;
+/// WASAPI callback interval. 10ms default is too tight when the CPU is busy.
+const DEVICE_PERIOD_MS: u32 = 20;
+/// WASAPI device buffer. Default 30ms underruns under load; ~120ms matches
+/// what desktop players typically use in shared mode.
+const DEVICE_BUFFER_MS: u32 = 120;
+/// Software playback buffer filled by BASS update threads (milliseconds).
+const PLAYBACK_BUFFER_MS: u32 = 500;
+/// How often those update threads wake (milliseconds).
+const UPDATE_PERIOD_MS: u32 = 20;
+/// Read-ahead for `BASS_ASYNCFILE` so disk I/O is not on the WASAPI thread.
+const ASYNCFILE_BUFFER_BYTES: u32 = 262_144;
 
 // Gapless: treat as ended this far before INDEX/file end so the next source is
 // already feeding the mixer while the last buffer of the current track plays out.
@@ -140,6 +152,8 @@ struct PlayerInner {
     bass_dir: PathBuf,
     /// The mixer stream (output). We play/pause this. The DSP rack attaches here.
     mixer_handle: u32,
+    /// Device mix rate used for the mixer (WASAPI shared native rate).
+    output_rate: u32,
     /// The current decode source plugged into the mixer (for the active track).
     current_source: u32,
     /// Handle of the one DSP that runs the whole effect rack (0 = not attached).
@@ -204,7 +218,9 @@ struct PlayerInner {
     live_bytes_fed: u64,
     live_last_pump_log_ms: u64,
     live_zero_pulls: u32,
+    #[allow(dead_code)]
     live_pcm_rate: u32,
+    #[allow(dead_code)]
     live_pcm_chans: u32,
     live_reconnect_after_ms: u64,
     live_meta_sync: u32,
@@ -247,6 +263,7 @@ struct LiveStreamState {
     /// Last station name (ICY `name` header) reported to the UI.
     last_station: Option<String>,
     /// Bytes BASS had buffered last time ICY was checked — change ⇒ new metadata.
+    #[allow(dead_code)]
     last_probe_bytes: u64,
     /// Wall ms of the last ICY probe (rate limit).
     last_probe_ms: u64,
@@ -507,6 +524,28 @@ const NON_FORMAT_BASS_DLLS: &[&str] = &[
 /// Work item executed serially on the dedicated BASS thread.
 type BassJob = Box<dyn FnOnce() + Send>;
 
+thread_local! {
+    static MMCSS_PINNED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// No-op mixer DSP whose only job is to mark BASS's audio callback thread as
+/// Pro Audio. Must be thread-local: a process-wide flag would skip a new
+/// WASAPI thread after a device change.
+unsafe extern "system" fn mmcss_pin_dsp(
+    _handle: u32,
+    _channel: u32,
+    _buffer: *mut std::ffi::c_void,
+    _length: u32,
+    _user: *mut std::ffi::c_void,
+) {
+    MMCSS_PINNED.with(|pinned| {
+        if !pinned.get() {
+            pinned.set(true);
+            crate::process_util::register_audio_thread();
+        }
+    });
+}
+
 // ── Public player handle ──────────────────────────────────────────────────────
 #[derive(Clone)]
 pub struct Player {
@@ -556,6 +595,7 @@ impl Player {
                 bass: None,
                 bass_dir: PathBuf::new(),
                 mixer_handle: 0,
+                output_rate: 44100,
                 current_source: 0,
                 chain_dsp_handle: 0,
                 current_file: None,
@@ -855,8 +895,10 @@ impl Player {
 
         let mut bass = BassLibrary::load(&inner.bass_dir)?;
 
-        // FLOATDSP must be configured before BASS_Init.
+        // Device period/buffer must be set *before* BASS_Init — afterwards they
+        // only apply to subsequently initialized devices.
         let float_dsp_ok = bass.set_config(bass::BASS_CONFIG_FLOATDSP, 1).is_ok();
+        Self::configure_output_device(&bass);
 
         match bass.init(-1, 44100) {
             Ok(()) => {}
@@ -867,11 +909,12 @@ impl Player {
             }
         }
 
-        // Device playback buffer. 300ms absorbs short decode stalls
-        // (Ctrl+R bootstrap, metadata, Discord) without audible dropouts. Was 200ms
-        // and could dip into silence under load. Update period 15ms keeps latency OK.
-        let _ = bass.set_config(bass::BASS_CONFIG_BUFFER, 300);
-        let _ = bass.set_config(bass::BASS_CONFIG_UPDATEPERIOD, 15);
+        inner.output_rate = bass
+            .get_info()
+            .ok()
+            .map(|info| info.freq)
+            .filter(|&freq| freq >= 8000)
+            .unwrap_or(44100);
 
         // Internet radio. Mixer never GetData's the URL (we pump on this thread),
         // so a short READTIMEOUT is only a safety net if we pull with an empty
@@ -917,6 +960,17 @@ impl Player {
         Self::load_bass_addons(inner);
         Self::create_mixer(inner)?;
         Ok(())
+    }
+
+    /// WASAPI shared-mode defaults (10ms period / 30ms buffer) underrun when
+    /// the CPU is busy. Other players keep 50–200ms of device buffering.
+    fn configure_output_device(bass: &BassLibrary) {
+        let _ = bass.set_config(bass::BASS_CONFIG_DEV_PERIOD, DEVICE_PERIOD_MS);
+        let _ = bass.set_config(bass::BASS_CONFIG_DEV_BUFFER, DEVICE_BUFFER_MS);
+        let _ = bass.set_config(bass::BASS_CONFIG_DEV_NONSTOP, 1);
+        let _ = bass.set_config(bass::BASS_CONFIG_BUFFER, PLAYBACK_BUFFER_MS);
+        let _ = bass.set_config(bass::BASS_CONFIG_UPDATEPERIOD, UPDATE_PERIOD_MS);
+        let _ = bass.set_config(bass::BASS_CONFIG_ASYNCFILE_BUFFER, ASYNCFILE_BUFFER_BYTES);
     }
 
     fn load_bass_addons(inner: &mut PlayerInner) {
@@ -1016,12 +1070,20 @@ impl Player {
         // keeping extra queued decode sources active during long playback, which can
         // contribute to crackling/underruns over time).
         let flags = bass::BASS_MIXER_NONSTOP | bass::BASS_SAMPLE_FLOAT;
-        let mixer = bass.mixer_stream_create(44100, 2, flags)?;
+        let rate = if inner.output_rate >= 8000 {
+            inner.output_rate
+        } else {
+            44100
+        };
+        let mixer = bass.mixer_stream_create(rate, 2, flags)?;
         let _ = bass.channel_set_attribute(
             mixer,
             bass::BASS_ATTRIB_BUFFER,
             MIXER_BUFFER_SECS,
         );
+        // First mixer callback runs on BASS's WASAPI thread. Pin MMCSS there even
+        // when the EQ rack is empty (that DSP is otherwise not attached).
+        let _ = bass.channel_set_dsp(mixer, mmcss_pin_dsp, i32::MIN + 1, std::ptr::null_mut());
         // Start the mixer (it will output silence until sources added, or play when first added).
         bass.channel_play(mixer, false)?;
         // Set initial volume on mixer
@@ -1196,7 +1258,13 @@ impl Player {
             return Ok(());
         }
         let current = bass.get_device();
-        match bass.init(device_id, 44100) {
+        Self::configure_output_device(bass);
+        let rate = if inner.output_rate >= 8000 {
+            inner.output_rate
+        } else {
+            44100
+        };
+        match bass.init(device_id, rate) {
             Ok(()) => {}
             Err(err) => {
                 if bass.last_error() != bass::BassError::Already {
@@ -3149,7 +3217,8 @@ impl Player {
             // No PRESCAN: much faster track start and manual switching.
             // Prescan is only useful for accurate seeking in VBR MP3 without good headers.
             // For speed (like Foobar) we skip it. Duration comes from metadata or later.
-            bass::BASS_SAMPLE_FLOAT | bass::BASS_STREAM_DECODE
+            // ASYNCFILE: disk reads happen off the WASAPI callback.
+            bass::BASS_SAMPLE_FLOAT | bass::BASS_STREAM_DECODE | bass::BASS_ASYNCFILE
         };
 
         let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
@@ -3161,7 +3230,12 @@ impl Player {
                 .or_else(|e| {
                     // Fallback: some plugins only work through StreamCreateFile
                     if e.contains("unsupported file format") {
-                        bass.stream_create_file(audio_path, bass::BASS_SAMPLE_FLOAT | bass::BASS_STREAM_DECODE)
+                        bass.stream_create_file(
+                            audio_path,
+                            bass::BASS_SAMPLE_FLOAT
+                                | bass::BASS_STREAM_DECODE
+                                | bass::BASS_ASYNCFILE,
+                        )
                     } else {
                         Err(e)
                     }
@@ -4333,6 +4407,7 @@ impl Player {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn reapply_at_rate(inner: &mut PlayerInner, rate: f32) {
         Self::reapply_at_rate_with_slide(inner, rate, 0);
     }

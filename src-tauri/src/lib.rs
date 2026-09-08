@@ -55,7 +55,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::path::BaseDirectory;
-use tauri::{Emitter, LogicalPosition, LogicalSize, Manager, WindowEvent};
+use tauri::{Emitter, PhysicalPosition, PhysicalSize, Manager, WindowEvent};
 
 fn bass_dir_is_valid(dir: &Path) -> bool {
     dir.join("bass.dll").is_file()
@@ -63,15 +63,22 @@ fn bass_dir_is_valid(dir: &Path) -> bool {
 
 fn is_valid_window_position(x: i32, y: i32) -> bool {
     // Windows uses -32000 when minimized; never restore or persist that.
-    x > -500 && y > -500 && x < 16000 && y < 16000
+    x > -32000 && y > -32000 && x < 32000 && y < 32000
 }
 
 fn apply_window_state(window: &tauri::WebviewWindow, state: &settings::WindowState) {
     let width = state.width.clamp(800, 3840);
     let height = state.height.clamp(600, 2160);
-    let _ = window.set_size(LogicalSize::new(width as f64, height as f64));
-    if is_valid_window_position(state.x, state.y) {
-        let _ = window.set_position(LogicalPosition::new(state.x as f64, state.y as f64));
+    let _ = window.set_size(PhysicalSize::new(width, height));
+    if is_valid_window_position(state.x, state.y) && window.available_monitors().map(|monitors| {
+        monitors.iter().any(|monitor| {
+            let p = monitor.position();
+            let s = monitor.size();
+            state.x + width as i32 > p.x + 64 && state.x < p.x + s.width as i32 - 64
+                && state.y >= p.y && state.y < p.y + s.height as i32 - 32
+        })
+    }).unwrap_or(true) {
+        let _ = window.set_position(PhysicalPosition::new(state.x, state.y));
     } else {
         let _ = window.center();
     }
@@ -81,6 +88,10 @@ fn apply_window_state(window: &tauri::WebviewWindow, state: &settings::WindowSta
 }
 
 fn capture_window_state(window: &tauri::WebviewWindow) -> Option<settings::WindowState> {
+    // Fullscreen monitor bounds must not replace the saved windowed geometry.
+    if window.is_fullscreen().unwrap_or(false) {
+        return None;
+    }
     let maximized = window.is_maximized().unwrap_or(false);
     let position = window.outer_position().ok()?;
     let size = window.outer_size().ok()?;
@@ -241,7 +252,8 @@ pub fn run() {
                         }
                     }
                     // Reliable path for exclusive-fullscreen games (JS focus can miss).
-                    // Throttle WebView position spam + drop process priority for Dota/etc.
+                    // Throttle WebView position spam + lower the UI thread for Dota/etc.
+                    // Process priority stays NORMAL so BASS's WASAPI thread is not starved.
                     WindowEvent::Focused(focused) => {
                         player_for_focus.set_ui_hot(*focused);
                         process_util::set_background_mode(!focused);
@@ -423,6 +435,7 @@ pub fn run() {
             commands::track_prefs_set_playback_rate,
             commands::track_prefs_get_video_bg,
             commands::track_prefs_set_video_bg,
+            commands::track_prefs_clear_all_video_bgs,
             commands::track_prefs_auto_download_video_bg,
             commands::library_detect_bpm,
             commands::library_get_bpm,

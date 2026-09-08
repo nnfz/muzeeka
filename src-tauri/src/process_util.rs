@@ -15,6 +15,7 @@ pub fn hide_console(cmd: &mut Command) {
 }
 
 #[cfg(windows)]
+#[allow(dead_code)]
 struct MmcssHandle(*mut core::ffi::c_void);
 
 #[cfg(windows)]
@@ -30,6 +31,10 @@ pub fn register_audio_thread() {
         let name: Vec<u16> = "Pro Audio\0".encode_utf16().collect();
         let handle = unsafe { AvSetMmThreadCharacteristicsW(name.as_ptr(), &mut task_index) };
         if handle.is_null() {
+            const THREAD_PRIORITY_HIGHEST: i32 = 2;
+            unsafe {
+                let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+            }
             return;
         }
         let _ = unsafe { AvSetMmThreadPriority(handle, AVRT_PRIORITY_CRITICAL) };
@@ -48,16 +53,20 @@ pub fn set_background_mode(background: bool) {
             return;
         }
 
-        const NORMAL_PRIORITY_CLASS: u32 = 0x0000_0020;
-        const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
-
-        let class = if background {
-            BELOW_NORMAL_PRIORITY_CLASS
-        } else {
-            NORMAL_PRIORITY_CLASS
-        };
+        // Only the calling UI thread. Dropping the *process* class to
+        // BELOW_NORMAL used to starve BASS's WASAPI/update threads whenever a
+        // game or encode saturated the CPU, which other players don't do.
+        const THREAD_PRIORITY_BELOW_NORMAL: i32 = -1;
+        const THREAD_PRIORITY_NORMAL: i32 = 0;
         unsafe {
-            let _ = SetPriorityClass(GetCurrentProcess(), class);
+            let _ = SetThreadPriority(
+                GetCurrentThread(),
+                if background {
+                    THREAD_PRIORITY_BELOW_NORMAL
+                } else {
+                    THREAD_PRIORITY_NORMAL
+                },
+            );
         }
     }
     #[cfg(not(windows))]
@@ -71,8 +80,8 @@ const AVRT_PRIORITY_CRITICAL: i32 = 2;
 
 #[cfg(windows)]
 unsafe extern "system" {
-    fn GetCurrentProcess() -> *mut core::ffi::c_void;
-    fn SetPriorityClass(h_process: *mut core::ffi::c_void, dw_priority_class: u32) -> i32;
+    fn GetCurrentThread() -> *mut core::ffi::c_void;
+    fn SetThreadPriority(h_thread: *mut core::ffi::c_void, n_priority: i32) -> i32;
 }
 
 #[cfg(windows)]

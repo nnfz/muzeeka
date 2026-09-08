@@ -105,11 +105,7 @@ function playButtonColors(accent: string): { bg: string; fg: string } {
   if (!rgb) return { bg: accent, fg: '#ffffff' };
 
   const luminance = relativeLuminance(rgb[0], rgb[1], rgb[2]);
-  if (luminance > 0.55) {
-    return { bg: '#111111', fg: '#ffffff' };
-  }
-
-  return { bg: accent, fg: '#ffffff' };
+  return { bg: accent, fg: (1.05 / (luminance + 0.05)) < 4.5 ? '#111111' : '#ffffff' };
 }
 
 function juicyScore(r: number, g: number, b: number): number {
@@ -147,6 +143,8 @@ function writeAccentVars(palette: AccentPalette) {
   const playButton = playButtonColors(palette.accent);
   root.style.setProperty('--play-btn-bg', playButton.bg);
   root.style.setProperty('--play-btn-fg', playButton.fg);
+  root.style.setProperty('--accent-fg', playButton.fg);
+  root.style.setProperty('--accent-hover-fg', playButtonColors(palette.hover).fg);
 }
 
 /** Apply accent CSS vars (used by secondary windows + main). */

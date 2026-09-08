@@ -386,12 +386,12 @@
     });
 
     // Properties — single track only.
-    if (!multi) {
+    {
       items.push({
         id: "properties",
         label: "Properties",
         icon: "properties",
-        onSelect: () => void openTrackPropertiesWindow(target.track),
+        onSelect: () => void openTrackPropertiesWindow(affectedTracks),
       });
     }
 

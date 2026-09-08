@@ -498,3 +498,9 @@
 .stream-btn-primary:not(:disabled):hover {
   transform: translateY(-1px);
 }
+
+.playlist-item.selected {
+  border-radius: var(--radius-sm);
+  background: var(--accent-soft);
+  box-shadow: inset 0 0 0 1px var(--border-accent);
+}

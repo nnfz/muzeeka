@@ -88,6 +88,10 @@
 
   let track = $state<MusicFile | null>(null);
   let rows = $state<TagTableRow[]>([]);
+  let batchTracks = $state<MusicFile[]>([]);
+  let mixedFields = $state<string[]>([]);
+  let changedFields = new Set<string>();
+  const isBatch = $derived(batchTracks.length > 1);
   /** Path the current `rows` belong to — prevents lyrics lookup using previous track tags. */
   let rowsForPath = $state<string | null>(null);
   let tech = $state<AudioTechInfo | null>(null);
@@ -349,7 +353,21 @@
         snapshot: t,
       });
       if (!stillCurrent(t, gen)) return;
-      rows = nextRows;
+      if (isBatch) {
+        const tables = [nextRows];
+        for (const item of batchTracks.slice(1)) {
+          tables.push(await invoke<TagTableRow[]>('library_get_tag_table', { path: item.path, audioPath: item.audio_path ?? null, snapshot: item }));
+        }
+        if (!stillCurrent(t, gen)) return;
+        const fields = new Map(tables.flat().map(row => [row.id, row]));
+        mixedFields = [];
+        rows = [...fields.values()].map(row => {
+          const values = tables.map(table => table.find(r => r.id === row.id)?.value ?? '');
+          const mixed = values.some(v => v !== values[0]);
+          if (mixed) mixedFields.push(row.id);
+          return { ...row, value: mixed ? '' : values[0], read_only: tables.some(table => table.find(r => r.id === row.id)?.read_only) };
+        });
+      } else rows = nextRows;
       rowsForPath = t.path;
     } catch (e) {
       if (!stillCurrent(t, gen)) return;
@@ -798,6 +816,8 @@
   }
 
   function updateRow(id: string, value: string) {
+    changedFields.add(id);
+    mixedFields = mixedFields.filter(field => field !== id);
     rows = rows.map((r) => (r.id === id ? { ...r, value } : r));
     markDirty();
   }
@@ -1046,6 +1066,21 @@
     error = null;
     success = null;
     try {
+      if (isBatch) {
+        const failures: string[] = [];
+        for (const item of batchTracks) {
+          try {
+            await invoke('library_set_tag_table', {
+              path: item.path, audioPath: item.audio_path ?? null, snapshot: item,
+              rows: rows.filter(row => changedFields.has(row.id) && !row.read_only),
+            });
+          } catch (e) { failures.push(item.file_name + ': ' + String(e)); }
+        }
+        if (failures.length) { error = failures.join('\n'); return; }
+        dirty = false; changedFields.clear(); success = 'Saved ' + batchTracks.length + ' tracks';
+        await loadTagTable(track);
+        return;
+      }
       const updated = await invoke<MusicFile>("library_set_tag_table", {
         path: track.path,
         audioPath: track.audio_path ?? null,
@@ -1298,6 +1333,8 @@
         "track-properties:open",
         (event) => {
           if (!acceptOpenPayload(event.payload)) return;
+          batchTracks = event.payload.tracks ?? [event.payload.track];
+          changedFields.clear();
           loadTrack(event.payload.track);
         },
       );
@@ -1335,6 +1372,8 @@
       // Per-label handoff written before this webview finished booting.
       const pending = takePendingTrackProperties(windowLabel);
       if (pending && acceptOpenPayload(pending)) {
+        batchTracks = pending.tracks ?? [pending.track];
+        changedFields.clear();
         loadTrack(pending.track);
       }
     })();
@@ -1482,6 +1521,7 @@
             <div>
               <h2 class="section-title">Metadata</h2>
               <p class="section-desc">
+                {#if isBatch}Editing {batchTracks.length} tracks. Multiple values are preserved unless edited.{/if}
                 Core tags + any extra fields present in the file. Empty value
                 removes the field.
                 {#if isStream}
@@ -1533,7 +1573,7 @@
                   <button
                     type="button"
                     class="action-btn cover-btn"
-                    disabled={coverBusy || saving}
+                    disabled={isBatch || coverBusy || saving}
                     onclick={() => void handleChangeCover()}
                   >
                     {coverBusy ? "Writing…" : "Cover…"}
@@ -1596,6 +1636,7 @@
                             class="field-input field-textarea"
                             rows="2"
                             value={row.value}
+                            placeholder={mixedFields.includes(row.id) ? "<multiple values>" : ""}
                             oninput={(e) =>
                               updateRow(
                                 row.id,
@@ -1609,6 +1650,7 @@
                             class="field-input"
                             type="text"
                             value={row.value}
+                            placeholder={mixedFields.includes(row.id) ? "<multiple values>" : ""}
                             oninput={(e) =>
                               updateRow(
                                 row.id,

@@ -34,6 +34,7 @@ const WINDOW_OPTIONS = {
 
 export interface TrackPropertiesOpenPayload {
   track: MusicFile;
+  tracks?: MusicFile[];
   /** Target window label — each properties webview ignores foreign labels. */
   windowLabel: string;
 }
@@ -72,11 +73,11 @@ function pendingKey(windowLabel: string): string {
 }
 
 /** Stash track for a specific properties window (survives boot race). */
-export function stashPendingTrackProperties(windowLabel: string, track: MusicFile) {
+export function stashPendingTrackProperties(windowLabel: string, track: MusicFile, tracks?: MusicFile[]) {
   try {
     localStorage.setItem(
       pendingKey(windowLabel),
-      JSON.stringify({ track, windowLabel } satisfies TrackPropertiesOpenPayload),
+      JSON.stringify({ track, tracks, windowLabel } satisfies TrackPropertiesOpenPayload),
     );
   } catch {
     /* quota / private mode */
@@ -97,6 +98,7 @@ export function takePendingTrackProperties(
     }
     return {
       track: parsed.track,
+      tracks: parsed.tracks,
       windowLabel: parsed.windowLabel || windowLabel,
     };
   } catch {
@@ -149,9 +151,9 @@ async function showWindow(win: WebviewWindow, track: MusicFile) {
   }
 }
 
-async function deliverOpen(windowLabel: string, track: MusicFile) {
-  const payload: TrackPropertiesOpenPayload = { track, windowLabel };
-  stashPendingTrackProperties(windowLabel, track);
+async function deliverOpen(windowLabel: string, track: MusicFile, tracks: MusicFile[] = [track]) {
+  const payload: TrackPropertiesOpenPayload = { track, tracks, windowLabel };
+  stashPendingTrackProperties(windowLabel, track, tracks);
   try {
     await emitTo(windowLabel, 'track-properties:open', payload);
   } catch {
@@ -164,13 +166,16 @@ async function deliverOpen(windowLabel: string, track: MusicFile) {
  * Same track again → focus the existing window (no second copy).
  * Different tracks → separate windows.
  */
-export async function openTrackPropertiesWindow(track: MusicFile) {
-  const windowLabel = trackPropertiesLabelForPath(track.path);
+export async function openTrackPropertiesWindow(input: MusicFile | MusicFile[]) {
+  const tracks = Array.isArray(input) ? input : [input];
+  if (!tracks.length) return;
+  const track = tracks[0];
+  const windowLabel = trackPropertiesLabelForPath(tracks.map(t => t.path).sort().join('|'));
   try {
     let win = await WebviewWindow.getByLabel(windowLabel);
 
     if (win) {
-      await deliverOpen(windowLabel, track);
+      await deliverOpen(windowLabel, track, tracks);
       await showWindow(win, track);
       return;
     }
@@ -184,7 +189,7 @@ export async function openTrackPropertiesWindow(track: MusicFile) {
     });
 
     // Stash before the webview boots so onMount can pick it up without a race.
-    stashPendingTrackProperties(windowLabel, track);
+    stashPendingTrackProperties(windowLabel, track, tracks);
 
     win.once('tauri://error', (e: { payload?: string }) => {
       console.error('[track-properties] creation error:', e?.payload || e);
@@ -195,7 +200,7 @@ export async function openTrackPropertiesWindow(track: MusicFile) {
     const openWithPayload = async () => {
       if (delivered) return;
       delivered = true;
-      await deliverOpen(windowLabel, track);
+      await deliverOpen(windowLabel, track, tracks);
       await showWindow(win!, track);
     };
 

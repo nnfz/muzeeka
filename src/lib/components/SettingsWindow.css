@@ -623,7 +623,7 @@ button.playlist-select:hover {
 
 .mode-btn.active {
   background: var(--accent);
-  color: white;
+  color: var(--accent-fg, white);
 }
 
 .preset-btn {
@@ -644,7 +644,7 @@ button.playlist-select:hover {
 
 .preset-btn.active {
   background: var(--accent);
-  color: white;
+  color: var(--accent-fg, white);
   border-color: var(--accent);
 }
 

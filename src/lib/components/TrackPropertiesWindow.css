@@ -884,3 +884,88 @@
     grid-template-columns: minmax(110px, 38%) 1fr;
   }
 }
+
+/* Copied from SettingsWindow.css; isolated to the properties window. */
+.props-window .action-btn {
+  padding: 7px 12px;
+  font-size: 12px;
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.props-window .action-btn:hover:not(:disabled) {
+  background: var(--hover);
+  color: var(--text-primary);
+}
+
+.props-window .action-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.props-window .action-btn-primary {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-color: transparent;
+}
+
+.props-window .action-btn-primary:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  color: var(--text-primary);
+  border-color: transparent;
+}
+
+.props-window .action-btn-danger {
+  background: color-mix(in srgb, #e05555 12%, transparent);
+  color: #e05555;
+  border-color: transparent;
+}
+
+.props-window .action-btn-danger:hover:not(:disabled) {
+  background: color-mix(in srgb, #e05555 22%, transparent);
+  color: #ff7070;
+  border-color: transparent;
+}
+
+.props-window .preset-btn {
+  padding: 16px 10px;
+  font-size: 11px;
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-secondary);
+  border-radius: 999px;
+  line-height: 0;
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.props-window .preset-btn:hover {
+  background: var(--accent-soft);
+  color: var(--text-primary);
+}
+
+.props-window .preset-btn.active {
+  background: var(--accent);
+  color: var(--accent-fg, white);
+  border-color: var(--accent);
+}
+
+
+.props-window .action-btn-active {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-color: transparent;
+}
+
+.props-window .action-btn:focus-visible,
+.props-window .preset-btn:focus-visible {
+  outline: 2px solid var(--border-accent);
+  outline-offset: 2px;
+}
+
+.props-window .preset-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}

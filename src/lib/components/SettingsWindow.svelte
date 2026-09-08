@@ -44,6 +44,17 @@
   const settings = getSettingsStore();
   const plugins = createPluginsStore();
 
+  let clearVideoBusy = $state(false);
+  let clearVideoConfirm = $state(false);
+  let clearVideoMessage = $state<string | null>(null);
+  async function clearAllVideoBgs() {
+    if (!clearVideoConfirm) { clearVideoConfirm = true; setTimeout(() => (clearVideoConfirm = false), 3500); return; }
+    clearVideoBusy = true; clearVideoMessage = null;
+    try { const count = await invoke<number>('track_prefs_clear_all_video_bgs'); clearVideoMessage = 'Removed ' + count + ' video backgrounds'; }
+    catch (e) { clearVideoMessage = String(e); }
+    finally { clearVideoBusy = false; clearVideoConfirm = false; }
+  }
+
   let clearAllBusy = $state(false);
   let clearAllConfirm = $state(false);
   let clearAllError = $state<string | null>(null);
@@ -631,11 +642,9 @@
                 <div class="card-label">Shuffle mode</div>
                 <div class="card-value">
                   {#if settings.shuffleMode === "smart"}
-                    Smart: remembers tracks already played in this playlist and
-                    won’t repeat them until every track has had a turn
+                    Smart: remembers tracks already played in this playlist
                   {:else}
-                    Normal: classic random order; tracks may come up again
-                    sooner when the order reshuffles
+                    Normal: classic random order
                   {/if}
                 </div>
               </div>
@@ -710,6 +719,13 @@
                   {tagRescanBusy ? "Rescanning…" : "Rescan tags"}
                 </button>
               </div>
+            </div>
+          </div>
+
+          <div class="settings-card">
+            <div class="card-row card-row-stack">
+              <div><div class="card-label">Video backgrounds</div><div class="card-value">Remove downloaded fullscreen video backgrounds from all tracks</div>{#if clearVideoMessage}<div class="card-value card-value-ok">{clearVideoMessage}</div>{/if}</div>
+              <div class="card-actions"><button type="button" class="action-btn action-btn-danger" disabled={clearVideoBusy} onclick={() => void clearAllVideoBgs()}>{clearVideoBusy ? "Clearing…" : clearVideoConfirm ? "Click again to confirm" : "Delete video backgrounds"}</button></div>
             </div>
           </div>
 

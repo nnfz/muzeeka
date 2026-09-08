@@ -23,6 +23,7 @@
     lines?: LyricLine[];
     syncType?: SyncType;
     currentTime?: number;
+    duration?: number;
     isPlaying?: boolean;
     chromeVisible?: boolean;
     onSeek?: (timeSec: number) => void;
@@ -40,6 +41,7 @@
     lines = [],
     syncType = 'none',
     currentTime = 0,
+    duration = 0,
     isPlaying = false,
     chromeVisible = true,
     onSeek,
@@ -52,6 +54,9 @@
   /** Precomputed soft wraps (active/bold metrics) so scale/weight don't reflow mid-anim. */
   let lineLayouts = $state<LineLayout[]>([]);
   let lastScrolledIndex = -1;
+  // Keep the user's offset across playback ticks and pause/resume effect restarts.
+  let plainScrollOffset = 0;
+  let lastPlainScrollTop: number | null = null;
   let scrollRaf = 0;
   let scrollToken = 0;
   let layoutRaf = 0;
@@ -487,6 +492,8 @@
   $effect(() => {
     lines;
     lastScrolledIndex = -1;
+    plainScrollOffset = 0;
+    lastPlainScrollTop = null;
     clearWordFill();
     if (viewportEl) viewportEl.scrollTop = 0;
     scrollActiveLineAfterLayout(false);
@@ -552,6 +559,61 @@
       disposed = true;
       document.removeEventListener('visibilitychange', syncLoop);
       stopFillLoop();
+    };
+  });
+  $effect(() => {
+    if (syncType !== 'none' || !viewportEl || !containerEl || !lines.length) return;
+    const viewport = viewportEl;
+    const container = containerEl;
+    const total = duration;
+    const playing = isPlaying;
+    void currentTime;
+    let frame = 0;
+    let firstCenter = 0;
+    let lastCenter = 0;
+    const measure = () => {
+      const first = container.firstElementChild as HTMLElement | null;
+      const last = container.lastElementChild as HTMLElement | null;
+      if (!first || !last) return;
+      const top = viewport.getBoundingClientRect().top;
+      const a = first.getBoundingClientRect(), b = last.getBoundingClientRect();
+      firstCenter = viewport.scrollTop + a.top - top + a.height / 2 - viewport.clientHeight / 2;
+      lastCenter = viewport.scrollTop + b.top - top + b.height / 2 - viewport.clientHeight / 2;
+    };
+    const baseline = () => {
+      const progress = total > 0 ? Math.max(0, Math.min(1, mediaNow() / total)) : 0;
+      return firstCenter + (lastCenter - firstCenter) * progress;
+    };
+    const rememberManualScroll = () => {
+      // Scroll events also follow our own writes. Compare the browser's actual
+      // (clamped/rounded) position to distinguish wheel, touch and keyboard input.
+      if (lastPlainScrollTop !== null && Math.abs(viewport.scrollTop - lastPlainScrollTop) > 1) {
+        plainScrollOffset = viewport.scrollTop - baseline();
+        lastPlainScrollTop = viewport.scrollTop;
+      }
+    };
+    const paint = () => {
+      // Check before writing too: a user scroll may precede its scroll event.
+      rememberManualScroll();
+      viewport.scrollTop = Math.max(0, baseline() + plainScrollOffset);
+      lastPlainScrollTop = viewport.scrollTop;
+    };
+    const tick = () => { paint(); frame = requestAnimationFrame(tick); };
+    const sync = () => {
+      cancelAnimationFrame(frame);
+      measure(); paint();
+      if (playing && document.visibilityState === 'visible') frame = requestAnimationFrame(tick);
+    };
+    const observer = new ResizeObserver(() => { measure(); paint(); });
+    observer.observe(viewport); observer.observe(container);
+    document.addEventListener('visibilitychange', sync);
+    viewport.addEventListener('scroll', rememberManualScroll, { passive: true });
+    sync();
+    return () => {
+      cancelAnimationFrame(frame);
+      observer.disconnect();
+      viewport.removeEventListener('scroll', rememberManualScroll);
+      document.removeEventListener('visibilitychange', sync);
     };
   });
 </script>

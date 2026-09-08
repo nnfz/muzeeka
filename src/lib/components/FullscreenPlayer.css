@@ -651,3 +651,8 @@
   }
 }
 
+
+.fullscreen-art-wrap, .fullscreen-meta-text { pointer-events: auto; }
+
+/* The fixed player owns the viewport; keep it clear of the windowed transport gutter. */
+.fullscreen-player { height: 100dvh; min-height: 100vh; }

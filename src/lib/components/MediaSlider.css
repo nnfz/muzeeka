@@ -269,3 +269,5 @@
   0%, 100% { opacity: 1; }
   50% { opacity: 0.3; }
 }
+.time-toggle { background: none; border: 0; padding: 0; font-family: inherit; cursor: pointer; }
+.time-toggle:focus-visible { outline: 1px solid var(--accent); outline-offset: 3px; }

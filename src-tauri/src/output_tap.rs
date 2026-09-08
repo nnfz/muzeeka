@@ -17,15 +17,13 @@ use crate::bass::{self, BassLibrary};
 /// is the highest priority, i.e. "first"; we want the opposite end of the scale.
 const TAP_DSP_PRIORITY: i32 = -1_000_000;
 
-/// Cap on unconsumed audio in the push stream (44100 × 2ch × f32 ≈ 0.5 s).
-/// If the device falls behind, the excess is dropped — otherwise latency grows forever.
-const MAX_BUFFERED_BYTES: u32 = 176_400;
-
 /// Lives in `ExtraOutput`; a pointer to it is handed to the DSP as `user`.
 /// The DSP must be removed before this struct is dropped.
 pub struct OutputTapCtx {
     pump: DataPump,
     push_handle: u32,
+    /// 0.5 s of mixer-format float PCM. Excess is dropped so latency cannot grow.
+    max_buffered: u32,
 }
 
 /// Copies the mixer buffer into the push stream. Does not modify the buffer.
@@ -48,7 +46,7 @@ unsafe extern "system" fn tap_dsp_callback(
         return;
     }
     // The device is not keeping up — skip this chunk instead of accumulating latency.
-    if ctx.pump.queued(ctx.push_handle) > MAX_BUFFERED_BYTES {
+    if ctx.pump.queued(ctx.push_handle) > ctx.max_buffered {
         return;
     }
     let data = std::slice::from_raw_parts(buffer as *const u8, length as usize);
@@ -75,14 +73,25 @@ pub fn attach(
         return Err("mixer is not running".into());
     }
 
+    // Match the mixer format so the DSP copy is a memcpy, not a resample.
+    let mixer_info = bass.channel_get_info(mixer)?;
+    let freq = if mixer_info.freq >= 8000 {
+        mixer_info.freq
+    } else {
+        44100
+    };
+    let chans = mixer_info.chans.max(1);
+    let max_buffered = freq.saturating_mul(chans).saturating_mul(4) / 2;
+
     // A push stream belongs to whichever device is current when it is created, so switch
     // over, create it, and switch back.
     let previous = bass.get_device();
     bass.set_device(device)?;
     let created = bass
-        .stream_create_push(44100, 2, bass::BASS_SAMPLE_FLOAT)
+        .stream_create_push(freq, chans, bass::BASS_SAMPLE_FLOAT)
         .and_then(|handle| {
             // Volume before play, otherwise the first milliseconds go out at full level.
+            let _ = bass.channel_set_attribute(handle, bass::BASS_ATTRIB_BUFFER, 0.5);
             bass.channel_set_attribute(handle, bass::BASS_ATTRIB_VOL, volume)
                 .and_then(|()| bass.channel_play(handle, false))
                 .map(|()| handle)
@@ -97,6 +106,7 @@ pub fn attach(
     let mut ctx = Box::new(OutputTapCtx {
         pump: bass.data_pump(),
         push_handle,
+        max_buffered,
     });
     let user = ctx.as_mut() as *mut OutputTapCtx as *mut std::ffi::c_void;
 

@@ -548,6 +548,13 @@ impl LibraryDatabase {
     ///
     /// The flag is what stops a track with no YouTube video from re-searching on
     /// every play; a successful download is remembered by `video_bg_path` instead.
+    pub fn clear_all_track_video_bgs(&self) -> Result<u32, String> {
+        let connection = self.inner.connection.lock();
+        let count = connection.execute("UPDATE track_prefs SET video_bg_path = NULL, video_bg_tried = NULL WHERE video_bg_path IS NOT NULL", []).map_err(db_error)?;
+        connection.execute("DELETE FROM track_prefs WHERE playback_rate IS NULL AND video_bg_path IS NULL AND video_bg_tried IS NULL", []).map_err(db_error)?;
+        Ok(count as u32)
+    }
+
     pub fn get_track_video_bg_tried(&self, track_path: &str) -> Result<bool, String> {
         let key = path_key(track_path.trim());
         if key.is_empty() {

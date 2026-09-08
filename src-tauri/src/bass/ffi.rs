@@ -126,6 +126,7 @@ pub struct BassLibrary {
     bass_plugin_load:
         unsafe extern "system" fn(file: *const u16, flags: DWORD) -> HPLUGIN,
 
+    bass_get_info: unsafe extern "system" fn(info: *mut BassInfo) -> BOOL,
     bass_get_device_info:
         unsafe extern "system" fn(device: DWORD, info: *mut BassDeviceInfo) -> BOOL,
     bass_set_device: unsafe extern "system" fn(device: DWORD) -> BOOL,
@@ -281,6 +282,7 @@ impl BassLibrary {
                 bass_channel_set_dsp_ex: load_fn!(lib, b"BASS_ChannelSetDSPEx\0"),
                 bass_channel_remove_dsp: load_fn!(lib, b"BASS_ChannelRemoveDSP\0"),
                 bass_plugin_load: load_fn!(lib, b"BASS_PluginLoad\0"),
+                bass_get_info: load_fn!(lib, b"BASS_GetInfo\0"),
                 bass_get_device_info: load_fn!(lib, b"BASS_GetDeviceInfo\0"),
                 bass_set_device: load_fn!(lib, b"BASS_SetDevice\0"),
                 bass_get_device: load_fn!(lib, b"BASS_GetDevice\0"),
@@ -377,6 +379,7 @@ impl BassLibrary {
     /// Create a decode stream from an internet URL (HTTP/HTTPS radio).
     /// BLOCK keeps memory bounded for endless streams; the caller must add the
     /// stream to the mixer and free it via ChannelFree like any decode source.
+    #[allow(dead_code)]
     pub fn stream_create_url(&self, url: &str, flags: DWORD) -> Result<HSTREAM, String> {
         self.url_opener().open(url, flags)
     }
@@ -401,6 +404,7 @@ impl BassLibrary {
         }
     }
 
+    #[allow(dead_code)]
     pub fn stream_put_data(&self, handle: DWORD, data: &[u8]) -> Result<u32, String> {
         if data.is_empty() {
             return Ok(0);
@@ -714,6 +718,12 @@ impl BassLibrary {
         self.check(ok)
     }
 
+    pub fn get_info(&self) -> Result<BassInfo, String> {
+        let mut info = BassInfo::default();
+        let ok = unsafe { (self.bass_get_info)(&mut info) };
+        self.check(ok).map(|()| info)
+    }
+
     pub fn set_config_ptr(&self, option: DWORD, value: *const std::ffi::c_void) -> Result<(), String> {
         let ok = unsafe { (self.bass_set_config_ptr)(option, value) };
         self.check(ok)
@@ -1006,6 +1016,7 @@ impl UrlStreamOpener {
     /// Open a URL decode stream. BLOCK keeps memory bounded for endless radio;
     /// STATUS exposes ICY/HTTP headers. Blocks during the network connect — call
     /// only on the BASS thread.
+    #[allow(dead_code)]
     pub fn open(&self, url: &str, flags: DWORD) -> Result<HSTREAM, String> {
         self.open_proc(url, flags, ptr::null_mut(), ptr::null_mut())
     }

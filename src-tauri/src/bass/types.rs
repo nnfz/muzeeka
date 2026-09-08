@@ -254,6 +254,8 @@ pub const BASS_UNICODE: DWORD = 0x80000000;
 pub const BASS_SAMPLE_FLOAT: DWORD = 256;
 /// Downmix to mono when creating a stream (good for analysis).
 pub const BASS_SAMPLE_MONO: DWORD = 2;
+/// File I/O on a worker thread so the WASAPI/mixer callback never blocks on disk.
+pub const BASS_ASYNCFILE: DWORD = 0x4000_0000;
 
 /// ICY (SHOUTcast) metadata tag: `StreamTitle='...';StreamUrl='...';`
 pub const BASS_TAG_META: DWORD = 0x10000;
@@ -297,24 +299,33 @@ pub const BASS_ATTRIB_VOL: DWORD = 2;
 pub const BASS_ATTRIB_PAN: DWORD = 3;
 pub const BASS_ATTRIB_BUFFER: DWORD = 13;
 
-// ── Config options ────────────────────────────────────────────────────────────
-pub const BASS_CONFIG_FLOATDSP: DWORD = 46;
+// ── Config options (numeric values from bass.h) ──────────────────────────────
 pub const BASS_CONFIG_BUFFER: DWORD = 0;
 pub const BASS_CONFIG_UPDATEPERIOD: DWORD = 1;
-/// Enable ICY metadata on internet streams (default 1).
-pub const BASS_CONFIG_NET_META: DWORD = 29;
+/// Pass 32-bit float to every DSP callback.
+pub const BASS_CONFIG_FLOATDSP: DWORD = 9;
 /// Internet connection timeout in milliseconds.
-pub const BASS_CONFIG_NET_TIMEOUT: DWORD = 8;
+pub const BASS_CONFIG_NET_TIMEOUT: DWORD = 11;
 /// Download buffer length for internet streams, in milliseconds (default 5000).
-pub const BASS_CONFIG_NET_BUFFER: DWORD = 9;
+pub const BASS_CONFIG_NET_BUFFER: DWORD = 12;
+/// Percent of [`BASS_CONFIG_NET_BUFFER`] to pre-buffer before `StreamCreateURL` returns (default 75).
+pub const BASS_CONFIG_NET_PREBUF: DWORD = 15;
 /// HTTP User-Agent string (via `BASS_SetConfigPtr`).
-pub const BASS_CONFIG_NET_AGENT: DWORD = 10;
+pub const BASS_CONFIG_NET_AGENT: DWORD = 16;
 /// How many playlist entries `StreamCreateURL` should follow (1 = first URL).
 pub const BASS_CONFIG_NET_PLAYLIST: DWORD = 21;
-/// Percent of [`BASS_CONFIG_NET_BUFFER`] to pre-buffer before `StreamCreateURL` returns (default 75).
-pub const BASS_CONFIG_NET_PREBUF: DWORD = 6;
+/// WASAPI/device buffer length in milliseconds. Must be set before `BASS_Init`.
+pub const BASS_CONFIG_DEV_BUFFER: DWORD = 27;
+/// Enable ICY metadata on internet streams (default 1). Unknown on some BASS builds.
+pub const BASS_CONFIG_NET_META: DWORD = 29;
 /// Stall timeout while reading an internet stream, in milliseconds (0 = no timeout).
 pub const BASS_CONFIG_NET_READTIMEOUT: DWORD = 37;
+/// Async file read-ahead size in bytes (default 65536).
+pub const BASS_CONFIG_ASYNCFILE_BUFFER: DWORD = 45;
+/// Keep the output device running even while nothing is playing.
+pub const BASS_CONFIG_DEV_NONSTOP: DWORD = 50;
+/// WASAPI/device update period in milliseconds. Must be set before `BASS_Init`.
+pub const BASS_CONFIG_DEV_PERIOD: DWORD = 53;
 
 /// `BASS_StreamGetFilePosition` modes.
 pub const BASS_FILEPOS_DOWNLOAD: DWORD = 1;
@@ -355,6 +366,26 @@ pub struct BassDeviceInfo {
     pub name: *const i8,
     pub driver: *const i8,
     pub flags: DWORD,
+}
+
+/// `BASS_INFO` from bass.h — device mix format after `BASS_Init`.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct BassInfo {
+    pub flags: DWORD,
+    pub hwsize: DWORD,
+    pub hwfree: DWORD,
+    pub freesam: DWORD,
+    pub free3d: DWORD,
+    pub minrate: DWORD,
+    pub maxrate: DWORD,
+    pub eax: BOOL,
+    pub minbuf: DWORD,
+    pub dsver: DWORD,
+    pub latency: DWORD,
+    pub initflags: DWORD,
+    pub speakers: DWORD,
+    pub freq: DWORD,
 }
 
 #[derive(Debug, Clone)]

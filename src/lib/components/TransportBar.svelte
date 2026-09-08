@@ -161,6 +161,8 @@
   }
 
   function openNowPlayingContextMenu(e: MouseEvent) {
+    e.preventDefault();
+    e.stopPropagation();
     if (!player.currentTrack || !player.currentFile) return;
     const position = openContextMenuFromEvent(e, { width: 220, height: 264 });
     playlistSubmenu = null;
@@ -604,7 +606,7 @@
 </div>
 
 {#if fullscreenOpen}
-  <FullscreenPlayer bind:open={fullscreenOpen} />
+  <FullscreenPlayer bind:open={fullscreenOpen} onTrackContextMenu={openNowPlayingContextMenu} />
 {/if}
 
 <svelte:window

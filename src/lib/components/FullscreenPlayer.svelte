@@ -34,9 +34,10 @@
 
   interface Props {
     open?: boolean;
+    onTrackContextMenu?: (event: MouseEvent) => void;
   }
 
-  let { open = $bindable(false) }: Props = $props();
+  let { open = $bindable(false), onTrackContextMenu }: Props = $props();
 
   const player = getPlayerStore();
 
@@ -337,11 +338,10 @@
   }
 
   function handleKeydown(e: KeyboardEvent) {
-    if (!open) return;
-    if (e.key === "Escape") {
-      e.preventDefault();
-      close();
-    }
+    if (!open || e.key !== "Escape") return;
+    e.preventDefault();
+    e.stopPropagation();
+    close();
   }
 
   $effect(() => {
@@ -749,7 +749,8 @@
     <div class="fullscreen-layout" class:lyrics-hidden={!showLyricsPanel}>
       <aside class="fullscreen-side">
         <div class="fullscreen-side-scale" class:is-paused={player.isPaused}>
-          <div class="fullscreen-art-wrap">
+          <!-- svelte-ignore a11y_no_static_element_interactions -->
+          <div class="fullscreen-art-wrap" oncontextmenu={onTrackContextMenu}>
             {#if !placeholderFailed}
               <img
                 class="fullscreen-art"
@@ -778,7 +779,8 @@
           </div>
 
           <div class="fullscreen-meta">
-            <div class="fullscreen-meta-text">
+            <!-- svelte-ignore a11y_no_static_element_interactions -->
+            <div class="fullscreen-meta-text" oncontextmenu={onTrackContextMenu}>
               <h2 class="fullscreen-title">
                 {player.currentIsStream
                   ? (player.nowPlayingTitle ?? player.currentFileName ?? "")
@@ -807,6 +809,7 @@
             lines={lyricsState?.lines ?? []}
             syncType={lyricsState?.syncType ?? "none"}
             currentTime={player.position}
+            duration={player.duration}
             isPlaying={player.isPlaying}
             {chromeVisible}
             onSeek={(time) => void player.seekAbsolute(time)}

@@ -592,3 +592,15 @@
   text-shadow: none !important;
   /* Still light up with the wave */
 }
+
+/* Untimed lyrics scroll continuously without line emphasis. */
+.fs-lyrics-container[data-sync="none"] .fs-lyrics-line,
+.fs-lyrics-container[data-sync="none"] .fs-lyrics-line.is-active,
+.fs-lyrics-container[data-sync="none"] .fs-lyrics-line.is-past,
+.fs-lyrics-container[data-sync="none"] .fs-lyrics-line:hover {
+  color: var(--text-primary);
+  opacity: 1;
+  filter: none;
+  transform: none;
+  transition: none;
+}

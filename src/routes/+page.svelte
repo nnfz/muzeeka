@@ -73,6 +73,33 @@
   }
   let searchQuery = $state('');
   let fullscreenOpen = $state(false);
+  let nativeFullscreen = false;
+  let fullscreenChanging = false;
+
+  async function toggleNativeFullscreen() {
+    if (fullscreenChanging) return;
+    fullscreenChanging = true;
+    try {
+      nativeFullscreen = !(await currentWin.isFullscreen());
+      await currentWin.setFullscreen(nativeFullscreen);
+    } catch (error) {
+      console.error('Failed to toggle window fullscreen:', error);
+    } finally {
+      fullscreenChanging = false;
+    }
+  }
+
+  $effect(() => {
+    if (isSecondaryWindow) return;
+    const onKeydown = (event: KeyboardEvent) => {
+      if (event.key !== 'F11' || event.ctrlKey || event.altKey || event.metaKey || event.repeat) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      void toggleNativeFullscreen();
+    };
+    window.addEventListener('keydown', onKeydown, { capture: true });
+    return () => window.removeEventListener('keydown', onKeydown, { capture: true });
+  });
 
   // Unstick UI if a previous drag-float / pointer-capture experiment left leftovers.
   if (!isSecondaryWindow && typeof document !== 'undefined') {

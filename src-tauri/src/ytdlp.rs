@@ -1226,7 +1226,7 @@ pub fn download_video_bg_clip(
 ) -> Result<(), String> {
     // Build search query - search without "-topic" exclusion first, then filter results
     // ytsearch doesn't support negative filters, so we just search for the artist and title
-    let query = format!("ytsearch1:{} {}", artist.trim(), title.trim());
+    let query = format!("ytsearch5:{} {} -topic", artist.trim(), title.trim());
 
     eprintln!("[video_bg] Starting download for: {} - {}", artist, title);
     eprintln!("[video_bg] Search query: {}", query);
@@ -1291,6 +1291,7 @@ pub fn download_video_bg_clip(
 
     if !temp_video.is_file() {
         eprintln!("[video_bg] ERROR: Downloaded file not found at {}", temp_video.display());
+        let _ = fs::remove_file(&temp_video);
         return Err("Video download succeeded but file not found".to_string());
     }
 
@@ -1301,7 +1302,7 @@ pub fn download_video_bg_clip(
     let ffmpeg_dir = resolve_ffmpeg_location(app)
         .ok_or_else(|| {
             eprintln!("[video_bg] ERROR: ffmpeg not found");
-            "ffmpeg not found".to_string()
+            { let _ = fs::remove_file(&temp_video); "ffmpeg not found".to_string() }
         })?;
     let ffmpeg_bin = ffmpeg_dir.join(if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" });
     let ffprobe_bin = ffmpeg_dir.join(if cfg!(windows) { "ffprobe.exe" } else { "ffprobe" });
@@ -1312,7 +1313,7 @@ pub fn download_video_bg_clip(
     if !ffprobe_bin.is_file() {
         eprintln!("[video_bg] ERROR: ffprobe binary not found!");
         let _ = fs::remove_file(&temp_video);
-        return Err("ffprobe not found".to_string());
+        return Err({ let _ = fs::remove_file(&temp_video); "ffprobe not found".to_string() });
     }
 
     // Probe duration
@@ -1358,7 +1359,7 @@ pub fn download_video_bg_clip(
         .arg(format!("{:.3}", start))
         .args(["-i"])
         .arg(&temp_video)
-        .args(["-t", "15", "-c", "copy", "-avoid_negative_ts", "make_zero"])
+        .args(["-t", "15", "-map", "0:v:0", "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-avoid_negative_ts", "make_zero"])
         .arg(output_path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

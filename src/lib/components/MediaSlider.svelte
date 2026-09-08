@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { timeDisplay } from '$lib/stores/timeDisplay.svelte';
   import { onDestroy } from 'svelte';
   import { getPlayerStore } from '$lib/stores/player.svelte';
 
@@ -39,7 +40,7 @@
 
   let displayTime = $derived(
     variant === 'progress'
-      ? formatTime(activeRatio * player.displayDuration)
+      ? (timeDisplay.remaining ? '-' : '') + formatTime((timeDisplay.remaining ? 1 - activeRatio : activeRatio) * player.displayDuration)
       : player.formattedPosition
   );
 
@@ -317,7 +318,7 @@
 
     <span class="slider-time duration live-badge">LIVE</span>
   {:else}
-    <span class="slider-time current">{displayTime}</span>
+    <button class="slider-time current time-toggle" onclick={() => timeDisplay.toggle()} title="Toggle elapsed / remaining time">{displayTime}</button>
 
     <div
       class="slider-track"

@@ -1034,6 +1034,21 @@ pub fn track_prefs_set_video_bg(
     Ok(validated)
 }
 
+/// Remove all downloaded video backgrounds and their track references.
+#[tauri::command]
+pub fn track_prefs_clear_all_video_bgs(app: AppHandle, database: State<'_, LibraryDatabase>) -> Result<u32, String> {
+    let count = database.clear_all_track_video_bgs()?;
+    let dir = app.path().app_data_dir().map_err(|e| format!("Failed to resolve app data dir: {e}"))?.join("video_backgrounds");
+    if dir.is_dir() {
+        for entry in std::fs::read_dir(&dir).map_err(|e| format!("Failed to read video backgrounds: {e}"))?.flatten() {
+            let path = entry.path();
+            if path.is_file() { std::fs::remove_file(path).map_err(|e| format!("Failed to remove video background: {e}"))?; }
+        }
+    }
+    let _ = app.emit("track-bg:changed", "");
+    Ok(count as u32)
+}
+
 /// Auto-download a 15-second video clip from YouTube for track background.
 ///
 /// Checks if setting is enabled and track has no existing video, then:
@@ -1053,6 +1068,7 @@ pub async fn track_prefs_auto_download_video_bg(
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
+    if title.trim().is_empty() || artist.trim().is_empty() || path.starts_with("http://") || path.starts_with("https://") || title.to_ascii_lowercase().contains("station") { return Ok(None); }
     let app_clone = app.clone();
     let database = database.inner().clone();
     let path_clone = path.clone();

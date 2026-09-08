@@ -48,6 +48,7 @@ pub fn init(app_data_dir: PathBuf) {
 }
 
 /// Return a previously stored public HTTPS cover URL, if any.
+#[allow(dead_code)]
 pub fn get(key: &str) -> Option<String> {
     match lookup(key) {
         CacheLookup::Url(url) => Some(url),

@@ -106,6 +106,7 @@ pub fn is_youtube_related_domain(domain: &str) -> bool {
         || d.ends_with(".ggpht.com")
 }
 
+#[allow(dead_code)]
 pub fn is_youtube_login_cookie(name: &str) -> bool {
     matches!(
         name,
