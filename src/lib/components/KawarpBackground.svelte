@@ -37,15 +37,15 @@
     paused = false,
     switchKey = null,
     class: className = '',
-    warpIntensity = 3.85,
-    blurPasses = 8,
+    warpIntensity = 1.1,
+    blurPasses = 5,
     animationSpeed = CRUISE_SPEED_DEFAULT,
     transitionDuration = 700,
     saturation = 1.65,
     tintColor = BG_TINT,
     tintIntensity = 0.06,
     dithering = 0.01,
-    scale = 1.25,
+    scale = 2,
   }: Props = $props();
 
   let containerEl = $state<HTMLDivElement | undefined>();
