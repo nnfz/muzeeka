@@ -11,7 +11,7 @@ export interface HttpStatus {
   last_error: string | null;
 }
 
-export type PluginSettingType = 'number' | 'boolean' | 'string';
+export type PluginSettingType = 'number' | 'boolean' | 'string' | 'slider' | 'button';
 
 export interface PluginSettingSpec {
   key: string;
@@ -21,6 +21,8 @@ export interface PluginSettingSpec {
   min?: number | null;
   max?: number | null;
   default?: unknown;
+  step?: number | null;
+  action?: string | null;
 }
 
 export type PluginRuntime = 'js' | 'native';

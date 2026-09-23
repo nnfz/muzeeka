@@ -1041,6 +1041,43 @@
                         />
                         <span class="settings-switch" aria-hidden="true"></span>
                       </label>
+                    {:else if spec.type === "slider"}
+                      <div class="plugin-slider-wrapper">
+                        <input
+                          type="range"
+                          class="plugin-slider"
+                          min={spec.min ?? 0}
+                          max={spec.max ?? 100}
+                          step={spec.step ?? 1}
+                          value={Number(plugin.config?.[spec.key] ?? spec.default ?? 0)}
+                          style={`--fill: ${((Number(plugin.config?.[spec.key] ?? spec.default ?? 0) - (spec.min ?? 0)) / ((spec.max ?? 100) - (spec.min ?? 0))) * 100}%`}
+                          oninput={(e) => {
+                            const value = Number((e.target as HTMLInputElement).value);
+                            (e.target as HTMLInputElement).style.setProperty('--fill',
+                              `${((value - (spec.min ?? 0)) / ((spec.max ?? 100) - (spec.min ?? 0))) * 100}%`);
+                            settingDrafts = {
+                              ...settingDrafts,
+                              [settingDraftKey(plugin.id, spec.key)]: value,
+                            };
+                          }}
+                          onchange={(e) =>
+                            void plugins.setConfig(
+                              plugin.id,
+                              { [spec.key]: Number((e.target as HTMLInputElement).value) }
+                            )}
+                        />
+                        <span class="plugin-slider-value">
+                          {settingDrafts[settingDraftKey(plugin.id, spec.key)] ?? plugin.config?.[spec.key] ?? spec.default ?? 0}
+                        </span>
+                      </div>
+                    {:else if spec.type === "button"}
+                      <button
+                        type="button"
+                        class="action-btn"
+                        onclick={() => void plugins.setConfig(plugin.id, { [spec.key]: true })}
+                      >
+                        {spec.label || spec.key}
+                      </button>
                     {:else}
                       <input
                         class="port-input"

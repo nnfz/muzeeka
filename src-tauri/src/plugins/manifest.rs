@@ -47,6 +47,8 @@ pub enum SettingKind {
     Number,
     Boolean,
     String,
+    Slider,
+    Button,
 }
 
 impl Default for SettingKind {
@@ -76,7 +78,7 @@ pub struct PluginSettingSpec {
 impl PluginSettingSpec {
     pub fn sanitize(&self, value: Option<&serde_json::Value>) -> serde_json::Value {
         match self.kind {
-            SettingKind::Number => {
+            SettingKind::Number | SettingKind::Slider => {
                 let mut n = value
                     .and_then(serde_json::Value::as_f64)
                     .or_else(|| self.default.as_ref().and_then(serde_json::Value::as_f64))
@@ -93,7 +95,7 @@ impl PluginSettingSpec {
                     serde_json::json!(n)
                 }
             }
-            SettingKind::Boolean => serde_json::json!(value
+            SettingKind::Boolean | SettingKind::Button => serde_json::json!(value
                 .and_then(serde_json::Value::as_bool)
                 .or_else(|| self.default.as_ref().and_then(serde_json::Value::as_bool))
                 .unwrap_or(false)),

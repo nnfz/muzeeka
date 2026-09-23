@@ -1,0 +1,52 @@
+{
+  "id": "user.discord-ducking",
+  "name": "Discord Ducking",
+  "version": "1.0.0",
+  "author": "muzeeka",
+  "description": "Автоматически убавляет музыку когда кто-то говорит в Discord",
+  "main": "discord_ducking.dll",
+  "runtime": "native",
+  "permissions": [
+    "player:control",
+    "player:read"
+  ],
+  "settings": [
+    {
+      "key": "duck_volume",
+      "type": "slider",
+      "label": "Громкость при разговоре",
+      "description": "Процент громкости музыки когда кто-то говорит",
+      "min": 0,
+      "max": 100,
+      "step": 5,
+      "default": 20
+    },
+    {
+      "key": "fade_ms",
+      "type": "slider",
+      "label": "Скорость перехода (мс)",
+      "description": "Время затухания и восстановления громкости",
+      "min": 50,
+      "max": 2000,
+      "step": 50,
+      "default": 300
+    },
+    {
+      "key": "release_delay_ms",
+      "type": "slider",
+      "label": "Задержка восстановления (мс)",
+      "description": "Пауза перед восстановлением громкости после окончания разговора",
+      "min": 0,
+      "max": 5000,
+      "step": 100,
+      "default": 500
+    },
+    {
+      "key": "test_duck",
+      "type": "button",
+      "label": "Проверить",
+      "description": "Проверить работу дакинга (убавит музыку на 3 секунды)"
+    }
+  ],
+  "enabled_by_default": false
+}

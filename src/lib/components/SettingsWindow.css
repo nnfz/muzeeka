@@ -652,3 +652,61 @@ button.playlist-select:hover {
   margin-left: auto;
   font-weight: 600;
 }
+
+/* Plugin slider control */
+.plugin-slider-wrapper {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 220px;
+}
+
+.plugin-slider {
+  flex: 1;
+  height: 4px;
+  appearance: none;
+  -webkit-appearance: none;
+  border-radius: var(--radius-full);
+  cursor: pointer;
+  background: linear-gradient(
+    to right,
+    var(--accent) 0%,
+    var(--accent) var(--fill, 50%),
+    rgba(255, 255, 255, 0.08) var(--fill, 50%),
+    rgba(255, 255, 255, 0.08) 100%
+  );
+  transition: background 0.1s ease;
+}
+
+.plugin-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 0 6px var(--accent-glow), 0 2px 3px rgba(0, 0, 0, 0.3);
+  transition: transform var(--transition-fast);
+}
+
+.plugin-slider:hover::-webkit-slider-thumb {
+  transform: scale(1.1);
+}
+
+.plugin-slider::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #fff;
+  border: none;
+  box-shadow: 0 0 6px var(--accent-glow), 0 2px 3px rgba(0, 0, 0, 0.3);
+}
+
+.plugin-slider-value {
+  font-size: 12px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-primary);
+  min-width: 36px;
+  text-align: right;
+}

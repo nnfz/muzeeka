@@ -175,6 +175,14 @@ impl PluginHost {
                 require(perms, HTTP_LISTEN)?;
                 Ok(serde_json::to_value(self.http.status(plugin_id)).unwrap_or(Value::Null))
             }
+            "plugin.getConfig" => Ok(load_settings(&self.app, plugin_id)),
+            "plugin.setConfig" => {
+                let values = args.clone();
+                if !values.is_object() {
+                    return Err("plugin.setConfig expects an object".into());
+                }
+                merge_settings(&self.app, plugin_id, values)
+            }
             "settings.get" => Ok(load_settings(&self.app, plugin_id)),
             "settings.set" => {
                 let values = args.get("values").cloned().unwrap_or_else(|| args.clone());
