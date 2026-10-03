@@ -6,7 +6,7 @@
 [![Tauri](https://img.shields.io/badge/Tauri-v2-24C8DB)](https://tauri.app/)
 [![SvelteKit](https://img.shields.io/badge/SvelteKit-FF3E00?logo=svelte&logoColor=white)](https://svelte.dev/docs/kit)
 <p align="center">
-	<img src="logo/logo-1024.png" alt="Muzeeka logo" width="180" />
+	<img src="logo/logo-1024.png" alt="muzeeka logo" width="180" />
 </p>
 
 <p align="center">
@@ -25,7 +25,7 @@ The app is currently in the process of transitioning from WebView to native code
 
 ## What is it?
 
-Muzeeka is a desktop audio player focused on local library playback, playlist management, and a polished UI.
+muzeeka is a desktop audio player focused on local library playback, playlist management, and a polished UI.
 
 **Supported platforms:** Windows only (for now).
 
@@ -122,7 +122,7 @@ If you are fixing a bug, please include the reproduction steps and what you veri
 
 ## Acknowledgements
 
-Muzeeka depends on a number of great projects and libraries:
+muzeeka depends on a number of great projects and libraries:
 
 - [BASS](https://www.un4seen.com/) - the core audio playback engine
 - [FFmpeg](https://ffmpeg.org/) - multimedia processing and conversion
@@ -150,9 +150,9 @@ Muzeeka depends on a number of great projects and libraries:
 - [Unison](https://unison.boidu.dev) - Lyrics from Unison
 ## Legal & Third-Party Notices
 
-Muzeeka integrates several powerful third-party libraries and CLI tools to handle media playback and extraction. These tools are governed by their own respective licenses:
+muzeeka integrates several powerful third-party libraries and CLI tools to handle media playback and extraction. These tools are governed by their own respective licenses:
 
-- **[BASS Audio Library](https://www.un4seen.com/)**: Audio playback is powered by the BASS library. BASS is a product of Un4seen Developments Ltd. It is free for non-commercial use. If you intend to distribute or use Muzeeka commercially, you must obtain a separate commercial license from Un4seen Developments.
+- **[BASS Audio Library](https://www.un4seen.com/)**: Audio playback is powered by the BASS library. BASS is a product of Un4seen Developments Ltd. It is free for non-commercial use. If you intend to distribute or use muzeeka commercially, you must obtain a separate commercial license from Un4seen Developments.
 - **[FFmpeg](https://ffmpeg.org/)**: This software uses the code of FFmpeg to handle audio processing, licensed under the LGPLv2.1 / GPLv3. FFmpeg is a trademark of Fabrice Bellard, originator of the FFmpeg project.
 - **[yt-dlp](https://github.com/yt-dlp/yt-dlp)**: Used for media extraction. Released into the public domain (Unlicense).
 
@@ -160,4 +160,4 @@ Muzeeka integrates several powerful third-party libraries and CLI tools to handl
 
 This project is licensed under the MIT License. See [LICENSE](LICENSE) for the full text. 
 
-*Note: The MIT license applies only to the source code of Muzeeka itself, not to the pre-compiled third-party binaries (such as BASS or FFmpeg) required to run the application.*
+*Note: The MIT license applies only to the source code of muzeeka itself, not to the pre-compiled third-party binaries (such as BASS or FFmpeg) required to run the application.*
