@@ -1,0 +1,76 @@
+{
+  "id": "user.stream-server",
+  "name": "Stream Server",
+  "version": "0.4.4",
+  "author": "you",
+  "description": "Отдаёт звук самого приложения HTTP-потоком Opus или MP3 и название текущего трека. Браузер получает страницу с коротким буфером, плеер — сам поток.",
+  "main": "stream_server.dll",
+  "runtime": "native",
+  "enabled_by_default": false,
+  "permissions": ["audio:output", "player:read"],
+  "settings": [
+    {
+      "key": "port",
+      "type": "number",
+      "label": "Port",
+      "description": "TCP-порт потока. Его надо пробросить на роутере.",
+      "min": 1024,
+      "max": 65535,
+      "default": 8800
+    },
+    {
+      "key": "token",
+      "type": "string",
+      "label": "Access token",
+      "description": "Если задан, поток открывается только с ?token=VALUE. На белом IP лучше задать.",
+      "default": ""
+    },
+    {
+      "key": "format",
+      "type": "string",
+      "label": "Format",
+      "description": "opus или mp3. Другое значение считается opus. Смена перезапускает поток.",
+      "default": "opus"
+    },
+    {
+      "key": "bitrate_kbps",
+      "type": "slider",
+      "label": "Bitrate (kbps)",
+      "description": "Битрейт стерео. Ближайшее из 32, 64, 96, 128, 160, 192, 224, 256. Для музыки хватает 96–128.",
+      "min": 32,
+      "max": 256,
+      "step": 32,
+      "default": 128
+    },
+    {
+      "key": "sample_rate",
+      "type": "slider",
+      "label": "Sample rate (Hz)",
+      "description": "8000, 12000, 16000, 24000 или 48000. Для музыки оставьте 48000. Одинаково для Opus и MP3.",
+      "min": 8000,
+      "max": 48000,
+      "step": 1000,
+      "default": 48000
+    },
+    {
+      "key": "gain_percent",
+      "type": "slider",
+      "label": "Stream gain (%)",
+      "description": "Уровень только в потоке, от полной громкости микшера. Регулятор в плеере на это не влияет. Выше 100 может клиппить.",
+      "min": 0,
+      "max": 200,
+      "step": 5,
+      "default": 100
+    },
+    {
+      "key": "max_listeners",
+      "type": "slider",
+      "label": "Max listeners",
+      "description": "Лишние подключения получают 503.",
+      "min": 1,
+      "max": 50,
+      "step": 1,
+      "default": 10
+    }
+  ]
+}

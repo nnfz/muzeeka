@@ -1,0 +1,54 @@
+[package]
+name = "muzeeka"
+version = "0.1.0"
+edition = "2021"
+authors = ["nnfz"]
+description = "Music player"
+
+[dependencies]
+gpui = { git = "https://github.com/zed-industries/zed" }
+gpui_platform = { git = "https://github.com/zed-industries/zed" }
+anyhow = "1"
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+crossbeam-channel = "0.5"
+
+# Audio engine (from existing codebase)
+libloading = "0.8"
+
+# Metadata & library
+lofty = "0.24"
+id3 = "1"
+walkdir = "2"
+rayon = "1"
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# Image processing
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp", "tiff"] }
+
+# Discord RPC
+discord-rich-presence = "1.1"
+
+# Network
+ureq = { version = "3", features = ["json"] }
+urlencoding = "2"
+base64 = "0.22"
+
+# Utilities
+regex = "1"
+cue-rw = "0.2"
+num-rational = "0.4"
+encoding_rs = "0.8"
+arc-swap = "1.9"
+
+[build-dependencies]
+embed-resource = "3.0"
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
