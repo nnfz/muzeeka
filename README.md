@@ -1,4 +1,4 @@
-# Muzeeka
+# muzeeka
 **Pronunciation:** *moo-ZEE-kah* (рус. «музыка»)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-	A desktop music player built with Tauri, SvelteKit, and Rust.
+	A desktop music player built with GPUI and BASS.
 </p>
 
 <p align="center">
@@ -19,7 +19,9 @@
 </p>
 
 > **Status:** early beta.  
-> It works, but expect rough edges, incomplete features and occasional weirdness.
+> It works, but expect rough edges, incomplete features and occasional weirdness. 
+
+The app is currently in the process of transitioning from WebView to native code.
 
 ## What is it?
 
