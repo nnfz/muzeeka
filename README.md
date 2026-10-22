@@ -1,6 +1,6 @@
 # muzeeka
 **Pronunciation:** *moo-ZEE-kah* (рус. «музыка»)
-
+### README NOT UPDATED
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![CodeFactor](https://www.codefactor.io/repository/github/nnfz/muzeeka/badge)](https://www.codefactor.io/repository/github/nnfz/muzeeka)
 [![Tauri](https://img.shields.io/badge/Tauri-v2-24C8DB)](https://tauri.app/)
