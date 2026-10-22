@@ -1,12 +1,12 @@
 # muzeeka
 **Pronunciation:** *moo-ZEE-kah* (рус. «музыка»)
-### README NOT UPDATED
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![CodeFactor](https://www.codefactor.io/repository/github/nnfz/muzeeka/badge)](https://www.codefactor.io/repository/github/nnfz/muzeeka)
-[![Tauri](https://img.shields.io/badge/Tauri-v2-24C8DB)](https://tauri.app/)
-[![SvelteKit](https://img.shields.io/badge/SvelteKit-FF3E00?logo=svelte&logoColor=white)](https://svelte.dev/docs/kit)
+[![Rust](https://shields.io/badge/-Rust-3776AB?style=flat&logo=rust)](https://rust-lang.org/)
+[![GPUI](https://img.shields.io/badge/GPUI-gray?logo=rust)](https://gpui.rs/)
+[![Bass Audio Library](https://img.shields.io/badge/BASS-Audio_Library-red)](https://www.un4seen.com/)
 <p align="center">
-	<img src="logo/logo-1024.png" alt="muzeeka logo" width="180" />
+	<img src="src/icons/logo.svg" alt="muzeeka logo" width="180" />
 </p>
 
 <p align="center">
@@ -33,7 +33,7 @@ muzeeka is a desktop audio player focused on local library playback, playlist ma
 
 - Local library with folder scanning, metadata & cover art
 - Playlists (create, reorder, custom covers, liked tracks)
-- Gapless playback powered by BASS
+- Gapless playback
 - Equalizer with custom presets
 - Synchronized lyrics (LRC/TTML) + fullscreen lyrics view
 - Search, drag-and-drop, context menus
@@ -48,74 +48,101 @@ muzeeka is a desktop audio player focused on local library playback, playlist ma
 
 ### Prerequisites
 
-- Node.js
-- Rust toolchain
-- WebView2 on Windows
+- Rust toolchain (stable, installed with [rustup](https://rustup.rs/))
+- Visual Studio Build Tools with the "Desktop development with C++" workload and the Windows SDK
+- CMake (needed to build GPUI dependencies on Windows)
+- Git
+
+Muzeeka is built on [GPUI](https://github.com/zed-industries/zed), which is pulled straight from the Zed repository. The first build downloads and compiles a lot of crates, so expect it to take a while.
+
+### Runtime binaries
+
+Playback, downloads and metadata rely on external binaries that are shipped in the repository under `src/bin`:
+
+```text
+src/bin/
+  bass/            bass.dll and the BASS plugins
+  ffmpeg.exe
+  ffprobe.exe
+  ffplay.exe
+  yt-dlp.exe
+  deno.exe
+```
+
+In debug builds (`cargo run`) they are picked up from `src/bin` automatically. In release builds they are searched in a `bin` folder next to the executable, and BASS in `bin/bass`.
 
 ### Development
 
 ```powershell
-npm install
-npm run tauri dev
+git clone https://github.com/nnfz/muzeeka.git
+cd muzeeka
+cargo run
 ```
 
-### Frontend checks
+### Checks
 
 ```powershell
-npm run check
+cargo check
+cargo test
 ```
 
 ## Build
 
-### Installer
+### Release
 
 ```powershell
-npm run build:installer
+cargo build --release
 ```
 
-The installer is generated in:
+The executable is generated at:
 
 ```text
-src-tauri/target/release/bundle/nsis/
+target/release/muzeeka.exe
 ```
 
 ### Portable
 
+There is no installer yet. A portable build is the executable plus the `bin` folder next to it:
+
 ```powershell
-npm run build:portable
+cargo build --release
+New-Item -ItemType Directory -Force dist | Out-Null
+Copy-Item target\release\muzeeka.exe dist\
+Copy-Item src\bin dist\bin -Recurse
 ```
 
 The folder is generated in:
 
 ```text
-src-tauri/target/release/
+dist/
 ```
 
-### Both builds
+The release profile uses thin LTO with a single codegen unit, so release builds are slower than usual.
 
-```powershell
-npm run build:both
+### Available commands
+
+- `cargo run` - build and start the app in debug mode
+- `cargo check` - fast compile check without producing a binary
+- `cargo test` - run the unit tests
+- `cargo build --release` - optimized build
+
+### Data location
+
+Settings are stored in:
+
+```text
+%APPDATA%\com.nnfz.muzeeka\settings.json
 ```
-
-### Available scripts
-
-- `npm run dev` - Vite dev server
-- `npm run build` - frontend build
-- `npm run check` - Svelte type and diagnostics check
-- `npm run tauri` - Tauri CLI
-- `npm run build:installer` - Windows installer build
-- `npm run build:portable` - portable bundle build
-- `npm run build:both` - run both build modes
 
 ## Contributing
 
 Contributions are welcome. If you want to help, a good workflow is:
 
 1. Fork or branch from the main repository
-2. Install dependencies with `npm install`
-3. Run `npm run tauri dev` to test your changes locally
+2. Install the prerequisites above
+3. Run `cargo run` to test your changes locally
 4. Make your changes
-5. Run `npm run check` and ensure `npm run tauri build` passes without errors
+5. Run `cargo check` and `cargo test`, and make sure `cargo build --release` passes without errors
 6. Open a pull request with a short description of what changed and why
 
 If you are fixing a bug, please include the reproduction steps and what you verified.
@@ -127,27 +154,30 @@ muzeeka depends on a number of great projects and libraries:
 - [BASS](https://www.un4seen.com/) - the core audio playback engine
 - [FFmpeg](https://ffmpeg.org/) - multimedia processing and conversion
 - [yt-dlp](https://github.com/yt-dlp/yt-dlp) - media extraction capabilities
-- [Tauri](https://tauri.app/) - the desktop application framework
-- [SvelteKit](https://svelte.dev/docs/kit) - application framework for the UI
-- [Svelte](https://svelte.dev/) - reactive component framework
-- [Vite](https://vite.dev/) - development server and build tool
-- [TypeScript](https://www.typescriptlang.org/) - typed JavaScript support
-- [Rust](https://www.rust-lang.org/) - systems language powering the backend
-- [@tauri-apps/api](https://www.npmjs.com/package/@tauri-apps/api) - Tauri JavaScript API
-- [@tauri-apps/plugin-dialog](https://www.npmjs.com/package/@tauri-apps/plugin-dialog) - native dialog integration
-- [@tauri-apps/plugin-opener](https://www.npmjs.com/package/@tauri-apps/plugin-opener) - external file and URL opening
-- [tauri-plugin-taskbar](https://www.npmjs.com/package/tauri-plugin-taskbar) - taskbar integration
-- [@kawarp/core](https://www.npmjs.com/package/@kawarp/core) - shared audio-related utilities
-- [@fontsource/inter](https://www.npmjs.com/package/@fontsource/inter) - font package used by the app
+- [Deno](https://deno.com/) - JavaScript runtime used alongside yt-dlp
+- [GPUI](https://github.com/zed-industries/zed) - the GPU-accelerated UI framework from Zed
+- [Rust](https://www.rust-lang.org/) - systems language powering the whole application
+- [windows](https://crates.io/crates/windows) - Windows API bindings
+- [Google Sans Flex](https://fonts.google.com/specimen/Google+Sans+Flex) - font used by the app
+- [tokio](https://crates.io/crates/tokio) - async runtime
+- [crossbeam-channel](https://crates.io/crates/crossbeam-channel) - multi-producer channels
+- [parking_lot](https://crates.io/crates/parking_lot) - faster synchronization primitives
+- [libloading](https://crates.io/crates/libloading) - dynamic loading of BASS libraries
 - [serde](https://serde.rs/) - Rust serialization framework
 - [serde_json](https://docs.rs/serde_json/) - JSON handling in Rust
 - [lofty](https://crates.io/crates/lofty) - audio metadata parsing
 - [id3](https://crates.io/crates/id3) - ID3 tag support
+- [cue-rw](https://crates.io/crates/cue-rw) - CUE sheet parsing
+- [encoding_rs](https://crates.io/crates/encoding_rs) - text encoding detection and conversion
+- [walkdir](https://crates.io/crates/walkdir) - recursive folder scanning
 - [rayon](https://crates.io/crates/rayon) - parallel iteration in Rust
 - [image](https://crates.io/crates/image) - image decoding and processing
 - [rusqlite](https://crates.io/crates/rusqlite) - SQLite access
-- [axum](https://crates.io/crates/axum) - backend HTTP server components
+- [ureq](https://crates.io/crates/ureq) - HTTP client
+- [regex](https://crates.io/crates/regex) - regular expressions
+- [discord-rich-presence](https://crates.io/crates/discord-rich-presence) - Discord Rich Presence integration
 - [Unison](https://unison.boidu.dev) - Lyrics from Unison
+
 ## Legal & Third-Party Notices
 
 muzeeka integrates several powerful third-party libraries and CLI tools to handle media playback and extraction. These tools are governed by their own respective licenses:
