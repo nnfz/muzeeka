@@ -3,7 +3,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://shields.io/badge/-Rust-3776AB?style=flat&logo=rust)](https://rust-lang.org/)
-[![GPUI](https://img.shields.io/badge/GPUI-gray?logo=rust)](https://gpui.rs/)
+[![GPUI](https://img.shields.io/badge/GPUI-gray)](https://gpui.rs/)
 [![Bass Audio Library](https://img.shields.io/badge/BASS-Audio_Library-red)](https://www.un4seen.com/)
 <p align="center">
 	<img src="src/icons/logo.svg" alt="muzeeka logo" width="180" />
