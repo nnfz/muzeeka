@@ -249,8 +249,8 @@ pub unsafe extern "system" fn mix_filter_dsp_callback(
         }
     }
     let ctx = &*(user as *const MixFilterCtx);
-    let use_float = ctx.float_dsp.load(Ordering::Acquire)
-        || ctx.bytes_per_sample.load(Ordering::Acquire) >= 4;
+    let use_float =
+        ctx.float_dsp.load(Ordering::Acquire) || ctx.bytes_per_sample.load(Ordering::Acquire) >= 4;
     if use_float {
         let n = (length / 4) as usize;
         if n == 0 {
@@ -297,9 +297,7 @@ pub fn attach_mix_filter(
             0,
             bass::BASS_DSP_FLOAT,
         )
-        .or_else(|_| {
-            bass.channel_set_dsp(channel, mix_filter_dsp_callback, 0, user)
-        })?;
+        .or_else(|_| bass.channel_set_dsp(channel, mix_filter_dsp_callback, 0, user))?;
     // Re-configure if float force failed (rare).
     if float_ch {
         ctx.configure(rate, chans, true);

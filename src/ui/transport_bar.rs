@@ -6,10 +6,26 @@ use gpui::{
 use crate::ui::cover::cover_art;
 use crate::ui::icons::{self, icon_scaled, scaled_disc};
 use crate::ui::main_window::{MainWindow, SliderDrag};
-use crate::ui::session::{self, RepeatMode, TrackId};
+use crate::ui::session::{self, OrderMode, RepeatMode, TrackId};
 use crate::ui::theme;
 
 const TRANSPORT_LABEL_CHARS: usize = 40;
+
+fn attach_bar_drag(
+    element: gpui::Stateful<gpui::Div>,
+    drag: crate::ui::item_drag::TrackDrag,
+    cx: &mut Context<MainWindow>,
+) -> gpui::Stateful<gpui::Div> {
+    element
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, event: &gpui::MouseDownEvent, _, _| {
+                this.press_at = Some(event.position);
+            }),
+        )
+        .on_drag(drag, crate::ui::item_drag::spawn_track_ghost())
+        .external_drag_payload(crate::ui::item_drag::file_drag_payload)
+}
 
 fn limit_label(text: &str) -> String {
     if text.chars().count() <= TRANSPORT_LABEL_CHARS {
@@ -31,11 +47,12 @@ impl MainWindow {
             progress,
             playing,
             has_track,
-            shuffle,
+            order,
             repeat,
             volume,
             cover,
             current_like,
+            bar_drag,
         ) = {
             let session = self.session.read(cx);
             let title = session
@@ -46,7 +63,15 @@ impl MainWindow {
                 .current_track()
                 .map(|track| limit_label(&track.artist))
                 .unwrap_or_default();
-            let time = session::format_time(session.position);
+            let time = if self.show_remaining {
+                let length = session
+                    .current_track()
+                    .map(|track| track.duration)
+                    .unwrap_or(0.0);
+                session::format_remaining(session.position, length)
+            } else {
+                session::format_time(session.position)
+            };
             let duration = session
                 .current_track()
                 .map(|track| session::format_time(track.duration))
@@ -59,13 +84,30 @@ impl MainWindow {
                 session.progress(),
                 session.playing,
                 session.current.is_some(),
-                session.shuffle,
+                if session.shuffle {
+                    Some(session.order_mode)
+                } else {
+                    None
+                },
                 session.repeat,
                 session.volume,
                 session
                     .current_track()
                     .and_then(|track| track.cover.clone()),
                 session.current_track().map(|track| (track.id, track.liked)),
+                {
+                    let source = session.drag_source();
+                    session
+                        .current_track()
+                        .map(|track| crate::ui::item_drag::TrackDrag {
+                            ids: vec![track.id],
+                            source,
+                            paths: vec![std::path::PathBuf::from(crate::ui::menu::file_on_disk(
+                                &track.path,
+                            ))],
+                            from_bar: true,
+                        })
+                },
             )
         };
 
@@ -85,8 +127,8 @@ impl MainWindow {
                     .flex()
                     .flex_1()
                     .items_center()
-                    .child(self.now_playing(&title, &artist, cover, current_like, cx))
-                    .child(self.transport_controls(playing, has_track, shuffle, repeat, cx))
+                    .child(self.now_playing(&title, &artist, cover, current_like, bar_drag, cx))
+                    .child(self.transport_controls(playing, has_track, order, repeat, cx))
                     .child(self.volume_control(volume, cx)),
             )
             .child(self.progress_bar(progress, &time, &duration, cx))
@@ -98,15 +140,36 @@ impl MainWindow {
         artist: &str,
         cover: Option<std::path::PathBuf>,
         current_like: Option<(TrackId, bool)>,
+        bar_drag: Option<crate::ui::item_drag::TrackDrag>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let cover_el = div()
+            .id("transport-cover")
+            .flex_shrink_0()
+            .child(cover_art(cover.as_deref(), 48.));
+        let cover_el = match bar_drag.clone() {
+            Some(drag) => attach_bar_drag(cover_el, drag, cx),
+            None => cover_el,
+        };
+        let title_el = div()
+            .id("transport-title")
+            .text_size(px(12.))
+            .line_height(px(16.))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(theme::text())
+            .truncate()
+            .child(title.to_string());
+        let title_el = match bar_drag {
+            Some(drag) => attach_bar_drag(title_el, drag, cx),
+            None => title_el,
+        };
         div()
             .flex()
             .flex_1()
             .min_w(px(0.))
             .items_center()
             .gap(px(10.))
-            .child(cover_art(cover.as_deref(), 48.))
+            .child(cover_el)
             .child(
                 div()
                     .flex()
@@ -121,15 +184,7 @@ impl MainWindow {
                             .flex_shrink(1.)
                             .min_w(px(0.))
                             .overflow_hidden()
-                            .child(
-                                div()
-                                    .text_size(px(12.))
-                                    .line_height(px(16.))
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_color(theme::text())
-                                    .truncate()
-                                    .child(title.to_string()),
-                            )
+                            .child(title_el)
                             .child(
                                 div()
                                     .text_size(px(11.))
@@ -159,11 +214,16 @@ impl MainWindow {
         &self,
         playing: bool,
         has_track: bool,
-        shuffle: bool,
+        order: Option<OrderMode>,
         repeat: RepeatMode,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let mode = theme::text_secondary();
+        let shuffle_icon = match order {
+            Some(OrderMode::Random) => icons::RANDOM,
+            Some(OrderMode::Shuffle) => icons::SHUFFLE,
+            None => icons::SHUFFLE_OFF,
+        };
         div()
             .flex()
             .items_center()
@@ -171,12 +231,8 @@ impl MainWindow {
             .gap(px(12.))
             .child(self.mode_button(
                 "shuffle",
-                if shuffle {
-                    icons::SHUFFLE
-                } else {
-                    icons::SHUFFLE_OFF
-                },
-                shuffle,
+                shuffle_icon,
+                order.is_some(),
                 cx,
                 |this, _, cx| {
                     this.session.update(cx, |session, cx| {
@@ -417,7 +473,7 @@ impl MainWindow {
             .items_center()
             .gap(px(8.))
             .pb(px(4.))
-            .child(seek_time(time, &time_slot(time), true))
+            .child(self.time_label("time-elapsed", time, true, cx))
             .child(div().flex_1().min_w(px(0.)).child(self.slider(
                 "progress",
                 progress,
@@ -425,7 +481,7 @@ impl MainWindow {
                 theme::accent(),
                 cx,
             )))
-            .child(seek_time(duration, &time_slot(duration), false))
+            .child(self.time_label("time-total", duration, false, cx))
     }
 
     fn slider(
@@ -567,16 +623,50 @@ impl MainWindow {
             cx.notify();
         });
     }
+
+    /// Either clock flips the left label between elapsed and `-1:35`.
+    fn time_label(
+        &mut self,
+        id: &'static str,
+        label: &str,
+        align_end: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let arm_id = SharedString::from(id);
+        let release_id = arm_id.clone();
+        seek_time(label, &time_slot(label), align_end)
+            .id(id)
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _: &gpui::MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.arm(arm_id.clone(), false);
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, _: &gpui::MouseUpEvent, _, cx| {
+                    cx.stop_propagation();
+                    if !this.armed(&release_id) {
+                        return;
+                    }
+                    this.show_remaining = !this.show_remaining;
+                    session::store_remaining_time(this.show_remaining);
+                    cx.notify();
+                }),
+            )
+    }
 }
 
 fn time_slot(label: &str) -> String {
     label
         .chars()
-        .map(|ch| if ch == ':' { ':' } else { '0' })
+        .map(|ch| if ch == ':' || ch == '-' { ch } else { '0' })
         .collect()
 }
 
-fn seek_time(label: &str, slot: &str, align_end: bool) -> impl IntoElement {
+fn seek_time(label: &str, slot: &str, align_end: bool) -> gpui::Div {
     // The slot is a zeroed copy of this label, drawn with tabular figures.
     // Each side keeps its own width, so a short elapsed time is not padded
     // out to an hour-long duration.
@@ -736,6 +826,8 @@ mod tests {
     fn elapsed_time_is_not_padded_to_the_duration() {
         assert_eq!(time_slot("0:12"), "0:00");
         assert_eq!(time_slot("1:02:03"), "0:00:00");
+        assert_eq!(time_slot("-1:35"), "-0:00");
+        assert_eq!(time_slot("-1:02:03"), "-0:00:00");
         assert_ne!(time_slot("0:12").len(), time_slot("1:02:03").len());
     }
 }

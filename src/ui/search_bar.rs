@@ -12,6 +12,7 @@ use crate::ui::icons::{self, icon};
 use crate::ui::main_window::{MainWindow, Scroller};
 use crate::ui::session::{self, has_search_text, looks_like_url, Suggestion, TrackId};
 use crate::ui::theme;
+use crate::ui::ytdlp;
 
 /// Search hit row. Cover is 28px, with 6px of air above and below.
 const SEARCH_ROW_H: f32 = 40.;
@@ -27,7 +28,6 @@ impl MainWindow {
         let query = self.search.read(cx).content.clone();
         let focused = self.search.read(cx).focus.is_focused(window);
         let expanded = focused || !query.is_empty();
-        let url = looks_like_url(&query);
 
         div()
             .id("search-shell")
@@ -40,6 +40,11 @@ impl MainWindow {
             .rounded_md()
             .bg(theme::bg_glass())
             .cursor(CursorStyle::IBeam)
+            .on_drop(
+                cx.listener(|this, paths: &gpui::ExternalPaths, window, cx| {
+                    this.receive_file_drop(paths, true, window.mouse_position(), cx);
+                }),
+            )
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, window, cx| {
@@ -52,7 +57,6 @@ impl MainWindow {
             .when(!query.is_empty(), |row| {
                 row.child(self.clear_search_button(cx))
             })
-            .when(url, |row| row.child(self.download_chip(cx)))
             .with_spring(
                 "search-width",
                 search_width_spring(expanded),
@@ -82,48 +86,16 @@ impl MainWindow {
             )
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, _: &gpui::MouseUpEvent, window, cx| {
-                    if !this.armed("search-clear") {
+                cx.listener(|this, _: &gpui::MouseUpEvent, _window, cx| {
+                    if !this.armed("search-clear")
+                        || this.download.downloading
+                        || this.download.importing
+                    {
                         return;
                     }
-                    this.search.update(cx, |field, cx| field.clear(window, cx));
-                }),
-            )
-            .into_any_element()
-    }
-
-    fn download_chip(&self, cx: &mut Context<Self>) -> AnyElement {
-        div()
-            .id("search-download")
-            .px(px(8.))
-            .h(px(22.))
-            .flex()
-            .items_center()
-            .w_full()
-            .rounded_sm()
-            .bg(theme::accent_soft())
-            .text_size(px(11.))
-            .text_color(theme::accent())
-            .cursor_pointer()
-            .child("Download")
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _: &gpui::MouseDownEvent, _, cx| {
-                    cx.stop_propagation();
-                    this.arm("search-download", false);
-                }),
-            )
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, _: &gpui::MouseUpEvent, _, cx| {
-                    if !this.armed("search-download") {
-                        return;
-                    }
-                    this.session.update(cx, |session, cx| {
-                        session.notice =
-                            Some("Downloads are not connected in the native port yet.".into());
-                        cx.notify();
-                    });
+                    this.search.update(cx, |field, cx| field.clear(cx));
+                    this.note_download_query("");
+                    cx.notify();
                 }),
             )
             .into_any_element()
@@ -136,13 +108,12 @@ impl MainWindow {
     ) -> impl IntoElement {
         let query = self.search.read(cx).content.clone();
         let focused = self.search.read(cx).focus.is_focused(window);
-        let (suggestions, notice) = {
-            let session = self.session.read(cx);
-            (session.suggestions(&query), session.notice.clone())
-        };
-        let show_suggestions = focused && !suggestions.is_empty() && !looks_like_url(&query);
+        let suggestions = self.session.read(cx).suggestions(&query);
+        let media = ytdlp::is_media_url(&query);
+        let show_suggestions =
+            focused && !suggestions.is_empty() && !looks_like_url(&query) && !media;
         // One plate at a time. `@` opens the filter menu, not the results list.
-        let show_results = has_search_text(&query) && suggestions.is_empty();
+        let show_results = has_search_text(&query) && suggestions.is_empty() && !media;
         let expanded = focused || !query.is_empty();
         let hits = show_results.then(|| self.cached_search_ids(&query, cx));
         if hits.as_ref().is_some_and(|hits| !hits.is_empty()) {
@@ -157,10 +128,10 @@ impl MainWindow {
             .flex()
             .flex_col()
             .gap(px(6.))
-            .when(show_suggestions || notice.is_some(), |layer| {
+            .when(show_suggestions, |layer| {
                 layer.child(fade_in(
                     "search-suggest-in",
-                    self.suggestion_plate(suggestions, show_suggestions, notice, cx),
+                    self.suggestion_plate(suggestions, cx),
                 ))
             })
             .when_some(hits, |layer, hits| {
@@ -168,6 +139,9 @@ impl MainWindow {
                     "search-results-in",
                     self.results_plate(hits, described, cx),
                 ))
+            })
+            .when(media, |layer| {
+                layer.child(fade_in("search-url-in", self.url_panel(cx)))
             })
             .with_spring(
                 "search-suggestions-width",
@@ -179,12 +153,16 @@ impl MainWindow {
     fn suggestion_plate(
         &self,
         suggestions: Vec<Suggestion>,
-        show: bool,
-        notice: Option<String>,
         cx: &mut Context<Self>,
-    ) -> gpui::Div {
+    ) -> gpui::Stateful<gpui::Div> {
         div()
+            .id("search-suggest-plate")
             .occlude()
+            .on_drop(
+                cx.listener(|this, paths: &gpui::ExternalPaths, window, cx| {
+                    this.receive_file_drop(paths, true, window.mouse_position(), cx);
+                }),
+            )
             .flex()
             .flex_col()
             .rounded_md()
@@ -192,71 +170,59 @@ impl MainWindow {
             .border_1()
             .border_color(theme::border())
             .overflow_hidden()
-            .when_some(notice, |layer, notice| {
-                layer.child(
-                    div()
-                        .px(px(12.))
-                        .py(px(8.))
-                        .text_size(px(12.))
-                        .text_color(theme::text_secondary())
-                        .child(notice),
-                )
-            })
-            .when(show, |layer| {
-                layer.children(
-                    suggestions
-                        .into_iter()
-                        .enumerate()
-                        .map(|(index, suggestion)| {
-                            let insert = suggestion.insert.clone();
-                            let suggestion_id =
-                                gpui::SharedString::from(format!("suggestion-{index}"));
-                            let arm_id = suggestion_id.clone();
-                            let release_id = suggestion_id.clone();
-                            div()
-                                .id(suggestion_id)
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .h(px(36.))
-                                .px(px(12.))
-                                .cursor_pointer()
-                                .hover(|style| style.bg(theme::accent_soft()))
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _: &gpui::MouseDownEvent, _, _cx| {
-                                        this.arm(arm_id.clone(), false);
-                                    }),
-                                )
-                                .on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _: &gpui::MouseUpEvent, window, cx| {
-                                        if !this.armed(&release_id) {
-                                            return;
-                                        }
-                                        let insert = insert.clone();
-                                        this.search.update(cx, |field, cx| {
-                                            field.set_text(insert, window, cx);
-                                        });
-                                        let focus = this.search.read(cx).focus.clone();
-                                        focus.focus(window, cx);
-                                    }),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(px(12.))
-                                        .text_color(theme::text())
-                                        .child(suggestion.label),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(px(11.))
-                                        .text_color(theme::text_muted())
-                                        .child(suggestion.detail),
-                                )
-                        }),
-                )
-            })
+            .children(
+                suggestions
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, suggestion)| {
+                        let insert = suggestion.insert.clone();
+                        let suggestion_id = gpui::SharedString::from(format!("suggestion-{index}"));
+                        let arm_id = suggestion_id.clone();
+                        let release_id = suggestion_id.clone();
+                        div()
+                            .id(suggestion_id)
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .h(px(36.))
+                            .px(px(12.))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(theme::accent_soft()))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _: &gpui::MouseDownEvent, _, _cx| {
+                                    this.arm(arm_id.clone(), false);
+                                }),
+                            )
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |this, _: &gpui::MouseUpEvent, window, cx| {
+                                    if !this.armed(&release_id) {
+                                        return;
+                                    }
+                                    let insert = insert.clone();
+                                    this.search.update(cx, |field, cx| {
+                                        field.set_text(insert, window, cx);
+                                    });
+                                    let focus = this.search.read(cx).focus.clone();
+                                    focus.focus(window, cx);
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(theme::text())
+                                    .child(suggestion.label),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(theme::text_muted())
+                                    .child(suggestion.detail),
+                            )
+                    }),
+            )
     }
 
     fn results_plate(
@@ -264,7 +230,7 @@ impl MainWindow {
         hits: Arc<Vec<TrackId>>,
         description: String,
         cx: &mut Context<Self>,
-    ) -> gpui::Div {
+    ) -> gpui::Stateful<gpui::Div> {
         let count = hits.len();
         let title = if count == 1 {
             "1 result".to_string()
@@ -272,7 +238,14 @@ impl MainWindow {
             format!("{count} results")
         };
         div()
+            .id("search-results-plate")
+            .w_full()
             .occlude()
+            .on_drop(
+                cx.listener(|this, paths: &gpui::ExternalPaths, window, cx| {
+                    this.receive_file_drop(paths, true, window.mouse_position(), cx);
+                }),
+            )
             .flex()
             .flex_col()
             .rounded_md()
@@ -381,7 +354,7 @@ impl MainWindow {
                                         cx,
                                     )
                                 }
-                                None => div().h(px(SEARCH_ROW_H)).into_any_element(),
+                                None => div().w_full().h(px(SEARCH_ROW_H)).into_any_element(),
                             })
                             .collect()
                     })
@@ -421,6 +394,7 @@ impl MainWindow {
         let features = gpui::FontFeatures(Arc::new(vec![("tnum".into(), 1)]));
         div()
             .id(row_id)
+            .w_full()
             .flex()
             .items_center()
             .gap(px(10.))
@@ -510,10 +484,16 @@ fn search_enter_spring() -> SpringAnimation<f32> {
         .from(0.)
 }
 
-fn fade_in(id: &'static str, plate: gpui::Div) -> impl IntoElement {
+fn fade_in(id: &'static str, plate: gpui::Stateful<gpui::Div>) -> impl IntoElement {
     plate.with_spring(id, search_enter_spring(), |plate, phase| {
         let phase = phase.clamp(0.0, 1.0);
         // Negative top is translateY(-6px): the plate starts above its slot and slides down.
-        plate.opacity(phase).top(px(-6. * (1.0 - phase)))
+        // `.top` takes the plate out of flow, and an absolute block shrinks to
+        // its text. Stretch it back across the search bar.
+        plate
+            .w_full()
+            .left(px(0.))
+            .opacity(phase)
+            .top(px(-6. * (1.0 - phase)))
     })
 }

@@ -29,14 +29,24 @@ pub struct BassLibrary {
     _lib: Library,
 
     // ── Core functions ────────────────────────────────────────────────────
-    bass_init:
-        unsafe extern "system" fn(device: i32, freq: DWORD, flags: DWORD, win: *mut std::ffi::c_void, dsguid: *const std::ffi::c_void) -> BOOL,
+    bass_init: unsafe extern "system" fn(
+        device: i32,
+        freq: DWORD,
+        flags: DWORD,
+        win: *mut std::ffi::c_void,
+        dsguid: *const std::ffi::c_void,
+    ) -> BOOL,
     bass_free: unsafe extern "system" fn() -> BOOL,
     bass_error_get_code: unsafe extern "system" fn() -> i32,
 
     // ── Stream creation ───────────────────────────────────────────────────
-    bass_stream_create_file:
-        unsafe extern "system" fn(mem: BOOL, file: *const u16, offset: QWORD, length: QWORD, flags: DWORD) -> HSTREAM,
+    bass_stream_create_file: unsafe extern "system" fn(
+        mem: BOOL,
+        file: *const u16,
+        offset: QWORD,
+        length: QWORD,
+        flags: DWORD,
+    ) -> HSTREAM,
     bass_stream_free: unsafe extern "system" fn(handle: HSTREAM) -> BOOL,
     // Internet streams: URL is always a narrow string (no UNICODE form).
     // Real signature: (url, DWORD offset, DWORD flags, DOWNLOADPROC*, user)
@@ -49,8 +59,7 @@ pub struct BassLibrary {
         proc: *mut std::ffi::c_void,
         user: *mut std::ffi::c_void,
     ) -> HSTREAM,
-    bass_stream_get_file_position:
-        unsafe extern "system" fn(handle: HSTREAM, mode: DWORD) -> QWORD,
+    bass_stream_get_file_position: unsafe extern "system" fn(handle: HSTREAM, mode: DWORD) -> QWORD,
     bass_stream_create: unsafe extern "system" fn(
         freq: DWORD,
         chans: DWORD,
@@ -58,12 +67,21 @@ pub struct BassLibrary {
         proc: *const std::ffi::c_void,
         user: *mut std::ffi::c_void,
     ) -> HSTREAM,
-    bass_stream_put_data:
-        unsafe extern "system" fn(handle: HSTREAM, buffer: *const std::ffi::c_void, length: DWORD) -> DWORD,
+    bass_stream_put_data: unsafe extern "system" fn(
+        handle: HSTREAM,
+        buffer: *const std::ffi::c_void,
+        length: DWORD,
+    ) -> DWORD,
 
     // Music / tracker modules (MOD, XM, IT, S3M etc.)
-    bass_music_load:
-        unsafe extern "system" fn(mem: BOOL, file: *const u16, offset: QWORD, length: DWORD, flags: DWORD, freq: DWORD) -> HSTREAM,
+    bass_music_load: unsafe extern "system" fn(
+        mem: BOOL,
+        file: *const u16,
+        offset: QWORD,
+        length: DWORD,
+        flags: DWORD,
+        freq: DWORD,
+    ) -> HSTREAM,
     bass_music_free: unsafe extern "system" fn(handle: HSTREAM) -> BOOL,
 
     // ── Channel control ───────────────────────────────────────────────────
@@ -72,14 +90,10 @@ pub struct BassLibrary {
     bass_channel_stop: unsafe extern "system" fn(handle: DWORD) -> BOOL,
     bass_channel_set_position:
         unsafe extern "system" fn(handle: DWORD, pos: QWORD, mode: DWORD) -> BOOL,
-    bass_channel_get_position:
-        unsafe extern "system" fn(handle: DWORD, mode: DWORD) -> QWORD,
-    bass_channel_get_length:
-        unsafe extern "system" fn(handle: DWORD, mode: DWORD) -> QWORD,
-    bass_channel_bytes2seconds:
-        unsafe extern "system" fn(handle: DWORD, pos: QWORD) -> f64,
-    bass_channel_seconds2bytes:
-        unsafe extern "system" fn(handle: DWORD, pos: f64) -> QWORD,
+    bass_channel_get_position: unsafe extern "system" fn(handle: DWORD, mode: DWORD) -> QWORD,
+    bass_channel_get_length: unsafe extern "system" fn(handle: DWORD, mode: DWORD) -> QWORD,
+    bass_channel_bytes2seconds: unsafe extern "system" fn(handle: DWORD, pos: QWORD) -> f64,
+    bass_channel_seconds2bytes: unsafe extern "system" fn(handle: DWORD, pos: f64) -> QWORD,
     bass_channel_set_attribute:
         unsafe extern "system" fn(handle: DWORD, attrib: DWORD, value: f32) -> BOOL,
     bass_channel_get_attribute:
@@ -91,8 +105,11 @@ pub struct BassLibrary {
     bass_channel_is_active: unsafe extern "system" fn(handle: DWORD) -> DWORD,
     #[allow(dead_code)] // used by channel_get_level
     bass_channel_get_level: unsafe extern "system" fn(handle: DWORD) -> DWORD,
-    bass_channel_get_data:
-        unsafe extern "system" fn(handle: DWORD, buffer: *mut std::ffi::c_void, length: DWORD) -> DWORD,
+    bass_channel_get_data: unsafe extern "system" fn(
+        handle: DWORD,
+        buffer: *mut std::ffi::c_void,
+        length: DWORD,
+    ) -> DWORD,
     bass_channel_get_tags:
         unsafe extern "system" fn(handle: DWORD, tags: DWORD) -> *const std::ffi::c_void,
     bass_channel_set_sync: unsafe extern "system" fn(
@@ -110,21 +127,23 @@ pub struct BassLibrary {
     bass_set_config: unsafe extern "system" fn(option: DWORD, value: DWORD) -> BOOL,
     bass_set_config_ptr:
         unsafe extern "system" fn(option: DWORD, value: *const std::ffi::c_void) -> BOOL,
-    bass_channel_set_dsp:
-        unsafe extern "system" fn(handle: DWORD, proc: DspProc, priority: i32, user: *mut std::ffi::c_void) -> HDSP,
-    bass_channel_set_dsp_ex:
-        unsafe extern "system" fn(
-            handle: DWORD,
-            proc: DspProc,
-            user: *mut std::ffi::c_void,
-            priority: i32,
-            flags: DWORD,
-        ) -> HDSP,
+    bass_channel_set_dsp: unsafe extern "system" fn(
+        handle: DWORD,
+        proc: DspProc,
+        priority: i32,
+        user: *mut std::ffi::c_void,
+    ) -> HDSP,
+    bass_channel_set_dsp_ex: unsafe extern "system" fn(
+        handle: DWORD,
+        proc: DspProc,
+        user: *mut std::ffi::c_void,
+        priority: i32,
+        flags: DWORD,
+    ) -> HDSP,
     bass_channel_remove_dsp: unsafe extern "system" fn(handle: DWORD, dsp: HDSP) -> BOOL,
 
     // ── Plugins ─────────────────────────────────────────────────────────────
-    bass_plugin_load:
-        unsafe extern "system" fn(file: *const u16, flags: DWORD) -> HPLUGIN,
+    bass_plugin_load: unsafe extern "system" fn(file: *const u16, flags: DWORD) -> HPLUGIN,
 
     bass_get_info: unsafe extern "system" fn(info: *mut BassInfo) -> BOOL,
     bass_get_device_info:
@@ -147,13 +166,13 @@ pub struct BassLibrary {
     #[allow(dead_code)] // used by mixer_channel_flags
     bass_mixer_channel_flags:
         Option<unsafe extern "system" fn(channel: DWORD, flags: DWORD, mask: DWORD) -> DWORD>,
-    bass_split_stream_create:
-        Option<unsafe extern "system" fn(channel: DWORD, flags: DWORD, chanmap: *const i32) -> HSTREAM>,
+    bass_split_stream_create: Option<
+        unsafe extern "system" fn(channel: DWORD, flags: DWORD, chanmap: *const i32) -> HSTREAM,
+    >,
 
     // ── FX (bass_fx.dll) — None until enable_fx_from_plugin succeeds ────────
     _fx_lib: Option<Library>,
-    bass_fx_tempo_create:
-        Option<unsafe extern "system" fn(chan: DWORD, flags: DWORD) -> HSTREAM>,
+    bass_fx_tempo_create: Option<unsafe extern "system" fn(chan: DWORD, flags: DWORD) -> HSTREAM>,
     bass_fx_tempo_get_source: Option<unsafe extern "system" fn(chan: HSTREAM) -> DWORD>,
 }
 
@@ -178,8 +197,7 @@ macro_rules! load_fn {
 
 macro_rules! try_load_fn {
     ($lib:expr, $name:expr) => {{
-        $lib
-            .get($name)
+        $lib.get($name)
             .ok()
             .map(|sym: Symbol<*const ()>| std::mem::transmute(*sym))
     }};
@@ -201,10 +219,7 @@ impl BassLibrary {
         }
     }
 
-    fn require_mixer_fn<'a, T>(
-        &self,
-        f: Option<&'a T>,
-    ) -> Result<&'a T, String> {
+    fn require_mixer_fn<'a, T>(&self, f: Option<&'a T>) -> Result<&'a T, String> {
         f.ok_or_else(|| "bassmix.dll not loaded".to_string())
     }
 
@@ -222,28 +237,34 @@ impl BassLibrary {
         }
 
         let lib = unsafe {
-            Library::new(&dll_path)
-                .map_err(|e| format!("Failed to load bass.dll: {e}"))?
+            Library::new(&dll_path).map_err(|e| format!("Failed to load bass.dll: {e}"))?
         };
 
         // Load bassmix for proper gapless (BASS_Mixer_*)
         let mixer_lib = unsafe { Library::new(bass_dir.join("bassmix.dll")).ok() };
-        let (mixer_create, mixer_add, mixer_remove, mixer_set_pos, mixer_get_pos, mixer_flags, split_create) =
-            if let Some(ref mlib) = mixer_lib {
-                unsafe {
-                    (
-                        Some(load_fn!(mlib, b"BASS_Mixer_StreamCreate\0")),
-                        Some(load_fn!(mlib, b"BASS_Mixer_StreamAddChannel\0")),
-                        Some(load_fn!(mlib, b"BASS_Mixer_ChannelRemove\0")),
-                        Some(load_fn!(mlib, b"BASS_Mixer_ChannelSetPosition\0")),
-                        Some(load_fn!(mlib, b"BASS_Mixer_ChannelGetPosition\0")),
-                        Some(load_fn!(mlib, b"BASS_Mixer_ChannelFlags\0")),
-                        try_load_fn!(mlib, b"BASS_Split_StreamCreate\0"),
-                    )
-                }
-            } else {
-                (None, None, None, None, None, None, None)
-            };
+        let (
+            mixer_create,
+            mixer_add,
+            mixer_remove,
+            mixer_set_pos,
+            mixer_get_pos,
+            mixer_flags,
+            split_create,
+        ) = if let Some(ref mlib) = mixer_lib {
+            unsafe {
+                (
+                    Some(load_fn!(mlib, b"BASS_Mixer_StreamCreate\0")),
+                    Some(load_fn!(mlib, b"BASS_Mixer_StreamAddChannel\0")),
+                    Some(load_fn!(mlib, b"BASS_Mixer_ChannelRemove\0")),
+                    Some(load_fn!(mlib, b"BASS_Mixer_ChannelSetPosition\0")),
+                    Some(load_fn!(mlib, b"BASS_Mixer_ChannelGetPosition\0")),
+                    Some(load_fn!(mlib, b"BASS_Mixer_ChannelFlags\0")),
+                    try_load_fn!(mlib, b"BASS_Split_StreamCreate\0"),
+                )
+            }
+        } else {
+            (None, None, None, None, None, None, None)
+        };
 
         unsafe {
             Ok(Self {
@@ -345,9 +366,7 @@ impl BassLibrary {
 
     /// Initialize BASS output. `device = -1` for default, `freq = 44100` typical.
     pub fn init(&self, device: i32, freq: u32) -> Result<(), String> {
-        let ok = unsafe {
-            (self.bass_init)(device, freq, 0, ptr::null_mut(), ptr::null())
-        };
+        let ok = unsafe { (self.bass_init)(device, freq, 0, ptr::null_mut(), ptr::null()) };
         self.check(ok)
     }
 
@@ -387,15 +406,14 @@ impl BassLibrary {
     /// Decode push stream — mixer reads this, a worker feeds it with `stream_put_data`.
     /// Never add an internet URL stream to the mixer directly: `ChannelGetData` on a
     /// URL decode source blocks BASS's update thread (silence + pause/Ctrl+R hang).
-    pub fn stream_create_push(&self, freq: u32, chans: u32, flags: DWORD) -> Result<HSTREAM, String> {
+    pub fn stream_create_push(
+        &self,
+        freq: u32,
+        chans: u32,
+        flags: DWORD,
+    ) -> Result<HSTREAM, String> {
         let handle = unsafe {
-            (self.bass_stream_create)(
-                freq,
-                chans,
-                flags,
-                STREAMPROC_PUSH,
-                ptr::null_mut(),
-            )
+            (self.bass_stream_create)(freq, chans, flags, STREAMPROC_PUSH, ptr::null_mut())
         };
         if handle == 0 {
             Err(self.last_error_string())
@@ -421,9 +439,8 @@ impl BassLibrary {
 
     /// Bytes already waiting in a decode/internet stream (does not block).
     pub fn channel_data_available(&self, handle: DWORD) -> u32 {
-        let got = unsafe {
-            (self.bass_channel_get_data)(handle, ptr::null_mut(), BASS_DATA_AVAILABLE)
-        };
+        let got =
+            unsafe { (self.bass_channel_get_data)(handle, ptr::null_mut(), BASS_DATA_AVAILABLE) };
         if got == DWORD::MAX {
             0
         } else {
@@ -521,9 +538,7 @@ impl BassLibrary {
         }
     }
 
-    pub fn tags_fn(
-        &self,
-    ) -> unsafe extern "system" fn(DWORD, DWORD) -> *const std::ffi::c_void {
+    pub fn tags_fn(&self) -> unsafe extern "system" fn(DWORD, DWORD) -> *const std::ffi::c_void {
         self.bass_channel_get_tags
     }
 
@@ -534,7 +549,8 @@ impl BassLibrary {
 
     /// Load a tracker/module (e.g. .it, .xm, .mod, .s3m) using BASS_MusicLoad.
     /// Many tracker plugins work best (or only) through the music API.
-    pub fn music_load(&self, path: &str, flags: DWORD) -> Result<HSTREAM, String> {        let wide = to_wide(path);
+    pub fn music_load(&self, path: &str, flags: DWORD) -> Result<HSTREAM, String> {
+        let wide = to_wide(path);
         let handle = unsafe {
             (self.bass_music_load)(
                 0, // mem = FALSE
@@ -584,7 +600,12 @@ impl BassLibrary {
         Err(self.last_error_string())
     }
 
-    pub fn channel_set_position(&self, handle: DWORD, pos: QWORD, mode: DWORD) -> Result<(), String> {
+    pub fn channel_set_position(
+        &self,
+        handle: DWORD,
+        pos: QWORD,
+        mode: DWORD,
+    ) -> Result<(), String> {
         let ok = unsafe { (self.bass_channel_set_position)(handle, pos, mode) };
         self.check(ok)
     }
@@ -605,7 +626,12 @@ impl BassLibrary {
         unsafe { (self.bass_channel_seconds2bytes)(handle, seconds) }
     }
 
-    pub fn channel_set_attribute(&self, handle: DWORD, attrib: DWORD, value: f32) -> Result<(), String> {
+    pub fn channel_set_attribute(
+        &self,
+        handle: DWORD,
+        attrib: DWORD,
+        value: f32,
+    ) -> Result<(), String> {
         let ok = unsafe { (self.bass_channel_set_attribute)(handle, attrib, value) };
         self.check(ok)
     }
@@ -656,8 +682,7 @@ impl BassLibrary {
             return got == 0;
         }
         let code = self.last_error();
-        matches!(code, BassError::Ended | BassError::Ok | BassError::Decode)
-            || code.code() == 0
+        matches!(code, BassError::Ended | BassError::Ok | BassError::Decode) || code.code() == 0
     }
 
     /// Pull float PCM from a decode stream. `buffer` length is in **samples**.
@@ -724,7 +749,11 @@ impl BassLibrary {
         self.check(ok).map(|()| info)
     }
 
-    pub fn set_config_ptr(&self, option: DWORD, value: *const std::ffi::c_void) -> Result<(), String> {
+    pub fn set_config_ptr(
+        &self,
+        option: DWORD,
+        value: *const std::ffi::c_void,
+    ) -> Result<(), String> {
         let ok = unsafe { (self.bass_set_config_ptr)(option, value) };
         self.check(ok)
     }
@@ -758,8 +787,7 @@ impl BassLibrary {
         priority: i32,
         flags: DWORD,
     ) -> Result<HDSP, String> {
-        let dsp =
-            unsafe { (self.bass_channel_set_dsp_ex)(handle, proc, user, priority, flags) };
+        let dsp = unsafe { (self.bass_channel_set_dsp_ex)(handle, proc, user, priority, flags) };
         if dsp == 0 {
             Err(self.last_error_string())
         } else {
@@ -774,7 +802,12 @@ impl BassLibrary {
 
     // ── Mixer wrappers (require bassmix.dll) ────────────────────────────────
 
-    pub fn mixer_stream_create(&self, freq: u32, chans: u32, flags: DWORD) -> Result<HSTREAM, String> {
+    pub fn mixer_stream_create(
+        &self,
+        freq: u32,
+        chans: u32,
+        flags: DWORD,
+    ) -> Result<HSTREAM, String> {
         let f = self.require_mixer_fn(self.bass_mixer_stream_create.as_ref())?;
         let handle = unsafe { f(freq, chans, flags) };
         if handle == 0 {
@@ -784,7 +817,12 @@ impl BassLibrary {
         }
     }
 
-    pub fn mixer_stream_add_channel(&self, mixer: DWORD, channel: DWORD, flags: DWORD) -> Result<(), String> {
+    pub fn mixer_stream_add_channel(
+        &self,
+        mixer: DWORD,
+        channel: DWORD,
+        flags: DWORD,
+    ) -> Result<(), String> {
         let f = self.require_mixer_fn(self.bass_mixer_stream_add_channel.as_ref())?;
         let ok = unsafe { f(mixer, channel, flags) };
         self.check(ok)
@@ -796,7 +834,12 @@ impl BassLibrary {
         self.check(ok)
     }
 
-    pub fn mixer_channel_set_position(&self, channel: DWORD, pos: QWORD, mode: DWORD) -> Result<(), String> {
+    pub fn mixer_channel_set_position(
+        &self,
+        channel: DWORD,
+        pos: QWORD,
+        mode: DWORD,
+    ) -> Result<(), String> {
         let f = self.require_mixer_fn(self.bass_mixer_channel_set_position.as_ref())?;
         let ok = unsafe { f(channel, pos, mode) };
         self.check(ok)
@@ -821,10 +864,9 @@ impl BassLibrary {
     /// this returns error 38 for it — extra outputs use [`crate::output_tap`] instead.
     #[allow(dead_code)] // public BASS API surface; not usable on the playing mixer
     pub fn split_stream_create(&self, channel: DWORD, flags: DWORD) -> Result<HSTREAM, String> {
-        let f = self
-            .bass_split_stream_create
-            .as_ref()
-            .ok_or_else(|| "BASS_Split_StreamCreate is not available (old bassmix.dll?)".to_string())?;
+        let f = self.bass_split_stream_create.as_ref().ok_or_else(|| {
+            "BASS_Split_StreamCreate is not available (old bassmix.dll?)".to_string()
+        })?;
         let handle = unsafe { f(channel, flags, std::ptr::null()) };
         if handle == 0 {
             Err(self.last_error_string())
@@ -859,7 +901,7 @@ impl BassLibrary {
     }
 
     #[allow(dead_code)] // public BASS API surface; extra outputs create their stream on
-    // the target device directly (see `crate::output_tap`)
+                        // the target device directly (see `crate::output_tap`)
     pub fn channel_set_device(&self, handle: DWORD, device: i32) -> Result<(), String> {
         if device < 0 {
             return Err("Invalid output device".into());
@@ -938,7 +980,7 @@ unsafe impl Send for DataPump {}
 
 impl DataPump {
     #[allow(dead_code)] // pull/available are the feeder side of the pump; only push and
-    // queued are used since extra outputs became a DSP tap
+                        // queued are used since extra outputs became a DSP tap
     pub fn available(&self, handle: DWORD) -> u32 {
         let got = unsafe { (self.get_data)(handle, ptr::null_mut(), BASS_DATA_AVAILABLE) };
         if got == DWORD::MAX {
@@ -1030,15 +1072,8 @@ impl UrlStreamOpener {
     ) -> Result<HSTREAM, String> {
         let narrow = std::ffi::CString::new(url)
             .map_err(|_| "Stream URL contains a NUL byte".to_string())?;
-        let handle = unsafe {
-            (self.create)(
-                narrow.as_ptr(),
-                0,
-                flags | BASS_STREAM_STATUS,
-                proc,
-                user,
-            )
-        };
+        let handle =
+            unsafe { (self.create)(narrow.as_ptr(), 0, flags | BASS_STREAM_STATUS, proc, user) };
         if handle == 0 {
             let code = unsafe { (self.error_get_code)() };
             Err(BassError::from(code).to_string())
@@ -1047,4 +1082,3 @@ impl UrlStreamOpener {
         }
     }
 }
-

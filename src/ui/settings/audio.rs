@@ -343,7 +343,9 @@ impl Session {
                 });
             }
             EffectSettings::Filter(filter) => {
-                self.rack.filter_presets.retain(|preset| preset.name != name);
+                self.rack
+                    .filter_presets
+                    .retain(|preset| preset.name != name);
                 self.rack.filter_presets.push(FilterPreset {
                     name,
                     lp_hz: filter.lp_hz,
@@ -352,7 +354,9 @@ impl Session {
                 });
             }
             EffectSettings::Limiter(limiter) => {
-                self.rack.limiter_presets.retain(|preset| preset.name != name);
+                self.rack
+                    .limiter_presets
+                    .retain(|preset| preset.name != name);
                 self.rack.limiter_presets.push(LimiterPreset {
                     name,
                     gain_db: limiter.gain_db,
@@ -368,10 +372,14 @@ impl Session {
     pub(crate) fn delete_effect_preset(&mut self, kind: EffectKind, name: &str) {
         match kind {
             EffectKind::Equalizer => self.rack.eq_presets.retain(|preset| preset.name != name),
-            EffectKind::Filter => self.rack.filter_presets.retain(|preset| preset.name != name),
-            EffectKind::Limiter => {
-                self.rack.limiter_presets.retain(|preset| preset.name != name)
-            }
+            EffectKind::Filter => self
+                .rack
+                .filter_presets
+                .retain(|preset| preset.name != name),
+            EffectKind::Limiter => self
+                .rack
+                .limiter_presets
+                .retain(|preset| preset.name != name),
         }
         self.rack.save();
     }
@@ -457,7 +465,11 @@ impl SettingsWindow {
         true
     }
 
-    pub(super) fn audio_drag_move(&mut self, position: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+    pub(super) fn audio_drag_move(
+        &mut self,
+        position: gpui::Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(drag) = self.audio.drag.clone() else {
             return;
         };
@@ -482,11 +494,7 @@ impl SettingsWindow {
                 }
                 cx.notify();
             }
-            Drag::Knob {
-                id,
-                knob,
-                vertical,
-            } => {
+            Drag::Knob { id, knob, vertical } => {
                 let Some(bounds) = self.audio.bounds.get(&id).copied() else {
                     return;
                 };
@@ -519,7 +527,9 @@ impl SettingsWindow {
                     }
                 }
             }
-            Drag::Knob { knob: Knob::Rate, .. } => {
+            Drag::Knob {
+                knob: Knob::Rate, ..
+            } => {
                 self.session.update(cx, |session, cx| {
                     session.commit_rate();
                     cx.notify();
@@ -568,7 +578,12 @@ impl SettingsWindow {
             .into_any_element()
     }
 
-    fn chain_card(&self, rack: &AudioRack, rows: Vec<AnyElement>, cx: &mut Context<Self>) -> gpui::Div {
+    fn chain_card(
+        &self,
+        rack: &AudioRack,
+        rows: Vec<AnyElement>,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
         let count = rack.chain.len();
         card()
             .py(px(10.))
@@ -688,21 +703,36 @@ impl SettingsWindow {
                 },
             ));
         }
-        div().flex().flex_col().gap(px(2.)).children(items).into_any_element()
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .children(items)
+            .into_any_element()
     }
 
     fn catalog_card(&self, full: bool, cx: &mut Context<Self>) -> gpui::Div {
         const CATALOG: [(EffectKind, &str, &str); 3] = [
-            (EffectKind::Equalizer, "Equalizer", "17-band graphic EQ with preamp"),
-            (EffectKind::Filter, "Filter", "Resonant low-pass / high-pass"),
-            (EffectKind::Limiter, "Limiter", "Brickwall ceiling, or hard clip"),
+            (
+                EffectKind::Equalizer,
+                "Equalizer",
+                "17-band graphic EQ with preamp",
+            ),
+            (
+                EffectKind::Filter,
+                "Filter",
+                "Resonant low-pass / high-pass",
+            ),
+            (
+                EffectKind::Limiter,
+                "Limiter",
+                "Brickwall ceiling, or hard clip",
+            ),
         ];
-        let mut card = card().py(px(10.)).gap(px(6.)).child(
-            div()
-                .text_size(px(13.))
-                .pb(px(4.))
-                .child("Available"),
-        );
+        let mut card = card()
+            .py(px(10.))
+            .gap(px(6.))
+            .child(div().text_size(px(13.)).pb(px(4.)).child("Available"));
         for (kind, label, blurb) in CATALOG {
             let id = format!("add-{}", kind_name(kind));
             card = card.child(
@@ -718,7 +748,11 @@ impl SettingsWindow {
                             .child(
                                 div()
                                     .text_size(px(13.))
-                                    .text_color(if full { theme::text_muted() } else { theme::text() })
+                                    .text_color(if full {
+                                        theme::text_muted()
+                                    } else {
+                                        theme::text()
+                                    })
                                     .child(label),
                             )
                             .child(
@@ -816,27 +850,36 @@ impl SettingsWindow {
                         .flex()
                         .flex_wrap()
                         .gap(px(6.))
-                        .children(RATE_PRESETS.map(|preset| {
-                            let active = (rate - preset).abs() < 0.01;
-                            let label = if (preset - 1.0).abs() < 0.001 {
-                                "1.0×".to_string()
-                            } else {
-                                format!("{preset:.2}×")
-                            };
-                            text_button(
-                                bind_click(format!("rate-{preset}"), cx, move |this, _, cx| {
-                                    this.session.update(cx, |session, cx| {
-                                        session.preview_rate(preset);
-                                        session.commit_rate();
-                                        cx.notify();
-                                    });
-                                    cx.notify();
-                                })
-                                .when(active, |button| button.bg(theme::bg_elevated())),
-                                label,
-                            )
-                            .into_any_element()
-                        }))
+                        .justify_between()
+                        .child(
+                            div()
+                                .children(RATE_PRESETS.map(|preset| {
+                                    let active = (rate - preset).abs() < 0.01;
+                                    let label = if (preset - 1.0).abs() < 0.001 {
+                                        "1.0×".to_string()
+                                    } else {
+                                        format!("{preset:.2}×")
+                                    };
+                                    text_button(
+                                        bind_click(
+                                            format!("rate-{preset}"),
+                                            cx,
+                                            move |this, _, cx| {
+                                                this.session.update(cx, |session, cx| {
+                                                    session.preview_rate(preset);
+                                                    session.commit_rate();
+                                                    cx.notify();
+                                                });
+                                                cx.notify();
+                                            },
+                                        )
+                                        .when(active, |button| button.bg(theme::accent_soft())),
+                                        label,
+                                    )
+                                }))
+                                .flex()
+                                .justify_start(),
+                        )
                         .child(text_button(
                             bind_click("pitch-toggle", cx, |this, _, cx| {
                                 let on = !this.session.read(cx).rack.pitch_enabled;
@@ -910,7 +953,11 @@ impl SettingsWindow {
                         .child(
                             div()
                                 .text_size(px(13.))
-                                .text_color(if slot.enabled { theme::text() } else { theme::text_muted() })
+                                .text_color(if slot.enabled {
+                                    theme::text()
+                                } else {
+                                    theme::text_muted()
+                                })
                                 .child(label),
                         )
                         .child(
@@ -940,14 +987,23 @@ impl SettingsWindow {
                         .justify_center()
                         .rounded_md()
                         .hover(|style| style.bg(theme::hover()))
-                        .child(icon(icons::CLOSE, theme::text_muted(), px(10.))),
+                        .child(icon(
+                            icons::CLOSE,
+                            theme::text_muted(),
+                            px(10.),
+                        )),
                     ),
             )
             .when(open, |row| row.child(self.slot_body(slot, rack, cx)))
             .into_any_element()
     }
 
-    fn slot_body(&self, slot: &ChainSlotSettings, rack: &AudioRack, cx: &mut Context<Self>) -> AnyElement {
+    fn slot_body(
+        &self,
+        slot: &ChainSlotSettings,
+        rack: &AudioRack,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         div()
             .px(px(8.))
             .pb(px(8.))
@@ -970,7 +1026,8 @@ impl SettingsWindow {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let id = slot.id.clone();
-        let open = matches!(&self.audio.menu, Menu::Effect { slot: open_id, .. } if open_id == &slot.id);
+        let open =
+            matches!(&self.audio.menu, Menu::Effect { slot: open_id, .. } if open_id == &slot.id);
         div()
             .flex()
             .flex_col()
@@ -1019,8 +1076,17 @@ impl SettingsWindow {
             .into_any_element()
     }
 
-    fn effect_menu(&self, slot: &ChainSlotSettings, rack: &AudioRack, cx: &mut Context<Self>) -> AnyElement {
-        let Menu::Effect { slot: open_id, saving } = &self.audio.menu else {
+    fn effect_menu(
+        &self,
+        slot: &ChainSlotSettings,
+        rack: &AudioRack,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Menu::Effect {
+            slot: open_id,
+            saving,
+        } = &self.audio.menu
+        else {
             return div().into_any_element();
         };
         if open_id != &slot.id {
@@ -1081,16 +1147,33 @@ impl SettingsWindow {
                 },
             ));
         }
-        div().flex().flex_col().gap(px(2.)).children(items).into_any_element()
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .children(items)
+            .into_any_element()
     }
 
-    fn equalizer(&self, slot: &ChainSlotSettings, eq: &EqualizerSettings, cx: &mut Context<Self>) -> AnyElement {
+    fn equalizer(
+        &self,
+        slot: &ChainSlotSettings,
+        eq: &EqualizerSettings,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let mut bands: Vec<AnyElement> = Vec::new();
         let pre_frac = ((eq.preamp_db + 15.0) / 30.0).clamp(0.0, 1.0);
         bands.push(self.band_column(
             "Pre",
             &db_text(eq.preamp_db),
-            self.v_slider(format!("pre|{}", slot.id), pre_frac, Knob::Preamp { slot: slot.id.clone() }, cx),
+            self.v_slider(
+                format!("pre|{}", slot.id),
+                pre_frac,
+                Knob::Preamp {
+                    slot: slot.id.clone(),
+                },
+                cx,
+            ),
         ));
         for index in 0..BAND_COUNT {
             let gain = eq.bands_db[index];
@@ -1101,7 +1184,10 @@ impl SettingsWindow {
                 self.v_slider(
                     format!("band|{index}|{}", slot.id),
                     frac,
-                    Knob::Band { slot: slot.id.clone(), index },
+                    Knob::Band {
+                        slot: slot.id.clone(),
+                        index,
+                    },
                     cx,
                 ),
             ));
@@ -1135,7 +1221,12 @@ impl SettingsWindow {
             .into_any_element()
     }
 
-    fn filter(&self, slot: &ChainSlotSettings, filter: &FilterSettings, cx: &mut Context<Self>) -> AnyElement {
+    fn filter(
+        &self,
+        slot: &ChainSlotSettings,
+        filter: &FilterSettings,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let hp_open = filter.hp_hz <= HP_OPEN_HZ + 0.5;
         let lp_open = filter.lp_hz >= LP_OPEN_HZ - 0.5;
         let inverted = !hp_open && !lp_open && filter.hp_hz >= filter.lp_hz;
@@ -1145,25 +1236,37 @@ impl SettingsWindow {
             .gap(px(10.))
             .child(self.labeled_slider(
                 "High-pass",
-                &if hp_open { "Open".to_string() } else { format!("{} Hz", format_hz(filter.hp_hz)) },
+                &if hp_open {
+                    "Open".to_string()
+                } else {
+                    format!("{} Hz", format_hz(filter.hp_hz))
+                },
                 "Open",
                 "20k",
                 self.h_slider(
                     format!("hp|{}", slot.id),
                     hz_to_pos(filter.hp_hz),
-                    Knob::Highpass { slot: slot.id.clone() },
+                    Knob::Highpass {
+                        slot: slot.id.clone(),
+                    },
                     cx,
                 ),
             ))
             .child(self.labeled_slider(
                 "Low-pass",
-                &if lp_open { "Open".to_string() } else { format!("{} Hz", format_hz(filter.lp_hz)) },
+                &if lp_open {
+                    "Open".to_string()
+                } else {
+                    format!("{} Hz", format_hz(filter.lp_hz))
+                },
                 "20",
                 "Open",
                 self.h_slider(
                     format!("lp|{}", slot.id),
                     hz_to_pos(filter.lp_hz),
-                    Knob::Lowpass { slot: slot.id.clone() },
+                    Knob::Lowpass {
+                        slot: slot.id.clone(),
+                    },
                     cx,
                 ),
             ))
@@ -1175,7 +1278,9 @@ impl SettingsWindow {
                 self.h_slider(
                     format!("q|{}", slot.id),
                     ((filter.resonance - 0.5) / 7.5).clamp(0.0, 1.0),
-                    Knob::Resonance { slot: slot.id.clone() },
+                    Knob::Resonance {
+                        slot: slot.id.clone(),
+                    },
                     cx,
                 ),
             ))
@@ -1190,8 +1295,19 @@ impl SettingsWindow {
             .into_any_element()
     }
 
-    fn limiter(&self, slot: &ChainSlotSettings, limiter: &LimiterSettings, cx: &mut Context<Self>) -> AnyElement {
-        let reduction = self.audio.meters.get(&slot.id).copied().unwrap_or(0.0).max(0.0);
+    fn limiter(
+        &self,
+        slot: &ChainSlotSettings,
+        limiter: &LimiterSettings,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let reduction = self
+            .audio
+            .meters
+            .get(&slot.id)
+            .copied()
+            .unwrap_or(0.0)
+            .max(0.0);
         let meter = (reduction / 12.0).clamp(0.0, 1.0);
         div()
             .flex()
@@ -1205,7 +1321,9 @@ impl SettingsWindow {
                 self.h_slider(
                     format!("gain|{}", slot.id),
                     (limiter.gain_db / 12.0).clamp(0.0, 1.0),
-                    Knob::Gain { slot: slot.id.clone() },
+                    Knob::Gain {
+                        slot: slot.id.clone(),
+                    },
                     cx,
                 ),
             ))
@@ -1253,7 +1371,11 @@ impl SettingsWindow {
                             .flex()
                             .justify_between()
                             .text_size(px(12.))
-                            .child(if limiter.clip { "Clipped" } else { "Gain reduction" })
+                            .child(if limiter.clip {
+                                "Clipped"
+                            } else {
+                                "Gain reduction"
+                            })
                             .child(format!("−{reduction:.1} dB")),
                     )
                     .child(
@@ -1262,13 +1384,13 @@ impl SettingsWindow {
                             .w_full()
                             .rounded_full()
                             .bg(theme::bg_elevated())
-                            .child(
-                                div()
-                                    .h_full()
-                                    .w(relative(meter))
-                                    .rounded_full()
-                                    .bg(if limiter.clip { theme::danger() } else { theme::accent() }),
-                            ),
+                            .child(div().h_full().w(relative(meter)).rounded_full().bg(
+                                if limiter.clip {
+                                    theme::danger()
+                                } else {
+                                    theme::accent()
+                                },
+                            )),
                     ),
             )
             .child(self.labeled_slider(
@@ -1279,7 +1401,9 @@ impl SettingsWindow {
                 self.h_slider(
                     format!("ceiling|{}", slot.id),
                     ((limiter.ceiling_db + 6.0) / 6.0).clamp(0.0, 1.0),
-                    Knob::Ceiling { slot: slot.id.clone() },
+                    Knob::Ceiling {
+                        slot: slot.id.clone(),
+                    },
                     cx,
                 ),
             ))
@@ -1291,7 +1415,9 @@ impl SettingsWindow {
                 self.h_slider(
                     format!("release|{}", slot.id),
                     ((limiter.release_ms - 10.0) / 990.0).clamp(0.0, 1.0),
-                    Knob::Release { slot: slot.id.clone() },
+                    Knob::Release {
+                        slot: slot.id.clone(),
+                    },
                     cx,
                 ),
             ))
@@ -1316,7 +1442,11 @@ impl SettingsWindow {
                     .justify_between()
                     .text_size(px(12.))
                     .child(label)
-                    .child(div().text_color(theme::text_muted()).child(value.to_string())),
+                    .child(
+                        div()
+                            .text_color(theme::text_muted())
+                            .child(value.to_string()),
+                    ),
             )
             .child(slider)
             .child(
@@ -1428,7 +1558,13 @@ impl SettingsWindow {
                     .h(px(4.))
                     .rounded_full()
                     .bg(theme::bg_elevated())
-                    .child(div().h_full().w(relative(frac)).rounded_full().bg(theme::accent())),
+                    .child(
+                        div()
+                            .h_full()
+                            .w(relative(frac))
+                            .rounded_full()
+                            .bg(theme::accent()),
+                    ),
             )
             .child(
                 div()
@@ -1443,7 +1579,13 @@ impl SettingsWindow {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
-                    this.begin_knob(id_down.clone(), knob_down.clone(), false, event.position, cx);
+                    this.begin_knob(
+                        id_down.clone(),
+                        knob_down.clone(),
+                        false,
+                        event.position,
+                        cx,
+                    );
                 }),
             )
             .on_mouse_up(
@@ -1512,7 +1654,11 @@ impl SettingsWindow {
         .rounded_full()
         .p(px(2.))
         .flex_shrink_0()
-        .bg(if on { theme::accent() } else { theme::bg_elevated() })
+        .bg(if on {
+            theme::accent()
+        } else {
+            theme::bg_elevated()
+        })
         .child(
             div()
                 .size(px(16.))
@@ -1535,7 +1681,11 @@ impl SettingsWindow {
             .h(px(20.))
             .rounded_full()
             .p(px(2.))
-            .bg(if on { theme::accent() } else { theme::bg_elevated() })
+            .bg(if on {
+                theme::accent()
+            } else {
+                theme::bg_elevated()
+            })
             .child(
                 div()
                     .size(px(16.))
@@ -1546,7 +1696,13 @@ impl SettingsWindow {
             .into_any_element()
     }
 
-    fn nudge_button(&self, slot_id: &str, dir: i32, enabled: bool, cx: &mut Context<Self>) -> AnyElement {
+    fn nudge_button(
+        &self,
+        slot_id: &str,
+        dir: i32,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let mark = if dir < 0 { "↑" } else { "↓" };
         if !enabled {
             return div()
@@ -1640,7 +1796,8 @@ impl SettingsWindow {
         };
         let rack = self.session.read(cx).rack.clone();
         let (key, body) = if let Some(slot) = open {
-            let Some(slot_settings) = rack.chain.iter().find(|item| item.id == slot).cloned() else {
+            let Some(slot_settings) = rack.chain.iter().find(|item| item.id == slot).cloned()
+            else {
                 return div().into_any_element();
             };
             (
@@ -1744,7 +1901,9 @@ impl SettingsWindow {
                     .child(self.preset_name.clone()),
             )
             .child(text_button(
-                bind_click("preset-confirm", cx, |this, _, cx| this.confirm_preset_save(cx)),
+                bind_click("preset-confirm", cx, |this, _, cx| {
+                    this.confirm_preset_save(cx)
+                }),
                 "Save",
             ))
             .child(text_button(
@@ -1843,7 +2002,10 @@ fn bind_click(
         )
 }
 
-fn text_button(button: gpui::Stateful<gpui::Div>, label: impl Into<SharedString>) -> gpui::Stateful<gpui::Div> {
+fn text_button(
+    button: gpui::Stateful<gpui::Div>,
+    label: impl Into<SharedString>,
+) -> gpui::Stateful<gpui::Div> {
     button
         .h(px(26.))
         .px(px(8.))
@@ -1899,7 +2061,10 @@ fn effect_from_preset(rack: &AudioRack, kind: EffectKind, name: &str) -> Option<
             ))
         }
         EffectKind::Filter => {
-            let preset = rack.filter_presets.iter().find(|preset| preset.name == name)?;
+            let preset = rack
+                .filter_presets
+                .iter()
+                .find(|preset| preset.name == name)?;
             Some(EffectSettings::Filter(
                 FilterSettings {
                     enabled: true,
@@ -1911,7 +2076,10 @@ fn effect_from_preset(rack: &AudioRack, kind: EffectKind, name: &str) -> Option<
             ))
         }
         EffectKind::Limiter => {
-            let preset = rack.limiter_presets.iter().find(|preset| preset.name == name)?;
+            let preset = rack
+                .limiter_presets
+                .iter()
+                .find(|preset| preset.name == name)?;
             Some(EffectSettings::Limiter(
                 LimiterSettings {
                     enabled: true,
@@ -2070,13 +2238,25 @@ fn effect_preset_label(rack: &AudioRack, slot: &ChainSlotSettings) -> String {
         EffectKind::Filter => rack.filter_presets.is_empty(),
         EffectKind::Limiter => rack.limiter_presets.is_empty(),
     };
-    if empty { "None".to_string() } else { "Custom".to_string() }
+    if empty {
+        "None".to_string()
+    } else {
+        "Custom".to_string()
+    }
 }
 
 fn preset_names(rack: &AudioRack, kind: EffectKind) -> Vec<String> {
     match kind {
-        EffectKind::Equalizer => rack.eq_presets.iter().map(|preset| preset.name.clone()).collect(),
-        EffectKind::Filter => rack.filter_presets.iter().map(|preset| preset.name.clone()).collect(),
+        EffectKind::Equalizer => rack
+            .eq_presets
+            .iter()
+            .map(|preset| preset.name.clone())
+            .collect(),
+        EffectKind::Filter => rack
+            .filter_presets
+            .iter()
+            .map(|preset| preset.name.clone())
+            .collect(),
         EffectKind::Limiter => rack
             .limiter_presets
             .iter()
@@ -2086,7 +2266,8 @@ fn preset_names(rack: &AudioRack, kind: EffectKind) -> Vec<String> {
 }
 
 fn eq_matches(eq: &EqualizerSettings, preset: &EqPreset) -> bool {
-    if (eq.preamp_db - preset.preamp_db).abs() >= 0.05 || preset.bands_db.len() != eq.bands_db.len() {
+    if (eq.preamp_db - preset.preamp_db).abs() >= 0.05 || preset.bands_db.len() != eq.bands_db.len()
+    {
         return false;
     }
     preset
@@ -2107,7 +2288,10 @@ fn chains_match(live: &[ChainSlotSettings], saved: &[ChainSlotSettings]) -> bool
         match (&left.effect, &right.effect) {
             (EffectSettings::Equalizer(a), EffectSettings::Equalizer(b)) => {
                 (a.preamp_db - b.preamp_db).abs() < 0.05
-                    && a.bands_db.iter().zip(b.bands_db.iter()).all(|(x, y)| (x - y).abs() < 0.05)
+                    && a.bands_db
+                        .iter()
+                        .zip(b.bands_db.iter())
+                        .all(|(x, y)| (x - y).abs() < 0.05)
             }
             (EffectSettings::Filter(a), EffectSettings::Filter(b)) => {
                 (a.lp_hz - b.lp_hz).abs() < 1.0

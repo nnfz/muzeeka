@@ -4,15 +4,19 @@
 // plays through BASS. `preview` and `empty` keep the clock so tests stay quiet.
 
 use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
 
 use muzeeka::audio::player::{GaplessTrack, PlaybackState};
+use muzeeka::MusicFile;
 
 use gpui::SharedString;
 use rusqlite::Connection;
 
 use crate::ui::catalog::{self, LoadedLibrary};
+use crate::ui::import::{self, ImportKind};
 use crate::ui::playback::{self, AudioRack, Engine};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -65,6 +69,63 @@ impl RepeatMode {
             Self::Off => Self::All,
             Self::All => Self::One,
             Self::One => Self::Off,
+        }
+    }
+}
+
+/// How tracks are chosen once the shuffle button is on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OrderMode {
+    /// One shuffled copy of the queue. Previous and next walk that copy.
+    Shuffle,
+    /// Every previous and next picks a track. Nothing is remembered.
+    Random,
+}
+
+impl OrderMode {
+    pub fn detail(self) -> &'static str {
+        match self {
+            Self::Shuffle => "Shuffle the playlist once. Previous and next follow that order",
+            Self::Random => "Previous and next each play a random track",
+        }
+    }
+
+    /// `settings.json` still stores the old smart/normal names. Both mean shuffle.
+    pub fn from_setting(value: Option<&str>) -> Self {
+        match value {
+            Some("random") => Self::Random,
+            _ => Self::Shuffle,
+        }
+    }
+
+    pub fn as_setting(self) -> &'static str {
+        match self {
+            Self::Shuffle => "shuffle",
+            Self::Random => "random",
+        }
+    }
+
+    pub fn load() -> Self {
+        let path = catalog::app_data_dir().join("settings.json");
+        let Ok(raw) = fs::read_to_string(path) else {
+            return Self::Shuffle;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            return Self::Shuffle;
+        };
+        Self::from_setting(value.get("shuffle_mode").and_then(|item| item.as_str()))
+    }
+
+    pub fn store(self) {
+        let path = catalog::app_data_dir().join("settings.json");
+        let raw = fs::read_to_string(&path).unwrap_or_else(|_| "{}".into());
+        let Ok(next) =
+            crate::ui::ytdlp::merge_setting(&raw, "shuffle_mode", Some(self.as_setting()))
+        else {
+            return;
+        };
+        if next != raw {
+            let _ = fs::write(path, next);
         }
     }
 }
@@ -155,6 +216,9 @@ impl SettingsSection {
 
 pub struct Session {
     tracks: Vec<Track>,
+    /// Liked view order. Independent of library order, so a like drag does not
+    /// reshuffle All tracks.
+    liked_order: Vec<TrackId>,
     pub playlists: Vec<Playlist>,
     pub view: LibraryView,
     pub current: Option<TrackId>,
@@ -166,15 +230,20 @@ pub struct Session {
     pub repeat: RepeatMode,
     pub sort: Option<Sort>,
     pub queue: Vec<TrackId>,
-    /// Shuffle play order. The current track stays at the front when the
-    /// mode is turned on, so the followers can be preloaded.
+    /// Shuffled copy of `queue`. Only [`OrderMode::Shuffle`] walks it.
     shuffle_order: Vec<TrackId>,
     rng: u32,
     pub discord_rpc: bool,
     pub auto_video_bg: bool,
-    pub shuffle_smart: bool,
+    pub order_mode: OrderMode,
     pub playlist_density: PlaylistDensity,
-    pub notice: Option<String>,
+    /// Failed to open the current file, or save the library. Shown beside search.
+    pub playback_error: Option<String>,
+    playback_error_until: Option<Instant>,
+    /// Full audio files that also have `#cue:` rows. Hidden from search and All.
+    cue_containers: HashSet<TrackId>,
+    /// Bumped when the visible track set changes. Playback position does not.
+    list_epoch: u64,
     index_by_id: HashMap<TrackId, usize>,
     playlist_of: HashMap<TrackId, String>,
     /// Lowercased title, artist, and album, parallel to `tracks`.
@@ -191,7 +260,19 @@ pub struct Session {
     heard_to: f64,
     /// User pressed pause. A stopped stream must not advance past that.
     hold: bool,
+    /// Playlist the queue was started from. Empty for All tracks and Liked.
+    playing_playlist: Option<String>,
+    /// Last successful write of `app_state`. Position updates are throttled.
+    playback_saved_at: Option<Instant>,
+    playback_stamp: Option<PlaybackStamp>,
     db: Option<Connection>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct PlaybackStamp {
+    file: Option<String>,
+    second: i64,
+    playing: bool,
 }
 
 struct SearchFold {
@@ -202,21 +283,21 @@ struct SearchFold {
 }
 
 impl Session {
-    /// Real library from the shared app-data folder. Sample tracks are only a
-    /// fallback when that database is not installed.
+    /// Real library from the shared app-data folder. A missing database is
+    /// created empty. Sample tracks stay in [`Self::preview`] for tests.
     pub fn open() -> Self {
         let mut session = match catalog::load() {
             Ok(library) => Self::from_library(library),
             Err(error) => {
-                let mut session = if catalog::app_data_dir().join("library.db").is_file() {
-                    Self::empty()
-                } else {
-                    Self::preview()
-                };
-                session.notice = Some(error);
+                let mut session = Self::empty();
+                session.push_notice(error);
                 session
             }
         };
+        session.order_mode = OrderMode::load();
+        if session.random_jumps() {
+            session.shuffle_order.clear();
+        }
         session.rack = AudioRack::load();
         if let Some(warning) = session.rack.warning.clone() {
             session.push_notice(warning);
@@ -227,27 +308,60 @@ impl Session {
                     session.push_notice(warning);
                 }
                 session.engine = Some(engine);
+                if session.playing {
+                    let at = session.position;
+                    session.output_play(at);
+                }
             }
-            Err(error) => session.push_notice(format!("Audio output is unavailable: {error}")),
+            Err(error) => {
+                session.playing = false;
+                session.push_notice(format!("Audio output is unavailable: {error}"));
+            }
         }
         session
     }
 
+    /// Appends a line to the header error, beside search.
     pub(crate) fn push_notice(&mut self, line: String) {
-        self.notice = Some(match self.notice.take() {
+        let line = match self.playback_error.take() {
             Some(existing) => format!("{existing} {line}"),
             None => line,
-        });
+        };
+        self.note_playback_error(line);
+    }
+
+    /// Replace the header playback error. It expires on its own, and a later
+    /// successful open clears it immediately.
+    pub(crate) fn note_playback_error(&mut self, line: String) {
+        self.playback_error = Some(line);
+        self.playback_error_until = Some(Instant::now() + PLAYBACK_ERROR_TTL);
+    }
+
+    pub(crate) fn clear_playback_error(&mut self) {
+        self.playback_error = None;
+        self.playback_error_until = None;
+    }
+
+    fn expire_playback_error(&mut self) -> bool {
+        let expired = self
+            .playback_error_until
+            .is_some_and(|until| Instant::now() >= until);
+        if expired {
+            self.clear_playback_error();
+        }
+        expired
     }
 
     fn from_library(library: LoadedLibrary) -> Self {
         let volume = library.volume;
+        let liked_order = catalog::load_liked_order(&library.db).unwrap_or_default();
         let mut session = Self {
             tracks: library.tracks,
+            liked_order,
             playlists: library.playlists,
             view: library.view,
             current: library.current,
-            playing: false,
+            playing: library.was_playing,
             position: library.position,
             volume,
             last_volume: volume,
@@ -259,26 +373,34 @@ impl Session {
             rng: 0x1234_5678,
             discord_rpc: true,
             auto_video_bg: false,
-            shuffle_smart: true,
+            order_mode: OrderMode::Shuffle,
             playlist_density: PlaylistDensity::Normal,
-            notice: None,
+            playback_error: None,
+            playback_error_until: None,
+            cue_containers: HashSet::new(),
+            list_epoch: 0,
             index_by_id: HashMap::new(),
             playlist_of: HashMap::new(),
             search_folds: Vec::new(),
             engine: None,
             rack: AudioRack::flat(),
             armed_at: None,
-            heard_to: 0.0,
+            heard_to: library.position,
             hold: false,
+            playing_playlist: library.playing_playlist_id,
+            playback_saved_at: None,
+            playback_stamp: None,
             db: Some(library.db),
         };
         session.rebuild_indexes();
+        session.restore_queue();
         session
     }
 
     fn empty() -> Self {
         Self {
             tracks: Vec::new(),
+            liked_order: Vec::new(),
             playlists: Vec::new(),
             view: LibraryView::All,
             current: None,
@@ -294,9 +416,12 @@ impl Session {
             rng: 0x1234_5678,
             discord_rpc: true,
             auto_video_bg: false,
-            shuffle_smart: true,
+            order_mode: OrderMode::Shuffle,
             playlist_density: PlaylistDensity::Normal,
-            notice: None,
+            playback_error: None,
+            playback_error_until: None,
+            cue_containers: HashSet::new(),
+            list_epoch: 0,
             index_by_id: HashMap::new(),
             playlist_of: HashMap::new(),
             search_folds: Vec::new(),
@@ -305,6 +430,9 @@ impl Session {
             armed_at: None,
             heard_to: 0.0,
             hold: false,
+            playing_playlist: None,
+            playback_saved_at: None,
+            playback_stamp: None,
             db: None,
         }
     }
@@ -331,6 +459,7 @@ impl Session {
         ];
         let mut session = Self {
             tracks,
+            liked_order: Vec::new(),
             playlists,
             view: LibraryView::All,
             current: None,
@@ -346,9 +475,12 @@ impl Session {
             rng: 0x1234_5678,
             discord_rpc: true,
             auto_video_bg: false,
-            shuffle_smart: true,
+            order_mode: OrderMode::Shuffle,
             playlist_density: PlaylistDensity::Normal,
-            notice: None,
+            playback_error: None,
+            playback_error_until: None,
+            cue_containers: HashSet::new(),
+            list_epoch: 0,
             index_by_id: HashMap::new(),
             playlist_of: HashMap::new(),
             search_folds: Vec::new(),
@@ -357,6 +489,9 @@ impl Session {
             armed_at: None,
             heard_to: 0.0,
             hold: false,
+            playing_playlist: None,
+            playback_saved_at: None,
+            playback_stamp: None,
             db: None,
         };
         session.rebuild_indexes();
@@ -364,6 +499,9 @@ impl Session {
     }
 
     fn rebuild_indexes(&mut self) {
+        self.sync_liked_order();
+        catalog::inherit_cue_covers(&mut self.tracks);
+        self.cue_containers = catalog::cue_container_ids(&self.tracks);
         self.index_by_id = self
             .tracks
             .iter()
@@ -393,6 +531,24 @@ impl Session {
                 })
                 .collect();
         }
+        self.list_epoch = self.list_epoch.wrapping_add(1);
+    }
+
+    /// Drop likes that no longer exist and append newly liked rows at the end.
+    fn sync_liked_order(&mut self) {
+        let liked: HashSet<TrackId> = self
+            .tracks
+            .iter()
+            .filter(|track| track.liked)
+            .map(|track| track.id)
+            .collect();
+        self.liked_order.retain(|id| liked.contains(id));
+        let known: HashSet<TrackId> = self.liked_order.iter().copied().collect();
+        for track in &self.tracks {
+            if track.liked && !known.contains(&track.id) {
+                self.liked_order.push(track.id);
+            }
+        }
     }
 
     pub fn track_by_index(&self, index: usize) -> Option<&Track> {
@@ -413,8 +569,49 @@ impl Session {
         self.tracks.iter().filter(|track| track.liked).count()
     }
 
+    /// Changes when the rows of a view can change. Position updates do not.
+    pub fn list_epoch(&self) -> u64 {
+        self.list_epoch
+    }
+
     pub fn current_track(&self) -> Option<&Track> {
         self.current.and_then(|id| self.track(id))
+    }
+
+    pub fn window_title(&self) -> String {
+        match self.current_track() {
+            Some(track) => format_window_title(&track.artist, &track.title),
+            None => "muzeeka".into(),
+        }
+    }
+
+    /// Play is available, and whether previous and next have somewhere to go.
+    pub fn taskbar_flags(&self) -> (bool, bool, bool, bool) {
+        let (has_prev, has_next) = self.can_navigate();
+        let can_play = self.current.is_some() || !self.queue.is_empty();
+        (self.playing, can_play, has_prev, has_next)
+    }
+
+    fn can_navigate(&self) -> (bool, bool) {
+        let Some(current) = self.current else {
+            return (false, false);
+        };
+        if self.queue.is_empty() {
+            return (self.position > 2.0, false);
+        }
+        if self.random_jumps() {
+            let any = !self.queue.is_empty();
+            return (any, self.repeat == RepeatMode::One || any);
+        }
+        let deck = self.shuffled_deck();
+        let repeat_all = self.repeat == RepeatMode::All;
+        let order = self.play_order();
+        // Repeat-one restarts the open track, so next still has somewhere to go.
+        let has_next =
+            self.repeat == RepeatMode::One || step_forward(order, current, repeat_all).is_some();
+        let has_prev =
+            self.position > 2.0 || step_back(order, current, !deck && repeat_all).is_some();
+        (has_prev, has_next)
     }
 
     pub fn view_label(&self) -> String {
@@ -440,6 +637,7 @@ impl Session {
     pub fn visible_indexes(&self, query: &str) -> Vec<usize> {
         let parsed = parse_query(query);
         let mut indexes: Vec<usize> = match &self.view {
+            LibraryView::Liked => self.liked_indexes(&parsed),
             LibraryView::Playlist(id) => self
                 .playlists
                 .iter()
@@ -468,8 +666,7 @@ impl Session {
         };
         if let Some(sort) = self.sort {
             indexes.sort_by(|left, right| {
-                let (Some(left), Some(right)) =
-                    (self.tracks.get(*left), self.tracks.get(*right))
+                let (Some(left), Some(right)) = (self.tracks.get(*left), self.tracks.get(*right))
                 else {
                     return std::cmp::Ordering::Equal;
                 };
@@ -491,6 +688,20 @@ impl Session {
         indexes
     }
 
+    fn liked_indexes(&self, query: &ParsedQuery) -> Vec<usize> {
+        self.liked_order
+            .iter()
+            .filter_map(|id| {
+                let index = self.index_by_id.get(id).copied()?;
+                let track = self.tracks.get(index)?;
+                (track.liked
+                    && self.matches_playlist_filter(track, query)
+                    && matches_query(track, query))
+                .then_some(index)
+            })
+            .collect()
+    }
+
     /// Hit ids for the search dropdown, in library order. Empty when the query
     /// has no text or is a media URL. Unlike [`Self::visible_tracks`], this
     /// ignores the open library view. Does not clone track bodies.
@@ -503,6 +714,7 @@ impl Session {
         self.search_folds
             .iter()
             .filter(|fold| allowed.as_ref().is_none_or(|ids| ids.contains(&fold.id)))
+            .filter(|fold| !self.cue_containers.contains(&fold.id))
             .filter(|fold| fold_matches(fold, &parsed))
             .map(|fold| fold.id)
             .collect()
@@ -541,7 +753,7 @@ impl Session {
             return false;
         }
         match &self.view {
-            LibraryView::All => true,
+            LibraryView::All => !self.cue_containers.contains(&track.id),
             LibraryView::Liked => track.liked,
             LibraryView::Playlist(id) => self
                 .playlists
@@ -614,18 +826,44 @@ impl Session {
     }
 
     pub fn toggle_like(&mut self, id: TrackId) {
-        let Some(liked) = self.tracks.iter().find(|track| track.id == id).map(|track| track.liked)
+        let Some(liked) = self
+            .tracks
+            .iter()
+            .find(|track| track.id == id)
+            .map(|track| track.liked)
         else {
             return;
         };
-        let next = !liked;
-        if let Err(error) = self.write_like(id, next) {
-            self.notice = Some(error);
+        self.set_liked(id, !liked);
+    }
+
+    fn set_liked(&mut self, id: TrackId, liked: bool) {
+        let Some(current) = self
+            .tracks
+            .iter()
+            .find(|track| track.id == id)
+            .map(|track| track.liked)
+        else {
+            return;
+        };
+        if current == liked {
+            return;
+        }
+        if let Err(error) = self.write_like(id, liked) {
+            self.push_notice(error);
             return;
         }
         if let Some(track) = self.tracks.iter_mut().find(|track| track.id == id) {
-            track.liked = next;
+            track.liked = liked;
         }
+        if liked {
+            if !self.liked_order.contains(&id) {
+                self.liked_order.push(id);
+            }
+        } else {
+            self.liked_order.retain(|item| *item != id);
+        }
+        self.list_epoch = self.list_epoch.wrapping_add(1);
     }
 
     fn write_like(&self, id: TrackId, liked: bool) -> Result<(), String> {
@@ -640,8 +878,11 @@ impl Session {
             )
             .map_err(|error| format!("Could not save like: {error}"))?;
         } else {
-            db.execute("DELETE FROM liked_tracks WHERE track_id = ?1", [id.0 as i64])
-                .map_err(|error| format!("Could not remove like: {error}"))?;
+            db.execute(
+                "DELETE FROM liked_tracks WHERE track_id = ?1",
+                [id.0 as i64],
+            )
+            .map_err(|error| format!("Could not remove like: {error}"))?;
         }
         Ok(())
     }
@@ -651,7 +892,7 @@ impl Session {
         let id = format!("playlist-{n}");
         let name = format!("Playlist {n}");
         if let Err(error) = self.insert_playlist(&id, &name) {
-            self.notice = Some(error);
+            self.push_notice(error);
             return;
         }
         self.playlists.push(Playlist {
@@ -694,7 +935,10 @@ impl Session {
 
     /// Copies one library track onto a playlist. Already-present tracks stay put.
     pub fn add_to_playlist(&mut self, playlist_id: &str, track: TrackId) -> bool {
-        let Some(playlist) = self.playlists.iter().find(|playlist| playlist.id == playlist_id)
+        let Some(playlist) = self
+            .playlists
+            .iter()
+            .find(|playlist| playlist.id == playlist_id)
         else {
             return false;
         };
@@ -718,7 +962,10 @@ impl Session {
 
     /// Removes a track from a playlist. The file stays in the library.
     pub fn remove_from_playlist(&mut self, playlist_id: &str, track: TrackId) {
-        let Some(playlist) = self.playlists.iter().find(|playlist| playlist.id == playlist_id)
+        let Some(playlist) = self
+            .playlists
+            .iter()
+            .find(|playlist| playlist.id == playlist_id)
         else {
             return;
         };
@@ -737,6 +984,380 @@ impl Session {
             playlist.track_ids.retain(|id| *id != track);
         }
         self.rebuild_indexes();
+    }
+
+    /// Reorder the open list. The pointer index is in the order on screen,
+    /// including a column sort. The sort is cleared, because that screen order
+    /// becomes the stored order.
+    pub(crate) fn reorder_view(&mut self, moving: &[TrackId], insert_at: usize) -> bool {
+        let displayed = self.displayed_ids();
+        let next = crate::ui::reorder::reorder_at_boundary(&displayed, moving, insert_at);
+        if next == displayed {
+            return false;
+        }
+        let view = self.view.clone();
+        let playing = self.playing_source(&view);
+        let saved = match &view {
+            LibraryView::Playlist(id) => self.write_playlist_track_positions(id, &next),
+            LibraryView::Liked => self.write_liked_positions(&next),
+            LibraryView::All => {
+                let order = self.spliced_library_order(&next);
+                self.write_library_positions(&order)
+            }
+        };
+        if let Err(error) = saved {
+            self.push_notice(error);
+            return false;
+        }
+        match &view {
+            LibraryView::Playlist(id) => {
+                if let Some(playlist) = self
+                    .playlists
+                    .iter_mut()
+                    .find(|playlist| &playlist.id == id)
+                {
+                    playlist.track_ids = next.clone();
+                }
+            }
+            LibraryView::Liked => self.liked_order = next.clone(),
+            LibraryView::All => {
+                let order = self.spliced_library_order(&next);
+                self.apply_track_order(&order);
+            }
+        }
+        self.sort = None;
+        self.rebuild_indexes();
+        if playing {
+            self.sync_playing_queue(&view);
+        }
+        true
+    }
+
+    /// Add tracks to a playlist. Tracks already there are left where they are.
+    pub(crate) fn copy_tracks(&mut self, ids: &[TrackId], target: &str) -> usize {
+        if !self.playlists.iter().any(|playlist| playlist.id == target) {
+            return 0;
+        }
+        self.unique_ids(ids)
+            .into_iter()
+            .filter(|id| self.add_to_playlist(target, *id))
+            .count()
+    }
+
+    /// Move tracks onto a playlist. Ctrl is the copy path. A move out of a
+    /// playlist takes the rows with it. A move out of Liked unlikes them.
+    /// A move out of All takes them out of every other playlist.
+    pub(crate) fn move_tracks(
+        &mut self,
+        ids: &[TrackId],
+        target: &str,
+        source: &LibraryView,
+    ) -> usize {
+        if !self.playlists.iter().any(|playlist| playlist.id == target) {
+            return 0;
+        }
+        if let LibraryView::Playlist(id) = source {
+            if id == target {
+                return 0;
+            }
+        }
+        let ids = self.unique_ids(ids);
+        if ids.is_empty() {
+            return 0;
+        }
+        let count = ids.len();
+        let playing_playlist = self.playing_playlist.clone();
+        let playing_source = self.playing_source(source);
+        for id in &ids {
+            let _ = self.add_to_playlist(target, *id);
+        }
+        match source {
+            LibraryView::Playlist(id) => {
+                let stop = self.current.is_some_and(|current| ids.contains(&current));
+                for track in &ids {
+                    self.remove_from_playlist(id, *track);
+                }
+                if stop {
+                    self.stop_playback();
+                } else if playing_playlist.as_deref() == Some(id.as_str()) {
+                    self.drop_ids_from_queue(&ids);
+                }
+            }
+            LibraryView::Liked => {
+                for track in &ids {
+                    self.set_liked(*track, false);
+                }
+                if playing_source {
+                    self.sync_playing_queue(&LibraryView::Liked);
+                }
+            }
+            LibraryView::All => {
+                let others: Vec<String> = self
+                    .playlists
+                    .iter()
+                    .filter(|playlist| playlist.id != target)
+                    .map(|playlist| playlist.id.clone())
+                    .collect();
+                for playlist in &others {
+                    for track in &ids {
+                        self.remove_from_playlist(playlist, *track);
+                    }
+                }
+                if let Some(playing) = playing_playlist {
+                    if playing != target {
+                        self.sync_playing_queue(&LibraryView::Playlist(playing));
+                    }
+                }
+            }
+        }
+        count
+    }
+
+    /// Sidebar order. `insert_at` is a boundary in the current playlist list.
+    pub(crate) fn reorder_playlists(&mut self, moving: &[String], insert_at: usize) -> bool {
+        let ids: Vec<String> = self
+            .playlists
+            .iter()
+            .map(|playlist| playlist.id.clone())
+            .collect();
+        let next = crate::ui::reorder::reorder_at_boundary(&ids, moving, insert_at);
+        if next == ids {
+            return false;
+        }
+        if let Err(error) = self.write_playlist_positions(&next) {
+            self.push_notice(error);
+            return false;
+        }
+        let mut by_id: HashMap<String, Playlist> = self
+            .playlists
+            .drain(..)
+            .map(|playlist| (playlist.id.clone(), playlist))
+            .collect();
+        self.playlists = next.iter().filter_map(|id| by_id.remove(id)).collect();
+        true
+    }
+
+    fn displayed_ids(&self) -> Vec<TrackId> {
+        self.visible_indexes("")
+            .into_iter()
+            .filter_map(|index| self.tracks.get(index).map(|track| track.id))
+            .collect()
+    }
+
+    fn unique_ids(&self, ids: &[TrackId]) -> Vec<TrackId> {
+        let mut seen = HashSet::new();
+        ids.iter()
+            .copied()
+            .filter(|id| self.track(*id).is_some() && seen.insert(*id))
+            .collect()
+    }
+
+    /// Library order with the visible rows replaced by `visible`, hidden rows
+    /// staying in their slots. Cue parents stay put while All tracks move.
+    fn spliced_library_order(&self, visible: &[TrackId]) -> Vec<TrackId> {
+        let visible_set: HashSet<TrackId> = visible.iter().copied().collect();
+        let mut upcoming = visible.iter().copied();
+        self.tracks
+            .iter()
+            .map(|track| {
+                if visible_set.contains(&track.id) {
+                    upcoming.next().unwrap_or(track.id)
+                } else {
+                    track.id
+                }
+            })
+            .collect()
+    }
+
+    fn apply_track_order(&mut self, order: &[TrackId]) {
+        let mut by_id: HashMap<TrackId, Track> = self
+            .tracks
+            .drain(..)
+            .map(|track| (track.id, track))
+            .collect();
+        self.tracks = order.iter().filter_map(|id| by_id.remove(id)).collect();
+        for track in by_id.into_values() {
+            self.tracks.push(track);
+        }
+    }
+
+    /// Playlist whose queue is playing, when playback started from one.
+    pub(crate) fn bars_playlist(&self) -> Option<&str> {
+        self.playing
+            .then(|| self.playing_playlist.as_deref())
+            .flatten()
+    }
+
+    /// Where a transport-bar drag should move or copy from.
+    pub(crate) fn drag_source(&self) -> LibraryView {
+        if let Some(id) = &self.playing_playlist {
+            return LibraryView::Playlist(id.clone());
+        }
+        if self.queue_matches(&LibraryView::Liked) {
+            LibraryView::Liked
+        } else {
+            LibraryView::All
+        }
+    }
+
+    fn playing_source(&self, source: &LibraryView) -> bool {
+        match source {
+            LibraryView::Playlist(id) => self.playing_playlist.as_deref() == Some(id.as_str()),
+            LibraryView::All | LibraryView::Liked => {
+                self.playing_playlist.is_none() && self.queue_matches(source)
+            }
+        }
+    }
+
+    fn queue_matches(&self, view: &LibraryView) -> bool {
+        let natural = self.natural_ids(view);
+        let queued: HashSet<TrackId> = self.queue.iter().copied().collect();
+        let base: HashSet<TrackId> = natural.iter().copied().collect();
+        if queued == base {
+            return true;
+        }
+        if let Some(current) = self.current {
+            let mut with_current = base;
+            with_current.insert(current);
+            return queued == with_current;
+        }
+        false
+    }
+
+    fn natural_ids(&self, view: &LibraryView) -> Vec<TrackId> {
+        match view {
+            LibraryView::Playlist(id) => self
+                .playlists
+                .iter()
+                .find(|playlist| &playlist.id == id)
+                .map(|playlist| playlist.track_ids.clone())
+                .unwrap_or_default(),
+            LibraryView::Liked => self.liked_order.clone(),
+            LibraryView::All => self
+                .tracks
+                .iter()
+                .filter(|track| !self.cue_containers.contains(&track.id))
+                .map(|track| track.id)
+                .collect(),
+        }
+    }
+
+    fn sync_playing_queue(&mut self, view: &LibraryView) {
+        let mut next = self.natural_ids(view);
+        if let Some(current) = self.current {
+            if !next.contains(&current) {
+                next.insert(0, current);
+            }
+        }
+        self.adopt_queue(next);
+    }
+
+    fn drop_ids_from_queue(&mut self, ids: &[TrackId]) {
+        let gone: HashSet<TrackId> = ids.iter().copied().collect();
+        self.queue.retain(|id| !gone.contains(id));
+        self.shuffle_order.retain(|id| !gone.contains(id));
+        self.refresh_gapless();
+    }
+
+    fn adopt_queue(&mut self, next: Vec<TrackId>) {
+        if self.queue == next {
+            return;
+        }
+        let previous: HashSet<TrackId> = self.queue.iter().copied().collect();
+        let same_set = next.len() == previous.len() && next.iter().all(|id| previous.contains(id));
+        self.queue = next;
+        if self.shuffle && !same_set {
+            self.rebuild_shuffle();
+        }
+        self.refresh_gapless();
+    }
+
+    fn stop_playback(&mut self) {
+        self.playing = false;
+        self.current = None;
+        self.position = 0.0;
+        self.queue.clear();
+        self.shuffle_order.clear();
+        self.playing_playlist = None;
+        self.output_pause();
+        self.remember_playback(true);
+    }
+
+    fn write_playlist_track_positions(&mut self, id: &str, ids: &[TrackId]) -> Result<(), String> {
+        let Some(db) = &mut self.db else {
+            return Ok(());
+        };
+        let tx = db
+            .transaction()
+            .map_err(|error| format!("Could not reorder: {error}"))?;
+        for (position, track) in ids.iter().enumerate() {
+            tx.execute(
+                "UPDATE playlist_tracks SET position = ?3
+                  WHERE playlist_id = ?1 AND track_id = ?2",
+                rusqlite::params![id, track.0 as i64, position as i64],
+            )
+            .map_err(|error| format!("Could not reorder: {error}"))?;
+        }
+        tx.commit()
+            .map_err(|error| format!("Could not reorder: {error}"))?;
+        Ok(())
+    }
+
+    fn write_library_positions(&mut self, ids: &[TrackId]) -> Result<(), String> {
+        let Some(db) = &mut self.db else {
+            return Ok(());
+        };
+        let tx = db
+            .transaction()
+            .map_err(|error| format!("Could not reorder: {error}"))?;
+        for (position, track) in ids.iter().enumerate() {
+            tx.execute(
+                "UPDATE tracks SET library_position = ?2 WHERE id = ?1",
+                rusqlite::params![track.0 as i64, position as i64],
+            )
+            .map_err(|error| format!("Could not reorder: {error}"))?;
+        }
+        tx.commit()
+            .map_err(|error| format!("Could not reorder: {error}"))?;
+        Ok(())
+    }
+
+    fn write_liked_positions(&mut self, ids: &[TrackId]) -> Result<(), String> {
+        let Some(db) = &mut self.db else {
+            return Ok(());
+        };
+        let tx = db
+            .transaction()
+            .map_err(|error| format!("Could not reorder: {error}"))?;
+        for (position, track) in ids.iter().enumerate() {
+            tx.execute(
+                "UPDATE liked_tracks SET position = ?2 WHERE track_id = ?1",
+                rusqlite::params![track.0 as i64, position as i64],
+            )
+            .map_err(|error| format!("Could not reorder: {error}"))?;
+        }
+        tx.commit()
+            .map_err(|error| format!("Could not reorder: {error}"))?;
+        Ok(())
+    }
+
+    fn write_playlist_positions(&mut self, ids: &[String]) -> Result<(), String> {
+        let Some(db) = &mut self.db else {
+            return Ok(());
+        };
+        let tx = db
+            .transaction()
+            .map_err(|error| format!("Could not reorder playlists: {error}"))?;
+        for (position, id) in ids.iter().enumerate() {
+            tx.execute(
+                "UPDATE playlists SET position = ?2 WHERE id = ?1",
+                rusqlite::params![id, position as i64],
+            )
+            .map_err(|error| format!("Could not reorder playlists: {error}"))?;
+        }
+        tx.commit()
+            .map_err(|error| format!("Could not reorder playlists: {error}"))?;
+        Ok(())
     }
 
     pub fn set_mix_mode(&mut self, id: &str, enabled: bool) {
@@ -787,6 +1408,177 @@ impl Session {
             playlist.cover_path = None;
             playlist.cover = fallback;
         }
+    }
+
+    /// Writes scanned files into the open library and refreshes the in-memory lists.
+    /// Playback keeps the current file when that row is still present.
+    pub fn import_dropped(
+        &mut self,
+        files: &[MusicFile],
+        kind: &ImportKind,
+    ) -> Result<import::ImportReport, String> {
+        let (report, tracks, playlists) = {
+            let db = self
+                .db
+                .as_mut()
+                .ok_or_else(|| "Library database is not open".to_string())?;
+            let report = import::commit(db, files, kind)?;
+            let (tracks, playlists) = catalog::read_lists(db)?;
+            (report, tracks, playlists)
+        };
+        if let Some(id) = &report.remember_download_playlist {
+            crate::ui::ytdlp::remember_download_playlist(id);
+        }
+        self.install_lists(tracks, playlists, report.open_id.clone());
+        Ok(report)
+    }
+
+    pub(crate) fn has_library(&self) -> bool {
+        self.db.is_some()
+    }
+
+    /// Drops in-memory rows staged before a scan when the database write fails.
+    pub(crate) fn reload_lists(&mut self) -> Result<(), String> {
+        let open = match &self.view {
+            LibraryView::Playlist(id) => Some(id.clone()),
+            LibraryView::All | LibraryView::Liked => None,
+        };
+        let db = self
+            .db
+            .as_mut()
+            .ok_or_else(|| "Library database is not open".to_string())?;
+        let (tracks, playlists) = catalog::read_lists(db)?;
+        self.install_lists(tracks, playlists, open);
+        Ok(())
+    }
+
+    /// Shows dropped audio in the open list before tags are read.
+    /// A file dropped on All tracks stays in that list. A file dropped on a
+    /// playlist opens that playlist and appends the row.
+    pub(crate) fn stage_dropped_files(
+        &mut self,
+        paths: &[String],
+        playlist_id: Option<&str>,
+        mut at: Option<usize>,
+    ) {
+        if let Some(id) = playlist_id {
+            if self.playlists.iter().any(|playlist| playlist.id == id) {
+                self.view = LibraryView::Playlist(id.to_string());
+            }
+        } else if matches!(self.view, LibraryView::Liked) {
+            self.view = LibraryView::All;
+        }
+        for raw in paths {
+            let path = raw.trim();
+            if path.is_empty() || !import::is_audio_drop(path) {
+                continue;
+            }
+            let key = crate::ui::paths::path_key(path);
+            if let Some(existing) = self
+                .tracks
+                .iter()
+                .find(|track| crate::ui::paths::path_key(&track.path) == key)
+                .map(|track| track.id)
+            {
+                if self.link_staged(playlist_id, existing, at) {
+                    at = at.map(|index| index + 1);
+                }
+                continue;
+            }
+            let id = next_placeholder_id(&self.tracks);
+            let title = std::path::Path::new(path)
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.is_empty())
+                .unwrap_or("Track")
+                .to_string();
+            self.tracks.push(Track {
+                id,
+                title,
+                artist: String::new(),
+                album: String::new(),
+                duration: 0.0,
+                liked: false,
+                path: path.to_string(),
+                cover: None,
+                lyrics: None,
+            });
+            if self.link_staged(playlist_id, id, at) {
+                at = at.map(|index| index + 1);
+            }
+        }
+        self.rebuild_indexes();
+    }
+
+    /// Inserts `id` at `at` when that index is set. Returns whether the row was new.
+    fn link_staged(&mut self, playlist_id: Option<&str>, id: TrackId, at: Option<usize>) -> bool {
+        let Some(playlist_id) = playlist_id else {
+            let Some(at) = at else {
+                return false;
+            };
+            let Some(pos) = self.tracks.iter().position(|track| track.id == id) else {
+                return false;
+            };
+            let track = self.tracks.remove(pos);
+            let at = at.min(self.tracks.len());
+            self.tracks.insert(at, track);
+            return true;
+        };
+        let Some(playlist) = self
+            .playlists
+            .iter_mut()
+            .find(|playlist| playlist.id == playlist_id)
+        else {
+            return false;
+        };
+        if playlist.track_ids.contains(&id) {
+            return false;
+        }
+        let at = at
+            .unwrap_or(playlist.track_ids.len())
+            .min(playlist.track_ids.len());
+        playlist.track_ids.insert(at, id);
+        true
+    }
+
+    fn install_lists(
+        &mut self,
+        tracks: Vec<Track>,
+        playlists: Vec<Playlist>,
+        open_id: Option<String>,
+    ) {
+        let live: HashSet<TrackId> = tracks.iter().map(|track| track.id).collect();
+        self.tracks = tracks;
+        self.playlists = playlists;
+        self.queue.retain(|id| live.contains(id));
+        self.shuffle_order.retain(|id| live.contains(id));
+        if self.current.is_some_and(|id| !live.contains(&id)) {
+            self.current = None;
+            self.playing = false;
+            self.position = 0.0;
+            self.output_pause();
+        }
+        if self
+            .playing_playlist
+            .as_ref()
+            .is_some_and(|id| !self.playlists.iter().any(|playlist| &playlist.id == id))
+        {
+            self.playing_playlist = None;
+        }
+        if let Some(id) = open_id {
+            if self.playlists.iter().any(|playlist| playlist.id == id) {
+                self.view = LibraryView::Playlist(id);
+            }
+        }
+        if let Some(db) = &self.db {
+            if let Ok(order) = catalog::load_liked_order(db) {
+                self.liked_order = order;
+            }
+        } else {
+            self.liked_order.clear();
+        }
+        self.search_folds.clear();
+        self.rebuild_indexes();
     }
 
     fn write_playlist_name(&self, id: &str, name: &str) -> Result<(), String> {
@@ -913,37 +1705,208 @@ impl Session {
     }
 
     pub fn play(&mut self, id: TrackId, queue: Vec<TrackId>) {
-        self.queue = if queue.iter().any(|queued| *queued == id) {
+        let queue = if queue.iter().any(|queued| *queued == id) {
             queue
         } else {
             let mut queue = queue;
             queue.insert(0, id);
             queue
         };
+        let same_queue = self.queue == queue;
+        self.queue = queue;
         self.current = Some(id);
         self.position = 0.0;
         self.playing = true;
+        self.playing_playlist = self.active_playlist_id();
+        // A new playlist gets a new shuffle. The same queue keeps its order,
+        // so previous and next still walk the deck after another track is opened.
+        if self.shuffled_deck() && (!same_queue || !self.order_matches()) {
+            self.rebuild_shuffle();
+        }
+        if self.random_jumps() {
+            self.shuffle_order.clear();
+        }
+        self.output_play(0.0);
+        self.remember_playback(true);
+    }
+
+    /// Start `id` from its first track. Shuffle starts on a random track instead.
+    /// The open library page stays put; next and previous still walk this playlist.
+    pub fn play_playlist(&mut self, id: &str) {
+        let Some(ids) = self
+            .playlists
+            .iter()
+            .find(|playlist| playlist.id == id)
+            .map(|playlist| playlist.track_ids.clone())
+        else {
+            return;
+        };
+        if ids.is_empty() {
+            return;
+        }
+        let start = if self.shuffle {
+            ids[(self.rand() as usize) % ids.len()]
+        } else {
+            ids[0]
+        };
+        self.play(start, ids);
+        if self.playing_playlist.as_deref() != Some(id) {
+            self.playing_playlist = Some(id.to_string());
+            self.remember_playback(true);
+        }
+    }
+
+    fn active_playlist_id(&self) -> Option<String> {
+        match &self.view {
+            LibraryView::Playlist(id) => Some(id.clone()),
+            LibraryView::All | LibraryView::Liked => None,
+        }
+    }
+
+    /// Put the saved track back into a queue so next and previous still have a list.
+    fn restore_queue(&mut self) {
+        let Some(current) = self.current else {
+            return;
+        };
+        let from_playlist = self.playing_playlist.as_deref().and_then(|id| {
+            self.playlists
+                .iter()
+                .find(|playlist| playlist.id == id)
+                .map(|playlist| playlist.track_ids.clone())
+        });
+        let mut ids = if let Some(ids) = from_playlist {
+            ids
+        } else {
+            match &self.view {
+                LibraryView::Liked => self.liked_order.clone(),
+                LibraryView::Playlist(id) => self
+                    .playlists
+                    .iter()
+                    .find(|playlist| &playlist.id == id)
+                    .map(|playlist| playlist.track_ids.clone())
+                    .unwrap_or_default(),
+                LibraryView::All => self.tracks.iter().map(|track| track.id).collect(),
+            }
+        };
+        if !ids.iter().any(|id| *id == current) {
+            ids.insert(0, current);
+        }
+        self.queue = ids;
         if self.shuffle {
             self.rebuild_shuffle();
         }
-        self.output_play(0.0);
     }
 
-    /// Shuffle applies to the song that is already open, not only the next play.
+    /// Write the open track and playhead into `app_state`.
+    /// A forced write runs on track changes, seek, and exit. The playhead
+    /// itself is stored at most every few seconds.
+    fn remember_playback(&mut self, force: bool) {
+        if self.db.is_none() {
+            return;
+        }
+        let file = self.current_track().map(|track| track.path.clone());
+        let position = if file.is_some() {
+            self.position.max(0.0)
+        } else {
+            0.0
+        };
+        let playing = self.playing && file.is_some();
+        let stamp = PlaybackStamp {
+            file: file.clone(),
+            second: position.floor() as i64,
+            playing,
+        };
+        if !force {
+            if self.playback_stamp.as_ref() == Some(&stamp) {
+                return;
+            }
+            if self
+                .playback_saved_at
+                .is_some_and(|saved| saved.elapsed() < Duration::from_secs(5))
+            {
+                return;
+            }
+        }
+        let memory = catalog::PlaybackMemory {
+            active_playlist_id: self.active_playlist_id(),
+            playing_playlist_id: self.playing_playlist.clone(),
+            current_file: file,
+            volume: self.volume,
+            shuffle: self.shuffle,
+            repeat: self.repeat,
+            position,
+            was_playing: playing,
+        };
+        let saved = catalog::save_playback(self.db.as_ref().expect("db"), &memory);
+        match saved {
+            Ok(()) => {
+                self.playback_stamp = Some(stamp);
+                self.playback_saved_at = Some(Instant::now());
+            }
+            Err(error) => eprintln!("Could not save playback: {error}"),
+        }
+    }
+
+    /// The transport button only turns the saved order on or off.
     pub fn toggle_shuffle(&mut self) {
         self.shuffle = !self.shuffle;
+        self.sync_shuffle_order();
+        self.refresh_gapless();
+        self.remember_playback(true);
+    }
+
+    /// Settings pick Shuffle or Random. The transport switch stays as it is.
+    pub fn set_order_mode(&mut self, mode: OrderMode) {
+        if self.order_mode == mode {
+            return;
+        }
+        self.order_mode = mode;
         if self.shuffle {
+            self.sync_shuffle_order();
+            self.refresh_gapless();
+        }
+    }
+
+    fn shuffled_deck(&self) -> bool {
+        self.shuffle && self.order_mode == OrderMode::Shuffle
+    }
+
+    fn random_jumps(&self) -> bool {
+        self.shuffle && self.order_mode == OrderMode::Random
+    }
+
+    fn sync_shuffle_order(&mut self) {
+        if self.shuffled_deck() {
             self.rebuild_shuffle();
         } else {
             self.shuffle_order.clear();
         }
-        self.refresh_gapless();
+    }
+
+    fn play_order(&self) -> &[TrackId] {
+        if self.shuffled_deck() {
+            &self.shuffle_order
+        } else {
+            &self.queue
+        }
+    }
+
+    fn order_matches(&self) -> bool {
+        if self.shuffle_order.len() != self.queue.len() {
+            return false;
+        }
+        let mut left: Vec<u32> = self.shuffle_order.iter().map(|id| id.0).collect();
+        let mut right: Vec<u32> = self.queue.iter().map(|id| id.0).collect();
+        left.sort_unstable();
+        right.sort_unstable();
+        left == right
     }
 
     /// Repeat applies to the song that is already open.
     pub fn cycle_repeat(&mut self) {
         self.repeat = self.repeat.next();
         self.refresh_gapless();
+        self.remember_playback(true);
     }
 
     fn rebuild_shuffle(&mut self) {
@@ -973,6 +1936,7 @@ impl Session {
             } else {
                 self.output_pause();
             }
+            self.remember_playback(true);
             return;
         }
         if let Some(first) = queue.first().copied() {
@@ -985,7 +1949,8 @@ impl Session {
     }
 
     pub fn prev(&mut self) {
-        if self.position > 2.0 {
+        // Random never restarts the open track. Forward and back are both a new pick.
+        if self.position > 2.0 && !self.random_jumps() {
             self.position = 0.0;
             self.playing = true;
             if self.output_holds_current() {
@@ -994,6 +1959,7 @@ impl Session {
             } else {
                 self.output_play(0.0);
             }
+            self.remember_playback(true);
             return;
         }
         self.skip(-1);
@@ -1010,32 +1976,39 @@ impl Session {
             self.position = 0.0;
             self.playing = true;
             self.output_play(0.0);
+            self.remember_playback(true);
             return;
         }
         if self.queue.is_empty() {
             self.playing = false;
             self.output_pause();
+            self.remember_playback(true);
             return;
         }
-        if self.shuffle
-            && direction > 0
-            && !self.shuffle_order.iter().any(|queued| *queued == current)
-        {
+        if self.random_jumps() {
+            let Some(id) = self.pick_random(current) else {
+                self.playing = false;
+                self.output_pause();
+                self.remember_playback(true);
+                return;
+            };
+            self.current = Some(id);
+            self.position = 0.0;
+            self.playing = true;
+            self.output_play(0.0);
+            self.remember_playback(true);
+            return;
+        }
+        let deck = self.shuffled_deck();
+        if deck && !self.order_matches() {
             self.rebuild_shuffle();
         }
         let repeat_all = self.repeat == RepeatMode::All;
-        let next = if self.shuffle && direction > 0 {
-            step_forward(&self.shuffle_order, current, repeat_all)
-        } else if direction < 0 {
-            let wrap = !self.shuffle && repeat_all;
-            let order = if self.shuffle {
-                self.shuffle_order.as_slice()
-            } else {
-                self.queue.as_slice()
-            };
-            step_back(order, current, wrap)
+        let wrap = !deck && repeat_all;
+        let next = if direction > 0 {
+            step_forward(self.play_order(), current, repeat_all)
         } else {
-            step_forward(&self.queue, current, repeat_all)
+            step_back(self.play_order(), current, wrap)
         };
         if let Some(id) = next {
             self.current = Some(id);
@@ -1049,6 +2022,7 @@ impl Session {
             }
             self.output_pause();
         }
+        self.remember_playback(true);
     }
 
     pub fn seek(&mut self, fraction: f32) {
@@ -1058,6 +2032,7 @@ impl Session {
         self.position = (fraction as f64).clamp(0.0, 1.0) * track.duration;
         self.heard_to = self.position;
         self.output_seek(self.position);
+        self.remember_playback(true);
     }
 
     /// Move the playhead by a number of seconds, clamped to the current track.
@@ -1071,6 +2046,7 @@ impl Session {
         self.position = (self.position + seconds).clamp(0.0, track.duration);
         self.heard_to = self.position;
         self.output_seek(self.position);
+        self.remember_playback(true);
     }
 
     pub fn set_volume(&mut self, volume: f32) {
@@ -1079,6 +2055,7 @@ impl Session {
             self.last_volume = self.volume;
         }
         self.output_volume();
+        self.remember_playback(false);
     }
 
     pub fn toggle_mute(&mut self) {
@@ -1093,16 +2070,22 @@ impl Session {
             };
         }
         self.output_volume();
+        self.remember_playback(true);
     }
 
     /// Advances playback. With BASS attached, the position comes from the
     /// engine. Without it, this is the preview clock used by tests.
     pub fn tick(&mut self, dt: f64) -> bool {
+        let expired = self.expire_playback_error();
         if self.engine.is_some() {
-            return self.poll_output();
+            let changed = self.poll_output();
+            if self.playing {
+                self.remember_playback(false);
+            }
+            return changed || expired;
         }
         if !self.playing {
-            return false;
+            return expired;
         }
         let Some(duration) = self.current_track().map(|track| track.duration) else {
             self.playing = false;
@@ -1143,6 +2126,7 @@ impl Session {
                         self.heard_to = snap.position;
                         self.refresh_gapless();
                         changed = true;
+                        self.remember_playback(true);
                     }
                 }
             }
@@ -1173,6 +2157,7 @@ impl Session {
                     self.current = Some(id);
                     self.heard_to = snap.position;
                     self.position = snap.position;
+                    self.remember_playback(true);
                 }
             }
         }
@@ -1207,17 +2192,14 @@ impl Session {
         self.armed_at = Some(Instant::now());
         self.heard_to = resume_at;
         self.hold = false;
-        let played = self
-            .engine
-            .as_ref()
-            .expect("engine")
-            .play(&path, queue);
+        let played = self.engine.as_ref().expect("engine").play(&path, queue);
         if let Err(error) = played {
             self.playing = false;
             self.hold = true;
-            self.push_notice(error);
+            self.note_playback_error(error);
             return;
         }
+        self.clear_playback_error();
         if resume_at > 0.25 {
             if let Some(engine) = self.engine.as_ref() {
                 let _ = engine.seek(resume_at);
@@ -1285,7 +2267,8 @@ impl Session {
     }
 
     /// Current track plus the next few, so BASS can open the follower early.
-    /// Repeat-one stays on this file. Shuffle follows `shuffle_order`.
+    /// Repeat-one stays on this file. A shuffled deck follows `shuffle_order`.
+    /// Random does not preload, because the next pick does not exist yet.
     fn output_queue(&self, id: TrackId) -> Vec<GaplessTrack> {
         let ids = self.upcoming_ids(id);
         let mut queue = Vec::new();
@@ -1304,26 +2287,44 @@ impl Session {
     }
 
     pub(crate) fn upcoming_ids(&self, id: TrackId) -> Vec<TrackId> {
-        if self.repeat == RepeatMode::One || self.queue.is_empty() {
+        if self.repeat == RepeatMode::One || self.queue.is_empty() || self.random_jumps() {
             return vec![id];
         }
-        let repeat_all = self.repeat == RepeatMode::All;
-        if self.shuffle {
-            gapless_window(&self.shuffle_order, id, repeat_all)
-        } else {
-            gapless_window(&self.queue, id, repeat_all)
+        gapless_window(self.play_order(), id, self.repeat == RepeatMode::All)
+    }
+
+    /// Any queue track except the one that is open, when there is another.
+    fn pick_random(&mut self, current: TrackId) -> Option<TrackId> {
+        let len = self.queue.len();
+        if len == 0 {
+            return None;
         }
+        if len == 1 {
+            return Some(self.queue[0]);
+        }
+        let start = (self.rand() as usize) % len;
+        for step in 0..len {
+            let id = self.queue[(start + step) % len];
+            if id != current {
+                return Some(id);
+            }
+        }
+        None
     }
 
     fn track_id_for_path(&self, path: &str) -> Option<TrackId> {
-        self.queue.iter().copied().find(|id| {
-            self.track(*id)
-                .is_some_and(|track| playback::same_audio_path(&track.path, path))
-        }).or_else(|| {
-            self.tracks.iter().find_map(|track| {
-                playback::same_audio_path(&track.path, path).then_some(track.id)
+        self.queue
+            .iter()
+            .copied()
+            .find(|id| {
+                self.track(*id)
+                    .is_some_and(|track| playback::same_audio_path(&track.path, path))
             })
-        })
+            .or_else(|| {
+                self.tracks.iter().find_map(|track| {
+                    playback::same_audio_path(&track.path, path).then_some(track.id)
+                })
+            })
     }
 
     pub fn progress(&self) -> f32 {
@@ -1483,7 +2484,20 @@ fn gapless_window(order: &[TrackId], id: TrackId, repeat_all: bool) -> Vec<Track
     out
 }
 
-/// True when a stopped stream is the end of the file, including a rewind to zero.
+const PLAYBACK_ERROR_TTL: Duration = Duration::from_secs(8);
+
+/// Taskbar and window caption: `artist - title | muzeeka`.
+pub fn format_window_title(artist: &str, title: &str) -> String {
+    let artist = artist.trim();
+    let title = title.trim();
+    match (artist.is_empty(), title.is_empty()) {
+        (true, true) => "muzeeka".into(),
+        (true, false) => format!("{title} | muzeeka"),
+        (false, true) => format!("{artist} | muzeeka"),
+        (false, false) => format!("{artist} - {title} | muzeeka"),
+    }
+}
+
 /// One Alt+wheel notch, as a fraction of full volume. Positive is louder.
 /// A notch is one event: Windows reports several lines, and that still counts as 1%.
 pub(crate) fn volume_wheel_step(delta_y: f32) -> Option<f32> {
@@ -1496,6 +2510,7 @@ pub(crate) fn volume_wheel_step(delta_y: f32) -> Option<f32> {
     }
 }
 
+/// True when a stopped stream is the end of the file, including a rewind to zero.
 pub(crate) fn playback_reached_end(heard: f64, position: f64, duration: f64) -> bool {
     if !duration.is_finite() || duration <= 0.0 {
         return false;
@@ -1531,6 +2546,40 @@ pub fn format_time(secs: f64) -> String {
         format!("{hours}:{minutes:02}:{seconds:02}")
     } else {
         format!("{minutes}:{seconds:02}")
+    }
+}
+
+/// Time left on the open track, drawn with a leading minus (`-1:35`).
+pub fn format_remaining(position: f64, duration: f64) -> String {
+    let left = if position.is_finite() && duration.is_finite() {
+        (duration - position).max(0.0)
+    } else {
+        0.0
+    };
+    format!("-{}", format_time(left))
+}
+
+/// `settings.json` key `remaining_time`: `"1"` counts down, anything else elapsed.
+pub(crate) fn load_remaining_time() -> bool {
+    let path = catalog::app_data_dir().join("settings.json");
+    let Ok(raw) = fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    value.get("remaining_time").and_then(|item| item.as_str()) == Some("1")
+}
+
+pub(crate) fn store_remaining_time(on: bool) {
+    let path = catalog::app_data_dir().join("settings.json");
+    let raw = fs::read_to_string(&path).unwrap_or_else(|_| "{}".into());
+    let flag = if on { "1" } else { "0" };
+    let Ok(next) = crate::ui::ytdlp::merge_setting(&raw, "remaining_time", Some(flag)) else {
+        return;
+    };
+    if next != raw {
+        let _ = fs::write(path, next);
     }
 }
 
@@ -1618,9 +2667,79 @@ fn sample_tracks() -> Vec<Track> {
         .collect()
 }
 
+impl Drop for Session {
+    fn drop(&mut self) {
+        // The playhead is written at most every few seconds. Closing the
+        // window is the last chance to store the position the throttle skipped.
+        self.remember_playback(true);
+    }
+}
+
+fn next_placeholder_id(tracks: &[Track]) -> TrackId {
+    static NEXT: AtomicU32 = AtomicU32::new(0xF000_0000);
+    for _ in 0..64 {
+        let id = TrackId(NEXT.fetch_add(1, Ordering::Relaxed));
+        if tracks.iter().all(|track| track.id != id) {
+            return id;
+        }
+    }
+    TrackId(NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
 #[cfg(test)]
 mod tests {
+    use super::catalog::{self, LoadedLibrary};
     use super::*;
+    use rusqlite::Connection;
+
+    #[test]
+    fn remaining_time_counts_down_with_a_minus() {
+        assert_eq!(format_remaining(10.0, 105.2), "-1:35");
+        assert_eq!(format_remaining(0.0, 3_723.0), "-1:02:03");
+        assert_eq!(format_remaining(90.0, 30.0), "-0:00");
+    }
+
+    #[test]
+    fn dropped_file_shows_in_the_list_before_the_scan() {
+        let mut session = Session::preview();
+        let before = session.tracks.len();
+        session.stage_dropped_files(&[r"D:\Music\new song.mp3".into()], None, None);
+        assert_eq!(session.tracks.len(), before + 1);
+        assert_eq!(session.view, LibraryView::All);
+        assert_eq!(session.tracks.last().unwrap().title, "new song");
+        assert!(session.visible_indexes("").iter().any(|index| {
+            session
+                .track_by_index(*index)
+                .is_some_and(|track| track.title == "new song")
+        }));
+
+        session.stage_dropped_files(&[r"D:\Music\new song.mp3".into()], Some("focus"), Some(0));
+        assert_eq!(
+            session
+                .playlists
+                .iter()
+                .find(|playlist| playlist.id == "focus")
+                .unwrap()
+                .track_ids
+                .first()
+                .copied(),
+            session
+                .tracks
+                .iter()
+                .rev()
+                .find(|track| track.title == "new song")
+                .map(|track| track.id)
+        );
+        assert_eq!(session.tracks.len(), before + 1);
+        assert_eq!(session.view, LibraryView::Playlist("focus".into()));
+        let id = session.tracks.last().unwrap().id;
+        let focus = session
+            .playlists
+            .iter()
+            .find(|playlist| playlist.id == "focus")
+            .unwrap();
+        assert!(focus.track_ids.contains(&id));
+    }
 
     #[test]
     fn search_filter_menu_lists_short_and_long_names() {
@@ -1684,6 +2803,178 @@ mod tests {
         let tracks = session.visible_tracks("");
         assert!(tracks.iter().all(|track| track.liked));
         assert_eq!(tracks.len(), session.liked_count());
+    }
+
+    fn ids_of(session: &Session) -> Vec<u32> {
+        session
+            .visible_indexes("")
+            .into_iter()
+            .filter_map(|index| session.track_by_index(index).map(|track| track.id.0))
+            .collect()
+    }
+
+    #[test]
+    fn reordering_a_playlist_moves_the_row_and_clears_sort() {
+        let mut session = Session::preview();
+        session.view = LibraryView::Playlist("focus".into());
+        session.sort = Some(Sort {
+            column: SortColumn::Title,
+            descending: false,
+        });
+        let before = ids_of(&session);
+        let moved = TrackId(before[0]);
+        assert!(session.reorder_view(&[moved], before.len()));
+        assert!(session.sort.is_none());
+        let after = ids_of(&session);
+        assert_eq!(after.last().copied(), Some(moved.0));
+        assert_eq!(after.len(), before.len());
+        let focus = session
+            .playlists
+            .iter()
+            .find(|playlist| playlist.id == "focus")
+            .unwrap();
+        assert_eq!(focus.track_ids.last().copied(), Some(moved));
+    }
+
+    #[test]
+    fn reordering_all_tracks_leaves_a_cue_parent_in_its_slot() {
+        let mut session = Session::preview();
+        session.tracks[0].path = r"D:\Album\disc.flac".into();
+        session.tracks[1].path = r"D:\Album\disc.flac#cue:1".into();
+        session.rebuild_indexes();
+        session.view = LibraryView::All;
+        let parent = session.tracks[0].id;
+        assert!(session.cue_containers.contains(&parent));
+        let visible = ids_of(&session);
+        let moved = TrackId(*visible.last().unwrap());
+        assert!(session.reorder_view(&[moved], 0));
+        assert_eq!(session.tracks[0].id, parent);
+        assert_eq!(ids_of(&session).first().copied(), Some(moved.0));
+    }
+
+    #[test]
+    fn reordering_liked_tracks_does_not_move_the_library() {
+        let mut session = Session::preview();
+        let library: Vec<u32> = session.tracks.iter().map(|track| track.id.0).collect();
+        session.view = LibraryView::Liked;
+        let liked = ids_of(&session);
+        let moved = TrackId(liked[0]);
+        assert!(session.reorder_view(&[moved], liked.len()));
+        assert_eq!(
+            session
+                .tracks
+                .iter()
+                .map(|track| track.id.0)
+                .collect::<Vec<_>>(),
+            library
+        );
+        assert_eq!(ids_of(&session).last().copied(), Some(moved.0));
+    }
+
+    #[test]
+    fn play_playlist_starts_at_the_first_track_until_shuffle_is_on() {
+        let mut session = Session::preview();
+        session.view = LibraryView::All;
+        session.play_playlist("missing");
+        assert!(session.current.is_none());
+        session.play_playlist("focus");
+        let focus: Vec<_> = (4..12).map(TrackId).collect();
+        assert_eq!(session.queue, focus);
+        assert_eq!(session.current, Some(TrackId(4)));
+        assert!(session.playing);
+        assert_eq!(session.playing_playlist.as_deref(), Some("focus"));
+        assert!(matches!(session.view, LibraryView::All));
+
+        session.shuffle = true;
+        session.rng = 1;
+        session.play_playlist("focus");
+        assert_eq!(session.queue, focus);
+        assert_eq!(session.current, Some(TrackId(5)));
+        assert_eq!(session.playing_playlist.as_deref(), Some("focus"));
+    }
+
+    #[test]
+    fn reordering_the_playing_playlist_updates_the_queue_and_keeps_the_deck() {
+        let mut session = Session::preview();
+        session.view = LibraryView::Playlist("night".into());
+        let queue = ids_of(&session)
+            .into_iter()
+            .map(TrackId)
+            .collect::<Vec<_>>();
+        session.play(queue[0], queue.clone());
+        session.shuffle = true;
+        session.rebuild_shuffle();
+        let deck = session.shuffle_order.clone();
+        let moved = queue[0];
+        assert!(session.reorder_view(&[moved], queue.len()));
+        assert_eq!(session.queue.first().copied(), Some(queue[1]));
+        assert_eq!(session.queue.last().copied(), Some(moved));
+        assert_eq!(session.shuffle_order, deck);
+    }
+
+    #[test]
+    fn copying_tracks_leaves_the_source_playlist() {
+        let mut session = Session::preview();
+        let id = TrackId(0);
+        assert_eq!(session.copy_tracks(&[id], "focus"), 1);
+        assert_eq!(session.copy_tracks(&[id], "focus"), 0);
+        assert!(session.playlists[0].track_ids.contains(&id));
+        assert!(session.playlists[1].track_ids.contains(&id));
+    }
+
+    #[test]
+    fn moving_tracks_out_of_a_playlist_removes_them_and_stops_the_open_one() {
+        let mut session = Session::preview();
+        session.view = LibraryView::Playlist("night".into());
+        let queue = ids_of(&session)
+            .into_iter()
+            .map(TrackId)
+            .collect::<Vec<_>>();
+        session.play(queue[0], queue.clone());
+        let moved = queue[0];
+        assert_eq!(
+            session.move_tracks(&[moved], "focus", &session.view.clone()),
+            1
+        );
+        assert!(!session.playlists[0].track_ids.contains(&moved));
+        assert!(session.playlists[1].track_ids.contains(&moved));
+        assert!(session.current.is_none());
+        assert!(!session.playing);
+    }
+
+    #[test]
+    fn moving_from_liked_unlikes_and_moving_from_all_leaves_only_the_target() {
+        let mut session = Session::preview();
+        let id = session.tracks.iter().find(|track| track.liked).unwrap().id;
+        session.view = LibraryView::Liked;
+        assert_eq!(session.move_tracks(&[id], "focus", &LibraryView::Liked), 1);
+        assert!(!session.track(id).unwrap().liked);
+        assert!(session.playlists[1].track_ids.contains(&id));
+
+        session.view = LibraryView::All;
+        let shared = TrackId(4);
+        assert!(session.playlists[0].track_ids.contains(&shared));
+        assert!(session.playlists[1].track_ids.contains(&shared));
+        assert_eq!(
+            session.move_tracks(&[shared], "focus", &LibraryView::All),
+            1
+        );
+        assert!(!session.playlists[0].track_ids.contains(&shared));
+        assert!(session.playlists[1].track_ids.contains(&shared));
+    }
+
+    #[test]
+    fn reordering_playlists_is_a_permutation() {
+        let mut session = Session::preview();
+        let ids: Vec<String> = session
+            .playlists
+            .iter()
+            .map(|playlist| playlist.id.clone())
+            .collect();
+        assert!(session.reorder_playlists(&[ids[0].clone()], ids.len()));
+        assert_eq!(session.playlists.last().unwrap().id, ids[0]);
+        assert_eq!(session.playlists.len(), ids.len());
+        assert!(!session.reorder_playlists(&[ids[0].clone()], ids.len()));
     }
 
     fn search_titles(session: &Session, query: &str) -> Vec<String> {
@@ -1836,17 +3127,18 @@ mod tests {
 
         session.view = LibraryView::Playlist("focus".into());
         session.remove_from_playlist("night", TrackId(0));
-        assert!(
-            !session
-                .playlists
-                .iter()
-                .find(|playlist| playlist.id == "night")
-                .unwrap()
-                .track_ids
-                .contains(&TrackId(0))
-        );
+        assert!(!session
+            .playlists
+            .iter()
+            .find(|playlist| playlist.id == "night")
+            .unwrap()
+            .track_ids
+            .contains(&TrackId(0)));
         session.delete_playlist("focus");
-        assert!(session.playlists.iter().all(|playlist| playlist.id != "focus"));
+        assert!(session
+            .playlists
+            .iter()
+            .all(|playlist| playlist.id != "focus"));
         assert_eq!(session.view, LibraryView::All);
     }
 
@@ -1866,6 +3158,7 @@ mod tests {
         session.play(TrackId(2), queue);
         session.toggle_shuffle();
         assert!(session.shuffle);
+        assert_eq!(session.order_mode, OrderMode::Shuffle);
         let upcoming = session.upcoming_ids(TrackId(2));
         assert_eq!(upcoming[0], TrackId(2));
         assert!(upcoming.len() > 1);
@@ -1877,15 +3170,344 @@ mod tests {
         assert_eq!(session.repeat, RepeatMode::All);
         session.cycle_repeat();
         assert_eq!(session.repeat, RepeatMode::One);
-        assert_eq!(session.upcoming_ids(TrackId(2)), vec![TrackId(2)]);
+        assert_eq!(
+            session.upcoming_ids(session.current.unwrap()),
+            vec![session.current.unwrap()]
+        );
 
         session.cycle_repeat();
         assert_eq!(session.repeat, RepeatMode::Off);
+        session.set_order_mode(OrderMode::Random);
+        assert!(session.shuffle);
+        assert_eq!(session.order_mode, OrderMode::Random);
         session.toggle_shuffle();
         assert!(!session.shuffle);
+        assert_eq!(session.order_mode, OrderMode::Random);
         assert_eq!(
             session.upcoming_ids(TrackId(2)),
             vec![TrackId(2), TrackId(3), TrackId(4), TrackId(5)]
         );
+    }
+
+    #[test]
+    fn closing_the_session_remembers_the_open_track() {
+        let path = std::env::temp_dir().join(format!(
+            "muzeeka-playback-{}-session.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(
+            "CREATE TABLE app_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                active_playlist_id TEXT,
+                current_file TEXT,
+                volume REAL,
+                shuffle_enabled INTEGER NOT NULL DEFAULT 0,
+                repeat_mode TEXT NOT NULL DEFAULT 'off'
+            );",
+        )
+        .unwrap();
+
+        let tracks = vec![
+            Track {
+                id: TrackId(3),
+                title: "Street".into(),
+                artist: "Playaz".into(),
+                album: "Remix".into(),
+                duration: 180.0,
+                liked: false,
+                path: r"Z:\Music\Street.mp3".into(),
+                cover: None,
+                lyrics: None,
+            },
+            Track {
+                id: TrackId(4),
+                title: "Next".into(),
+                artist: "Playaz".into(),
+                album: "Remix".into(),
+                duration: 120.0,
+                liked: false,
+                path: r"Z:\Music\Next.mp3".into(),
+                cover: None,
+                lyrics: None,
+            },
+        ];
+        let playlists = vec![Playlist {
+            id: "mix".into(),
+            name: "Mix".into(),
+            track_ids: vec![TrackId(3), TrackId(4)],
+            cover: None,
+            cover_path: None,
+            mix_mode: false,
+        }];
+        let mut session = Session::from_library(LoadedLibrary {
+            tracks: tracks.clone(),
+            playlists: playlists.clone(),
+            view: LibraryView::Playlist("mix".into()),
+            current: None,
+            position: 0.0,
+            volume: 0.5,
+            shuffle: false,
+            repeat: RepeatMode::Off,
+            playing_playlist_id: None,
+            was_playing: false,
+            db,
+        });
+        session.play(TrackId(3), vec![TrackId(3), TrackId(4)]);
+        session.position = 40.0;
+        drop(session);
+
+        let db = Connection::open(&path).unwrap();
+        let stored = catalog::load_state(&db).unwrap();
+        assert_eq!(stored.current_file.as_deref(), Some(r"Z:\Music\Street.mp3"));
+        assert!((stored.position - 40.0).abs() < 1e-6);
+        assert!(stored.was_playing);
+        assert_eq!(stored.active_playlist_id.as_deref(), Some("mix"));
+        assert_eq!(stored.playing_playlist_id.as_deref(), Some("mix"));
+        assert!((stored.volume - 0.5).abs() < 1e-3);
+
+        let current = tracks
+            .iter()
+            .find(|track| stored.current_file.as_deref() == Some(track.path.as_str()))
+            .map(|track| track.id);
+        let restored = Session::from_library(LoadedLibrary {
+            tracks,
+            playlists,
+            view: LibraryView::Playlist(stored.active_playlist_id.clone().unwrap()),
+            current,
+            position: stored.position,
+            volume: stored.volume,
+            shuffle: stored.shuffle,
+            repeat: stored.repeat,
+            playing_playlist_id: stored.playing_playlist_id.clone(),
+            was_playing: stored.was_playing,
+            db,
+        });
+        assert_eq!(restored.current, Some(TrackId(3)));
+        assert!((restored.position - 40.0).abs() < 1e-6);
+        assert!(restored.playing);
+        assert_eq!(restored.queue, vec![TrackId(3), TrackId(4)]);
+        drop(restored);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn window_title_uses_artist_and_track() {
+        assert_eq!(
+            format_window_title("Playaz", "Street"),
+            "Playaz - Street | muzeeka"
+        );
+        assert_eq!(format_window_title("", "Street"), "Street | muzeeka");
+        assert_eq!(format_window_title("Playaz", "  "), "Playaz | muzeeka");
+        assert_eq!(format_window_title("  ", ""), "muzeeka");
+    }
+
+    #[test]
+    fn playback_error_replaces_itself_and_expires() {
+        let mut session = Session::preview();
+        session.note_playback_error("no decoder".into());
+        session.note_playback_error("still closed".into());
+        assert_eq!(session.playback_error.as_deref(), Some("still closed"));
+        assert!(session.playback_error.is_some());
+        session.playback_error_until = Some(Instant::now() - Duration::from_secs(1));
+        assert!(session.tick(0.1));
+        assert!(session.playback_error.is_none());
+    }
+
+    #[test]
+    fn cue_parent_stays_out_of_search_and_the_split_keeps_its_cover() {
+        let cover = std::path::PathBuf::from(r"C:\covers\c-0123456789abcdef-thumb.webp");
+        let mut session = Session::empty();
+        session.tracks = vec![
+            Track {
+                id: TrackId(1),
+                title: "Full Show".into(),
+                artist: "Band".into(),
+                album: "Live".into(),
+                duration: 3000.0,
+                liked: false,
+                path: r"Z:\Music\live.flac".into(),
+                cover: Some(cover.clone()),
+                lyrics: None,
+            },
+            Track {
+                id: TrackId(2),
+                title: "Intro".into(),
+                artist: "Band".into(),
+                album: "Live".into(),
+                duration: 120.0,
+                liked: false,
+                path: r"Z:\Music\live.flac#cue:1".into(),
+                cover: None,
+                lyrics: None,
+            },
+            Track {
+                id: TrackId(3),
+                title: "Verse".into(),
+                artist: "Band".into(),
+                album: "Live".into(),
+                duration: 180.0,
+                liked: false,
+                path: r"Z:\Music\live.flac#cue:2".into(),
+                cover: None,
+                lyrics: None,
+            },
+        ];
+        session.playlists = vec![Playlist {
+            id: "show".into(),
+            name: "Show".into(),
+            track_ids: vec![TrackId(1), TrackId(2)],
+            cover: None,
+            cover_path: None,
+            mix_mode: false,
+        }];
+        session.rebuild_indexes();
+        assert_eq!(session.tracks[1].cover, Some(cover.clone()));
+        assert_eq!(session.tracks[2].cover, Some(cover));
+        let hits = session.search_ids("live");
+        assert_eq!(hits, vec![TrackId(2), TrackId(3)]);
+        assert!(session
+            .visible_indexes("")
+            .iter()
+            .all(|index| { session.tracks[*index].id != TrackId(1) }));
+        session.view = LibraryView::Playlist("show".into());
+        let in_playlist = session.visible_indexes("");
+        assert!(in_playlist
+            .iter()
+            .any(|index| session.tracks[*index].id == TrackId(1)));
+    }
+
+    #[test]
+    fn shuffle_walks_every_track_once_then_stops_and_wraps_on_repeat_all() {
+        let mut session = Session::preview();
+        let queue: Vec<_> = (0..5).map(TrackId).collect();
+        session.play(TrackId(0), queue.clone());
+        session.repeat = RepeatMode::Off;
+        session.toggle_shuffle();
+        let order = session.shuffle_order.clone();
+        assert_eq!(order.first().copied(), Some(TrackId(0)));
+        assert_eq!(order.len(), 5);
+        let mut sorted = order.clone();
+        sorted.sort_by_key(|id| id.0);
+        assert_eq!(sorted, queue);
+        assert_ne!(order, queue);
+
+        session.position = 0.0;
+        session.next();
+        assert_eq!(session.current, Some(order[1]));
+        session.position = 0.0;
+        session.prev();
+        assert_eq!(session.current, Some(order[0]));
+        assert!(session.playing);
+
+        for id in order.iter().skip(1).copied() {
+            session.position = 0.0;
+            session.next();
+            assert_eq!(session.current, Some(id));
+            assert!(session.playing);
+        }
+        session.position = 0.0;
+        session.next();
+        assert!(!session.playing);
+        assert_eq!(session.current, order.last().copied());
+
+        session.repeat = RepeatMode::All;
+        session.next();
+        assert_eq!(session.current, Some(order[0]));
+        assert!(session.playing);
+        session.position = 0.0;
+        session.prev();
+        assert_eq!(session.current, Some(order[0]));
+        assert!(!session.playing);
+
+        session.position = 0.0;
+        let (has_prev, has_next) = session.can_navigate();
+        assert!(!has_prev);
+        assert!(has_next);
+
+        session.play(TrackId(2), queue);
+        session.repeat = RepeatMode::One;
+        session.next();
+        assert_eq!(session.current, Some(TrackId(2)));
+        assert!(session.playing);
+        assert!(session.taskbar_flags().3 || session.repeat == RepeatMode::One);
+    }
+
+    #[test]
+    fn shuffle_keeps_its_deck_until_the_playlist_changes() {
+        let mut session = Session::preview();
+        let queue: Vec<_> = (0..5).map(TrackId).collect();
+        session.play(TrackId(0), queue.clone());
+        session.toggle_shuffle();
+        let order = session.shuffle_order.clone();
+        assert_eq!(order.first().copied(), Some(TrackId(0)));
+
+        session.play(TrackId(3), queue.clone());
+        assert_eq!(session.shuffle_order, order);
+        assert_eq!(session.current, Some(TrackId(3)));
+        session.repeat = RepeatMode::All;
+        session.position = 0.0;
+        session.next();
+        let after = order.iter().position(|id| *id == TrackId(3)).unwrap() + 1;
+        let expected = if after < order.len() {
+            order[after]
+        } else {
+            order[0]
+        };
+        assert_eq!(session.current, Some(expected));
+
+        session.repeat = RepeatMode::Off;
+        let other = vec![TrackId(6), TrackId(7), TrackId(8), TrackId(9)];
+        session.play(TrackId(8), other.clone());
+        assert_eq!(session.shuffle_order.first().copied(), Some(TrackId(8)));
+        assert_eq!(session.shuffle_order.len(), other.len());
+        let mut sorted = session.shuffle_order.clone();
+        sorted.sort_by_key(|id| id.0);
+        assert_eq!(sorted, other);
+        assert_ne!(session.shuffle_order, order);
+    }
+
+    #[test]
+    fn shuffle_random_picks_without_a_deck() {
+        let mut session = Session::preview();
+        let queue: Vec<_> = (0..4).map(TrackId).collect();
+        session.play(TrackId(0), queue.clone());
+        session.toggle_shuffle();
+        session.set_order_mode(OrderMode::Random);
+        assert!(session.shuffle);
+        assert_eq!(session.order_mode, OrderMode::Random);
+        assert!(session.shuffle_order.is_empty());
+        assert_eq!(session.upcoming_ids(TrackId(0)), vec![TrackId(0)]);
+
+        session.position = 30.0;
+        session.prev();
+        assert_ne!(session.current, Some(TrackId(0)));
+        assert_eq!(session.position, 0.0);
+        assert!(queue.contains(&session.current.unwrap()));
+
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(session.current.unwrap());
+        for _ in 0..12 {
+            let before = session.current.unwrap();
+            session.position = 0.0;
+            session.next();
+            let now = session.current.unwrap();
+            assert_ne!(now, before);
+            assert!(queue.contains(&now));
+            seen.insert(now);
+        }
+        assert!(seen.len() > 2, "random keeps visiting the queue");
+        assert!(session.shuffle_order.is_empty());
+
+        session.repeat = RepeatMode::One;
+        let held = session.current;
+        session.next();
+        assert_eq!(session.current, held);
+
+        assert_eq!(OrderMode::from_setting(Some("random")), OrderMode::Random);
+        assert_eq!(OrderMode::from_setting(Some("smart")), OrderMode::Shuffle);
+        assert_eq!(OrderMode::from_setting(Some("shuffle")), OrderMode::Shuffle);
+        assert_eq!(OrderMode::from_setting(None), OrderMode::Shuffle);
     }
 }

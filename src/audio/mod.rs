@@ -10,6 +10,7 @@ pub mod equalizer;
 pub mod events;
 pub mod filter;
 pub mod icy_tap;
+pub mod levels;
 pub mod limiter;
 pub mod metadata;
 pub mod mix_filter;

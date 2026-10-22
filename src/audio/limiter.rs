@@ -609,11 +609,17 @@ mod tests {
         );
 
         let peak = buf.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
-        assert!((peak - 1.0).abs() < 1.0e-6, "clip missed the ceiling: {peak:.6}");
+        assert!(
+            (peak - 1.0).abs() < 1.0e-6,
+            "clip missed the ceiling: {peak:.6}"
+        );
 
         // Flat tops are the tell: +12 dB on a 0.5 sine pins most of each half-cycle.
         let pinned = buf.iter().filter(|s| s.abs() >= 1.0 - 1.0e-6).count();
-        assert!(pinned > buf.len() / 4, "signal was not actually chopped: {pinned}");
+        assert!(
+            pinned > buf.len() / 4,
+            "signal was not actually chopped: {pinned}"
+        );
         assert!(ctx.reduction_db() > 5.0, "meter ignored the chopping");
     }
 }

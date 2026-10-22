@@ -1,6 +1,6 @@
 // CUE sheet parser — expands album image files into virtual tracks.
 
-use cue_rw::{CUEFile, CUETrack, CUETimeStamp};
+use cue_rw::{CUEFile, CUETimeStamp, CUETrack};
 use num_rational::Rational32;
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::SystemTime;
 
-use crate::library::MusicFile;
 use crate::audio::metadata;
+use crate::library::MusicFile;
 
 // ── Short-lived path caches (mtime-invalidated) ───────────────────────────────
 // repair_track / resolve_playback hit the same album CUE once per track; cache
@@ -208,8 +208,7 @@ fn companion_cue_for_audio_uncached(audio_path: &Path, parent: &Path) -> Option<
                     return Some(cue_path);
                 }
                 // Resolved path match (ALAC → m4a) — reuse folder listing.
-                if let Some(resolved) =
-                    resolve_audio_file_with_listing(parent, file_name, &listing)
+                if let Some(resolved) = resolve_audio_file_with_listing(parent, file_name, &listing)
                 {
                     if same_path_key(&resolved, audio_path) {
                         return Some(cue_path);
@@ -377,9 +376,9 @@ pub fn resolve_playback(
             .ok_or_else(|| "CUE sheet does not contain playable tracks".to_string())?;
 
         return Ok(PlaybackTarget {
-            audio_path: expanded.audio_path.ok_or_else(|| {
-                "CUE sheet is missing a valid audio file reference".to_string()
-            })?,
+            audio_path: expanded
+                .audio_path
+                .ok_or_else(|| "CUE sheet is missing a valid audio file reference".to_string())?,
             cue_start: expanded.cue_start_secs,
             cue_end: expanded.cue_end_secs,
         });
@@ -712,7 +711,11 @@ fn resolve_audio_file_from_listing(file_name: &str, listing: &[PathBuf]) -> Opti
                 .iter()
                 .filter(|p| {
                     p.file_name()
-                        .map(|n| n.to_string_lossy().to_lowercase().starts_with(&prefix_lower))
+                        .map(|n| {
+                            n.to_string_lossy()
+                                .to_lowercase()
+                                .starts_with(&prefix_lower)
+                        })
                         .unwrap_or(false)
                 })
                 .filter(|p| {
@@ -857,11 +860,10 @@ fn expand_cue_file_impl(cue_path: &Path, resolve_covers: bool) -> Vec<MusicFile>
             None => continue,
         };
 
-        let audio_path =
-            match resolve_audio_file_with_listing(&cue_dir, file_name, &listing) {
-                Some(path) => path,
-                None => continue,
-            };
+        let audio_path = match resolve_audio_file_with_listing(&cue_dir, file_name, &listing) {
+            Some(path) => path,
+            None => continue,
+        };
 
         let start = match track_index_start(track) {
             Some(value) => value,
@@ -888,7 +890,11 @@ fn expand_cue_file_impl(cue_path: &Path, resolve_covers: bool) -> Vec<MusicFile>
             .clone();
         let size = *size_by_audio
             .entry(audio_path_str.clone())
-            .or_insert_with(|| fs::metadata(&audio_path).map(|meta| meta.len()).unwrap_or(0));
+            .or_insert_with(|| {
+                fs::metadata(&audio_path)
+                    .map(|meta| meta.len())
+                    .unwrap_or(0)
+            });
         let ext = audio_path
             .extension()
             .and_then(|value| value.to_str())
@@ -900,8 +906,8 @@ fn expand_cue_file_impl(cue_path: &Path, resolve_covers: bool) -> Vec<MusicFile>
             .unwrap_or_else(|| format!("Track {}", index + 1));
 
         // One TRACK per FILE starting at 0 → multi-file rip (separate audio per song).
-        let single_file_track = tracks_per_file.get(*file_id).copied().unwrap_or(0) == 1
-            && start <= 0.05;
+        let single_file_track =
+            tracks_per_file.get(*file_id).copied().unwrap_or(0) == 1 && start <= 0.05;
 
         let (path, audio_path_field, cue_start_secs, cue_end_secs, duration_secs) =
             if single_file_track {
@@ -912,12 +918,7 @@ fn expand_cue_file_impl(cue_path: &Path, resolve_covers: bool) -> Vec<MusicFile>
                     .flatten()
                     .filter(|e| *e > start + 0.05)
                     .or_else(|| {
-                        end_secs_for_track(
-                            &track_refs,
-                            index,
-                            *file_id,
-                            audio_meta.duration_secs,
-                        )
+                        end_secs_for_track(&track_refs, index, *file_id, audio_meta.duration_secs)
                     })
                     .or(audio_meta.duration_secs);
                 let dur = cue_end.map(|e| (e - start).max(0.0));
@@ -930,12 +931,8 @@ fn expand_cue_file_impl(cue_path: &Path, resolve_covers: bool) -> Vec<MusicFile>
                     dur,
                 )
             } else {
-                let end_secs = end_secs_for_track(
-                    &track_refs,
-                    index,
-                    *file_id,
-                    audio_meta.duration_secs,
-                );
+                let end_secs =
+                    end_secs_for_track(&track_refs, index, *file_id, audio_meta.duration_secs);
                 let duration_secs = end_secs.map(|end| (end - start).max(0.0));
                 (
                     format!("{}{}{}", audio_path_str, CUE_PATH_MARKER, index + 1),
@@ -982,9 +979,7 @@ pub fn covered_audio_paths(cue_paths: &[PathBuf]) -> Vec<String> {
 
         let listing = list_files_in_dir(&cue_dir);
         for file_name in &cue.files {
-            if let Some(audio) =
-                resolve_audio_file_with_listing(&cue_dir, file_name, &listing)
-            {
+            if let Some(audio) = resolve_audio_file_with_listing(&cue_dir, file_name, &listing) {
                 covered.push(audio.to_string_lossy().to_string());
             }
         }
@@ -1031,7 +1026,10 @@ FILE "03. Three.ALAC" ALAC
     INDEX 01 00:00:00
 "#;
         let normalized = normalize_eac_multifile_cue(raw);
-        let cue: CUEFile = normalized.as_str().try_into().expect("parse normalized cue");
+        let cue: CUEFile = normalized
+            .as_str()
+            .try_into()
+            .expect("parse normalized cue");
         assert_eq!(cue.files.len(), 3);
         assert_eq!(cue.tracks.len(), 3);
         assert_eq!(cue.tracks[0].0, 0);
@@ -1111,7 +1109,12 @@ FILE "02. Two.ALAC" ALAC
         );
 
         let tracks = expand_cue_file(&base.join("album.cue"));
-        assert_eq!(tracks.len(), 2, "expected 2 expanded tracks, got {}", tracks.len());
+        assert_eq!(
+            tracks.len(),
+            2,
+            "expected 2 expanded tracks, got {}",
+            tracks.len()
+        );
         assert!(
             tracks[0]
                 .audio_path
@@ -1165,7 +1168,11 @@ FILE "album.flac" WAVE
         assert_eq!(tracks[1].title.as_deref(), Some("Second Song"));
         assert_eq!(tracks[0].cue_start_secs, Some(0.0));
         assert_eq!(tracks[1].cue_start_secs, Some(120.0));
-        assert!(tracks[0].audio_path.as_ref().unwrap().ends_with("album.flac"));
+        assert!(tracks[0]
+            .audio_path
+            .as_ref()
+            .unwrap()
+            .ends_with("album.flac"));
         assert!(tracks[0].path.contains(CUE_PATH_MARKER));
 
         let target = resolve_playback(
@@ -1178,7 +1185,8 @@ FILE "album.flac" WAVE
         assert!(target.audio_path.ends_with("album.flac"));
         assert_eq!(target.cue_start, Some(120.0));
 
-        let fallback = resolve_playback(&tracks[0].path, None, None, None).expect("fallback resolve");
+        let fallback =
+            resolve_playback(&tracks[0].path, None, None, None).expect("fallback resolve");
         assert!(fallback.audio_path.ends_with("album.flac"));
         assert_eq!(fallback.cue_start, Some(0.0));
 
@@ -1211,25 +1219,18 @@ FILE "album.flac" WAVE
         );
 
         let companion = companion_cue_for_audio(&audio).expect("find .flac.cue");
-        assert!(
-            companion
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.eq_ignore_ascii_case("album.flac.cue"))
-        );
+        assert!(companion
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case("album.flac.cue")));
 
         let tracks = expand_cue_file(&companion);
         assert_eq!(tracks.len(), 2, "expand via .flac.cue companion");
 
         // Prefer expanded virtual path (may include \\?\ canonicalize prefix on Windows).
         let path = tracks[1].path.clone();
-        let target = resolve_playback(
-            &path,
-            tracks[1].audio_path.as_deref(),
-            None,
-            None,
-        )
-        .expect("resolve via companion .flac.cue");
+        let target = resolve_playback(&path, tracks[1].audio_path.as_deref(), None, None)
+            .expect("resolve via companion .flac.cue");
         assert_eq!(target.cue_start, Some(60.0));
 
         let _ = fs::remove_dir_all(&base);
@@ -1259,18 +1260,11 @@ FILE "album.ape" WAVE
         let tracks = expand_cue_file(&base.join("album.cue"));
         let second = &tracks[1];
 
-        let target = resolve_playback(
-            &second.path,
-            second.audio_path.as_deref(),
-            None,
-            None,
-        )
-        .expect("resolve missing cue times");
+        let target = resolve_playback(&second.path, second.audio_path.as_deref(), None, None)
+            .expect("resolve missing cue times");
 
         assert!(target.audio_path.ends_with("album.ape"));
-        assert!(
-            (target.cue_start.unwrap() - (2.0 * 60.0 + 59.0 + 43.0 / 75.0)).abs() < 0.01
-        );
+        assert!((target.cue_start.unwrap() - (2.0 * 60.0 + 59.0 + 43.0 / 75.0)).abs() < 0.01);
         assert_eq!(target.cue_end, tracks[1].cue_end_secs);
 
         let _ = fs::remove_dir_all(&base);

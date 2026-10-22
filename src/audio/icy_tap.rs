@@ -124,7 +124,11 @@ fn tap_once(
         return Err(format!("HTTP {}", status.as_u16()));
     }
 
-    let mut http_raw = format!("HTTP {} {}\0", status.as_u16(), status.canonical_reason().unwrap_or(""));
+    let mut http_raw = format!(
+        "HTTP {} {}\0",
+        status.as_u16(),
+        status.canonical_reason().unwrap_or("")
+    );
     let mut metaint = 0u32;
     let mut station: Option<String> = None;
     for (name, value) in response.headers().iter() {
@@ -151,7 +155,11 @@ fn tap_once(
 
     crate::audio::stream_debug::log(format!(
         "icy tap headers: {}",
-        http_raw.replace('\0', " | ").chars().take(400).collect::<String>()
+        http_raw
+            .replace('\0', " | ")
+            .chars()
+            .take(400)
+            .collect::<String>()
     ));
     if metaint > 0 {
         crate::audio::stream_debug::log(format!("icy tap metaint={metaint}"));
@@ -202,7 +210,12 @@ fn tap_once(
         // Alignment-independent fallback: `StreamTitle='…'` is unique in AAC/MP3.
         scan_tail.extend_from_slice(chunk);
         if let Some(title) = scan_stream_title(&scan_tail) {
-            publish_title(&format!("StreamTitle='{title}';"), inbox, gen, &mut last_title);
+            publish_title(
+                &format!("StreamTitle='{title}';"),
+                inbox,
+                gen,
+                &mut last_title,
+            );
         }
         if scan_tail.len() > SCAN_TAIL {
             let keep = SCAN_TAIL;
@@ -212,12 +225,7 @@ fn tap_once(
     }
 }
 
-fn publish_title(
-    raw: &str,
-    inbox: &StdMutex<LiveMetaInbox>,
-    gen: u64,
-    last: &mut Option<String>,
-) {
+fn publish_title(raw: &str, inbox: &StdMutex<LiveMetaInbox>, gen: u64, last: &mut Option<String>) {
     let Some(title) = parse_icy_stream_title(raw) else {
         return;
     };

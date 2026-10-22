@@ -1,6 +1,19 @@
 // Muzeeka colors, matched to the CSS variables in src/app.css.
+//
+// `accent` follows the playing track. Every call reads the current value, so a
+// window redraw after `set_accent_rgb` picks the new color up without each
+// control storing its own copy.
 
-use gpui::{Rgba, rgb, rgba};
+use std::sync::atomic::{AtomicU32, Ordering};
+
+use gpui::{rgb, rgba, Rgba};
+
+/// Purple used when nothing is playing, or the cover has no usable color.
+pub const DEFAULT_ACCENT: u32 = 0xcdcecd;
+/// Same wash as the old `rgba(0x8b5cf61f)`.
+const ACCENT_SOFT_ALPHA: f32 = 31.0 / 255.0;
+
+static ACCENT: AtomicU32 = AtomicU32::new(DEFAULT_ACCENT);
 
 pub const FONT_FAMILY: &str = "Google Sans Flex";
 
@@ -17,7 +30,7 @@ pub fn bg_elevated() -> Rgba {
 }
 
 pub fn bg_glass() -> Rgba {
-    rgb(0x121212)
+    rgba(0x121212ab)
 }
 
 pub fn hover() -> Rgba {
@@ -43,11 +56,32 @@ pub fn border() -> Rgba {
 }
 
 pub fn accent() -> Rgba {
-    rgb(0x8b5cf6)
+    rgb(ACCENT.load(Ordering::Relaxed))
 }
 
 pub fn accent_soft() -> Rgba {
-    rgba(0x8b5cf61f)
+    // Flattened onto the row background. A plain alpha wash lets the rows
+    // behind a dragged row show through it.
+    mix(bg_surface(), accent(), ACCENT_SOFT_ALPHA)
+}
+
+fn mix(base: Rgba, over: Rgba, amount: f32) -> Rgba {
+    let t = amount.clamp(0.0, 1.0);
+    rgb(channel(base.r, over.r, t) << 16
+        | channel(base.g, over.g, t) << 8
+        | channel(base.b, over.b, t))
+}
+
+fn channel(base: f32, over: f32, t: f32) -> u32 {
+    (base + (over - base) * t)
+        .clamp(0.0, 1.0)
+        .mul_add(255.0, 0.5) as u32
+}
+
+/// Install `0xRRGGBB` as the accent. Returns whether it changed.
+pub fn set_accent_rgb(rgb24: u32) -> bool {
+    let next = rgb24 & 0x00ff_ffff;
+    ACCENT.swap(next, Ordering::Relaxed) != next
 }
 
 pub fn danger() -> Rgba {

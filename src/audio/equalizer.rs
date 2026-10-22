@@ -26,8 +26,8 @@ pub const BAND_COUNT: usize = 17;
 /// Graphic EQ centers (Hz) through 20 kHz — closer to foobar2000's upper range.
 /// Top band (20 kHz) is a high-shelf so cut/boost holds to Nyquist (not a peaking bell).
 pub const BAND_FREQUENCIES: [f32; BAND_COUNT] = [
-    25.0, 40.0, 63.0, 100.0, 160.0, 250.0, 400.0, 630.0, 1000.0, 1600.0, 2500.0, 4000.0,
-    6300.0, 10000.0, 12500.0, 16000.0, 20000.0,
+    25.0, 40.0, 63.0, 100.0, 160.0, 250.0, 400.0, 630.0, 1000.0, 1600.0, 2500.0, 4000.0, 6300.0,
+    10000.0, 12500.0, 16000.0, 20000.0,
 ];
 
 /// Q factor for 1/3-octave peaking bandwidth: Q = 1 / (2 * sinh(ln(2)/2 * 1/3)) ≈ 4.318

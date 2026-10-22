@@ -1,7 +1,7 @@
 // Minimal test to verify audio engine compiles
 
+use muzeeka_gpui::audio::{EventSink, Player};
 use std::path::PathBuf;
-use muzeeka_gpui::audio::{Player, EventSink};
 
 fn main() {
     let player = Player::new();

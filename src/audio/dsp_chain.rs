@@ -260,7 +260,6 @@ impl DspNode for LimiterDspContext {
     }
 }
 
-
 pub struct DspChain {
     slots: ArcSwap<Vec<ChainSlot>>,
     sample_rate: AtomicU32,
@@ -666,7 +665,10 @@ mod tests {
     #[test]
     fn slot_settings_round_trip() {
         let json = serde_json::to_string(&slot("s1", clip_limiter())).unwrap();
-        assert!(json.contains("\"kind\":\"limiter\""), "unexpected shape: {json}");
+        assert!(
+            json.contains("\"kind\":\"limiter\""),
+            "unexpected shape: {json}"
+        );
         let back: ChainSlotSettings = serde_json::from_str(&json).unwrap();
         assert_eq!(back.id, "s1");
         assert!(back.enabled);

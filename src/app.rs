@@ -22,7 +22,15 @@ impl MuzeekaApp {
         let player = Arc::new(Player::new());
         let event_sink = EventSink::new();
 
-        let bass_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/bin/bass");
+        let beside = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|dir| dir.join("bin").join("bass")))
+            .filter(|dir| dir.join("bass.dll").is_file());
+        let bass_dir = if cfg!(debug_assertions) {
+            beside.unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/bin/bass"))
+        } else {
+            beside.unwrap_or_default()
+        };
         player.set_bass_dir(bass_dir);
 
         if let Err(e) = player.init() {

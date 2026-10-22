@@ -24,6 +24,7 @@ impl MainWindow {
                 icons::MINIMIZE,
                 false,
                 WindowControlArea::Min,
+                cx,
             ))
             .child(self.caption_button(
                 "win-max",
@@ -34,6 +35,7 @@ impl MainWindow {
                 },
                 false,
                 WindowControlArea::Max,
+                cx,
             ))
             .child(self.close_button(cx))
     }
@@ -45,6 +47,11 @@ impl MainWindow {
             .items_center()
             .justify_center()
             .occlude()
+            .on_drop(
+                cx.listener(|this, paths: &gpui::ExternalPaths, window, cx| {
+                    this.receive_file_drop(paths, false, window.mouse_position(), cx);
+                }),
+            )
             .size(px(32.))
             .rounded_md()
             .cursor_pointer()
@@ -74,9 +81,15 @@ impl MainWindow {
         glyph: &'static [u8],
         close: bool,
         area: WindowControlArea,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
         self.chrome_button(id, glyph, close)
             .occlude()
+            .on_drop(
+                cx.listener(|this, paths: &gpui::ExternalPaths, window, cx| {
+                    this.receive_file_drop(paths, false, window.mouse_position(), cx);
+                }),
+            )
             .window_control_area(area)
             .into_any_element()
     }
@@ -84,6 +97,11 @@ impl MainWindow {
     fn close_button(&self, cx: &mut Context<Self>) -> AnyElement {
         self.chrome_button("win-close", icons::CLOSE, true)
             .occlude()
+            .on_drop(
+                cx.listener(|this, paths: &gpui::ExternalPaths, window, cx| {
+                    this.receive_file_drop(paths, false, window.mouse_position(), cx);
+                }),
+            )
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _: &gpui::MouseDownEvent, _, cx| {
@@ -93,9 +111,9 @@ impl MainWindow {
             )
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, _: &gpui::MouseUpEvent, _, cx| {
+                cx.listener(|this, _: &gpui::MouseUpEvent, window, _cx| {
                     if this.armed("win-close") {
-                        cx.quit();
+                        window.remove_window();
                     }
                 }),
             )

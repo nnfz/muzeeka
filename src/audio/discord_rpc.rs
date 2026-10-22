@@ -13,8 +13,8 @@ use discord_rich_presence::{DiscordIpc, DiscordIpcClient};
 use parking_lot::Mutex;
 
 use crate::audio::cue;
-use crate::audio::player::{PlaybackState, PlayerStateSnapshot};
 use crate::audio::metadata::{self, TrackMetadata};
+use crate::audio::player::{PlaybackState, PlayerStateSnapshot};
 use crate::library::MusicFile;
 // TODO: port imgbb, musicbrainz modules
 // use crate::imgbb;
@@ -378,7 +378,11 @@ fn truncate(value: &str, max_chars: usize) -> String {
     if value.chars().count() <= max_chars {
         return value.to_string();
     }
-    value.chars().take(max_chars.saturating_sub(1)).collect::<String>() + "…"
+    value
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>()
+        + "…"
 }
 
 fn resolve_cover_url(
@@ -410,16 +414,6 @@ fn local_cover_from_audio(track_path: &str, track: &MusicFile) -> Option<String>
     }
 
     None
-}
-
-fn local_cover_path(track_path: &str) -> Option<std::path::PathBuf> {
-    let cover_path = metadata_for_path(track_path).cover_path?;
-    let path = std::path::PathBuf::from(cover_path);
-    if path.is_file() {
-        Some(path)
-    } else {
-        None
-    }
 }
 
 fn filename_title(path: &str) -> String {

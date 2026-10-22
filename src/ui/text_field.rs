@@ -4,13 +4,13 @@
 use std::ops::Range;
 use std::rc::Rc;
 
+use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
-    Entity, EntityInputHandler, FocusHandle, GlobalElementId, InspectorElementId,
-    InteractiveElement, IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PaintQuad, ParentElement, Pixels, Point, ShapedLine, SharedString, Styled,
-    TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div, fill, point, px,
-    relative, size,
+    actions, div, fill, point, px, relative, size, App, Bounds, ClipboardItem, Context,
+    CursorStyle, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler, FocusHandle,
+    GlobalElementId, InspectorElementId, InteractiveElement, IntoElement, LayoutId, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement, Pixels, Point,
+    ShapedLine, SharedString, Styled, TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window,
 };
 
 use crate::ui::theme;
@@ -45,6 +45,8 @@ pub struct TextField {
     last_layout: Option<ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
     selecting: bool,
+    /// Download in progress. Keystrokes, paste, and IME leave the text alone.
+    locked: bool,
     element_id: SharedString,
     on_change: Rc<dyn Fn(&str, &mut Window, &mut App)>,
     on_escape: Rc<dyn Fn(&mut Window, &mut App)>,
@@ -68,6 +70,7 @@ impl TextField {
             last_layout: None,
             last_bounds: None,
             selecting: false,
+            locked: false,
             element_id: "search-field".into(),
             on_change: Rc::new(on_change),
             on_escape: Rc::new(on_escape),
@@ -88,7 +91,32 @@ impl TextField {
         self.on_escape = Rc::new(escape);
     }
 
-    pub fn set_text(&mut self, text: impl Into<String>, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn set_locked(&mut self, locked: bool) -> bool {
+        if self.locked == locked {
+            return false;
+        }
+        self.locked = locked;
+        true
+    }
+
+    /// Replaces the value without telling `on_change`. Used when a timer clears
+    /// the field after a successful download.
+    pub fn replace_text(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
+        let text = text.into();
+        let end = text.len();
+        self.content = text.into();
+        self.selected_range = end..end;
+        self.selection_reversed = false;
+        self.marked_range = None;
+        cx.notify();
+    }
+
+    pub fn set_text(
+        &mut self,
+        text: impl Into<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let text = text.into();
         let end = text.len();
         self.content = text.into();
@@ -99,8 +127,20 @@ impl TextField {
         cx.notify();
     }
 
-    pub fn clear(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.set_text("", window, cx);
+    /// Clears the value without `on_change`. Callers that already hold the
+    /// parent view update the download probe themselves.
+    pub fn clear(&mut self, cx: &mut Context<Self>) {
+        if self.locked {
+            return;
+        }
+        self.replace_text("", cx);
+    }
+
+    /// Highlight the whole value so the next key replaces the name.
+    pub fn select_all_text(&mut self, cx: &mut Context<Self>) {
+        self.selected_range = 0..self.content.len();
+        self.selection_reversed = false;
+        cx.notify();
     }
 
     fn emit(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -147,6 +187,9 @@ impl TextField {
     }
 
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
+        if self.locked {
+            return;
+        }
         if self.selected_range.is_empty() {
             let prev = self.previous_boundary(self.cursor_offset());
             if self.cursor_offset() == prev {
@@ -158,6 +201,9 @@ impl TextField {
     }
 
     fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
+        if self.locked {
+            return;
+        }
         if self.selected_range.is_empty() {
             let next = self.next_boundary(self.cursor_offset());
             if self.cursor_offset() == next {
@@ -169,6 +215,9 @@ impl TextField {
     }
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
+        if self.locked {
+            return;
+        }
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
             self.replace_text_in_range(None, &text.replace(['\n', '\r'], " "), window, cx);
         }
@@ -183,6 +232,9 @@ impl TextField {
     }
 
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
+        if self.locked {
+            return;
+        }
         if !self.selected_range.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(
                 self.content[self.selected_range.clone()].to_string(),
@@ -202,7 +254,15 @@ impl TextField {
         submit(&text, window, cx);
     }
 
-    fn on_mouse_down(&mut self, event: &MouseDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.locked {
+            return;
+        }
         self.selecting = true;
         let index = self.index_for_position(event.position);
         if event.modifiers.shift {
@@ -217,6 +277,9 @@ impl TextField {
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.locked {
+            return;
+        }
         if self.selecting {
             self.select_to(self.index_for_position(event.position), cx);
         }
@@ -340,8 +403,14 @@ impl EntityInputHandler for TextField {
         })
     }
 
-    fn marked_text_range(&self, _window: &mut Window, _cx: &mut Context<Self>) -> Option<Range<usize>> {
-        self.marked_range.as_ref().map(|range| self.range_to_utf16(range))
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        self.marked_range
+            .as_ref()
+            .map(|range| self.range_to_utf16(range))
     }
 
     fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
@@ -355,6 +424,9 @@ impl EntityInputHandler for TextField {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.locked {
+            return;
+        }
         let range = range_utf16
             .as_ref()
             .map(|range_utf16| self.range_from_utf16(range_utf16))
@@ -380,6 +452,9 @@ impl EntityInputHandler for TextField {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.locked {
+            return;
+        }
         let range = range_utf16
             .as_ref()
             .map(|range_utf16| self.range_from_utf16(range_utf16))
@@ -564,7 +639,10 @@ impl Element for TextElement {
             (
                 Some(fill(
                     Bounds::from_corners(
-                        point(origin_x + line.x_for_index(selected_range.start), bounds.top()),
+                        point(
+                            origin_x + line.x_for_index(selected_range.start),
+                            bounds.top(),
+                        ),
                         point(
                             origin_x + line.x_for_index(selected_range.end),
                             bounds.bottom(),
@@ -595,13 +673,24 @@ impl Element for TextElement {
         cx: &mut App,
     ) {
         let focus = self.input.read(cx).focus.clone();
-        window.handle_input(&focus, ElementInputHandler::new(bounds, self.input.clone()), cx);
+        window.handle_input(
+            &focus,
+            ElementInputHandler::new(bounds, self.input.clone()),
+            cx,
+        );
         if let Some(selection) = prepaint.selection.take() {
             window.paint_quad(selection);
         }
         let line = prepaint.line.take().unwrap();
         let origin = point(bounds.left() - prepaint.scroll, bounds.top());
-        let _ = line.paint(origin, window.line_height(), TextAlign::Left, None, window, cx);
+        let _ = line.paint(
+            origin,
+            window.line_height(),
+            TextAlign::Left,
+            None,
+            window,
+            cx,
+        );
         if focus.is_focused(window) {
             if let Some(cursor) = prepaint.cursor.take() {
                 window.paint_quad(cursor);
@@ -629,6 +718,7 @@ impl gpui::Render for TextField {
             .cursor(CursorStyle::IBeam)
             .text_size(px(12.))
             .text_color(theme::text())
+            .when(self.locked, |field| field.opacity(0.7))
             .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::delete))
             .on_action(cx.listener(Self::left))
@@ -647,9 +737,7 @@ impl gpui::Render for TextField {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
-            .child(TextElement {
-                input: cx.entity(),
-            })
+            .child(TextElement { input: cx.entity() })
     }
 }
 

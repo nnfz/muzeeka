@@ -1,8 +1,8 @@
 //! BASS output for the GPUI window.
 //!
 //! The effect rack is the one saved by the installable app in
-//! `%APPDATA%\com.nnfz.muzeeka\settings.json`. Playback position is not written
-//! back into `library.db`, so a running Tauri window keeps its own resume point.
+//! `%APPDATA%\com.nnfz.muzeeka\settings.json`. The last track and playhead are
+//! written back into `library.db`, in `app_state`.
 
 use std::path::PathBuf;
 
@@ -105,7 +105,10 @@ impl Engine {
     /// Opens BASS, then installs the saved rack before any file is played.
     pub fn attach(volume: f32, rack: &AudioRack) -> Result<Self, String> {
         let player = Player::new();
-        player.set_bass_dir(bass_directory());
+        let bass_dir = bass_directory();
+        // BASS delay-loads sibling DLLs from this folder, not from the process cwd.
+        pin_dll_directory(&bass_dir);
+        player.set_bass_dir(bass_dir);
         player.set_ui_hot(true);
         let sink = EventSink::new();
         player.set_event_sink(sink.clone());
@@ -227,19 +230,57 @@ pub fn same_audio_path(left: &str, right: &str) -> bool {
 }
 
 fn bass_directory() -> PathBuf {
+    let candidates = bass_candidates();
+    pick_bass_dir(&candidates).unwrap_or_else(|| candidates.into_iter().next().unwrap_or_default())
+}
+
+/// `bass.dll` lives in `bin/bass` next to the executable. A loose copy beside
+/// the exe still works. `src/bin` is only searched in debug builds (`cargo run`).
+fn bass_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
+            candidates.push(parent.join("bin").join("bass"));
             candidates.push(parent.join("bass"));
+            candidates.push(parent.to_path_buf());
         }
     }
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    candidates.push(manifest.join("src").join("bin").join("bass"));
-    candidates.push(manifest.join("bass"));
+    if cfg!(debug_assertions) {
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        candidates.push(manifest.join("src").join("bin").join("bass"));
+        candidates.push(manifest.join("bass"));
+    }
     candidates
-        .into_iter()
+}
+
+fn pick_bass_dir(candidates: &[PathBuf]) -> Option<PathBuf> {
+    candidates
+        .iter()
         .find(|dir| dir.join("bass.dll").is_file())
-        .unwrap_or_else(|| manifest.join("src").join("bin").join("bass"))
+        .cloned()
+}
+
+fn pin_dll_directory(dir: &std::path::Path) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn SetDllDirectoryW(path: *const u16) -> i32;
+        }
+        let wide: Vec<u16> = dir
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe {
+            SetDllDirectoryW(wide.as_ptr());
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = dir;
+    }
 }
 
 impl AudioRack {
@@ -276,7 +317,10 @@ impl AudioRack {
                     Ok(rack) => return rack,
                     Err(error) => {
                         last_error = Some(error);
-                        eprintln!("[audio] could not read {}: {last_error:?}", candidate.display());
+                        eprintln!(
+                            "[audio] could not read {}: {last_error:?}",
+                            candidate.display()
+                        );
                     }
                 },
                 Err(error) => {
@@ -325,8 +369,7 @@ impl AudioRack {
 }
 
 fn parse_saved_audio(raw: &str) -> Result<AudioRack, String> {
-    let mut file: SavedAudioFile =
-        serde_json::from_str(raw).map_err(|error| error.to_string())?;
+    let mut file: SavedAudioFile = serde_json::from_str(raw).map_err(|error| error.to_string())?;
     let mut chain = match file.dsp_chain.take() {
         Some(chain) => chain,
         // A file from before the rack stored one EQ and one limiter.
@@ -416,6 +459,19 @@ pub(crate) fn merge_audio_json(raw: &str, rack: &AudioRack) -> Result<String, St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bass_in_bin_beats_a_copy_beside_the_executable() {
+        let root = std::env::temp_dir().join(format!("muzeeka-bass-{}", std::process::id()));
+        let beside = root.join("app");
+        let nested = beside.join("bin").join("bass");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(beside.join("bass.dll"), b"").unwrap();
+        std::fs::write(nested.join("bass.dll"), b"").unwrap();
+        let picked = pick_bass_dir(&[nested.clone(), beside.clone()]).unwrap();
+        assert_eq!(picked, nested);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn cue_virtual_path_keeps_the_audio_file() {

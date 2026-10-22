@@ -345,10 +345,7 @@ fn open_decode(bass: &BassLibrary, path: &str) -> Result<(u32, &'static str), St
             bass::BASS_STREAM_DECODE | bass::BASS_SAMPLE_FLOAT | bass::BASS_SAMPLE_MONO,
             "float+mono",
         ),
-        (
-            bass::BASS_STREAM_DECODE | bass::BASS_SAMPLE_FLOAT,
-            "float",
-        ),
+        (bass::BASS_STREAM_DECODE | bass::BASS_SAMPLE_FLOAT, "float"),
         (bass::BASS_STREAM_DECODE, "default-16bit"),
     ];
     let mut last_err = String::from("Failed to open decode stream");

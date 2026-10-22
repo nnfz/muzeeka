@@ -30,7 +30,10 @@ fn now_ms() -> u64 {
 /// Register a callback invoked for every new log line. `fn` pointers only, so it
 /// can live in a `static` without a leak.
 pub fn subscribe(listener: fn(&LogLine)) {
-    LISTENERS.lock().unwrap_or_else(|e| e.into_inner()).push(listener);
+    LISTENERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(listener);
 }
 
 pub fn push(level: &str, source: &str, message: &str) {

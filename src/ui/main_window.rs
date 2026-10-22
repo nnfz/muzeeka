@@ -38,6 +38,13 @@ pub struct MainWindow {
     pub(crate) focus: FocusHandle,
     pub(crate) use_ui_font: bool,
     settings_window: Option<WindowHandle<SettingsWindow>>,
+    /// Track the accent was sampled from. `None` until the first pass.
+    /// `Some(None)` means nothing is loaded, so the accent is the default purple.
+    accent_source: Option<Option<TrackId>>,
+    /// Bumped on every sample so a slow cover decode cannot paint over a newer track.
+    accent_epoch: u64,
+    /// The restored row is scrolled into view once the list has a real height.
+    revealed_current: bool,
     pub(crate) progress_bounds: Bounds<Pixels>,
     pub(crate) volume_bounds: Bounds<Pixels>,
     pub(crate) drag: Option<SliderDrag>,
@@ -49,28 +56,53 @@ pub struct MainWindow {
     pub(crate) hovered_track: Option<TrackId>,
     /// Sidebar row, transport button, or slider currently under the pointer.
     pub(crate) hovered_ui: Option<SharedString>,
+    /// Playlist cover under the pointer. Separate from the row, so the play
+    /// button can show without the row hover wiping it.
+    pub(crate) hovered_cover: Option<SharedString>,
     /// Transport button held down. Drives the press shrink.
     pub(crate) pressed_ui: Option<SharedString>,
     /// Control that received the mouse down. Its action runs on mouse up
     /// only while this still matches, and only if the pointer is still over it.
     /// GPUI on_click is not used: a pending click clears on_hover for the hold.
     pub(crate) armed_ui: Option<SharedString>,
+    /// Where the pointer went down. A GPUI drag starts at 2px; the reorder waits
+    /// for the longer travel measured from this point.
+    pub(crate) press_at: Option<gpui::Point<Pixels>>,
+    /// Track or playlist reorder. Cleared on drop, or when the GPUI drag ends
+    /// without one, so a release outside the window does not stick the gap.
+    pub(crate) item_drag: Option<crate::ui::item_drag::ItemDrag>,
     /// Track list scroll. Wheel notches ease toward a target instead of jumping.
     pub(crate) track_scroll: UniformListScrollHandle,
     /// Playlist list in the sidebar. Same eased wheel as the track list.
     pub(crate) sidebar_scroll: ScrollHandle,
     /// Search results plate. Same eased wheel as the track list.
     pub(crate) search_scroll: UniformListScrollHandle,
+    /// Context menu and its playlist submenu. Separate so each list scrolls alone.
+    menu_scroll: ScrollHandle,
+    submenu_scroll: ScrollHandle,
     track_ease: EaseScroll,
     sidebar_ease: EaseScroll,
     search_ease: EaseScroll,
     /// Query, library size, and hit ids. Reused while the text is unchanged
     /// so a wheel frame does not scan the library again.
-    search_hits: Option<(String, usize, Arc<Vec<TrackId>>)>,
+    pub(crate) search_hits: Option<(String, usize, Arc<Vec<TrackId>>)>,
     bar_drag: Option<BarDrag>,
     menu: PopMenu,
-    rename_field: gpui::Entity<TextField>,
+    pub(crate) rename_field: gpui::Entity<TextField>,
     rename_wired: bool,
+    /// Kept alive so leaving the inline name commits the edit.
+    rename_blur: Option<gpui::Subscription>,
+    pub(crate) file_drop: crate::ui::file_drop::FileDropState,
+    pub(crate) download: crate::ui::download_ui::DownloadState,
+    shown_title: String,
+    taskbar_attached: bool,
+    /// Visible track rows. Reused while the library view is unchanged, so the
+    /// playing bars can tick without scanning the library again.
+    pub(crate) listed: Option<crate::ui::track_list::ListedTracks>,
+    /// First Esc while a download locks the field. The next Esc leaves search.
+    search_escape_armed: bool,
+    /// Left time reads the remainder (`-1:35`) instead of the elapsed time.
+    pub(crate) show_remaining: bool,
     _tick: Task<()>,
 }
 
@@ -88,7 +120,6 @@ enum PopMenu {
     },
     Rename {
         id: String,
-        at: gpui::Point<Pixels>,
     },
     Properties {
         id: TrackId,
@@ -106,6 +137,8 @@ pub(crate) enum Scroller {
     Tracks,
     Sidebar,
     Search,
+    Menu,
+    Submenu,
 }
 
 /// Critically damped follow of a scroll offset. Not the hover spring.
@@ -128,7 +161,12 @@ impl EaseScroll {
 
     /// GPUI already applied the wheel delta. Put the offset back and ease to it.
     /// Returns true when a frame should be queued.
-    fn note(&mut self, handle: &ScrollHandle, event: &ScrollWheelEvent, reduce_motion: bool) -> bool {
+    fn note(
+        &mut self,
+        handle: &ScrollHandle,
+        event: &ScrollWheelEvent,
+        reduce_motion: bool,
+    ) -> bool {
         let jumped = handle.offset().y.as_f32();
         if event.delta.precise() || reduce_motion {
             self.snap(jumped);
@@ -188,8 +226,8 @@ impl EaseScroll {
             }
         }
         handle.set_offset(point(px(0.), px(self.spring.position)));
-        let settled = (self.spring.position - self.target).abs() < 0.5
-            && self.spring.velocity.abs() < 12.;
+        let settled =
+            (self.spring.position - self.target).abs() < 0.5 && self.spring.velocity.abs() < 12.;
         if settled {
             self.snap(self.target);
             handle.set_offset(point(px(0.), px(self.target)));
@@ -233,6 +271,20 @@ impl MainWindow {
         SpringAnimation::new(SpringConfig::new(580.0, 26.8, 1.0)).to(on)
     }
 
+    /// Critically damped, about 200ms. Sidebar rows and the drop gap use it.
+    pub(crate) fn smooth_config() -> SpringConfig {
+        SpringConfig::new(324.0, 36.0, 1.0)
+    }
+
+    pub(crate) fn smooth_spring(on: bool) -> SpringAnimation<bool> {
+        SpringAnimation::new(Self::smooth_config()).to(on)
+    }
+
+    /// The same spring as a pixel offset, so a reordering row eases into its slot.
+    pub(crate) fn smooth_spring_px(offset: f32) -> SpringAnimation<gpui::Pixels> {
+        SpringAnimation::new(Self::smooth_config()).to(px(offset))
+    }
+
     /// Pressed transport buttons draw at 92% so the shrink stays small.
     pub(crate) fn press_scale(phase: gpui::AnimationPhase) -> f32 {
         1.0 - 0.08 * phase.0.clamp(0.0, 1.0)
@@ -260,6 +312,11 @@ impl MainWindow {
         move |over, _, app| {
             entity.update(app, |this, cx| {
                 let same = this.hovered_ui.as_ref() == Some(&id);
+                // GPUI drops hover as soon as a press becomes a drag. Hold the wash
+                // on the pressed row until the pointer comes back up.
+                if !*over && same && this.press_at.is_some() {
+                    return;
+                }
                 if *over {
                     if !same {
                         this.hovered_ui = Some(id.clone());
@@ -273,27 +330,64 @@ impl MainWindow {
         }
     }
 
+    pub(crate) fn hover_cover_listener(
+        id: SharedString,
+        cx: &mut Context<Self>,
+    ) -> impl Fn(&bool, &mut Window, &mut App) + 'static {
+        let entity = cx.entity().clone();
+        move |over, _, app| {
+            entity.update(app, |this, cx| {
+                let same = this.hovered_cover.as_ref() == Some(&id);
+                if *over {
+                    if !same {
+                        this.hovered_cover = Some(id.clone());
+                        cx.notify();
+                    }
+                } else if same {
+                    this.hovered_cover = None;
+                    cx.notify();
+                }
+            });
+        }
+    }
+
     pub fn new(use_ui_font: bool, cx: &mut Context<Self>) -> Self {
         let session = cx.new(|_| Session::open());
         let focus = cx.focus_handle();
         let rename_field = cx.new(|cx| {
-            TextField::new(cx, "Playlist name", |_, _, _| {}, |_, _| {}).element_id("playlist-rename")
+            TextField::new(cx, "Playlist name", |_, _, _| {}, |_, _| {})
+                .element_id("playlist-rename")
         });
+        let host = cx.entity().clone();
         let search = cx.new({
             let session = session.clone();
             let focus = focus.clone();
+            let escape_host = host.clone();
             move |cx| {
                 TextField::new(
                     cx,
                     "Search or paste URL",
-                    move |_text, _window, app| {
-                        session.update(app, |session, cx| {
-                            session.notice = None;
+                    move |text, window, app| {
+                        let text = text.to_string();
+                        session.update(app, |_session, cx| {
                             cx.notify();
+                        });
+                        // The clear button updates this window and then the field.
+                        // Updating the window again from that callback panics.
+                        let host = host.clone();
+                        window.defer(app, move |_window, app| {
+                            host.update(app, |this, cx| {
+                                this.search_escape_armed = false;
+                                this.note_download_query(&text);
+                                cx.notify();
+                            });
                         });
                     },
                     move |window, app| {
-                        window.focus(&focus, app);
+                        let dismiss = escape_host.update(app, |this, cx| this.on_search_escape(cx));
+                        if dismiss {
+                            window.focus(&focus, app);
+                        }
                     },
                 )
             }
@@ -304,11 +398,34 @@ impl MainWindow {
                 .await;
             if this
                 .update(cx, |view, cx| {
-                    view.session.update(cx, |session, cx| {
-                        if session.tick(0.1) {
+                    let (playing, can_play, has_prev, has_next) =
+                        view.session.read(cx).taskbar_flags();
+                    let taskbar_action =
+                        crate::ui::taskbar::poll(playing, can_play, has_prev, has_next);
+                    if let Some(action) = taskbar_action {
+                        view.session.update(cx, |session, cx| {
+                            match action {
+                                crate::ui::taskbar::Action::Prev => session.prev(),
+                                crate::ui::taskbar::Action::Next => session.next(),
+                                crate::ui::taskbar::Action::Toggle => {
+                                    session.toggle_playback(Vec::new());
+                                }
+                            }
+                            cx.notify();
+                        });
+                    }
+                    let session_dirty = view.session.update(cx, |session, cx| {
+                        let dirty = session.tick(0.1);
+                        if dirty {
                             cx.notify();
                         }
+                        dirty
                     });
+                    let drop_dirty = view.tick_file_drop();
+                    let download_dirty = view.tick_download(cx);
+                    if session_dirty || drop_dirty || download_dirty {
+                        cx.notify();
+                    }
                 })
                 .is_err()
             {
@@ -322,6 +439,9 @@ impl MainWindow {
             focus,
             use_ui_font,
             settings_window: None,
+            accent_source: None,
+            accent_epoch: 0,
+            revealed_current: false,
             progress_bounds: Bounds::new(point(px(0.), px(0.)), size(px(0.), px(0.))),
             volume_bounds: Bounds::new(point(px(0.), px(0.)), size(px(0.), px(0.))),
             drag: None,
@@ -329,11 +449,16 @@ impl MainWindow {
             album_resize: None,
             hovered_track: None,
             hovered_ui: None,
+            hovered_cover: None,
             pressed_ui: None,
             armed_ui: None,
+            press_at: None,
+            item_drag: None,
             track_scroll: UniformListScrollHandle::new(),
             sidebar_scroll: ScrollHandle::new(),
             search_scroll: UniformListScrollHandle::new(),
+            menu_scroll: ScrollHandle::new(),
+            submenu_scroll: ScrollHandle::new(),
             track_ease: EaseScroll::new(),
             sidebar_ease: EaseScroll::new(),
             search_ease: EaseScroll::new(),
@@ -342,6 +467,14 @@ impl MainWindow {
             menu: PopMenu::None,
             rename_field,
             rename_wired: false,
+            rename_blur: None,
+            file_drop: crate::ui::file_drop::FileDropState::default(),
+            download: crate::ui::download_ui::DownloadState::default(),
+            shown_title: String::new(),
+            taskbar_attached: false,
+            listed: None,
+            search_escape_armed: false,
+            show_remaining: session::load_remaining_time(),
             _tick: tick,
         }
     }
@@ -351,6 +484,8 @@ impl MainWindow {
             Scroller::Tracks => self.track_scroll.0.borrow().base_handle.clone(),
             Scroller::Sidebar => self.sidebar_scroll.clone(),
             Scroller::Search => self.search_scroll.0.borrow().base_handle.clone(),
+            Scroller::Menu => self.menu_scroll.clone(),
+            Scroller::Submenu => self.submenu_scroll.clone(),
         }
     }
 
@@ -359,6 +494,9 @@ impl MainWindow {
             Scroller::Tracks => &mut self.track_ease,
             Scroller::Sidebar => &mut self.sidebar_ease,
             Scroller::Search => &mut self.search_ease,
+            // The menu uses the element's own wheel scroll. Easing it would
+            // put the thumb back to zero on the next frame.
+            Scroller::Menu | Scroller::Submenu => unreachable!("context menu scroll is not eased"),
         }
     }
 
@@ -449,6 +587,40 @@ impl MainWindow {
         });
     }
 
+    /// Bring the restored track on screen once. Later frames leave the user's scroll alone.
+    fn reveal_current(&mut self, cx: &mut Context<Self>) {
+        if self.revealed_current {
+            return;
+        }
+        if self
+            .track_scroll
+            .0
+            .borrow()
+            .base_handle
+            .bounds()
+            .size
+            .height
+            <= px(1.)
+        {
+            return;
+        }
+        let row = {
+            let session = self.session.read(cx);
+            session.current.map(|current| {
+                session.visible_indexes("").iter().position(|index| {
+                    session
+                        .track_by_index(*index)
+                        .is_some_and(|track| track.id == current)
+                })
+            })
+        };
+        self.revealed_current = true;
+        if let Some(Some(row)) = row {
+            self.track_scroll
+                .scroll_to_item(row, gpui::ScrollStrategy::Center);
+        }
+    }
+
     fn sync_scrolls_if_idle(&mut self) {
         let tracks = self.scroll_handle(Scroller::Tracks);
         let sidebar = self.scroll_handle(Scroller::Sidebar);
@@ -456,6 +628,37 @@ impl MainWindow {
         self.track_ease.sync_if_idle(&tracks);
         self.sidebar_ease.sync_if_idle(&sidebar);
         self.search_ease.sync_if_idle(&search);
+    }
+
+    /// Move the playlist list by `delta` on the offset (negative scrolls down).
+    /// Snaps the wheel spring so the next frame does not pull the offset back.
+    pub(crate) fn scroll_sidebar_by(&mut self, delta: f32) -> bool {
+        let current = self.sidebar_scroll.offset();
+        let max = self.sidebar_scroll.max_offset().y.as_f32();
+        let y = current.y.as_f32();
+        let next = if max > 0. {
+            (y + delta).clamp(-max, 0.)
+        } else {
+            y
+        };
+        if (next - y).abs() < 0.05 {
+            return false;
+        }
+        self.sidebar_scroll.set_offset(point(current.x, px(next)));
+        self.sidebar_ease.snap(next);
+        true
+    }
+
+    /// Clear the press, the armed click, and any slider drag. A drop consumes
+    /// the mouse-up, so the drop path has to do this itself.
+    pub(crate) fn release_pointer_gesture(&mut self) -> bool {
+        self.drag = None;
+        let resized = self.album_resize.take().is_some();
+        let released = self.pressed_ui.take().is_some();
+        let scrolled = self.bar_drag.take().is_some();
+        self.armed_ui = None;
+        self.press_at = None;
+        resized || released || scrolled
     }
 
     fn kick_scroll(&mut self, which: Scroller, window: &mut Window, cx: &mut Context<Self>) {
@@ -506,6 +709,8 @@ impl MainWindow {
             Scroller::Tracks => "scrollbar-tracks",
             Scroller::Sidebar => "scrollbar-sidebar",
             Scroller::Search => "scrollbar-search",
+            Scroller::Menu => "scrollbar-menu",
+            Scroller::Submenu => "scrollbar-submenu",
         };
         let hot = self.bar_drag.is_some_and(|drag| drag.which == which)
             || self.hovered_ui.as_deref() == Some(id);
@@ -553,7 +758,9 @@ impl MainWindow {
         if travel <= 0. {
             return;
         }
-        self.ease_mut(which).snap(offset);
+        if !matches!(which, Scroller::Menu | Scroller::Submenu) {
+            self.ease_mut(which).snap(offset);
+        }
         self.bar_drag = Some(BarDrag {
             which,
             origin_y: y.as_f32(),
@@ -572,32 +779,93 @@ impl MainWindow {
         let next = (drag.origin_offset - delta / drag.travel * drag.max).clamp(-drag.max, 0.);
         let handle = self.scroll_handle(drag.which);
         handle.set_offset(point(px(0.), px(next)));
-        self.ease_mut(drag.which).snap(next);
+        if !matches!(drag.which, Scroller::Menu | Scroller::Submenu) {
+            self.ease_mut(drag.which).snap(next);
+        }
         cx.notify();
     }
 
     pub fn open(use_ui_font: bool, cx: &mut App) {
         let bounds = Bounds::centered(None, size(px(1100.), px(720.)), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(TitlebarOptions {
-                    title: Some("muzeeka".into()),
-                    appears_transparent: true,
-                    traffic_light_position: None,
-                }),
-                window_min_size: Some(size(px(860.), px(520.))),
-                ..Default::default()
-            },
-            move |window, cx| {
-                let view = cx.new(|cx| Self::new(use_ui_font, cx));
-                let focus = view.read(cx).focus.clone();
-                window.focus(&focus, cx);
-                view
-            },
-        )
-        .expect("open main window");
+        let main = cx
+            .open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    titlebar: Some(TitlebarOptions {
+                        title: Some("muzeeka".into()),
+                        appears_transparent: true,
+                        traffic_light_position: None,
+                    }),
+                    window_min_size: Some(size(px(860.), px(520.))),
+                    ..Default::default()
+                },
+                move |window, cx| {
+                    let view = cx.new(|cx| Self::new(use_ui_font, cx));
+                    let focus = view.read(cx).focus.clone();
+                    window.focus(&focus, cx);
+                    view
+                },
+            )
+            .expect("open main window");
+        // Settings is its own OS window. Closing that one leaves the player up.
+        // Closing the player has to take the others with it, including Alt+F4,
+        // which only destroys the window that received it.
+        let main_id = main.window_id();
+        cx.on_window_closed(move |cx, closed| {
+            if closed != main_id {
+                return;
+            }
+            cx.defer(|cx| {
+                for window in cx.windows() {
+                    let _ = window.update(cx, |_, window, _| window.remove_window());
+                }
+                cx.quit();
+            });
+        })
+        .detach();
         cx.activate(true);
+    }
+
+    /// Point the accent at the current track's cover. A missing or gray cover
+    /// falls back to [`theme::DEFAULT_ACCENT`].
+    fn sync_accent(&mut self, cx: &mut Context<Self>) {
+        let (track_id, cover) = {
+            let session = self.session.read(cx);
+            let track = session.current_track();
+            (
+                track.map(|track| track.id),
+                track.and_then(|track| track.cover.clone()),
+            )
+        };
+        if self.accent_source == Some(track_id) {
+            return;
+        }
+        self.accent_source = Some(track_id);
+        self.accent_epoch = self.accent_epoch.wrapping_add(1);
+        let epoch = self.accent_epoch;
+        let Some(path) = cover.filter(|path| path.is_file()) else {
+            self.publish_accent(theme::DEFAULT_ACCENT, cx);
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let rgb = cx
+                .background_executor()
+                .spawn(async move { crate::ui::accent::from_cover(&path) })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                if view.accent_epoch != epoch {
+                    return;
+                }
+                view.publish_accent(rgb.unwrap_or(theme::DEFAULT_ACCENT), cx);
+            });
+        })
+        .detach();
+    }
+
+    fn publish_accent(&self, rgb: u32, cx: &mut Context<Self>) {
+        if theme::set_accent_rgb(rgb) {
+            cx.refresh_windows();
+        }
     }
 
     fn toggle_play(&mut self, _: &TogglePlay, _: &mut Window, cx: &mut Context<Self>) {
@@ -673,9 +941,16 @@ impl Focusable for MainWindow {
 
 impl Render for MainWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.retire_item_drag_if_finished(cx);
+        self.tick_drop_motion(window, cx.reduce_motion());
         self.sync_scrolls_if_idle();
+        self.tick_playlist_autoscroll(window);
+        self.reveal_current(cx);
         self.warm_scrollbars(window, cx);
-        self.wire_rename(cx);
+        self.sync_accent(cx);
+        self.sync_title(window, cx);
+        self.attach_taskbar(window);
+        self.wire_rename(window, cx);
         let session = self.session.clone();
         div()
             .id("muzeeka-root")
@@ -689,6 +964,7 @@ impl Render for MainWindow {
                 root.font_family(theme::FONT_FAMILY)
             })
             .child(alt_wheel_layer(session))
+            .child(crate::ui::item_drag::drag_cursor_layer(cx.entity().clone()))
             .key_context("Muzeeka")
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::toggle_play))
@@ -714,17 +990,62 @@ impl Render for MainWindow {
                     this.close_menu(window, cx);
                 }
             }))
+            // Alt alone, with the pointer still down, is the start of Alt+Tab.
+            // Hand the files over before the switch, or the other app never sees them.
+            .on_modifiers_changed(cx.listener(
+                |this, event: &gpui::ModifiersChangedEvent, window, cx| {
+                    if event.modifiers.alt {
+                        this.hand_held_tracks_out(window, cx);
+                    }
+                },
+            ))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _: &gpui::MouseUpEvent, _, cx| {
-                    this.drag = None;
-                    let resized = this.album_resize.take().is_some();
-                    let released = this.pressed_ui.take().is_some();
-                    let scrolled = this.bar_drag.take().is_some();
-                    this.armed_ui = None;
-                    if resized || released || scrolled {
+                    let changed = this.release_pointer_gesture();
+                    let leftover = this.item_drag.take().is_some();
+                    if leftover {
+                        this.set_reorder_gap(None);
+                    }
+                    if changed || leftover {
                         cx.notify();
                     }
+                }),
+            )
+            .on_drag_move::<gpui::ExternalPaths>(cx.listener(
+                |this, event: &gpui::DragMoveEvent<gpui::ExternalPaths>, _, cx| {
+                    this.note_file_drag(event, cx);
+                },
+            ))
+            .on_drop(
+                cx.listener(|this, paths: &gpui::ExternalPaths, window, cx| {
+                    this.receive_file_drop(paths, false, window.mouse_position(), cx);
+                }),
+            )
+            .on_file_drop_exit(cx.listener(|this, _: &gpui::FileDropEvent, _, cx| {
+                this.clear_file_drag(cx);
+            }))
+            .on_drag_move::<crate::ui::item_drag::TrackDrag>(cx.listener(
+                |this, event: &gpui::DragMoveEvent<crate::ui::item_drag::TrackDrag>, window, cx| {
+                    this.note_track_drag(event, window, cx);
+                },
+            ))
+            .on_drag_move::<crate::ui::item_drag::PlaylistDrag>(cx.listener(
+                |this,
+                 event: &gpui::DragMoveEvent<crate::ui::item_drag::PlaylistDrag>,
+                 window,
+                 cx| {
+                    this.note_playlist_drag(event, window, cx);
+                },
+            ))
+            .on_drop(
+                cx.listener(|this, drag: &crate::ui::item_drag::TrackDrag, _, cx| {
+                    this.finish_track_drag(drag, cx);
+                }),
+            )
+            .on_drop(
+                cx.listener(|this, drag: &crate::ui::item_drag::PlaylistDrag, _, cx| {
+                    this.finish_playlist_drag(drag, cx);
                 }),
             )
             .child(self.header(window, cx))
@@ -740,6 +1061,7 @@ impl Render for MainWindow {
             )
             .child(self.transport(cx))
             .child(self.search_suggestions(window, cx))
+            .child(self.drop_overlay(window, cx))
             .child(self.menu_layer(window, cx))
     }
 }
@@ -752,7 +1074,9 @@ impl MainWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.commit_rename_if_editing(window, cx);
         self.armed_ui = None;
+        self.reset_menu_scroll();
         self.menu = PopMenu::Track {
             id,
             at,
@@ -769,10 +1093,25 @@ impl MainWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.commit_rename_if_editing(window, cx);
         self.armed_ui = None;
+        self.reset_menu_scroll();
         self.menu = PopMenu::Playlist { id, at };
         window.focus(&self.focus, cx);
         cx.notify();
+    }
+
+    pub(crate) fn renaming_id(&self) -> Option<&str> {
+        match &self.menu {
+            PopMenu::Rename { id } => Some(id.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Close a menu, saving a playlist rename that is still open.
+    pub(crate) fn dismiss_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.commit_rename_if_editing(window, cx);
+        self.close_menu(window, cx);
     }
 
     fn close_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -785,7 +1124,43 @@ impl MainWindow {
         cx.notify();
     }
 
-    fn wire_rename(&mut self, cx: &mut Context<Self>) {
+    /// First Esc clears a filled search. The next Esc, or the only Esc on an
+    /// empty field, leaves the field so the bar collapses.
+    fn on_search_escape(&mut self, cx: &mut Context<Self>) -> bool {
+        let empty = self.search.read(cx).content.is_empty();
+        let locked = self.download.downloading || self.download.importing;
+        if !empty && !locked {
+            self.search.update(cx, |field, cx| field.clear(cx));
+            self.note_download_query("");
+            self.search_escape_armed = false;
+            cx.notify();
+            return false;
+        }
+        if !empty && locked && !self.search_escape_armed {
+            self.search_escape_armed = true;
+            return false;
+        }
+        self.search_escape_armed = false;
+        true
+    }
+
+    fn sync_title(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let title = self.session.read(cx).window_title();
+        if self.shown_title == title {
+            return;
+        }
+        self.shown_title = title.clone();
+        window.set_window_title(&title);
+    }
+
+    fn attach_taskbar(&mut self, window: &Window) {
+        if self.taskbar_attached {
+            return;
+        }
+        self.taskbar_attached = crate::ui::taskbar::attach(window);
+    }
+
+    fn wire_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.rename_wired {
             return;
         }
@@ -801,6 +1176,18 @@ impl MainWindow {
                 escape_host.update(app, |this, cx| this.close_menu(window, cx));
             });
         });
+        let handle = self.rename_field.read(cx).focus.clone();
+        self.rename_blur = Some(cx.on_blur(&handle, window, |this, window, cx| {
+            this.commit_rename_if_editing(window, cx);
+        }));
+    }
+
+    fn commit_rename_if_editing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(self.menu, PopMenu::Rename { .. }) {
+            return;
+        }
+        let name = self.rename_field.read(cx).content.to_string();
+        self.commit_rename(name, window, cx);
     }
 
     fn commit_rename(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -818,13 +1205,7 @@ impl MainWindow {
         cx.notify();
     }
 
-    fn begin_rename(
-        &mut self,
-        id: String,
-        at: gpui::Point<Pixels>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn begin_rename(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
         let name = self
             .session
             .read(cx)
@@ -833,37 +1214,123 @@ impl MainWindow {
             .find(|playlist| playlist.id == id)
             .map(|playlist| playlist.name.clone())
             .unwrap_or_default();
-        self.rename_field
-            .update(cx, |field, cx| field.set_text(name, window, cx));
-        self.menu = PopMenu::Rename { id, at };
+        self.rename_field.update(cx, |field, cx| {
+            field.set_text(name, window, cx);
+            field.select_all_text(cx);
+        });
+        self.menu = PopMenu::Rename { id };
+        // The row mounts the field on this frame. Focusing now would blur
+        // straight away, because the closing menu still owns the focus, and
+        // that blur would save before the name is editable.
         let handle = self.rename_field.read(cx).focus.clone();
-        window.focus(&handle, cx);
+        let entity = cx.entity().clone();
+        window.on_next_frame(move |window, cx| {
+            entity.update(cx, |this, cx| {
+                if matches!(this.menu, PopMenu::Rename { .. }) {
+                    window.focus(&handle, cx);
+                }
+            });
+        });
         cx.notify();
     }
 
+    fn reset_menu_scroll(&self) {
+        let top = point(px(0.), px(0.));
+        self.menu_scroll.set_offset(top);
+        self.submenu_scroll.set_offset(top);
+    }
+
+    /// One more frame after the menu mounts, so the thumb can read a real viewport.
+    fn warm_menu_bar(&self, which: Scroller, window: &mut Window, cx: &mut Context<Self>) {
+        if self.scroll_handle(which).bounds().size.height > px(1.) {
+            return;
+        }
+        let entity = cx.entity().clone();
+        window.on_next_frame(move |_window, cx| {
+            entity.update(cx, |_this, cx| cx.notify());
+        });
+    }
+
+    /// Context menu list. At most twelve rows stay on screen; the rest scroll.
+    fn menu_frame(
+        &mut self,
+        id: &'static str,
+        which: Scroller,
+        min_w: f32,
+        items: Vec<AnyElement>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let count = items.len();
+        let handle = self.scroll_handle(which);
+        // The border sits on the shell, so the scroller's cap is the old panel
+        // height without that border. Twelve rows still fit without scrolling.
+        let mut list = div()
+            .id(id)
+            .flex()
+            .flex_col()
+            .min_w(px(min_w))
+            .max_w(px(320.))
+            .max_h(px(crate::ui::menu::max_height() - 2.))
+            .overflow_y_scroll()
+            .p(px(4.))
+            .on_drop(
+                cx.listener(|this, paths: &gpui::ExternalPaths, window, cx| {
+                    this.receive_file_drop(paths, true, window.mouse_position(), cx);
+                }),
+            )
+            .track_scroll(&handle);
+        if count > crate::ui::menu::VISIBLE_ROWS {
+            list = list.pr(px(14.));
+        }
+        self.warm_menu_bar(which, window, cx);
+        div()
+            .relative()
+            .occlude()
+            .rounded(px(6.))
+            .border_1()
+            .border_color(theme::border())
+            .shadow_md()
+            .bg(theme::bg_surface())
+            .child(list.children(items))
+            .child(self.scrollbar(which, cx))
+            .into_any_element()
+    }
+
     fn menu_layer(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let _ = window;
         if !self.menu.is_open() {
             return div().into_any_element();
         }
         if let PopMenu::Properties { id } = self.menu {
             return self.properties_layer(id, cx);
         }
+        // Rename edits the playlist title in its own row, not in a popup.
+        if matches!(self.menu, PopMenu::None | PopMenu::Rename { .. }) {
+            return div().into_any_element();
+        }
         let at = match self.menu {
-            PopMenu::Track { at, .. } | PopMenu::Playlist { at, .. } | PopMenu::Rename { at, .. } => at,
-            PopMenu::None | PopMenu::Properties { .. } => return div().into_any_element(),
+            PopMenu::Track { at, .. } | PopMenu::Playlist { at, .. } => at,
+            PopMenu::None | PopMenu::Rename { .. } | PopMenu::Properties { .. } => {
+                return div().into_any_element()
+            }
         };
         let panel = match self.menu.clone() {
-            PopMenu::Track { .. } => self.track_menu(cx),
-            PopMenu::Playlist { .. } => self.playlist_menu(cx),
-            PopMenu::Rename { .. } => self.rename_menu(cx),
-            PopMenu::None | PopMenu::Properties { .. } => return div().into_any_element(),
+            PopMenu::Track { .. } => self.track_menu(window, cx),
+            PopMenu::Playlist { .. } => self.playlist_menu(window, cx),
+            PopMenu::None | PopMenu::Rename { .. } | PopMenu::Properties { .. } => {
+                return div().into_any_element()
+            }
         };
         div()
             .absolute()
             .size_full()
             .child(
                 crate::ui::menu::backdrop("context-backdrop")
+                    .on_drop(
+                        cx.listener(|this, paths: &gpui::ExternalPaths, window, cx| {
+                            this.receive_file_drop(paths, false, window.mouse_position(), cx);
+                        }),
+                    )
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, window, cx| this.close_menu(window, cx)),
@@ -911,7 +1378,7 @@ impl MainWindow {
         .into_any_element()
     }
 
-    fn track_menu(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn track_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let PopMenu::Track { id, at, submenu } = self.menu.clone() else {
             return div().into_any_element();
         };
@@ -936,9 +1403,11 @@ impl MainWindow {
             )
         };
         let in_playlist = open_playlist.as_ref().is_some_and(|playlist_id| {
-            self.session.read(cx).playlists.iter().any(|playlist| {
-                &playlist.id == playlist_id && playlist.track_ids.contains(&id)
-            })
+            self.session
+                .read(cx)
+                .playlists
+                .iter()
+                .any(|playlist| &playlist.id == playlist_id && playlist.track_ids.contains(&id))
         });
         let like_label = if liked {
             "Remove from Liked"
@@ -981,6 +1450,7 @@ impl MainWindow {
                 "Добавить в плейлист ›",
                 cx,
                 move |this, _, cx| {
+                    this.submenu_scroll.set_offset(point(px(0.), px(0.)));
                     this.menu = PopMenu::Track {
                         id,
                         at,
@@ -989,13 +1459,19 @@ impl MainWindow {
                     cx.notify();
                 },
             ),
-            self.bind_menu("track-like", crate::ui::menu::Tone::Normal, like_label, cx, move |this, window, cx| {
-                this.session.update(cx, |session, cx| {
-                    session.toggle_like(id);
-                    cx.notify();
-                });
-                this.close_menu(window, cx);
-            }),
+            self.bind_menu(
+                "track-like",
+                crate::ui::menu::Tone::Normal,
+                like_label,
+                cx,
+                move |this, window, cx| {
+                    this.session.update(cx, |session, cx| {
+                        session.toggle_like(id);
+                        cx.notify();
+                    });
+                    this.close_menu(window, cx);
+                },
+            ),
         ];
         if let Some(playlist_id) = open_playlist.clone().filter(|_| in_playlist) {
             items.push(self.bind_menu(
@@ -1012,11 +1488,9 @@ impl MainWindow {
                 },
             ));
         }
-        let main = crate::ui::menu::panel("track-menu")
-            .min_w(px(220.))
-            .children(items);
+        let main = self.menu_frame("track-menu", Scroller::Menu, 220., items, window, cx);
         if !submenu {
-            return main.into_any_element();
+            return main;
         }
         let sub = targets
             .into_iter()
@@ -1044,18 +1518,19 @@ impl MainWindow {
             .items_start()
             .gap(px(4.))
             .child(main)
-            .child(
-                div().mt(px(68.)).child(
-                    crate::ui::menu::panel("track-playlist-menu")
-                        .min_w(px(180.))
-                        .children(sub),
-                ),
-            )
+            .child(div().mt(px(68.)).child(self.menu_frame(
+                "track-playlist-menu",
+                Scroller::Submenu,
+                180.,
+                sub,
+                window,
+                cx,
+            )))
             .into_any_element()
     }
 
-    fn playlist_menu(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let PopMenu::Playlist { id, at } = self.menu.clone() else {
+    fn playlist_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let PopMenu::Playlist { id, .. } = self.menu.clone() else {
             return div().into_any_element();
         };
         let (mix_mode, has_cover) = {
@@ -1149,7 +1624,7 @@ impl MainWindow {
             cx,
             {
                 let id = id.clone();
-                move |this, window, cx| this.begin_rename(id.clone(), at, window, cx)
+                move |this, window, cx| this.begin_rename(id.clone(), window, cx)
             },
         ));
         items.push(self.bind_menu(
@@ -1168,37 +1643,7 @@ impl MainWindow {
                 }
             },
         ));
-        crate::ui::menu::panel("playlist-menu")
-            .min_w(px(200.))
-            .children(items)
-            .into_any_element()
-    }
-
-    fn rename_menu(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        crate::ui::menu::panel("rename-menu")
-            .min_w(px(220.))
-            .child(
-                div()
-                    .h(px(28.))
-                    .px(px(8.))
-                    .mb(px(4.))
-                    .flex()
-                    .items_center()
-                    .rounded(px(4.))
-                    .bg(theme::bg_elevated())
-                    .child(self.rename_field.clone()),
-            )
-            .child(self.bind_menu(
-                "rename-save",
-                crate::ui::menu::Tone::Accent,
-                "Save",
-                cx,
-                |this, window, cx| {
-                    let name = this.rename_field.read(cx).content.to_string();
-                    this.commit_rename(name, window, cx);
-                },
-            ))
-            .into_any_element()
+        self.menu_frame("playlist-menu", Scroller::Menu, 200., items, window, cx)
     }
 
     fn properties_layer(&mut self, id: TrackId, cx: &mut Context<Self>) -> AnyElement {
@@ -1213,6 +1658,11 @@ impl MainWindow {
             .child(
                 crate::ui::menu::backdrop("properties-backdrop")
                     .bg(gpui::rgba(0x00000099))
+                    .on_drop(
+                        cx.listener(|this, paths: &gpui::ExternalPaths, window, cx| {
+                            this.receive_file_drop(paths, false, window.mouse_position(), cx);
+                        }),
+                    )
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, window, cx| this.close_menu(window, cx)),
@@ -1243,6 +1693,16 @@ impl MainWindow {
                             .border_1()
                             .border_color(theme::border())
                             .shadow_md()
+                            .on_drop(cx.listener(
+                                |this, paths: &gpui::ExternalPaths, window, cx| {
+                                    this.receive_file_drop(
+                                        paths,
+                                        true,
+                                        window.mouse_position(),
+                                        cx,
+                                    );
+                                },
+                            ))
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .child(
                                 div()
@@ -1272,6 +1732,7 @@ impl MainWindow {
     }
 
     fn header(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let error = self.session.read(cx).playback_error.clone();
         div()
             .flex()
             .items_center()
@@ -1280,8 +1741,47 @@ impl MainWindow {
             .gap(px(8.))
             .window_control_area(WindowControlArea::Drag)
             .child(self.search_bar(window, cx))
-            .child(div().flex_1().h_full())
+            .child(self.playback_error_slot(error, cx))
             .child(self.header_buttons(window, cx))
+    }
+
+    fn playback_error_slot(
+        &self,
+        error: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        div()
+            .flex_1()
+            .min_w(px(0.))
+            .h_full()
+            .flex()
+            .items_center()
+            .overflow_hidden()
+            .when_some(error, |slot, error| {
+                slot.child(
+                    div()
+                        .id("playback-error")
+                        .min_w(px(0.))
+                        .overflow_hidden()
+                        .text_size(px(12.))
+                        .text_color(theme::danger())
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .cursor_pointer()
+                        .child(error)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _: &gpui::MouseDownEvent, _, cx| {
+                                cx.stop_propagation();
+                                this.session.update(cx, |session, cx| {
+                                    session.clear_playback_error();
+                                    cx.notify();
+                                });
+                            }),
+                        ),
+                )
+            })
+            .into_any_element()
     }
 }
 
