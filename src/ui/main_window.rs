@@ -387,6 +387,7 @@ impl MainWindow {
                         let dismiss = escape_host.update(app, |this, cx| this.on_search_escape(cx));
                         if dismiss {
                             window.focus(&focus, app);
+                            escape_host.update(app, |_, cx| cx.notify());
                         }
                     },
                 )

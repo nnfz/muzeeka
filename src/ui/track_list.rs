@@ -2,9 +2,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    deferred, div, prelude::*, px, rgb, svg, uniform_list, Animation, AnimationExt, AnyElement,
-    Context, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, Rgba,
-    SharedString, Styled,
+    deferred, div, linear_color_stop, linear_gradient, prelude::*, px, rgb, svg, uniform_list,
+    Animation, AnimationExt, AnyElement, Context, InteractiveElement, IntoElement, MouseButton,
+    ParentElement, Pixels, Rgba, SharedString, Styled,
 };
 
 use crate::ui::cover::cover_art;
@@ -561,23 +561,66 @@ impl MainWindow {
                             group,
                         ))
                         .child(self.title_cell(&track, current))
-                        .child(
+                        .child({
+                            let base_color = if current {
+                                theme::accent_soft()
+                            } else {
+                                theme::bg_surface()
+                            };
+                            let album_fade_id = SharedString::from(format!("track-hover-{}", id.0));
                             div()
+                                .relative()
                                 .w(px(self.album_width))
                                 .h(px(14.))
                                 .mr(px(COL_GAP))
                                 .flex_shrink_0()
                                 .flex()
                                 .items_center()
-                                .justify_start()
-                                .text_left()
-                                .text_size(px(12.))
-                                .line_height(px(14.))
-                                .text_color(theme::text_muted())
-                                .whitespace_nowrap()
-                                .truncate()
-                                .child(track.album.clone()),
-                        )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .text_left()
+                                        .text_size(px(12.))
+                                        .line_height(px(14.))
+                                        .text_color(theme::text_muted())
+                                        .whitespace_nowrap()
+                                        .overflow_hidden()
+                                        .child(track.album.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .top(px(0.))
+                                        .bottom(px(0.))
+                                        .right(px(0.))
+                                        .w(px(24.))
+                                        .with_spring(
+                                            album_fade_id,
+                                            MainWindow::hover_spring(hovered),
+                                            move |overlay, phase| {
+                                                let fade_color = if current {
+                                                    base_color
+                                                } else {
+                                                    mix_rgba(
+                                                        theme::bg_surface(),
+                                                        theme::hover(),
+                                                        phase.0,
+                                                    )
+                                                };
+                                                let fade_color_transparent = Rgba {
+                                                    a: 0.0,
+                                                    ..fade_color
+                                                };
+                                                overlay.bg(linear_gradient(
+                                                    90.0,
+                                                    linear_color_stop(fade_color_transparent, 0.0),
+                                                    linear_color_stop(fade_color, 1.0),
+                                                ))
+                                            },
+                                        ),
+                                )
+                        })
                         .child(self.duration_cell(like_id, liked, id, track.duration, cx))
                         .with_spring(
                             SharedString::from(format!("track-hover-{}", id.0)),
@@ -734,6 +777,7 @@ impl MainWindow {
             .child(
                 div()
                     .flex_shrink_0()
+                    .w(px(44.))
                     .text_right()
                     .text_size(px(12.))
                     .text_color(theme::text_muted())

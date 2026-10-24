@@ -245,7 +245,9 @@ impl TextField {
 
     fn escape(&mut self, _: &EscapeField, window: &mut Window, cx: &mut Context<Self>) {
         let escape = self.on_escape.clone();
-        escape(window, cx);
+        window.defer(cx, move |window, cx| {
+            escape(window, cx);
+        });
     }
 
     fn submit(&mut self, _: &Submit, window: &mut Window, cx: &mut Context<Self>) {
