@@ -522,7 +522,7 @@ mod tests {
         EffectSettings::Equalizer(EqualizerSettings {
             enabled: true,
             preamp_db: 12.0,
-            bands_db: [0.0; crate::equalizer::BAND_COUNT],
+            bands_db: [0.0; crate::audio::equalizer::BAND_COUNT],
         })
     }
 

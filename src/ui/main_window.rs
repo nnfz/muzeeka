@@ -99,8 +99,6 @@ pub struct MainWindow {
     /// Visible track rows. Reused while the library view is unchanged, so the
     /// playing bars can tick without scanning the library again.
     pub(crate) listed: Option<crate::ui::track_list::ListedTracks>,
-    /// First Esc while a download locks the field. The next Esc leaves search.
-    search_escape_armed: bool,
     /// Left time reads the remainder (`-1:35`) instead of the elapsed time.
     pub(crate) show_remaining: bool,
     _tick: Task<()>,
@@ -377,8 +375,7 @@ impl MainWindow {
                         let host = host.clone();
                         window.defer(app, move |_window, app| {
                             host.update(app, |this, cx| {
-                                this.search_escape_armed = false;
-                                this.note_download_query(&text);
+                                this.note_download_query(&text, cx);
                                 cx.notify();
                             });
                         });
@@ -474,7 +471,6 @@ impl MainWindow {
             shown_title: String::new(),
             taskbar_attached: false,
             listed: None,
-            search_escape_armed: false,
             show_remaining: session::load_remaining_time(),
             _tick: tick,
         }
@@ -1129,19 +1125,12 @@ impl MainWindow {
     /// empty field, leaves the field so the bar collapses.
     fn on_search_escape(&mut self, cx: &mut Context<Self>) -> bool {
         let empty = self.search.read(cx).content.is_empty();
-        let locked = self.download.downloading || self.download.importing;
-        if !empty && !locked {
+        if !empty {
             self.search.update(cx, |field, cx| field.clear(cx));
-            self.note_download_query("");
-            self.search_escape_armed = false;
+            self.note_search_cleared();
             cx.notify();
             return false;
         }
-        if !empty && locked && !self.search_escape_armed {
-            self.search_escape_armed = true;
-            return false;
-        }
-        self.search_escape_armed = false;
         true
     }
 

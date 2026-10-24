@@ -5915,7 +5915,7 @@ mod tests {
 
     #[test]
     fn parses_icy_stream_title() {
-        use crate::icy_tap::parse_icy_stream_title;
+        use crate::audio::icy_tap::parse_icy_stream_title;
         assert_eq!(
             parse_icy_stream_title("StreamTitle='Artist - Song';StreamUrl='http://x';"),
             Some("Artist - Song".to_string())

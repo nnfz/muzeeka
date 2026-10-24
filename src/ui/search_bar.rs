@@ -27,7 +27,7 @@ impl MainWindow {
     ) -> impl IntoElement {
         let query = self.search.read(cx).content.clone();
         let focused = self.search.read(cx).focus.is_focused(window);
-        let expanded = focused || !query.is_empty();
+        let expanded = focused || !query.is_empty() || self.has_download_cards();
 
         div()
             .id("search-shell")
@@ -87,14 +87,11 @@ impl MainWindow {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _: &gpui::MouseUpEvent, _window, cx| {
-                    if !this.armed("search-clear")
-                        || this.download.downloading
-                        || this.download.importing
-                    {
+                    if !this.armed("search-clear") {
                         return;
                     }
                     this.search.update(cx, |field, cx| field.clear(cx));
-                    this.note_download_query("");
+                    this.note_search_cleared();
                     cx.notify();
                 }),
             )
@@ -112,9 +109,10 @@ impl MainWindow {
         let media = ytdlp::is_media_url(&query);
         let show_suggestions =
             focused && !suggestions.is_empty() && !looks_like_url(&query) && !media;
-        // One plate at a time. `@` opens the filter menu, not the results list.
+        // Suggestions and results stay one plate. Download cards stack under them.
         let show_results = has_search_text(&query) && suggestions.is_empty() && !media;
-        let expanded = focused || !query.is_empty();
+        let cards = self.download_cards(cx);
+        let expanded = focused || !query.is_empty() || !cards.is_empty();
         let hits = show_results.then(|| self.cached_search_ids(&query, cx));
         if hits.as_ref().is_some_and(|hits| !hits.is_empty()) {
             self.warm_search_scrollbar(window, cx);
@@ -140,9 +138,7 @@ impl MainWindow {
                     self.results_plate(hits, described, cx),
                 ))
             })
-            .when(media, |layer| {
-                layer.child(fade_in("search-url-in", self.url_panel(cx)))
-            })
+            .children(cards)
             .with_spring(
                 "search-suggestions-width",
                 search_width_spring(expanded),
@@ -487,10 +483,10 @@ fn search_enter_spring() -> SpringAnimation<f32> {
 fn fade_in(id: &'static str, plate: gpui::Stateful<gpui::Div>) -> impl IntoElement {
     plate.with_spring(id, search_enter_spring(), |plate, phase| {
         let phase = phase.clamp(0.0, 1.0);
-        // Negative top is translateY(-6px): the plate starts above its slot and slides down.
-        // `.top` takes the plate out of flow, and an absolute block shrinks to
-        // its text. Stretch it back across the search bar.
+        // Negative top slides the plate down into its slot. Relative keeps that
+        // slot in the column, so download cards stay underneath.
         plate
+            .relative()
             .w_full()
             .left(px(0.))
             .opacity(phase)
