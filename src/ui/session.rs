@@ -49,6 +49,13 @@ pub struct Playlist {
     pub mix_mode: bool,
 }
 
+/// A library row the download manager can scroll into view.
+pub(crate) struct TrackSpot {
+    pub track_id: TrackId,
+    pub view: LibraryView,
+    pub playlist_name: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LibraryView {
     All,
@@ -736,6 +743,123 @@ impl Session {
 
     pub fn playlist_label(&self, id: TrackId) -> Option<String> {
         self.playlist_of.get(&id).cloned()
+    }
+
+    pub(crate) fn tracks(&self) -> &[Track] {
+        &self.tracks
+    }
+
+    /// Playlist that should open for this track. `prefer` wins when the track
+    /// is still in it, otherwise the first playlist that contains the track.
+    pub(crate) fn playlist_home(
+        &self,
+        id: TrackId,
+        prefer: Option<&str>,
+    ) -> Option<(String, String)> {
+        if let Some(prefer) = prefer.map(str::trim).filter(|id| !id.is_empty()) {
+            if let Some(playlist) = self
+                .playlists
+                .iter()
+                .find(|playlist| playlist.id == prefer && playlist.track_ids.contains(&id))
+            {
+                return Some((playlist.id.clone(), playlist.name.clone()));
+            }
+        }
+        self.playlists
+            .iter()
+            .find(|playlist| playlist.track_ids.contains(&id))
+            .map(|playlist| (playlist.id.clone(), playlist.name.clone()))
+    }
+
+    /// Where a downloaded file should scroll into view.
+    /// Stays on the open list when the track is already there.
+    pub(crate) fn spot_for_path(&self, path: &str) -> Option<TrackSpot> {
+        let key = crate::ui::paths::path_key(path);
+        let track = self
+            .tracks
+            .iter()
+            .find(|track| crate::ui::paths::path_key(&track.path) == key)?;
+        Some(self.spot_in_open_view(track.id))
+    }
+
+    /// Where "Go to track" should scroll. Stays on the open list when this
+    /// track is already there, and opens All tracks otherwise.
+    pub(crate) fn spot_for_track(&self, id: TrackId) -> Option<TrackSpot> {
+        self.track(id)?;
+        Some(self.spot_in_open_view(id))
+    }
+
+    /// Sidebar rows to blink with the track, when it lives in more than one playlist.
+    pub(crate) fn playlists_to_flash(&self, id: TrackId) -> Vec<String> {
+        let ids: Vec<String> = self
+            .playlists
+            .iter()
+            .filter(|playlist| playlist.track_ids.contains(&id))
+            .map(|playlist| playlist.id.clone())
+            .collect();
+        if ids.len() > 1 { ids } else { Vec::new() }
+    }
+
+    fn spot_in_open_view(&self, id: TrackId) -> TrackSpot {
+        if self.open_view_contains(id) {
+            return TrackSpot {
+                track_id: id,
+                view: self.view.clone(),
+                playlist_name: self.open_view_name(),
+            };
+        }
+        TrackSpot {
+            track_id: id,
+            view: LibraryView::All,
+            playlist_name: "All tracks".into(),
+        }
+    }
+
+    fn open_view_name(&self) -> String {
+        match &self.view {
+            LibraryView::All => "All tracks".into(),
+            LibraryView::Liked => "Liked".into(),
+            LibraryView::Playlist(id) => self
+                .playlists
+                .iter()
+                .find(|playlist| &playlist.id == id)
+                .map(|playlist| playlist.name.clone())
+                .unwrap_or_else(|| "Playlist".into()),
+        }
+    }
+
+    fn open_view_contains(&self, id: TrackId) -> bool {
+        match &self.view {
+            LibraryView::All => !self.cue_containers.contains(&id),
+            LibraryView::Liked => self.track(id).is_some_and(|track| track.liked),
+            LibraryView::Playlist(playlist_id) => self.playlists.iter().any(|playlist| {
+                &playlist.id == playlist_id && playlist.track_ids.contains(&id)
+            }),
+        }
+    }
+
+    /// Start `id` inside its playlist, the same way a row in that playlist does.
+    /// `prefer` wins when the track is still in that playlist.
+    pub(crate) fn play_track(&mut self, id: TrackId, prefer: Option<&str>) {
+        if self.track(id).is_none() {
+            return;
+        }
+        let home = self.playlist_home(id, prefer);
+        let queue = home
+            .as_ref()
+            .and_then(|(playlist_id, _)| {
+                self.playlists
+                    .iter()
+                    .find(|playlist| playlist.id == *playlist_id)
+                    .map(|playlist| playlist.track_ids.clone())
+            })
+            .unwrap_or_else(|| vec![id]);
+        let playlist_id = home.map(|(playlist_id, _)| playlist_id);
+        self.play(id, queue);
+        if let Some(playlist_id) = playlist_id {
+            self.playing_playlist = Some(playlist_id);
+            self.remember_playback(true);
+        }
     }
 
     fn matches_playlist_filter(&self, track: &Track, query: &ParsedQuery) -> bool {
@@ -2597,6 +2721,44 @@ pub fn has_search_text(query: &str) -> bool {
     !looks_like_url(query) && !parse_query(query).text.is_empty()
 }
 
+/// What Tab should do with the open search plate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SearchTab {
+    /// Replace the query with this suggestion.
+    Complete(String),
+    /// Open this result the way "Go to track" does.
+    Reveal(TrackId),
+}
+
+/// The highlighted suggestion wins. Otherwise that track result, when the plate lists tracks.
+/// An index past the end stays on the last row.
+pub(crate) fn search_tab(session: &Session, query: &str, index: usize) -> Option<SearchTab> {
+    if looks_like_url(query) {
+        return None;
+    }
+    let suggestions = session.suggestions(query);
+    if !suggestions.is_empty() {
+        let pick = index.min(suggestions.len() - 1);
+        return Some(SearchTab::Complete(suggestions[pick].insert.clone()));
+    }
+    let ids = session.search_ids(query);
+    if ids.is_empty() {
+        return None;
+    }
+    let pick = index.min(ids.len() - 1);
+    Some(SearchTab::Reveal(ids[pick]))
+}
+
+/// Move a highlight through `len` rows. Stops at the ends. `None` when there is nothing to pick.
+pub(crate) fn step_pick(len: usize, current: usize, delta: i32) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    let last = len as i32 - 1;
+    let current = (current as i32).min(last);
+    Some((current + delta).clamp(0, last) as usize)
+}
+
 pub fn describe_search(query: &str) -> String {
     let parsed = parse_query(query);
     let field = match parsed.field {
@@ -2693,6 +2855,71 @@ mod tests {
     use rusqlite::Connection;
 
     #[test]
+    fn download_spot_stays_in_the_open_playlist() {
+        let mut session = Session::preview();
+        session.tracks[5].path = r"D:\muz\downloads\quiet.mp3".into();
+        session.view = LibraryView::Playlist("focus".into());
+        let spot = session
+            .spot_for_path(r"d:/muz/downloads/quiet.mp3")
+            .expect("track");
+        assert_eq!(spot.track_id, TrackId(5));
+        assert_eq!(spot.view, LibraryView::Playlist("focus".into()));
+        assert_eq!(spot.playlist_name, "Focus");
+
+        session.view = LibraryView::Playlist("night".into());
+        let here = session
+            .spot_for_path(r"D:\muz\downloads\quiet.mp3")
+            .expect("track");
+        assert_eq!(here.view, LibraryView::Playlist("night".into()));
+
+        session.tracks[0].path = r"D:\muz\downloads\glass.mp3".into();
+        session.view = LibraryView::Playlist("focus".into());
+        let away = session
+            .spot_for_path(r"D:\muz\downloads\glass.mp3")
+            .expect("track");
+        assert_eq!(away.view, LibraryView::All);
+        assert_eq!(away.playlist_name, "All tracks");
+    }
+
+    #[test]
+    fn search_spot_stays_in_the_open_view_and_play_starts_in_the_playlist() {
+        let mut session = Session::preview();
+        session.view = LibraryView::All;
+        let spot = session.spot_for_track(TrackId(5)).expect("track");
+        assert_eq!(spot.view, LibraryView::All);
+        assert_eq!(spot.playlist_name, "All tracks");
+
+        session.view = LibraryView::Playlist("night".into());
+        let here = session.spot_for_track(TrackId(5)).expect("track");
+        assert_eq!(here.view, LibraryView::Playlist("night".into()));
+        assert_eq!(here.playlist_name, "Night Drive");
+
+        session.view = LibraryView::Playlist("focus".into());
+        let missing = session.spot_for_track(TrackId(0)).expect("track");
+        assert_eq!(missing.view, LibraryView::All);
+
+        session.view = LibraryView::Liked;
+        let liked = session.spot_for_track(TrackId(0)).expect("track");
+        assert_eq!(liked.view, LibraryView::Liked);
+        let not_liked = session.spot_for_track(TrackId(1)).expect("track");
+        assert_eq!(not_liked.view, LibraryView::All);
+
+        assert_eq!(
+            session.playlists_to_flash(TrackId(5)),
+            vec!["night".to_string(), "focus".to_string()]
+        );
+        assert!(session.playlists_to_flash(TrackId(0)).is_empty());
+
+        session.view = LibraryView::All;
+        session.play_track(TrackId(5), Some("focus"));
+        assert_eq!(session.current, Some(TrackId(5)));
+        assert!(session.playing);
+        assert_eq!(session.queue, (4..12).map(TrackId).collect::<Vec<_>>());
+        assert_eq!(session.playing_playlist.as_deref(), Some("focus"));
+        assert!(matches!(session.view, LibraryView::All));
+    }
+
+    #[test]
     fn remaining_time_counts_down_with_a_minus() {
         assert_eq!(format_remaining(10.0, 105.2), "-1:35");
         assert_eq!(format_remaining(0.0, 3_723.0), "-1:02:03");
@@ -2770,6 +2997,70 @@ mod tests {
             .map(|suggestion| suggestion.insert)
             .collect();
         assert_eq!(named, vec!["@playlist=Focus "]);
+
+        // Tab takes the first row: a tag, or a playlist name.
+        assert_eq!(
+            session
+                .suggestions("@ti")
+                .first()
+                .map(|item| item.insert.as_str()),
+            Some("@title ")
+        );
+        assert_eq!(
+            session
+                .suggestions("@")
+                .first()
+                .map(|item| item.insert.as_str()),
+            Some("@a ")
+        );
+        assert_eq!(
+            session
+                .suggestions("night @playlist=fo")
+                .first()
+                .map(|item| item.insert.as_str()),
+            Some("night @playlist=Focus ")
+        );
+        assert!(session.suggestions("@title desk").is_empty());
+        assert_eq!(
+            search_tab(&session, "@ti", 0),
+            Some(SearchTab::Complete("@title ".into()))
+        );
+        assert_eq!(
+            search_tab(&session, "@", 1),
+            Some(SearchTab::Complete("@t ".into()))
+        );
+        assert_eq!(
+            search_tab(&session, "@", 50),
+            Some(SearchTab::Complete(
+                session.suggestions("@").last().unwrap().insert.clone()
+            ))
+        );
+        assert_eq!(
+            search_tab(&session, "night @playlist=fo", 0),
+            Some(SearchTab::Complete("night @playlist=Focus ".into()))
+        );
+        match search_tab(&session, "desk", 0) {
+            Some(SearchTab::Reveal(id)) => {
+                assert_eq!(session.track(id).unwrap().title, "Second Desk");
+            }
+            other => panic!("expected the first track, got {other:?}"),
+        }
+        let ids = session.search_ids("a");
+        assert!(ids.len() > 1, "{}", ids.len());
+        assert_eq!(search_tab(&session, "a", 1), Some(SearchTab::Reveal(ids[1])));
+        match search_tab(&session, "@title desk", 0) {
+            Some(SearchTab::Reveal(id)) => {
+                assert_eq!(session.track(id).unwrap().title, "Second Desk");
+            }
+            other => panic!("expected the first track, got {other:?}"),
+        }
+        assert_eq!(search_tab(&session, "", 0), None);
+        assert_eq!(search_tab(&session, "https://youtu.be/abc", 0), None);
+        assert_eq!(step_pick(0, 0, 1), None);
+        assert_eq!(step_pick(4, 0, -1), Some(0));
+        assert_eq!(step_pick(4, 0, 1), Some(1));
+        assert_eq!(step_pick(4, 3, 1), Some(3));
+        assert_eq!(step_pick(3, 9, -1), Some(1));
     }
 
     #[test]
