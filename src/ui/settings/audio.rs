@@ -1162,25 +1162,12 @@ impl SettingsWindow {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let mut bands: Vec<AnyElement> = Vec::new();
-        let pre_frac = ((eq.preamp_db + 15.0) / 30.0).clamp(0.0, 1.0);
-        bands.push(self.band_column(
-            "Pre",
-            &db_text(eq.preamp_db),
-            self.v_slider(
-                format!("pre|{}", slot.id),
-                pre_frac,
-                Knob::Preamp {
-                    slot: slot.id.clone(),
-                },
-                cx,
-            ),
-        ));
         for index in 0..BAND_COUNT {
             let gain = eq.bands_db[index];
             let frac = ((gain + 20.0) / 40.0).clamp(0.0, 1.0);
             bands.push(self.band_column(
                 &format_hz(BAND_FREQUENCIES[index]),
-                &db_text(gain),
+                &db_tick(gain),
                 self.v_slider(
                     format!("band|{index}|{}", slot.id),
                     frac,
@@ -1192,30 +1179,72 @@ impl SettingsWindow {
                 ),
             ));
         }
+        let pre_frac = ((eq.preamp_db + 15.0) / 30.0).clamp(0.0, 1.0);
         div()
-            .id("eq-bands")
             .w_full()
-            .overflow_x_scroll()
             .flex()
-            .gap(px(2.))
-            .children(bands)
+            .flex_col()
+            .gap(px(10.))
+            .child(
+                div()
+                    .rounded_md()
+                    .bg(theme::bg_elevated())
+                    .border_1()
+                    .border_color(theme::border())
+                    .px(px(8.))
+                    .py(px(6.))
+                    .child(self.labeled_slider(
+                        "Preamp",
+                        &format!("{} dB", db_text(eq.preamp_db)),
+                        "-15",
+                        "+15",
+                        self.h_slider(
+                            format!("pre|{}", slot.id),
+                            pre_frac,
+                            Knob::Preamp {
+                                slot: slot.id.clone(),
+                            },
+                            cx,
+                        ),
+                    )),
+            )
+            .child(
+                div()
+                    .id("eq-bands")
+                    .w_full()
+                    .flex()
+                    .gap(px(1.))
+                    .children(bands),
+            )
             .into_any_element()
     }
 
     fn band_column(&self, freq: &str, gain: &str, slider: AnyElement) -> AnyElement {
         div()
-            .w(px(36.))
-            .flex_shrink_0()
+            .flex_1()
+            .min_w(px(0.))
             .flex()
             .flex_col()
             .items_center()
-            .gap(px(4.))
+            .gap(px(2.))
             .child(slider)
-            .child(div().text_size(px(10.)).child(gain.to_string()))
             .child(
                 div()
-                    .text_size(px(10.))
+                    .w_full()
+                    .min_w(px(0.))
+                    .text_center()
+                    .text_size(px(9.))
+                    .whitespace_nowrap()
+                    .child(gain.to_string()),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .min_w(px(0.))
+                    .text_center()
+                    .text_size(px(8.))
                     .text_color(theme::text_muted())
+                    .whitespace_nowrap()
                     .child(freq.to_string()),
             )
             .into_any_element()
@@ -1482,24 +1511,26 @@ impl SettingsWindow {
         let knob_down = knob.clone();
         div()
             .relative()
-            .w(px(28.))
-            .h(px(112.))
+            .w_full()
+            .h(px(96.))
             .cursor_pointer()
             .child(self.bounds_canvas(id.clone(), cx))
             .child(
                 div()
                     .absolute()
                     .top(px(0.))
-                    .left(px(12.))
-                    .w(px(4.))
                     .h_full()
+                    .left(relative(0.5))
+                    .ml(px(-2.))
+                    .w(px(4.))
                     .rounded_full()
                     .bg(theme::bg_elevated()),
             )
             .child(
                 div()
                     .absolute()
-                    .left(px(12.))
+                    .left(relative(0.5))
+                    .ml(px(-2.))
                     .w(px(4.))
                     .top(relative(fill_top))
                     .h(relative(fill_h))
@@ -1509,7 +1540,8 @@ impl SettingsWindow {
             .child(
                 div()
                     .absolute()
-                    .left(px(9.))
+                    .left(relative(0.5))
+                    .ml(px(-5.))
                     .top(relative(top))
                     .mt(px(-5.))
                     .size(px(10.))
@@ -2331,6 +2363,24 @@ fn db_text(value: f32) -> String {
     }
 }
 
+/// Band readout short enough to sit under a slider that shares the card width.
+/// Tenths stay while the number is a single digit. Larger gains drop the tenth.
+fn db_tick(value: f32) -> String {
+    let shown = (value * 10.0).round() / 10.0;
+    if shown.abs() >= 9.95 || (shown - shown.round()).abs() < 0.05 {
+        let whole = shown.round() as i32;
+        if whole > 0 {
+            format!("+{whole}")
+        } else {
+            format!("{whole}")
+        }
+    } else if shown > 0.0 {
+        format!("+{shown:.1}")
+    } else {
+        format!("{shown:.1}")
+    }
+}
+
 fn hz_to_pos(hz: f32) -> f32 {
     let hz = hz.clamp(HP_OPEN_HZ, LP_OPEN_HZ);
     let log_min = HP_OPEN_HZ.ln();
@@ -2383,6 +2433,17 @@ mod tests {
         assert_eq!(format_hz(63.0), "63");
         assert_eq!(format_hz(1000.0), "1k");
         assert_eq!(format_hz(12500.0), "12.5k");
+        for hz in BAND_FREQUENCIES {
+            let label = format_hz(hz);
+            assert!(label.chars().count() <= 5, "{label}");
+        }
+        for value in [-20.0, -12.4, -9.5, -0.4, 0.0, 4.0, 9.4, 12.0, 20.0] {
+            let label = db_tick(value);
+            assert!(label.chars().count() <= 4, "{value} -> {label}");
+        }
+        assert_eq!(db_tick(0.0), "0");
+        assert_eq!(db_tick(4.4), "+4.4");
+        assert_eq!(db_tick(-12.4), "-12");
         assert_eq!(pos_to_hz(0.0), 20.0);
         assert_eq!(pos_to_hz(1.0), 20000.0);
     }

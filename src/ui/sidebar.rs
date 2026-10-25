@@ -321,6 +321,131 @@ impl MainWindow {
             .into_any_element()
     }
 
+    /// Cover with the same hover play button as a playlist. `on_play` starts the track.
+    pub(crate) fn cover_with_play(
+        &self,
+        key: &str,
+        size: f32,
+        cover: Option<&std::path::Path>,
+        cx: &mut Context<Self>,
+        on_play: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+    ) -> AnyElement {
+        let hover_id = SharedString::from(format!("track-cover-{key}"));
+        let hovered = self.item_drag.is_none() && self.hovered_cover.as_ref() == Some(&hover_id);
+        let play_id = SharedString::from(format!("track-cover-play-{key}"));
+        let play_size = (size * 0.5).max(12.);
+        let fade_id = SharedString::from(format!("track-cover-fade-{key}"));
+        div()
+            .id(hover_id.clone())
+            .relative()
+            .size(px(size))
+            .flex_shrink_0()
+            .on_hover(Self::hover_cover_listener(hover_id, cx))
+            .child(cover_art(cover, size))
+            .child({
+                let play_id = play_id.clone();
+                div()
+                    .id(play_id.clone())
+                    .absolute()
+                    .inset_0()
+                    .rounded(px(4.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .when(hovered, |overlay| {
+                        let play_id = play_id.clone();
+                        overlay
+                            .cursor_pointer()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener({
+                                    let play_id = play_id.clone();
+                                    move |this, _: &gpui::MouseDownEvent, _, cx| {
+                                        cx.stop_propagation();
+                                        this.arm(play_id.clone(), false);
+                                    }
+                                }),
+                            )
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |this, _: &gpui::MouseUpEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    if !this.armed(&play_id) {
+                                        return;
+                                    }
+                                    on_play(this, cx);
+                                }),
+                            )
+                    })
+                    .with_spring(
+                        fade_id,
+                        Self::smooth_spring(hovered),
+                        move |overlay, phase| {
+                            let t = phase.0.clamp(0.0, 1.0);
+                            overlay.bg(gpui::rgba(0x000000b0).opacity(t)).child(
+                                div()
+                                    .size(px(play_size))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(icon_scaled(
+                                        icons::PLAY,
+                                        theme::white().opacity(t),
+                                        px(play_size),
+                                        0.92 + 0.08 * t,
+                                    )),
+                            )
+                        },
+                    )
+            })
+            .into_any_element()
+    }
+
+    /// Right-side control that scrolls a track into view without playing it.
+    pub(crate) fn go_to_track_button(
+        &self,
+        key: &str,
+        cx: &mut Context<Self>,
+        on_go: impl Fn(&mut Self, &mut gpui::Window, &mut Context<Self>) + 'static,
+    ) -> AnyElement {
+        let arm_id = SharedString::from(format!("go-track-{key}"));
+        let release_id = arm_id.clone();
+        div()
+            .id(arm_id.clone())
+            .flex_shrink_0()
+            .h(px(22.))
+            .px(px(8.))
+            .rounded_sm()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(gpui::rgba(0xffffff0f))
+            .text_size(px(10.))
+            .text_color(theme::text_secondary())
+            .whitespace_nowrap()
+            .cursor_pointer()
+            .hover(|style| style.bg(theme::hover()).text_color(theme::text()))
+            .child("Go to track")
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _: &gpui::MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.arm(arm_id.clone(), false);
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, _: &gpui::MouseUpEvent, window, cx| {
+                    cx.stop_propagation();
+                    if !this.armed(&release_id) {
+                        return;
+                    }
+                    on_go(this, window, cx);
+                }),
+            )
+            .into_any_element()
+    }
+
     fn playlist_list(
         &self,
         playlists: Vec<Playlist>,
@@ -394,6 +519,7 @@ impl MainWindow {
                         let playing = playing_here(&playlist);
                         let count = playlist.track_ids.len();
                         let id = playlist.id.clone();
+                        let rename_id = id.clone();
                         let drop_name = playlist.name.clone();
                         let element_id = SharedString::from(format!("playlist-{}", playlist.id));
                         let hovered = self.hovered_ui.as_ref() == Some(&element_id);
@@ -428,6 +554,14 @@ impl MainWindow {
                         } else {
                             theme::text()
                         };
+                        let flash =
+                            self.found_playlist_flash_amount(&playlist.id, cx.reduce_motion());
+                        let row_base = if active {
+                            theme::accent_soft()
+                        } else {
+                            theme::bg_surface()
+                        };
+                        let row_color = theme::flash_wash(row_base, flash);
                         let row = div()
                             .id(element_id.clone())
                             .relative()
@@ -460,7 +594,7 @@ impl MainWindow {
                                     .overflow_hidden()
                                     .px(px(8.))
                             })
-                            .when(active, |row| row.bg(theme::accent_soft()))
+                            .when(active || flash > 0.0, |row| row.bg(row_color))
                             .on_hover(Self::hover_listener(element_id.clone(), cx))
                             .on_mouse_down(
                                 MouseButton::Left,
@@ -572,6 +706,10 @@ impl MainWindow {
                                             .into_any_element()
                                     } else {
                                         div()
+                                            .id(SharedString::from(format!(
+                                                "playlist-name-{}",
+                                                playlist.id
+                                            )))
                                             .text_size(px(12.))
                                             .when(density != PlaylistDensity::Nano, |name| {
                                                 name.line_height(px(14.))
@@ -584,6 +722,18 @@ impl MainWindow {
                                             .text_color(name_color)
                                             .truncate()
                                             .child(playlist.name)
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                                                    if event.click_count < 2 {
+                                                        return;
+                                                    }
+                                                    cx.stop_propagation();
+                                                    this.armed_ui = None;
+                                                    this.press_at = None;
+                                                    this.begin_rename(rename_id.clone(), window, cx);
+                                                }),
+                                            )
                                             .into_any_element()
                                     })
                                     .when(density != PlaylistDensity::Nano, |col| {
@@ -616,7 +766,7 @@ impl MainWindow {
                                 SharedString::from(format!("{element_id}-hover")),
                                 Self::smooth_spring(hovered && !drop_here),
                                 move |row, phase| {
-                                    if active {
+                                    if active || flash > 0.0 {
                                         row
                                     } else {
                                         row.bg(theme::hover().opacity(phase.0))

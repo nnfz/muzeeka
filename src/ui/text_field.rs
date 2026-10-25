@@ -31,6 +31,9 @@ actions!(
         Copy,
         EscapeField,
         Submit,
+        AcceptSuggestion,
+        PickUp,
+        PickDown,
     ]
 );
 
@@ -48,6 +51,13 @@ pub struct TextField {
     on_change: Rc<dyn Fn(&str, &mut Window, &mut App)>,
     on_escape: Rc<dyn Fn(&mut Window, &mut App)>,
     on_submit: Rc<dyn Fn(&str, &mut Window, &mut App)>,
+    /// Returns whether Tab was used. False leaves the key for whoever else wants it.
+    /// The text is passed in so the handler does not read this field while it is updating.
+    on_tab: Rc<dyn Fn(&str, &mut Window, &mut App) -> bool>,
+    /// Up and down in the search field. `delta` is -1 or 1. False leaves the key alone.
+    on_pick: Rc<dyn Fn(&str, i32, &mut Window, &mut App) -> bool>,
+    /// Arrow bindings apply only while this is set, so a rename field keeps them.
+    picks: bool,
 }
 
 impl TextField {
@@ -71,6 +81,9 @@ impl TextField {
             on_change: Rc::new(on_change),
             on_escape: Rc::new(on_escape),
             on_submit: Rc::new(|_text, _window, _app| {}),
+            on_tab: Rc::new(|_text, _window, _app| false),
+            on_pick: Rc::new(|_text, _delta, _window, _app| false),
+            picks: false,
         }
     }
 
@@ -81,6 +94,19 @@ impl TextField {
 
     pub fn set_on_submit(&mut self, submit: impl Fn(&str, &mut Window, &mut App) + 'static) {
         self.on_submit = Rc::new(submit);
+    }
+
+    pub fn set_on_tab(&mut self, accept: impl Fn(&str, &mut Window, &mut App) -> bool + 'static) {
+        self.on_tab = Rc::new(accept);
+    }
+
+    /// Up and down choose a search row. The query is passed in so this field stays unread.
+    pub fn set_on_pick(
+        &mut self,
+        pick: impl Fn(&str, i32, &mut Window, &mut App) -> bool + 'static,
+    ) {
+        self.on_pick = Rc::new(pick);
+        self.picks = true;
     }
 
     pub fn set_on_escape(&mut self, escape: impl Fn(&mut Window, &mut App) + 'static) {
@@ -226,6 +252,35 @@ impl TextField {
         let text = self.content.to_string();
         let submit = self.on_submit.clone();
         submit(&text, window, cx);
+    }
+
+    fn accept_suggestion(
+        &mut self,
+        _: &AcceptSuggestion,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let accept = self.on_tab.clone();
+        let text = self.content.to_string();
+        if !accept(&text, window, cx) {
+            cx.propagate();
+        }
+    }
+
+    fn pick_up(&mut self, _: &PickUp, window: &mut Window, cx: &mut Context<Self>) {
+        self.pick(-1, window, cx);
+    }
+
+    fn pick_down(&mut self, _: &PickDown, window: &mut Window, cx: &mut Context<Self>) {
+        self.pick(1, window, cx);
+    }
+
+    fn pick(&mut self, delta: i32, window: &mut Window, cx: &mut Context<Self>) {
+        let pick = self.on_pick.clone();
+        let text = self.content.to_string();
+        if !pick(&text, delta, window, cx) {
+            cx.propagate();
+        }
     }
 
     fn on_mouse_down(
@@ -675,7 +730,11 @@ impl gpui::Render for TextField {
             .h_full()
             .items_center()
             .overflow_hidden()
-            .key_context("TextInput")
+            .key_context(if self.picks {
+                "TextInput SearchField"
+            } else {
+                "TextInput"
+            })
             .track_focus(&self.focus)
             .cursor(CursorStyle::IBeam)
             .text_size(px(12.))
@@ -694,6 +753,9 @@ impl gpui::Render for TextField {
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::escape))
             .on_action(cx.listener(Self::submit))
+            .on_action(cx.listener(Self::accept_suggestion))
+            .on_action(cx.listener(Self::pick_up))
+            .on_action(cx.listener(Self::pick_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -719,5 +781,8 @@ pub fn bind_text_keys(cx: &mut App) {
         KeyBinding::new("ctrl-x", Cut, Some("TextInput")),
         KeyBinding::new("escape", EscapeField, Some("TextInput")),
         KeyBinding::new("enter", Submit, Some("TextInput")),
+        KeyBinding::new("tab", AcceptSuggestion, Some("TextInput")),
+        KeyBinding::new("up", PickUp, Some("SearchField")),
+        KeyBinding::new("down", PickDown, Some("SearchField")),
     ]);
 }

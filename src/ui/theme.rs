@@ -65,6 +65,18 @@ pub fn accent_soft() -> Rgba {
     mix(bg_surface(), accent(), ACCENT_SOFT_ALPHA)
 }
 
+/// How much white a reveal blink mixes in at full strength.
+/// High enough to read on `#111`, low enough that the row stays gray.
+const FLASH_PEAK: f32 = 0.22;
+
+/// Soft gray lift for a track that was just scrolled into view.
+/// `amount` is 0 at rest and 1 at the peak of a blink. Flattened onto `base`
+/// for the same reason as [`accent_soft`]: a plain alpha wash lets the rows
+/// behind a dragged row show through.
+pub fn flash_wash(base: Rgba, amount: f32) -> Rgba {
+    mix(base, rgb(0xffffff), FLASH_PEAK * amount.clamp(0.0, 1.0))
+}
+
 fn mix(base: Rgba, over: Rgba, amount: f32) -> Rgba {
     let t = amount.clamp(0.0, 1.0);
     rgb(channel(base.r, over.r, t) << 16

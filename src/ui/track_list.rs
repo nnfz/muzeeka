@@ -463,6 +463,14 @@ impl MainWindow {
         let play_id = row_id.clone();
         let like_id = SharedString::from(format!("like-{}", id.0));
         let hovered = self.hovered_track == Some(id);
+        let flash = self.found_flash_amount(id, cx.reduce_motion());
+        let row_base = if current {
+            theme::accent_soft()
+        } else {
+            theme::bg_surface()
+        };
+        let row_color = theme::flash_wash(row_base, flash);
+        let lit = current || flash > 0.0;
         let hover_entity = cx.entity().clone();
 
         let row = div()
@@ -493,7 +501,7 @@ impl MainWindow {
                         .pr(px(TRACK_END_PAD))
                         .rounded_md()
                         .cursor_pointer()
-                        .when(current, |row| row.bg(theme::accent_soft()))
+                        .when(lit, |row| row.bg(row_color))
                         .on_hover(move |over, _, app| {
                             hover_entity.update(app, |this, cx| {
                                 // A press turns into a drag, and GPUI reports the row as
@@ -562,11 +570,7 @@ impl MainWindow {
                         ))
                         .child(self.title_cell(&track, current))
                         .child({
-                            let base_color = if current {
-                                theme::accent_soft()
-                            } else {
-                                theme::bg_surface()
-                            };
+                            let base_color = if lit { row_color } else { theme::bg_surface() };
                             let album_fade_id = SharedString::from(format!("track-hover-{}", id.0));
                             div()
                                 .relative()
@@ -599,7 +603,7 @@ impl MainWindow {
                                             album_fade_id,
                                             MainWindow::hover_spring(hovered),
                                             move |overlay, phase| {
-                                                let fade_color = if current {
+                                                let fade_color = if lit {
                                                     base_color
                                                 } else {
                                                     mix_rgba(
@@ -626,7 +630,7 @@ impl MainWindow {
                             SharedString::from(format!("track-hover-{}", id.0)),
                             MainWindow::hover_spring(hovered),
                             move |row, phase| {
-                                if current {
+                                if lit {
                                     row
                                 } else {
                                     row.bg(theme::hover().opacity(phase.0))

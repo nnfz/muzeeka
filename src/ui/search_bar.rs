@@ -7,7 +7,6 @@ use gpui::{
     SpringConfig, Styled, Window,
 };
 
-use crate::ui::cover::cover_art;
 use crate::ui::icons::{self, icon};
 use crate::ui::main_window::{MainWindow, Scroller};
 use crate::ui::session::{self, has_search_text, looks_like_url, Suggestion, TrackId};
@@ -118,6 +117,11 @@ impl MainWindow {
             self.warm_search_scrollbar(window, cx);
         }
         let described = session::describe_search(&query);
+        let suggestion_pick = self.picked_index(&query, suggestions.len());
+        let result_pick = hits
+            .as_ref()
+            .map(|hits| self.picked_index(&query, hits.len()))
+            .unwrap_or(0);
 
         div()
             .absolute()
@@ -129,13 +133,13 @@ impl MainWindow {
             .when(show_suggestions, |layer| {
                 layer.child(fade_in(
                     "search-suggest-in",
-                    self.suggestion_plate(suggestions, cx),
+                    self.suggestion_plate(suggestions, suggestion_pick, cx),
                 ))
             })
             .when_some(hits, |layer, hits| {
                 layer.child(fade_in(
                     "search-results-in",
-                    self.results_plate(hits, described, cx),
+                    self.results_plate(hits, described, result_pick, cx),
                 ))
             })
             .children(cards)
@@ -146,9 +150,103 @@ impl MainWindow {
             )
     }
 
+    /// Tab takes the highlighted suggestion, or opens that result the way "Go to track" does.
+    /// The field is still handling the key, so the edit is deferred until that update ends.
+    pub(crate) fn accept_search_suggestion(
+        &mut self,
+        query: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if ytdlp::is_media_url(query) {
+            return false;
+        }
+        let len = self.search_choice_count(query, cx);
+        let index = self.picked_index(query, len);
+        let choice = session::search_tab(self.session.read(cx), query, index);
+        match choice {
+            Some(session::SearchTab::Complete(insert)) => {
+                let search = self.search.clone();
+                window.defer(cx, move |window, cx| {
+                    search.update(cx, |field, cx| field.set_text(insert, window, cx));
+                });
+                true
+            }
+            Some(session::SearchTab::Reveal(id)) => {
+                let entity = cx.entity().clone();
+                window.defer(cx, move |window, cx| {
+                    entity.update(cx, |this, cx| this.go_to_search_track(id, window, cx));
+                });
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Up or down moves the highlight. The first row is selected until an arrow moves it.
+    pub(crate) fn move_search_pick(
+        &mut self,
+        query: &str,
+        delta: i32,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let len = self.search_choice_count(query, cx);
+        let Some(next) = session::step_pick(len, self.picked_index(query, len), delta) else {
+            return false;
+        };
+        let showing_results = self.session.read(cx).suggestions(query).is_empty();
+        if next != self.search_pick || self.search_pick_query != query {
+            self.search_pick = next;
+            self.search_pick_query = query.to_string();
+            if showing_results {
+                self.search_scroll
+                    .scroll_to_item(next, gpui::ScrollStrategy::Nearest);
+            }
+            cx.notify();
+        }
+        true
+    }
+
+    fn search_choice_count(&self, query: &str, cx: &Context<Self>) -> usize {
+        if ytdlp::is_media_url(query) || looks_like_url(query) {
+            return 0;
+        }
+        let session = self.session.read(cx);
+        let suggestions = session.suggestions(query).len();
+        if suggestions > 0 {
+            return suggestions;
+        }
+        if has_search_text(query) {
+            session.search_ids(query).len()
+        } else {
+            0
+        }
+    }
+
+    /// Highlight for this query. A query that just changed still shows the first row.
+    fn picked_index(&self, query: &str, len: usize) -> usize {
+        if len == 0 || self.search_pick_query != query {
+            return 0;
+        }
+        self.search_pick.min(len - 1)
+    }
+
+    /// Clear the query and scroll this track into view, without playing it.
+    fn go_to_search_track(&mut self, id: TrackId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(spot) = self.session.read(cx).spot_for_track(id) else {
+            return;
+        };
+        let view = spot.view.clone();
+        let track_id = spot.track_id;
+        self.search.update(cx, |field, cx| field.clear(cx));
+        self.note_search_cleared();
+        self.reveal_in_playlist(track_id, view, window, cx);
+    }
+
     fn suggestion_plate(
         &self,
         suggestions: Vec<Suggestion>,
+        pick: usize,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         div()
@@ -184,6 +282,7 @@ impl MainWindow {
                             .h(px(36.))
                             .px(px(12.))
                             .cursor_pointer()
+                            .when(index == pick, |row| row.bg(theme::accent_soft()))
                             .hover(|style| style.bg(theme::accent_soft()))
                             .on_mouse_down(
                                 MouseButton::Left,
@@ -213,9 +312,27 @@ impl MainWindow {
                             )
                             .child(
                                 div()
-                                    .text_size(px(11.))
-                                    .text_color(theme::text_muted())
-                                    .child(suggestion.detail),
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.))
+                                    .when(index == pick, |side| {
+                                        side.child(
+                                            div()
+                                                .px(px(4.))
+                                                .rounded_sm()
+                                                .border_1()
+                                                .border_color(theme::border())
+                                                .text_size(px(10.))
+                                                .text_color(theme::text_muted())
+                                                .child("Tab"),
+                                        )
+                                    })
+                                    .child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .text_color(theme::text_muted())
+                                            .child(suggestion.detail),
+                                    ),
                             )
                     }),
             )
@@ -225,6 +342,7 @@ impl MainWindow {
         &self,
         hits: Arc<Vec<TrackId>>,
         description: String,
+        pick: usize,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let count = hits.len();
@@ -297,11 +415,16 @@ impl MainWindow {
                     .child("No matches — try @a, @t, @p, @artist, @title or @playlist")
                     .into_any_element()
             } else {
-                self.result_rows(hits, cx).into_any_element()
+                self.result_rows(hits, pick, cx).into_any_element()
             })
     }
 
-    fn result_rows(&self, hits: Arc<Vec<TrackId>>, cx: &mut Context<Self>) -> impl IntoElement {
+    fn result_rows(
+        &self,
+        hits: Arc<Vec<TrackId>>,
+        pick: usize,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let count = hits.len();
         let list_h = (count as f32 * SEARCH_ROW_H).min(SEARCH_LIST_MAX_H);
         let entity = cx.entity().clone();
@@ -330,6 +453,7 @@ impl MainWindow {
                                         track.duration,
                                         session.playlist_label(id),
                                         session.current,
+                                        row == pick,
                                     ))
                                 })
                                 .collect::<Vec<_>>()
@@ -337,19 +461,19 @@ impl MainWindow {
                         prepared
                             .into_iter()
                             .map(|hit| match hit {
-                                Some((id, title, artist, cover, duration, playlist, current)) => {
-                                    view.search_result_row(
-                                        id,
-                                        title,
-                                        artist,
-                                        cover,
-                                        duration,
-                                        playlist,
-                                        current,
-                                        Arc::clone(&hits),
-                                        cx,
-                                    )
-                                }
+                                Some((
+                                    id,
+                                    title,
+                                    artist,
+                                    cover,
+                                    duration,
+                                    playlist,
+                                    current,
+                                    primary,
+                                )) => view.search_result_row(
+                                    id, title, artist, cover, duration, playlist, current, primary,
+                                    cx,
+                                ),
                                 None => div().w_full().h(px(SEARCH_ROW_H)).into_any_element(),
                             })
                             .collect()
@@ -376,18 +500,18 @@ impl MainWindow {
         duration: f64,
         playlist: Option<String>,
         current: Option<TrackId>,
-        hits: Arc<Vec<TrackId>>,
+        primary: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let active = current == Some(id);
         let row_id = gpui::SharedString::from(format!("search-hit-{}", id.0));
-        let arm_id = row_id.clone();
-        let release_id = row_id.clone();
         let secondary = match playlist {
             Some(name) => format!("{artist} · {name}"),
             None => artist,
         };
         let features = gpui::FontFeatures(Arc::new(vec![("tnum".into(), 1)]));
+        let cover_key = format!("search-{}", id.0);
+        let go_key = cover_key.clone();
         div()
             .id(row_id)
             .w_full()
@@ -396,36 +520,22 @@ impl MainWindow {
             .gap(px(10.))
             .h(px(SEARCH_ROW_H))
             .px(px(12.))
-            .cursor_pointer()
-            .when(active, |row| row.bg(theme::accent_soft()))
+            .when(active || primary, |row| row.bg(theme::accent_soft()))
             .hover(|style| {
-                style.bg(if active {
+                style.bg(if active || primary {
                     theme::accent_soft()
                 } else {
                     theme::hover()
                 })
             })
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _: &gpui::MouseDownEvent, _, cx| {
-                    cx.stop_propagation();
-                    this.arm(arm_id.clone(), false);
-                }),
-            )
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(move |this, _: &gpui::MouseUpEvent, _, cx| {
-                    if !this.armed(&release_id) {
-                        return;
-                    }
-                    let queue = hits.as_ref().clone();
+            .child(
+                self.cover_with_play(&cover_key, 28., cover.as_deref(), cx, move |this, cx| {
                     this.session.update(cx, |session, cx| {
-                        session.play(id, queue);
+                        session.play_track(id, None);
                         cx.notify();
                     });
                 }),
             )
-            .child(cover_art(cover.as_deref(), 28.))
             .child(
                 div()
                     .flex()
@@ -458,6 +568,24 @@ impl MainWindow {
                     .text_color(theme::text_muted())
                     .font_features(features)
                     .child(session::format_time(duration)),
+            )
+            .when(primary, |row| {
+                row.child(
+                    div()
+                        .flex_shrink_0()
+                        .px(px(4.))
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(theme::border())
+                        .text_size(px(10.))
+                        .text_color(theme::text_muted())
+                        .child("Tab"),
+                )
+            })
+            .child(
+                self.go_to_track_button(&go_key, cx, move |this, window, cx| {
+                    this.go_to_search_track(id, window, cx);
+                }),
             )
             .into_any_element()
     }

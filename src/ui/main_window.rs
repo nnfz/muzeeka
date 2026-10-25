@@ -22,7 +22,8 @@ actions!(
         PrevTrack,
         FocusSearch,
         VolumeUp,
-        VolumeDown
+        VolumeDown,
+        RenamePlaylist
     ]
 );
 
@@ -86,6 +87,10 @@ pub struct MainWindow {
     /// Query, library size, and hit ids. Reused while the text is unchanged
     /// so a wheel frame does not scan the library again.
     pub(crate) search_hits: Option<(String, usize, Arc<Vec<TrackId>>)>,
+    /// Highlighted suggestion or result. Arrows move it. Tab accepts it.
+    pub(crate) search_pick: usize,
+    /// Query `search_pick` belongs to. A newer query highlights the first row.
+    pub(crate) search_pick_query: String,
     bar_drag: Option<BarDrag>,
     menu: PopMenu,
     pub(crate) rename_field: gpui::Entity<TextField>,
@@ -94,6 +99,12 @@ pub struct MainWindow {
     rename_blur: Option<gpui::Subscription>,
     pub(crate) file_drop: crate::ui::file_drop::FileDropState,
     pub(crate) download: crate::ui::download_ui::DownloadState,
+    /// Track to scroll into the open playlist, and how many frames to keep trying.
+    pending_reveal: Option<(TrackId, u8)>,
+    /// Track just scrolled into view, and when its white blink started.
+    found_flash: Option<(TrackId, Instant)>,
+    /// Playlists that blink with `found_flash` because the track is in more than one.
+    found_playlists: Vec<String>,
     shown_title: String,
     taskbar_attached: bool,
     /// Visible track rows. Reused while the library view is unchanged, so the
@@ -362,7 +373,9 @@ impl MainWindow {
             let focus = focus.clone();
             let escape_host = host.clone();
             move |cx| {
-                TextField::new(
+                let tab_host = escape_host.clone();
+                let pick_host = tab_host.clone();
+                let mut field = TextField::new(
                     cx,
                     "Search or paste URL",
                     move |text, window, app| {
@@ -376,6 +389,8 @@ impl MainWindow {
                         window.defer(app, move |_window, app| {
                             host.update(app, |this, cx| {
                                 this.note_download_query(&text, cx);
+                                this.search_pick = 0;
+                                this.search_pick_query = text;
                                 cx.notify();
                             });
                         });
@@ -387,7 +402,18 @@ impl MainWindow {
                             escape_host.update(app, |_, cx| cx.notify());
                         }
                     },
-                )
+                );
+                field.set_on_tab(move |text, window, app| {
+                    let text = text.to_string();
+                    tab_host.update(app, |this, cx| {
+                        this.accept_search_suggestion(&text, window, cx)
+                    })
+                });
+                field.set_on_pick(move |text, delta, _window, app| {
+                    let text = text.to_string();
+                    pick_host.update(app, |this, cx| this.move_search_pick(&text, delta, cx))
+                });
+                field
             }
         });
         let tick = cx.spawn(async move |this, cx| loop {
@@ -421,7 +447,8 @@ impl MainWindow {
                     });
                     let drop_dirty = view.tick_file_drop();
                     let download_dirty = view.tick_download(cx);
-                    if session_dirty || drop_dirty || download_dirty {
+                    let flash_dirty = view.tick_found_flash(cx.reduce_motion());
+                    if session_dirty || drop_dirty || download_dirty || flash_dirty {
                         cx.notify();
                     }
                 })
@@ -461,13 +488,18 @@ impl MainWindow {
             sidebar_ease: EaseScroll::new(),
             search_ease: EaseScroll::new(),
             search_hits: None,
+            search_pick: 0,
+            search_pick_query: String::new(),
             bar_drag: None,
             menu: PopMenu::None,
             rename_field,
             rename_wired: false,
             rename_blur: None,
             file_drop: crate::ui::file_drop::FileDropState::default(),
-            download: crate::ui::download_ui::DownloadState::default(),
+            download: crate::ui::download_ui::DownloadState::load(),
+            pending_reveal: None,
+            found_flash: None,
+            found_playlists: Vec::new(),
             shown_title: String::new(),
             taskbar_attached: false,
             listed: None,
@@ -654,6 +686,7 @@ impl MainWindow {
         let released = self.pressed_ui.take().is_some();
         let scrolled = self.bar_drag.take().is_some();
         self.armed_ui = None;
+        self.download.close_press = false;
         self.press_at = None;
         resized || released || scrolled
     }
@@ -883,6 +916,22 @@ impl MainWindow {
         });
     }
 
+    fn rename_open_playlist(
+        &mut self,
+        _: &RenamePlaylist,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let id = match &self.session.read(cx).view {
+            session::LibraryView::Playlist(id) => id.clone(),
+            session::LibraryView::All | session::LibraryView::Liked => return,
+        };
+        if matches!(&self.menu, PopMenu::Rename { id: editing } if editing == &id) {
+            return;
+        }
+        self.begin_rename(id, window, cx);
+    }
+
     fn focus_search(&mut self, _: &FocusSearch, window: &mut Window, cx: &mut Context<Self>) {
         let focus = self.search.read(cx).focus.clone();
         focus.focus(window, cx);
@@ -943,6 +992,8 @@ impl Render for MainWindow {
         self.sync_scrolls_if_idle();
         self.tick_playlist_autoscroll(window);
         self.reveal_current(cx);
+        self.reveal_queued(cx);
+        self.pump_found_flash(window, cx.reduce_motion());
         self.warm_scrollbars(window, cx);
         self.sync_accent(cx);
         self.sync_title(window, cx);
@@ -970,6 +1021,7 @@ impl Render for MainWindow {
             .on_action(cx.listener(Self::focus_search))
             .on_action(cx.listener(Self::volume_up))
             .on_action(cx.listener(Self::volume_down))
+            .on_action(cx.listener(Self::rename_open_playlist))
             .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
                 if !event.dragging() {
                     return;
@@ -983,6 +1035,11 @@ impl Render for MainWindow {
                 }
             }))
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                if event.keystroke.key == "escape" && this.download.open {
+                    this.download.open = false;
+                    cx.notify();
+                    return;
+                }
                 if event.keystroke.key == "escape" && this.menu.is_open() {
                     this.close_menu(window, cx);
                 }
@@ -1121,9 +1178,129 @@ impl MainWindow {
         cx.notify();
     }
 
+    /// Scroll `id` into `view` without starting playback.
+    pub(crate) fn reveal_in_playlist(
+        &mut self,
+        id: TrackId,
+        view: crate::ui::session::LibraryView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.session.update(cx, |session, cx| {
+            session.view = view;
+            cx.notify();
+        });
+        let y = self.track_scroll.0.borrow().base_handle.offset().y.as_f32();
+        self.track_ease.snap(y);
+        self.pending_reveal = Some((id, 3));
+        self.found_flash = None;
+        self.found_playlists.clear();
+        self.download.open = false;
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
+    /// The list may still be the previous page on the first frame. Retry a few.
+    fn reveal_queued(&mut self, cx: &mut Context<Self>) {
+        let Some((id, left)) = self.pending_reveal else {
+            return;
+        };
+        if self
+            .track_scroll
+            .0
+            .borrow()
+            .base_handle
+            .bounds()
+            .size
+            .height
+            <= px(1.)
+        {
+            return;
+        }
+        let row = {
+            let session = self.session.read(cx);
+            session.visible_indexes("").iter().position(|index| {
+                session
+                    .track_by_index(*index)
+                    .is_some_and(|track| track.id == id)
+            })
+        };
+        if let Some(row) = row {
+            self.track_scroll
+                .scroll_to_item(row, gpui::ScrollStrategy::Center);
+            if self.found_flash.is_none() {
+                self.found_playlists = self.session.read(cx).playlists_to_flash(id);
+                self.found_flash = Some((id, Instant::now()));
+            }
+        }
+        self.pending_reveal = if row.is_some() && left > 1 {
+            Some((id, left - 1))
+        } else {
+            None
+        };
+    }
+
+    /// 0 at rest, 1 at the peak of a reveal blink. Other rows stay at 0.
+    pub(crate) fn found_flash_amount(&self, id: TrackId, reduce_motion: bool) -> f32 {
+        let Some((found, started)) = self.found_flash else {
+            return 0.0;
+        };
+        if found != id {
+            return 0.0;
+        }
+        flash_amount(started.elapsed().as_millis(), reduce_motion)
+    }
+
+    /// Same clock as the found track. Quiet unless this playlist is one of several homes.
+    pub(crate) fn found_playlist_flash_amount(&self, id: &str, reduce_motion: bool) -> f32 {
+        let Some((_, started)) = self.found_flash else {
+            return 0.0;
+        };
+        if !self.found_playlists.iter().any(|playlist| playlist == id) {
+            return 0.0;
+        }
+        flash_amount(started.elapsed().as_millis(), reduce_motion)
+    }
+
+    /// Draw another frame while the blink is fading. A reduced-motion hold
+    /// does not pulse, so the 100ms tick is enough to clear it.
+    fn pump_found_flash(&mut self, window: &mut Window, reduce_motion: bool) {
+        let Some((_, started)) = self.found_flash else {
+            return;
+        };
+        if flash_done(started.elapsed().as_millis(), reduce_motion) {
+            self.found_flash = None;
+            self.found_playlists.clear();
+            return;
+        }
+        if !reduce_motion {
+            window.request_animation_frame();
+        }
+    }
+
+    /// Clear the blink once it has finished. Frames repaint the fade; this
+    /// only asks for a paint when the wash actually goes away.
+    fn tick_found_flash(&mut self, reduce_motion: bool) -> bool {
+        let Some((_, started)) = self.found_flash else {
+            return false;
+        };
+        if flash_done(started.elapsed().as_millis(), reduce_motion) {
+            self.found_flash = None;
+            self.found_playlists.clear();
+            true
+        } else {
+            false
+        }
+    }
+
     /// First Esc clears a filled search. The next Esc, or the only Esc on an
     /// empty field, leaves the field so the bar collapses.
     fn on_search_escape(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.download.open {
+            self.download.open = false;
+            cx.notify();
+            return false;
+        }
         let empty = self.search.read(cx).content.is_empty();
         if !empty {
             self.search.update(cx, |field, cx| field.clear(cx));
@@ -1195,7 +1372,7 @@ impl MainWindow {
         cx.notify();
     }
 
-    fn begin_rename(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn begin_rename(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
         let name = self
             .session
             .read(cx)
@@ -1723,6 +1900,7 @@ impl MainWindow {
 
     fn header(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let error = self.session.read(cx).playback_error.clone();
+        let show_downloads = self.downloads_shown(cx);
         div()
             .flex()
             .items_center()
@@ -1731,6 +1909,7 @@ impl MainWindow {
             .gap(px(8.))
             .window_control_area(WindowControlArea::Drag)
             .child(self.search_bar(window, cx))
+            .when(show_downloads, |bar| bar.child(self.downloads_button(cx)))
             .child(self.playback_error_slot(error, cx))
             .child(self.header_buttons(window, cx))
     }
@@ -1832,7 +2011,95 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-right", NextTrack, Some("!TextInput")),
         KeyBinding::new("ctrl-left", PrevTrack, Some("!TextInput")),
         KeyBinding::new("ctrl-f", FocusSearch, None),
+        KeyBinding::new("tab", FocusSearch, Some("!TextInput")),
         KeyBinding::new("ctrl-up", VolumeUp, Some("!TextInput")),
         KeyBinding::new("ctrl-down", VolumeDown, Some("!TextInput")),
+        KeyBinding::new("f2", RenamePlaylist, Some("!TextInput")),
     ]);
+}
+
+/// One blink eases in, eases out, then rests. Four of these, then the wash is gone.
+const FLASH_RISE_MS: u128 = 170;
+const FLASH_FALL_MS: u128 = 170;
+const FLASH_REST_MS: u128 = 60;
+const FLASH_COUNT: u128 = 4;
+const FLASH_CYCLE_MS: u128 = FLASH_RISE_MS + FLASH_FALL_MS + FLASH_REST_MS;
+const FLASH_TOTAL_MS: u128 = FLASH_CYCLE_MS * FLASH_COUNT;
+/// Reduced motion keeps a steady dim mark, then drops it. No repeated blink.
+const FLASH_STILL_MS: u128 = 800;
+
+fn smoothstep(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+fn flash_done(elapsed_ms: u128, reduce_motion: bool) -> bool {
+    elapsed_ms
+        >= if reduce_motion {
+            FLASH_STILL_MS
+        } else {
+            FLASH_TOTAL_MS
+        }
+}
+
+/// Strength of the reveal wash, 0–1. Each pulse leaves and returns at rest
+/// with a flat slope, so the four blinks read as fades rather than a strobe.
+fn flash_amount(elapsed_ms: u128, reduce_motion: bool) -> f32 {
+    if reduce_motion {
+        return if elapsed_ms < FLASH_STILL_MS {
+            1.0
+        } else {
+            0.0
+        };
+    }
+    if elapsed_ms >= FLASH_TOTAL_MS {
+        return 0.0;
+    }
+    let into = elapsed_ms % FLASH_CYCLE_MS;
+    if into < FLASH_RISE_MS {
+        smoothstep(into as f32 / FLASH_RISE_MS as f32)
+    } else if into < FLASH_RISE_MS + FLASH_FALL_MS {
+        let t = (into - FLASH_RISE_MS) as f32 / FLASH_FALL_MS as f32;
+        1.0 - smoothstep(t)
+    } else {
+        0.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        flash_amount, FLASH_CYCLE_MS, FLASH_FALL_MS, FLASH_RISE_MS, FLASH_STILL_MS, FLASH_TOTAL_MS,
+    };
+
+    #[test]
+    fn found_track_blinks_four_times_then_stays_off() {
+        assert_eq!(flash_amount(0, false), 0.0);
+        let early = flash_amount(FLASH_RISE_MS / 4, false);
+        assert!(early < 0.25, "{early}");
+        let mid_rise = flash_amount(FLASH_RISE_MS / 2, false);
+        assert!((mid_rise - 0.5).abs() < 0.02, "{mid_rise}");
+        assert!((flash_amount(FLASH_RISE_MS, false) - 1.0).abs() < 1e-4);
+        let mid_fall = flash_amount(FLASH_RISE_MS + FLASH_FALL_MS / 2, false);
+        assert!((mid_fall - 0.5).abs() < 0.02, "{mid_fall}");
+        assert_eq!(flash_amount(FLASH_RISE_MS + FLASH_FALL_MS, false), 0.0);
+        assert_eq!(flash_amount(FLASH_CYCLE_MS - 1, false), 0.0);
+        assert!((flash_amount(FLASH_CYCLE_MS + FLASH_RISE_MS, false) - 1.0).abs() < 1e-4);
+        assert!((flash_amount(FLASH_CYCLE_MS * 3 + FLASH_RISE_MS, false) - 1.0).abs() < 1e-4);
+        assert_eq!(flash_amount(FLASH_TOTAL_MS, false), 0.0);
+        assert_eq!(flash_amount(5000, false), 0.0);
+
+        let mut prev = 0.0;
+        let mut max_step = 0.0_f32;
+        for ms in 0..=FLASH_TOTAL_MS {
+            let next = flash_amount(ms, false);
+            max_step = max_step.max((next - prev).abs());
+            prev = next;
+        }
+        assert!(max_step < 0.02, "{max_step}");
+
+        assert_eq!(flash_amount(0, true), 1.0);
+        assert_eq!(flash_amount(FLASH_STILL_MS - 1, true), 1.0);
+        assert_eq!(flash_amount(FLASH_STILL_MS, true), 0.0);
+    }
 }
