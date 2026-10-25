@@ -193,6 +193,34 @@ impl Engine {
         self.player.get_state()
     }
 
+    pub fn output_devices(&self) -> Result<Vec<muzeeka::audio::player::OutputDevice>, String> {
+        self.player.list_output_devices()
+    }
+
+    pub fn add_output(
+        &self,
+        device_id: i32,
+        volume: f32,
+    ) -> Result<muzeeka::audio::player::ExtraOutputInfo, String> {
+        self.player.add_extra_output(device_id, volume)
+    }
+
+    pub fn remove_output(&self, id: &str) -> Result<(), String> {
+        self.player.remove_extra_output(id)
+    }
+
+    pub fn set_output_volume(
+        &self,
+        id: &str,
+        volume: f32,
+    ) -> Result<muzeeka::audio::player::ExtraOutputInfo, String> {
+        self.player.set_extra_output_volume(id, volume)
+    }
+
+    pub fn outputs(&self) -> Result<Vec<muzeeka::audio::player::ExtraOutputInfo>, String> {
+        self.player.extra_outputs()
+    }
+
     /// True while this path is the open stream, including a pause fade.
     pub fn holds(&self, path: &str) -> bool {
         let snap = self.snapshot();

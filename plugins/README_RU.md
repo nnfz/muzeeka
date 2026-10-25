@@ -9,8 +9,8 @@ REST/SSE API плеера).
 
 Папка плагинов:
 
-- **dev-сборка** — `plugins/` в корне репозитория (рядом с `src-tauri`);
-- **packaged-сборка** — `plugins/` рядом с exe (иначе — в ресурсах приложения).
+- **dev-сборка** — `plugins/` в корне репозитория, рядом с `Cargo.toml`;
+- **packaged-сборка** — `plugins/` рядом с exe, если папки репозитория нет.
 
 Плагин — это папка с файлом `plugin.json` внутри. Положили папку → перезапустили/обновили
 список в *Настройки → Плагины*. Папка `sdk/` сканером игнорируется.
@@ -59,10 +59,13 @@ REST/SSE API плеера).
 
 ### settings[]
 
-Каждый элемент: `key`, `type` (`number` \| `boolean` \| `string`), `label`, `description`,
-для чисел — `min`/`max`, и необязательный `default`. Хост приводит сохранённые значения к
-объявленному типу, clamp-ит числа в min/max и подставляет default, поэтому плагин всегда
-получает валидное значение. Изменение настроек в UI **перезапускает** плагин.
+Каждый элемент: `key`, `type` (`number` \| `boolean` \| `string` \| `slider` \| `button`),
+`label`, `description`, для чисел и слайдеров — `min`/`max`, необязательный `step`
+(слайдер прилипает к шагу; в настройках −/+ двигает число и слайдер на `step` или на 1)
+и необязательный `default`. Хост приводит сохранённые значения к объявленному типу,
+ограничивает числа min/max и подставляет default, поэтому плагин всегда получает
+валидное значение. Изменение настроек в UI **перезапускает** плагин. `settings.set`
+из самого плагина записывает `settings.json` и не перезапускает его.
 
 ---
 
@@ -72,7 +75,8 @@ REST/SSE API плеера).
 |---|---|
 | `player:read` | `player.state` |
 | `player:control` | `player.play / pause / resume / toggle / next / prev / seek / volume` |
-| `library:read` | `library.playlists`, `library.playlist` |
+| `library:read` | `library.playlists`, `library.playlist`, `library.tracks` |
+| `library:write` | создать, переименовать, удалить и очистить плейлист; добавить, убрать, импортировать и удалить треки; `library.setLiked` |
 | `audio:devices` | `audio.devices` |
 | `audio:output` | `audio.addOutput`, `audio.removeOutput`, `audio.setOutputVolume`, `audio.outputs` |
 | `http:listen` | `http.serve`, `http.stop`, `http.status` |
@@ -99,6 +103,26 @@ muzeeka.player
 muzeeka.library
   .playlists()              // [{ id, name, trackCount }]
   .playlist(id)             // { id, name, tracks: [{ path, title, artist, album, durationSecs, coverUrl }] }
+  .tracks(query?)           // поиск по библиотеке; пустой запрос — все треки
+  .createPlaylist(name)     // новый плейлист; открытый вид не переключается
+  .ensurePlaylist(name)     // тот же плейлист, если имя уже есть, без учёта регистра
+  .renamePlaylist(id, name)
+  .deletePlaylist(id)       // треки остаются в библиотеке
+  .clearPlaylist(id)
+  .addTracks(playlistId, paths) // файлы или папки в этот плейлист
+  .removeTracks(playlistId, paths)
+  .deleteTracks(paths)      // убрать треки из библиотеки; файлы на диске остаются
+  .import({ paths, playlist?, playlistId?, clear?, open? })
+  .setLiked(path, liked)
+
+// import забирает саундтрек игры в один плейлист и может сначала его очистить:
+muzeeka.library.import({
+  playlist: "Celeste",
+  paths: ["C:/Games/Celeste/Content/Music"],
+  clear: true
+})
+// { ok, added, message, playlistId, playlist }
+// open: true открывает этот плейлист на экране. По умолчанию вид не меняется.
 
 muzeeka.audio
   .devices()                // устройства вывода
@@ -231,16 +255,28 @@ POST /api/play            { "path": "...", "playlistId"?: "..." }
 POST /api/toggle | /api/pause | /api/resume | /api/next | /api/prev
 POST /api/seek            { "position": 12.5 }
 POST /api/volume          { "volume": 0.5 }
-POST /api/playlist/select { "id": "..." }
+POST /api/playlist/select { "id": "..." }   контекст воспроизведения; открытый вид остаётся
 POST /api/shuffle/toggle  → { "shuffle_enabled": bool }
 POST /api/repeat/toggle   → { "repeat_mode": "off|one|all" }
+POST /api/playlist/create { "name": "..." }
+POST /api/playlist/rename { "id": "...", "name": "..." }
+POST /api/playlist/delete { "id": "..." }
+POST /api/playlist/clear  { "id": "..." }
+POST /api/playlist/tracks { "id": "...", "paths": ["..."], "clear"?: false }
+POST /api/tracks/delete   { "paths": ["..."] }   файлы остаются на диске
+POST /api/library/import  { "paths": ["..."], "playlist"?: "...", "playlistId"?: "...", "clear"?: false, "open"?: false }
 ```
+
+`__all__` (все треки) и `__liked__` (понравившиеся) нельзя создать, переименовать, очистить или править.
+`playlist/select` меняет, что играет дальше. Открытый на экране плейлист не меняется.
+`library/import` с `open: true` открывает его.
 
 
 ## что умеет плагин
 
-- Читать состояние плеера и библиотеку (плейлисты, треки).
+- Читать состояние плеера и библиотеку (плейлисты, треки, поиск).
 - Управлять воспроизведением: play/pause/next/prev/seek/volume.
+- Собрать плейлист из файлов или папок, в том числе из папки с музыкой игры. Очистить его, добавить треки, убрать треки, переименовать или удалить. Удалить треки из библиотеки, не удаляя файлы. Отметить трек понравившимся. `ensurePlaylist` находит плейлист по имени.
 - Добавлять и убирать параллельные аудиовыходы (например, вторая колонка).
 - Поднимать HTTP-сервер со своим веб-UI и REST/SSE API плеера — удалённый пульт,
   интеграции, OBS-оверлеи и т.п.

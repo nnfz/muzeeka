@@ -12,7 +12,12 @@ anyhow = "1"
 parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+futures-util = "0.3"
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors", "fs"] }
+boa_engine = "0.20"
+if-addrs = "0.13"
 crossbeam-channel = "0.5"
 
 # Audio engine (from existing codebase)

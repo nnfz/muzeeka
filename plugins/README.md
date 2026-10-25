@@ -9,8 +9,8 @@ player's REST/SSE API).
 
 Plugin folder:
 
-- **dev build** — `plugins/` in the repository root (next to `src-tauri`);
-- **packaged build** — `plugins/` next to the exe (otherwise the app resources).
+- **dev build** — `plugins/` in the repository root, next to `Cargo.toml`;
+- **packaged build** — `plugins/` next to the executable, when that repository folder is not there.
 
 A plugin is a folder containing a `plugin.json`. Drop the folder in, then restart or
 refresh the list in *Settings → Plugins*. The `sdk/` folder is skipped by the scanner.
@@ -60,10 +60,13 @@ Plugin data (settings and anything else) lives separately, in
 
 ### settings[]
 
-Each entry has `key`, `type` (`number` \| `boolean` \| `string`), `label`, `description`,
-`min`/`max` for numbers, and an optional `default`. The host coerces stored values to the
-declared type, clamps numbers into min/max and falls back to the default, so a plugin
-always receives a valid value. Changing settings in the UI **restarts** the plugin.
+Each entry has `key`, `type` (`number` \| `boolean` \| `string` \| `slider` \| `button`),
+`label`, `description`, `min`/`max` for numbers and sliders, an optional `step` (sliders
+snap to it; the settings form also steps numbers and sliders by `step` or by 1), and an
+optional `default`. The host coerces stored values to the declared type, clamps numbers
+into min/max and falls back to the default, so a plugin always receives a valid value.
+Changing settings in the UI **restarts** the plugin. `settings.set` from the plugin itself
+merges `settings.json` and does not restart it.
 
 ---
 
@@ -73,7 +76,8 @@ always receives a valid value. Changing settings in the UI **restarts** the plug
 |---|---|
 | `player:read` | `player.state` |
 | `player:control` | `player.play / pause / resume / toggle / next / prev / seek / volume` |
-| `library:read` | `library.playlists`, `library.playlist` |
+| `library:read` | `library.playlists`, `library.playlist`, `library.tracks` |
+| `library:write` | create, rename, delete, and clear playlists; add, remove, import, and delete tracks; `library.setLiked` |
 | `audio:devices` | `audio.devices` |
 | `audio:output` | `audio.addOutput`, `audio.removeOutput`, `audio.setOutputVolume`, `audio.outputs` |
 | `http:listen` | `http.serve`, `http.stop`, `http.status` |
@@ -101,6 +105,26 @@ muzeeka.player
 muzeeka.library
   .playlists()              // [{ id, name, trackCount }]
   .playlist(id)             // { id, name, tracks: [{ path, title, artist, album, durationSecs, coverUrl }] }
+  .tracks(query?)           // search the library; empty query lists tracks
+  .createPlaylist(name)     // new playlist; does not switch the open view
+  .ensurePlaylist(name)     // same playlist if the name already exists, ignoring case
+  .renamePlaylist(id, name)
+  .deletePlaylist(id)       // tracks stay in the library
+  .clearPlaylist(id)
+  .addTracks(playlistId, paths) // scan files or folders into that playlist
+  .removeTracks(playlistId, paths)
+  .deleteTracks(paths)      // drop tracks from the library; files stay on disk
+  .import({ paths, playlist?, playlistId?, clear?, open? })
+  .setLiked(path, liked)
+
+// import pulls a game soundtrack into one playlist and can replace it first:
+muzeeka.library.import({
+  playlist: "Celeste",
+  paths: ["C:/Games/Celeste/Content/Music"],
+  clear: true
+})
+// { ok, added, message, playlistId, playlist }
+// open: true switches the desktop view to that playlist. The default leaves it.
 
 muzeeka.audio
   .devices()                // output devices
@@ -236,15 +260,27 @@ POST /api/play            { "path": "...", "playlistId"?: "..." }
 POST /api/toggle | /api/pause | /api/resume | /api/next | /api/prev
 POST /api/seek            { "position": 12.5 }
 POST /api/volume          { "volume": 0.5 }
-POST /api/playlist/select { "id": "..." }
+POST /api/playlist/select { "id": "..." }   playback context; the open view stays
 POST /api/shuffle/toggle  → { "shuffle_enabled": bool }
 POST /api/repeat/toggle   → { "repeat_mode": "off|one|all" }
+POST /api/playlist/create { "name": "..." }
+POST /api/playlist/rename { "id": "...", "name": "..." }
+POST /api/playlist/delete { "id": "..." }
+POST /api/playlist/clear  { "id": "..." }
+POST /api/playlist/tracks { "id": "...", "paths": ["..."], "clear"?: false }
+POST /api/tracks/delete   { "paths": ["..."] }   files stay on disk
+POST /api/library/import  { "paths": ["..."], "playlist"?: "...", "playlistId"?: "...", "clear"?: false, "open"?: false }
 ```
+
+`__all__` (All tracks) and `__liked__` (Liked) cannot be created, renamed, cleared, or edited.
+`playlist/select` changes what plays next. It does not change the playlist open on screen.
+`library/import` with `open: true` does.
 
 ## Checklist: what a plugin can do
 
-- Read the player state and the library (playlists, tracks).
+- Read the player state and the library (playlists, tracks, search).
 - Control playback: play/pause/next/prev/seek/volume.
+- Build a playlist from files or folders, including a game's music folder. Clear it, add tracks, remove tracks, rename it, or delete it. Delete tracks from the library without deleting the files. Mark tracks liked. `ensurePlaylist` reuses a playlist by name.
 - Add and remove parallel audio outputs (a second pair of speakers, for instance).
 - Run an HTTP server with its own web UI and the player REST/SSE API — remote controls,
   integrations, OBS overlays and so on.

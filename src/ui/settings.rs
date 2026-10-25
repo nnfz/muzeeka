@@ -1,4 +1,5 @@
 mod audio;
+mod plugins_page;
 
 use std::time::Duration;
 
@@ -29,6 +30,7 @@ pub struct SettingsWindow {
     preset_name: gpui::Entity<TextField>,
     download_menu: bool,
     download_error: Option<String>,
+    plugins: plugins_page::PluginUi,
     _meter: Task<()>,
 }
 
@@ -51,13 +53,16 @@ impl SettingsWindow {
             }),
             download_menu: false,
             download_error: None,
+            plugins: plugins_page::PluginUi::new(),
             _meter: cx.spawn(async move |this, cx| loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(100))
                     .await;
                 if this
                     .update(cx, |view, cx| {
-                        if view.poll_meters(cx) {
+                        let meters = view.poll_meters(cx);
+                        let plugins = view.refresh_plugins(cx);
+                        if meters || plugins {
                             cx.notify();
                         }
                     })
@@ -100,7 +105,7 @@ impl SettingsWindow {
                     appears_transparent: true,
                     traffic_light_position: None,
                 }),
-                window_min_size: Some(size(px(786.), px(480.))),
+                window_min_size: Some(size(px(870.), px(480.))),
                 is_minimizable: false,
                 ..Default::default()
             },
@@ -264,6 +269,10 @@ impl SettingsWindow {
                             }
                             this.section = section;
                             this.download_menu = false;
+                            if section == SettingsSection::Plugins {
+                                this.plugins.due = true;
+                                this.refresh_plugins(cx);
+                            }
                             cx.notify();
                         }),
                     )
@@ -284,13 +293,7 @@ impl SettingsWindow {
             .child(match section {
                 SettingsSection::General => self.general(cx).into_any_element(),
                 SettingsSection::Downloads => self.downloads(cx).into_any_element(),
-                SettingsSection::Plugins => static_section(
-                    "Plugins",
-                    "Extensions loaded from the plugins folder.",
-                    "Installed",
-                    "No plugins are listed until the plugin host is ported.",
-                )
-                .into_any_element(),
+                SettingsSection::Plugins => self.plugins_section(cx),
                 SettingsSection::Audio => self.audio_section(cx),
                 SettingsSection::About => {
                     static_section("About", "Muzeeka native", "Version", "0.1.0").into_any_element()

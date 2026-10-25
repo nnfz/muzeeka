@@ -23,6 +23,14 @@ pub extern "C" fn muzeeka_plugin_start(host: *const MuzeekaHost) -> c_int {
         let host = HOST.as_ref().unwrap();
         let _ = host.call("log.info", r#"{"message":"native plugin started"}"#);
         let _ = host.call("player.state", "{}");
+        // A soundtrack plugin also requests "library:write" and imports the
+        // game's music folder into one playlist. ensurePlaylist matches the
+        // name without caring about case. clear replaces the previous import.
+        // host.call("library.import", r#"{
+        //   "playlist": "Celeste",
+        //   "paths": ["C:/Games/Celeste/Content/Music"],
+        //   "clear": true
+        // }"#).ok();
     }
     0
 }

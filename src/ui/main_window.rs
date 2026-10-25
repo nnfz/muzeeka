@@ -362,6 +362,7 @@ impl MainWindow {
 
     pub fn new(use_ui_font: bool, cx: &mut Context<Self>) -> Self {
         let session = cx.new(|_| Session::open());
+        crate::ui::plugins::attach(session.clone(), cx);
         let focus = cx.focus_handle();
         let rename_field = cx.new(|cx| {
             TextField::new(cx, "Playlist name", |_, _, _| {}, |_, _| {})
@@ -846,6 +847,7 @@ impl MainWindow {
                 return;
             }
             cx.defer(|cx| {
+                crate::ui::plugins::shutdown(cx);
                 for window in cx.windows() {
                     let _ = window.update(cx, |_, window, _| window.remove_window());
                 }

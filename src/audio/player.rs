@@ -3217,11 +3217,17 @@ impl Player {
         let flags = if is_tracker {
             bass::BASS_SAMPLE_FLOAT | bass::BASS_MUSIC_DECODE | bass::BASS_MUSIC_RAMPS
         } else {
-            // No PRESCAN: much faster track start and manual switching.
+            // No PRESCAN on named files: much faster track start and manual switching.
             // Prescan is only useful for accurate seeking in VBR MP3 without good headers.
-            // For speed (like Foobar) we skip it. Duration comes from metadata or later.
+            // Extensionless audio (osu! files) is often that VBR MP3. Without a scan,
+            // BASS reports no length and a seek is ignored.
             // ASYNCFILE: disk reads happen off the WASAPI callback.
-            bass::BASS_SAMPLE_FLOAT | bass::BASS_STREAM_DECODE | bass::BASS_ASYNCFILE
+            let mut flags =
+                bass::BASS_SAMPLE_FLOAT | bass::BASS_STREAM_DECODE | bass::BASS_ASYNCFILE;
+            if ext.is_empty() {
+                flags |= bass::BASS_STREAM_PRESCAN;
+            }
+            flags
         };
 
         let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;

@@ -1946,10 +1946,7 @@ fn panel_body_height(active_bar: usize, active_idle: usize, downloaded: usize) -
     let active_h = if active == 0 {
         0.
     } else {
-        SECTION_H
-            + active_bar as f32 * ACTIVE_ROW
-            + active_idle as f32 * ACTIVE_IDLE
-            + SECTION_GAP
+        SECTION_H + active_bar as f32 * ACTIVE_ROW + active_idle as f32 * ACTIVE_IDLE + SECTION_GAP
     };
     let done_h = FINISHED_H
         + if downloaded == 0 {
@@ -2147,9 +2144,7 @@ fn under_root(path: &str, root: &str) -> bool {
     }
     let root = paths::path_key(root);
     let path = paths::path_key(path);
-    path == root
-        || path.starts_with(&format!("{root}\\"))
-        || path.starts_with(&format!("{root}/"))
+    path == root || path.starts_with(&format!("{root}\\")) || path.starts_with(&format!("{root}/"))
 }
 
 fn now_millis() -> u64 {

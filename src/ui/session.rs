@@ -797,7 +797,11 @@ impl Session {
             .filter(|playlist| playlist.track_ids.contains(&id))
             .map(|playlist| playlist.id.clone())
             .collect();
-        if ids.len() > 1 { ids } else { Vec::new() }
+        if ids.len() > 1 {
+            ids
+        } else {
+            Vec::new()
+        }
     }
 
     fn spot_in_open_view(&self, id: TrackId) -> TrackSpot {
@@ -832,9 +836,10 @@ impl Session {
         match &self.view {
             LibraryView::All => !self.cue_containers.contains(&id),
             LibraryView::Liked => self.track(id).is_some_and(|track| track.liked),
-            LibraryView::Playlist(playlist_id) => self.playlists.iter().any(|playlist| {
-                &playlist.id == playlist_id && playlist.track_ids.contains(&id)
-            }),
+            LibraryView::Playlist(playlist_id) => self
+                .playlists
+                .iter()
+                .any(|playlist| &playlist.id == playlist_id && playlist.track_ids.contains(&id)),
         }
     }
 
@@ -2150,10 +2155,14 @@ impl Session {
     }
 
     pub fn seek(&mut self, fraction: f32) {
-        let Some(track) = self.current_track() else {
+        let Some(id) = self.current else {
             return;
         };
-        self.position = (fraction as f64).clamp(0.0, 1.0) * track.duration;
+        let duration = self.duration_of(id);
+        if duration <= 0.0 {
+            return;
+        }
+        self.position = (fraction as f64).clamp(0.0, 1.0) * duration;
         self.heard_to = self.position;
         self.output_seek(self.position);
         self.remember_playback(true);
@@ -2161,13 +2170,14 @@ impl Session {
 
     /// Move the playhead by a number of seconds, clamped to the current track.
     pub fn seek_by(&mut self, seconds: f64) {
-        let Some(track) = self.current_track() else {
+        let Some(id) = self.current else {
             return;
         };
-        if track.duration <= 0.0 {
+        let duration = self.duration_of(id);
+        if duration <= 0.0 {
             return;
         }
-        self.position = (self.position + seconds).clamp(0.0, track.duration);
+        self.position = (self.position + seconds).clamp(0.0, duration);
         self.heard_to = self.position;
         self.output_seek(self.position);
         self.remember_playback(true);
@@ -2256,6 +2266,11 @@ impl Session {
             }
             if snap.position > self.heard_to {
                 self.heard_to = snap.position;
+            }
+            if snap.duration > 0.5 {
+                if let Some(id) = self.current {
+                    self.remember_duration(id, snap.duration);
+                }
             }
             let duration = snap.duration.max(
                 self.current_track()
@@ -2459,6 +2474,45 @@ impl Session {
             return 0.0;
         }
         (self.position / track.duration).clamp(0.0, 1.0) as f32
+    }
+
+    /// Library duration, or the length BASS just measured when the file had none.
+    fn duration_of(&mut self, id: TrackId) -> f64 {
+        let stored = self.track(id).map(|track| track.duration).unwrap_or(0.0);
+        if stored > 0.0 {
+            return stored;
+        }
+        let live = self
+            .engine
+            .as_ref()
+            .map(|engine| engine.snapshot().duration)
+            .unwrap_or(0.0);
+        if live > 0.5 {
+            self.remember_duration(id, live);
+        }
+        live
+    }
+
+    /// osu! files have no extension, so the first import stored no length.
+    /// Keep the length BASS reports and the seek bar can move.
+    fn remember_duration(&mut self, id: TrackId, seconds: f64) {
+        if !seconds.is_finite() || seconds < 0.5 {
+            return;
+        }
+        if self.track(id).is_none_or(|track| track.duration > 0.0) {
+            return;
+        }
+        if let Some(track) = self.tracks.iter_mut().find(|track| track.id == id) {
+            track.duration = seconds;
+        }
+        let Some(db) = &self.db else {
+            return;
+        };
+        let _ = db.execute(
+            "UPDATE tracks SET duration_secs = ?1
+              WHERE id = ?2 AND (duration_secs IS NULL OR duration_secs <= 0)",
+            rusqlite::params![seconds, id.0 as i64],
+        );
     }
 
     fn rand(&mut self) -> u32 {
@@ -2829,6 +2883,667 @@ fn sample_tracks() -> Vec<Track> {
         .collect()
 }
 
+impl Session {
+    pub(crate) fn plugin_state(&self) -> crate::ui::plugins::model::PlayerView {
+        use crate::ui::plugins::model::{PlayerView, ALL_ID, LIKED_ID};
+
+        let snap = self.engine.as_ref().map(|engine| engine.snapshot());
+        let (is_playing, is_paused, position, duration, volume) = if let Some(snap) = snap {
+            (
+                snap.is_playing,
+                snap.is_paused,
+                snap.position,
+                snap.duration,
+                snap.volume,
+            )
+        } else {
+            let duration = self.current_track().map(|track| track.duration).unwrap_or(0.0);
+            (
+                self.playing,
+                !self.playing && self.current.is_some(),
+                self.position,
+                duration,
+                self.volume,
+            )
+        };
+        let active_playlist_id = self.playing_playlist.clone().or_else(|| {
+            if self.current.is_none() {
+                return None;
+            }
+            match &self.view {
+                LibraryView::Liked => Some(LIKED_ID.to_string()),
+                LibraryView::Playlist(id) => Some(id.clone()),
+                LibraryView::All => Some(ALL_ID.to_string()),
+            }
+        });
+        let active_playlist_name = active_playlist_id
+            .as_deref()
+            .and_then(|id| self.plugin_playlist_name(id));
+        PlayerView {
+            is_playing,
+            is_paused,
+            position,
+            duration,
+            volume,
+            shuffle_enabled: self.shuffle,
+            repeat_mode: self.repeat_label().to_string(),
+            track: self.current_track().map(plugin_track_info),
+            active_playlist_id,
+            active_playlist_name,
+        }
+    }
+
+    pub(crate) fn plugin_play(
+        &mut self,
+        path: &str,
+        playlist_id: Option<&str>,
+    ) -> Result<(), String> {
+        use crate::ui::plugins::model::{is_virtual_playlist, ALL_ID, LIKED_ID};
+
+        let id = self
+            .track_by_path(path)
+            .ok_or_else(|| "Track is not in the library".to_string())?;
+        let queue = match playlist_id {
+            Some(ALL_ID) => self.tracks.iter().map(|track| track.id).collect(),
+            Some(LIKED_ID) => self.liked_ids(),
+            Some(playlist) => self
+                .playlists
+                .iter()
+                .find(|item| item.id == playlist)
+                .map(|item| item.track_ids.clone())
+                .ok_or_else(|| "Playlist not found".to_string())?,
+            None => {
+                if let Some(playlist) = &self.playing_playlist {
+                    if let Some(item) = self.playlists.iter().find(|item| &item.id == playlist) {
+                        if item.track_ids.contains(&id) {
+                            item.track_ids.clone()
+                        } else {
+                            vec![id]
+                        }
+                    } else {
+                        vec![id]
+                    }
+                } else {
+                    vec![id]
+                }
+            }
+        };
+        let requested = playlist_id.map(str::to_string);
+        self.play(id, queue);
+        if let Some(playlist) = requested {
+            if !is_virtual_playlist(&playlist) {
+                self.playing_playlist = Some(playlist);
+                self.remember_playback(true);
+            } else {
+                self.playing_playlist = None;
+                self.remember_playback(true);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn plugin_playlists(&self) -> Vec<crate::ui::plugins::model::PlaylistSummary> {
+        use crate::ui::plugins::model::{PlaylistSummary, ALL_ID, LIKED_ID};
+
+        let mut list = vec![
+            PlaylistSummary {
+                id: ALL_ID.to_string(),
+                name: "All tracks".into(),
+                track_count: self.tracks.len(),
+            },
+            PlaylistSummary {
+                id: LIKED_ID.to_string(),
+                name: "Liked".into(),
+                track_count: self.liked_count(),
+            },
+        ];
+        for playlist in &self.playlists {
+            list.push(PlaylistSummary {
+                id: playlist.id.clone(),
+                name: playlist.name.clone(),
+                track_count: playlist.track_ids.len(),
+            });
+        }
+        list
+    }
+
+    pub(crate) fn plugin_playlist(
+        &self,
+        id: &str,
+    ) -> Result<crate::ui::plugins::model::PlaylistDetail, String> {
+        use crate::ui::plugins::model::{PlaylistDetail, ALL_ID, LIKED_ID};
+
+        let (name, ids) = if id == ALL_ID {
+            (
+                "All tracks".to_string(),
+                self.tracks
+                    .iter()
+                    .filter(|track| !self.cue_containers.contains(&track.id))
+                    .map(|track| track.id)
+                    .collect(),
+            )
+        } else if id == LIKED_ID {
+            ("Liked".to_string(), self.liked_ids())
+        } else {
+            let playlist = self
+                .playlists
+                .iter()
+                .find(|playlist| playlist.id == id)
+                .ok_or_else(|| "Playlist not found".to_string())?;
+            (playlist.name.clone(), playlist.track_ids.clone())
+        };
+        let tracks = ids
+            .iter()
+            .filter_map(|id| self.track(*id).map(plugin_track_info))
+            .collect();
+        Ok(PlaylistDetail {
+            id: id.to_string(),
+            name,
+            tracks,
+        })
+    }
+
+    pub(crate) fn plugin_tracks(&self, query: &str) -> Vec<crate::ui::plugins::model::TrackInfo> {
+        let query = query.trim().to_lowercase();
+        self.tracks
+            .iter()
+            .filter(|track| !self.cue_containers.contains(&track.id))
+            .filter(|track| {
+                if query.is_empty() {
+                    return true;
+                }
+                track.title.to_lowercase().contains(&query)
+                    || track.artist.to_lowercase().contains(&query)
+                    || track.album.to_lowercase().contains(&query)
+                    || track.path.to_lowercase().contains(&query)
+            })
+            .map(plugin_track_info)
+            .collect()
+    }
+
+    pub(crate) fn plugin_select_playlist(&mut self, id: &str) -> Result<(), String> {
+        use crate::ui::plugins::model::{is_virtual_playlist, ALL_ID, LIKED_ID};
+
+        if id == ALL_ID || id == LIKED_ID {
+            self.playing_playlist = None;
+        } else if is_virtual_playlist(id) {
+            return Err("Playlist not found".into());
+        } else if !self.playlists.iter().any(|playlist| playlist.id == id) {
+            return Err("Playlist not found".into());
+        } else {
+            self.playing_playlist = Some(id.to_string());
+        }
+        if self.current.is_some() {
+            let ids = if id == ALL_ID {
+                self.tracks.iter().map(|track| track.id).collect()
+            } else if id == LIKED_ID {
+                self.liked_ids()
+            } else {
+                self.playlists
+                    .iter()
+                    .find(|playlist| playlist.id == id)
+                    .map(|playlist| playlist.track_ids.clone())
+                    .unwrap_or_default()
+            };
+            self.adopt_queue(ids);
+        }
+        self.remember_playback(true);
+        Ok(())
+    }
+
+    pub(crate) fn plugin_pause(&mut self) {
+        if self.playing {
+            self.toggle_playback(Vec::new());
+        }
+    }
+
+    pub(crate) fn plugin_resume(&mut self) {
+        if self.current.is_some() && !self.playing {
+            self.toggle_playback(Vec::new());
+        }
+    }
+
+    pub(crate) fn plugin_toggle(&mut self) {
+        if self.current.is_some() {
+            self.toggle_playback(Vec::new());
+            return;
+        }
+        let ids = if let Some(id) = &self.playing_playlist {
+            self.playlists
+                .iter()
+                .find(|playlist| &playlist.id == id)
+                .map(|playlist| playlist.track_ids.clone())
+                .unwrap_or_default()
+        } else if matches!(self.view, LibraryView::Liked) {
+            self.liked_ids()
+        } else {
+            self.tracks.iter().map(|track| track.id).collect()
+        };
+        self.toggle_playback(ids);
+    }
+
+    pub(crate) fn plugin_toggle_shuffle(&mut self) -> bool {
+        self.toggle_shuffle();
+        self.shuffle
+    }
+
+    pub(crate) fn plugin_cycle_repeat(&mut self) -> String {
+        self.cycle_repeat();
+        self.repeat_label().to_string()
+    }
+
+    pub(crate) fn plugin_cover_bytes(&self, path: &str) -> Result<Option<(Vec<u8>, String)>, String> {
+        let path = std::path::Path::new(path);
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let bytes = std::fs::read(path).map_err(|error| format!("Failed to read cover: {error}"))?;
+        Ok(Some((bytes, cover_mime(path))))
+    }
+
+    pub(crate) fn plugin_create_playlist(
+        &mut self,
+        name: &str,
+    ) -> Result<crate::ui::plugins::model::PlaylistSummary, String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("Playlist name is empty".into());
+        }
+        self.insert_named_playlist(name)
+    }
+
+    pub(crate) fn plugin_ensure_playlist(
+        &mut self,
+        name: &str,
+    ) -> Result<crate::ui::plugins::model::PlaylistSummary, String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("Playlist name is empty".into());
+        }
+        if let Some(playlist) = self
+            .playlists
+            .iter()
+            .find(|playlist| playlist.name.eq_ignore_ascii_case(name))
+        {
+            return Ok(crate::ui::plugins::model::PlaylistSummary {
+                id: playlist.id.clone(),
+                name: playlist.name.clone(),
+                track_count: playlist.track_ids.len(),
+            });
+        }
+        self.insert_named_playlist(name)
+    }
+
+    pub(crate) fn plugin_rename_playlist(&mut self, id: &str, name: &str) -> Result<(), String> {
+        self.reject_virtual(id)?;
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("Playlist name is empty".into());
+        }
+        if !self.playlists.iter().any(|playlist| playlist.id == id) {
+            return Err("Playlist not found".into());
+        }
+        self.write_playlist_name(id, name)?;
+        if let Some(playlist) = self.playlists.iter_mut().find(|playlist| playlist.id == id) {
+            playlist.name = name.to_string();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn plugin_delete_playlist(&mut self, id: &str) -> Result<(), String> {
+        self.reject_virtual(id)?;
+        if !self.playlists.iter().any(|playlist| playlist.id == id) {
+            return Err("Playlist not found".into());
+        }
+        self.delete_playlist_row(id)?;
+        self.playlists.retain(|playlist| playlist.id != id);
+        if matches!(&self.view, LibraryView::Playlist(open) if open == id) {
+            self.view = LibraryView::All;
+        }
+        if self.playing_playlist.as_deref() == Some(id) {
+            self.playing_playlist = None;
+            self.remember_playback(true);
+        }
+        self.rebuild_indexes();
+        Ok(())
+    }
+
+    pub(crate) fn plugin_clear_playlist(&mut self, id: &str) -> Result<(), String> {
+        self.reject_virtual(id)?;
+        let Some(playlist) = self.playlists.iter().find(|playlist| playlist.id == id) else {
+            return Err("Playlist not found".into());
+        };
+        let ids = playlist.track_ids.clone();
+        if let Some(db) = &self.db {
+            db.execute("DELETE FROM playlist_tracks WHERE playlist_id = ?1", [id])
+                .map_err(|error| format!("Could not clear playlist: {error}"))?;
+        }
+        if let Some(playlist) = self.playlists.iter_mut().find(|playlist| playlist.id == id) {
+            playlist.track_ids.clear();
+        }
+        if self.playing_playlist.as_deref() == Some(id) {
+            self.drop_ids_from_queue(&ids);
+            if self.current.is_some_and(|current| ids.contains(&current)) {
+                self.stop_playback();
+            }
+        }
+        self.rebuild_indexes();
+        Ok(())
+    }
+
+    pub(crate) fn plugin_remove_tracks(
+        &mut self,
+        id: &str,
+        paths: &[String],
+    ) -> Result<usize, String> {
+        self.reject_virtual(id)?;
+        if !self.playlists.iter().any(|playlist| playlist.id == id) {
+            return Err("Playlist not found".into());
+        }
+        let mut removed = 0usize;
+        let mut gone = Vec::new();
+        for path in paths {
+            let Some(track) = self.track_by_path(path) else {
+                continue;
+            };
+            let present = self
+                .playlists
+                .iter()
+                .find(|playlist| playlist.id == id)
+                .is_some_and(|playlist| playlist.track_ids.contains(&track));
+            if !present {
+                continue;
+            }
+            self.remove_from_playlist(id, track);
+            gone.push(track);
+            removed += 1;
+        }
+        if self.playing_playlist.as_deref() == Some(id) {
+            self.drop_ids_from_queue(&gone);
+            if self.current.is_some_and(|current| gone.contains(&current)) {
+                self.stop_playback();
+            }
+        }
+        Ok(removed)
+    }
+
+    pub(crate) fn plugin_delete_tracks(&mut self, paths: &[String]) -> Result<usize, String> {
+        let ids: Vec<TrackId> = paths
+            .iter()
+            .filter_map(|path| self.track_by_path(path))
+            .collect();
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        if let Some(db) = &self.db {
+            for id in &ids {
+                db.execute(
+                    "DELETE FROM playlist_tracks WHERE track_id = ?1",
+                    [id.0 as i64],
+                )
+                .map_err(|error| format!("Could not delete track: {error}"))?;
+                db.execute("DELETE FROM liked_tracks WHERE track_id = ?1", [id.0 as i64])
+                    .map_err(|error| format!("Could not delete track: {error}"))?;
+                db.execute("DELETE FROM tracks WHERE id = ?1", [id.0 as i64])
+                    .map_err(|error| format!("Could not delete track: {error}"))?;
+            }
+        }
+        let current_gone = self.current.is_some_and(|current| ids.contains(&current));
+        self.tracks.retain(|track| !ids.contains(&track.id));
+        self.liked_order.retain(|id| !ids.contains(id));
+        for playlist in &mut self.playlists {
+            playlist.track_ids.retain(|id| !ids.contains(id));
+        }
+        self.queue.retain(|id| !ids.contains(id));
+        self.shuffle_order.retain(|id| !ids.contains(id));
+        if current_gone {
+            self.stop_playback();
+        }
+        self.rebuild_indexes();
+        Ok(ids.len())
+    }
+
+    pub(crate) fn plugin_set_liked(&mut self, path: &str, liked: bool) -> Result<(), String> {
+        let id = self
+            .track_by_path(path)
+            .ok_or_else(|| "Track is not in the library".to_string())?;
+        self.set_liked(id, liked);
+        Ok(())
+    }
+
+    /// Scan is done by the caller. This writes the rows and refreshes the lists.
+    pub(crate) fn plugin_import(
+        &mut self,
+        files: &[muzeeka::MusicFile],
+        request: &crate::ui::plugins::ImportRequest,
+    ) -> Result<serde_json::Value, String> {
+        use crate::ui::import::{DropSource, ImportKind};
+
+        if self.db.is_none() {
+            return Err("Library database is not open".into());
+        }
+        if files.is_empty() {
+            return Ok(serde_json::json!({
+                "ok": true,
+                "added": 0,
+                "message": "No supported audio files found",
+                "tracks": [],
+            }));
+        }
+        let playlist_id = self.resolve_import_playlist(request)?;
+        if request.clear {
+            if let Some(id) = &playlist_id {
+                self.plugin_clear_playlist(id)?;
+            }
+        }
+        let before = playlist_id
+            .as_ref()
+            .and_then(|id| {
+                self.playlists
+                    .iter()
+                    .find(|playlist| &playlist.id == id)
+                    .map(|playlist| playlist.track_ids.len())
+            })
+            .unwrap_or(0);
+        let sources: Vec<DropSource> = request
+            .paths
+            .iter()
+            .map(|path| DropSource {
+                path: path.clone(),
+                is_dir: std::path::Path::new(path).is_dir(),
+            })
+            .collect();
+        let kind = if let Some(id) = &playlist_id {
+            let label = self
+                .playlists
+                .iter()
+                .find(|playlist| &playlist.id == id)
+                .map(|playlist| playlist.name.clone())
+                .unwrap_or_else(|| "Playlist".into());
+            ImportKind::Playlist {
+                id: id.clone(),
+                label,
+                sources,
+                at: None,
+            }
+        } else {
+            ImportKind::Library { sources, at: None }
+        };
+        let report = self.import_dropped(files, &kind)?;
+        let open_id = playlist_id.clone().or(report.open_id.clone());
+        if request.open {
+            if let Some(id) = &open_id {
+                if self.playlists.iter().any(|playlist| &playlist.id == id) {
+                    self.view = LibraryView::Playlist(id.clone());
+                }
+            }
+        }
+        let detail = open_id
+            .as_deref()
+            .and_then(|id| self.plugin_playlist(id).ok());
+        let added = detail
+            .as_ref()
+            .map(|detail| detail.tracks.len().saturating_sub(before))
+            .unwrap_or(0);
+        Ok(serde_json::json!({
+            "ok": true,
+            "added": added,
+            "message": report.toast,
+            "playlistId": open_id,
+            "playlist": detail,
+        }))
+    }
+
+    fn resolve_import_playlist(
+        &mut self,
+        request: &crate::ui::plugins::ImportRequest,
+    ) -> Result<Option<String>, String> {
+        use crate::ui::plugins::model::is_virtual_playlist;
+
+        if let Some(id) = &request.playlist_id {
+            if is_virtual_playlist(id) {
+                return Err("All tracks and Liked cannot be edited".into());
+            }
+            if !self.playlists.iter().any(|playlist| &playlist.id == id) {
+                return Err("Playlist not found".into());
+            }
+            return Ok(Some(id.clone()));
+        }
+        if let Some(name) = &request.playlist_name {
+            let summary = self.plugin_ensure_playlist(name)?;
+            return Ok(Some(summary.id));
+        }
+        Ok(None)
+    }
+
+    fn insert_named_playlist(
+        &mut self,
+        name: &str,
+    ) -> Result<crate::ui::plugins::model::PlaylistSummary, String> {
+        let id = fresh_playlist_id(&self.playlists);
+        self.insert_playlist(&id, name)?;
+        self.playlists.push(Playlist {
+            id: id.clone(),
+            name: name.to_string(),
+            track_ids: Vec::new(),
+            cover: None,
+            cover_path: None,
+            mix_mode: false,
+        });
+        self.rebuild_indexes();
+        Ok(crate::ui::plugins::model::PlaylistSummary {
+            id,
+            name: name.to_string(),
+            track_count: 0,
+        })
+    }
+
+    fn reject_virtual(&self, id: &str) -> Result<(), String> {
+        if crate::ui::plugins::model::is_virtual_playlist(id) {
+            Err("All tracks and Liked cannot be edited".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn plugin_playlist_name(&self, id: &str) -> Option<String> {
+        use crate::ui::plugins::model::{ALL_ID, LIKED_ID};
+        if id == ALL_ID {
+            Some("All tracks".into())
+        } else if id == LIKED_ID {
+            Some("Liked".into())
+        } else {
+            self.playlists
+                .iter()
+                .find(|playlist| playlist.id == id)
+                .map(|playlist| playlist.name.clone())
+        }
+    }
+
+    fn liked_ids(&self) -> Vec<TrackId> {
+        if self.liked_order.is_empty() {
+            self.tracks
+                .iter()
+                .filter(|track| track.liked)
+                .map(|track| track.id)
+                .collect()
+        } else {
+            self.liked_order.clone()
+        }
+    }
+
+    fn repeat_label(&self) -> &'static str {
+        match self.repeat {
+            RepeatMode::Off => "off",
+            RepeatMode::All => "all",
+            RepeatMode::One => "one",
+        }
+    }
+
+    fn track_by_path(&self, path: &str) -> Option<TrackId> {
+        let key = crate::ui::paths::path_key(path);
+        self.tracks
+            .iter()
+            .find(|track| crate::ui::paths::path_key(&track.path) == key)
+            .map(|track| track.id)
+    }
+}
+
+fn plugin_track_info(track: &Track) -> crate::ui::plugins::model::TrackInfo {
+    crate::ui::plugins::model::TrackInfo {
+        path: track.path.clone(),
+        title: track.title.clone(),
+        artist: track.artist.clone(),
+        album: if track.album.is_empty() {
+            None
+        } else {
+            Some(track.album.clone())
+        },
+        duration_secs: if track.duration > 0.0 {
+            Some(track.duration)
+        } else {
+            None
+        },
+        cover_url: track.cover.as_ref().map(|path| {
+            format!(
+                "/api/cover?path={}",
+                urlencoding::encode(&path.to_string_lossy())
+            )
+        }),
+    }
+}
+
+fn cover_mime(path: &std::path::Path) -> String {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" => "image/png",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "bmp" => "image/bmp",
+        _ => "image/jpeg",
+    }
+    .to_string()
+}
+
+fn fresh_playlist_id(playlists: &[Playlist]) -> String {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    for n in 0..64 {
+        let id = format!("pl-{millis:x}-{n:x}");
+        if !playlists.iter().any(|playlist| playlist.id == id) {
+            return id;
+        }
+    }
+    format!("pl-{millis:x}-x")
+}
+
 impl Drop for Session {
     fn drop(&mut self) {
         // The playhead is written at most every few seconds. Closing the
@@ -3047,7 +3762,10 @@ mod tests {
         }
         let ids = session.search_ids("a");
         assert!(ids.len() > 1, "{}", ids.len());
-        assert_eq!(search_tab(&session, "a", 1), Some(SearchTab::Reveal(ids[1])));
+        assert_eq!(
+            search_tab(&session, "a", 1),
+            Some(SearchTab::Reveal(ids[1]))
+        );
         match search_tab(&session, "@title desk", 0) {
             Some(SearchTab::Reveal(id)) => {
                 assert_eq!(session.track(id).unwrap().title, "Second Desk");
@@ -3800,5 +4518,49 @@ mod tests {
         assert_eq!(OrderMode::from_setting(Some("smart")), OrderMode::Shuffle);
         assert_eq!(OrderMode::from_setting(Some("shuffle")), OrderMode::Shuffle);
         assert_eq!(OrderMode::from_setting(None), OrderMode::Shuffle);
+    }
+
+    #[test]
+    fn plugin_can_build_and_edit_a_playlist() {
+        let mut session = Session::preview();
+        session.tracks[0].path = r"C:\Games\Ost\menu.flac".into();
+        session.tracks[1].path = r"C:\Games\Ost\boss.flac".into();
+        session.rebuild_indexes();
+
+        let created = session.plugin_ensure_playlist("Celeste").unwrap();
+        let again = session.plugin_ensure_playlist("celeste").unwrap();
+        assert_eq!(created.id, again.id);
+
+        session.add_to_playlist(&created.id, TrackId(0));
+        session.add_to_playlist(&created.id, TrackId(1));
+        let view = session.plugin_playlist(&created.id).unwrap();
+        assert_eq!(view.tracks.len(), 2);
+        assert_eq!(view.tracks[0].path, r"C:\Games\Ost\menu.flac");
+
+        let removed = session
+            .plugin_remove_tracks(&created.id, &[r"C:\Games\Ost\boss.flac".into()])
+            .unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(session.plugin_playlist(&created.id).unwrap().tracks.len(), 1);
+
+        session.plugin_clear_playlist(&created.id).unwrap();
+        assert!(session.plugin_playlist(&created.id).unwrap().tracks.is_empty());
+
+        session.plugin_rename_playlist(&created.id, "Celeste OST").unwrap();
+        assert_eq!(
+            session.plugin_playlist(&created.id).unwrap().name,
+            "Celeste OST"
+        );
+
+        let deleted = session
+            .plugin_delete_tracks(&[r"C:\Games\Ost\menu.flac".into()])
+            .unwrap();
+        assert_eq!(deleted, 1);
+        assert!(session.track_by_path(r"C:\Games\Ost\menu.flac").is_none());
+        assert!(session.tracks.iter().any(|track| track.id == TrackId(1)));
+
+        session.plugin_delete_playlist(&created.id).unwrap();
+        assert!(session.plugin_playlist(&created.id).is_err());
+        assert!(session.plugin_clear_playlist("__all__").is_err());
     }
 }

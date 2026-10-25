@@ -66,6 +66,52 @@ enum Menu {
     Effect { slot: String, saving: bool },
 }
 
+struct LabeledSlider {
+    label: &'static str,
+    value: SharedString,
+    ends: Option<(&'static str, &'static str)>,
+    slider: AnyElement,
+}
+
+impl LabeledSlider {
+    fn ends(mut self, low: &'static str, high: &'static str) -> Self {
+        self.ends = Some((low, high));
+        self
+    }
+}
+
+impl IntoElement for LabeledSlider {
+    type Element = AnyElement;
+
+    fn into_element(self) -> Self::Element {
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .text_size(px(12.))
+                    .child(self.label)
+                    .child(div().text_color(theme::text_muted()).child(self.value)),
+            )
+            .child(self.slider)
+            .when_some(self.ends, |row, (low, high)| {
+                row.child(
+                    div()
+                        .flex()
+                        .justify_between()
+                        .text_size(px(11.))
+                        .text_color(theme::text_muted())
+                        .child(low)
+                        .child(high),
+                )
+            })
+            .into_any_element()
+    }
+}
+
 impl AudioUi {
     pub(super) fn new() -> Self {
         Self {
@@ -1196,8 +1242,6 @@ impl SettingsWindow {
                     .child(self.labeled_slider(
                         "Preamp",
                         &format!("{} dB", db_text(eq.preamp_db)),
-                        "-15",
-                        "+15",
                         self.h_slider(
                             format!("pre|{}", slot.id),
                             pre_frac,
@@ -1263,56 +1307,59 @@ impl SettingsWindow {
             .flex()
             .flex_col()
             .gap(px(10.))
-            .child(self.labeled_slider(
-                "High-pass",
-                &if hp_open {
-                    "Open".to_string()
-                } else {
-                    format!("{} Hz", format_hz(filter.hp_hz))
-                },
-                "Open",
-                "20k",
-                self.h_slider(
-                    format!("hp|{}", slot.id),
-                    hz_to_pos(filter.hp_hz),
-                    Knob::Highpass {
-                        slot: slot.id.clone(),
+            .child(
+                self.labeled_slider(
+                    "High-pass",
+                    &if hp_open {
+                        "Open".to_string()
+                    } else {
+                        format!("{} Hz", format_hz(filter.hp_hz))
                     },
-                    cx,
-                ),
-            ))
-            .child(self.labeled_slider(
-                "Low-pass",
-                &if lp_open {
-                    "Open".to_string()
-                } else {
-                    format!("{} Hz", format_hz(filter.lp_hz))
-                },
-                "20",
-                "Open",
-                self.h_slider(
-                    format!("lp|{}", slot.id),
-                    hz_to_pos(filter.lp_hz),
-                    Knob::Lowpass {
-                        slot: slot.id.clone(),
+                    self.h_slider(
+                        format!("hp|{}", slot.id),
+                        hz_to_pos(filter.hp_hz),
+                        Knob::Highpass {
+                            slot: slot.id.clone(),
+                        },
+                        cx,
+                    ),
+                )
+                .ends("Open", "20k"),
+            )
+            .child(
+                self.labeled_slider(
+                    "Low-pass",
+                    &if lp_open {
+                        "Open".to_string()
+                    } else {
+                        format!("{} Hz", format_hz(filter.lp_hz))
                     },
-                    cx,
-                ),
-            ))
-            .child(self.labeled_slider(
-                "Resonance",
-                &format!("Q {:.2}", filter.resonance),
-                "Flat",
-                "Squelch",
-                self.h_slider(
-                    format!("q|{}", slot.id),
-                    ((filter.resonance - 0.5) / 7.5).clamp(0.0, 1.0),
-                    Knob::Resonance {
-                        slot: slot.id.clone(),
-                    },
-                    cx,
-                ),
-            ))
+                    self.h_slider(
+                        format!("lp|{}", slot.id),
+                        hz_to_pos(filter.lp_hz),
+                        Knob::Lowpass {
+                            slot: slot.id.clone(),
+                        },
+                        cx,
+                    ),
+                )
+                .ends("20", "Open"),
+            )
+            .child(
+                self.labeled_slider(
+                    "Resonance",
+                    &format!("Q {:.2}", filter.resonance),
+                    self.h_slider(
+                        format!("q|{}", slot.id),
+                        ((filter.resonance - 0.5) / 7.5).clamp(0.0, 1.0),
+                        Knob::Resonance {
+                            slot: slot.id.clone(),
+                        },
+                        cx,
+                    ),
+                )
+                .ends("Flat", "Squelch"),
+            )
             .when(inverted, |column| {
                 column.child(
                     div()
@@ -1342,20 +1389,21 @@ impl SettingsWindow {
             .flex()
             .flex_col()
             .gap(px(10.))
-            .child(self.labeled_slider(
-                "Gain",
-                &format!("+{:.1} dB", limiter.gain_db),
-                "0 dB",
-                "+12 dB",
-                self.h_slider(
-                    format!("gain|{}", slot.id),
-                    (limiter.gain_db / 12.0).clamp(0.0, 1.0),
-                    Knob::Gain {
-                        slot: slot.id.clone(),
-                    },
-                    cx,
-                ),
-            ))
+            .child(
+                self.labeled_slider(
+                    "Gain",
+                    &format!("+{:.1} dB", limiter.gain_db),
+                    self.h_slider(
+                        format!("gain|{}", slot.id),
+                        (limiter.gain_db / 12.0).clamp(0.0, 1.0),
+                        Knob::Gain {
+                            slot: slot.id.clone(),
+                        },
+                        cx,
+                    ),
+                )
+                .ends("0 dB", "+12 dB"),
+            )
             .child(
                 div()
                     .flex()
@@ -1422,34 +1470,36 @@ impl SettingsWindow {
                             )),
                     ),
             )
-            .child(self.labeled_slider(
-                "Ceiling",
-                &format!("{:.1} dBFS", limiter.ceiling_db),
-                "−6",
-                "0",
-                self.h_slider(
-                    format!("ceiling|{}", slot.id),
-                    ((limiter.ceiling_db + 6.0) / 6.0).clamp(0.0, 1.0),
-                    Knob::Ceiling {
-                        slot: slot.id.clone(),
-                    },
-                    cx,
-                ),
-            ))
-            .child(self.labeled_slider(
-                "Release",
-                &format!("{:.0} ms", limiter.release_ms),
-                "10 ms",
-                "1000 ms",
-                self.h_slider(
-                    format!("release|{}", slot.id),
-                    ((limiter.release_ms - 10.0) / 990.0).clamp(0.0, 1.0),
-                    Knob::Release {
-                        slot: slot.id.clone(),
-                    },
-                    cx,
-                ),
-            ))
+            .child(
+                self.labeled_slider(
+                    "Ceiling",
+                    &format!("{:.1} dBFS", limiter.ceiling_db),
+                    self.h_slider(
+                        format!("ceiling|{}", slot.id),
+                        ((limiter.ceiling_db + 6.0) / 6.0).clamp(0.0, 1.0),
+                        Knob::Ceiling {
+                            slot: slot.id.clone(),
+                        },
+                        cx,
+                    ),
+                )
+                .ends("−6", "0"),
+            )
+            .child(
+                self.labeled_slider(
+                    "Release",
+                    &format!("{:.0} ms", limiter.release_ms),
+                    self.h_slider(
+                        format!("release|{}", slot.id),
+                        ((limiter.release_ms - 10.0) / 990.0).clamp(0.0, 1.0),
+                        Knob::Release {
+                            slot: slot.id.clone(),
+                        },
+                        cx,
+                    ),
+                )
+                .ends("10 ms", "1000 ms"),
+            )
             .into_any_element()
     }
 
@@ -1457,37 +1507,14 @@ impl SettingsWindow {
         &self,
         label: &'static str,
         value: &str,
-        low: &'static str,
-        high: &'static str,
         slider: AnyElement,
-    ) -> AnyElement {
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(4.))
-            .child(
-                div()
-                    .flex()
-                    .justify_between()
-                    .text_size(px(12.))
-                    .child(label)
-                    .child(
-                        div()
-                            .text_color(theme::text_muted())
-                            .child(value.to_string()),
-                    ),
-            )
-            .child(slider)
-            .child(
-                div()
-                    .flex()
-                    .justify_between()
-                    .text_size(px(11.))
-                    .text_color(theme::text_muted())
-                    .child(low)
-                    .child(high),
-            )
-            .into_any_element()
+    ) -> LabeledSlider {
+        LabeledSlider {
+            label,
+            value: value.into(),
+            ends: None,
+            slider,
+        }
     }
 
     fn h_slider(

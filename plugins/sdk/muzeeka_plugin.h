@@ -4,13 +4,22 @@
 /*
   Muzeeka native plugin ABI 1 (Windows x64).
 
-  Export these three functions from a DLL. Same host methods as JS plugins:
+  Export these three functions from a DLL. ABI stays 1; new methods are new call names.
   player.state / play / pause / resume / toggle / next / prev / seek / volume
-  library.playlists / library.playlist
-  audio.devices / audio.addOutput / audio.removeOutput / audio.outputs
+  library.playlists / playlist / tracks
+  library.createPlaylist / ensurePlaylist / renamePlaylist / deletePlaylist / clearPlaylist
+  library.addTracks / removeTracks / deleteTracks / import / setLiked
+  audio.devices / addOutput / removeOutput / setOutputVolume / outputs
   http.serve / http.stop / http.status
   settings.get / settings.set
   log.info / log.error
+
+  library.import scans files or folders into a playlist (a game soundtrack, for
+  example). A file with no extension is accepted when its header is audio.
+  Optional labels [{path, title, artist, cover}] fill a blank title or artist.
+  cover is an image path used only when the file has no embedded cover.
+  clear replaces that playlist. All tracks and Liked cannot be edited.
+  settings.set from the plugin saves the file and does not restart it.
 
   Payload and return value are UTF-8 JSON. Errors: {"__error":"..."}.
   Strings returned by `call` must be released with `free_str`.

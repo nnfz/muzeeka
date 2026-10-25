@@ -819,6 +819,9 @@ fn build_files(paths: Vec<PathBuf>) -> Vec<MusicFile> {
         match extension_of(path).as_deref() {
             Some("cue") => cue_paths.push(path.clone()),
             Some(ext) if is_audio(ext) => audio_paths.push(path.clone()),
+            // osu!lazer stores beatmap audio with no extension. The header says
+            // what it is, and playback opens that same file.
+            None if sniff_extension(path).is_some() => audio_paths.push(path.clone()),
             _ => {}
         }
     }
@@ -891,11 +894,101 @@ fn is_audio(ext: &str) -> bool {
     AUDIO_EXTENSIONS.contains(&ext)
 }
 
-fn read_audio(path: &Path, covers: &Path) -> Option<MusicFile> {
-    let ext = extension_of(path)?;
-    if !is_audio(&ext) {
+/// Extensionless audio. A named extension that is not audio stays ignored.
+fn sniff_extension(path: &Path) -> Option<String> {
+    if extension_of(path).is_some() {
         return None;
     }
+    let mut file = fs::File::open(path).ok()?;
+    let mut head = [0u8; 16];
+    use std::io::Read;
+    let n = file.read(&mut head).ok()?;
+    sniff_audio_magic(&head[..n]).map(str::to_string)
+}
+
+fn sniff_audio_magic(head: &[u8]) -> Option<&'static str> {
+    if head.starts_with(b"ID3") || (head.len() >= 2 && head[0] == 0xFF && (head[1] & 0xE0) == 0xE0)
+    {
+        return Some("mp3");
+    }
+    if head.starts_with(b"OggS") {
+        return Some("ogg");
+    }
+    if head.starts_with(b"fLaC") {
+        return Some("flac");
+    }
+    if head.len() >= 12 && &head[..4] == b"RIFF" && &head[8..12] == b"WAVE" {
+        return Some("wav");
+    }
+    if head.len() >= 8 && &head[4..8] == b"ftyp" {
+        return Some("m4a");
+    }
+    None
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct BlankName<'a> {
+    pub path: &'a str,
+    pub title: &'a str,
+    pub artist: &'a str,
+    /// Image used only when the file has no embedded cover.
+    pub cover: &'a str,
+}
+
+/// Uses the label only where the file has no title, artist, or cover of its own.
+pub(crate) fn fill_blank_names(files: &mut [MusicFile], labels: &[BlankName<'_>]) {
+    let covers = catalog::app_data_dir().join("covers");
+    apply_labels(files, labels, &covers);
+}
+
+fn apply_labels(files: &mut [MusicFile], labels: &[BlankName<'_>], covers: &Path) {
+    if labels.is_empty() || files.is_empty() {
+        return;
+    }
+    let mut by_key = HashMap::new();
+    for label in labels {
+        by_key.insert(paths::path_key(label.path), *label);
+    }
+    let mut covers_ready = false;
+    for file in files.iter_mut() {
+        let Some(label) = by_key.get(&paths::path_key(&file.path)) else {
+            continue;
+        };
+        if name_blank(&file.title) && !label.title.trim().is_empty() {
+            file.title = Some(label.title.trim().to_string());
+        }
+        if name_blank(&file.artist) && !label.artist.trim().is_empty() {
+            file.artist = Some(label.artist.trim().to_string());
+        }
+        let cover = label.cover.trim();
+        if file.cover_path.is_none() && !cover.is_empty() {
+            if !covers_ready {
+                if fs::create_dir_all(covers).is_err() {
+                    continue;
+                }
+                covers_ready = true;
+            }
+            if let Some((thumb, full)) = store_image_file(Path::new(cover), covers) {
+                file.cover_path = Some(thumb);
+                file.cover_path_full = Some(full);
+            }
+        }
+    }
+}
+
+fn name_blank(value: &Option<String>) -> bool {
+    value
+        .as_ref()
+        .map(|text| text.trim().is_empty())
+        .unwrap_or(true)
+}
+
+fn read_audio(path: &Path, covers: &Path) -> Option<MusicFile> {
+    let ext = match extension_of(path) {
+        Some(ext) if is_audio(&ext) => ext,
+        Some(_) => return None,
+        None => sniff_extension(path)?,
+    };
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -930,7 +1023,7 @@ fn read_audio(path: &Path, covers: &Path) -> Option<MusicFile> {
 }
 
 fn apply_tags(file: &mut MusicFile, path: &Path, covers: &Path) {
-    let Ok(tagged) = lofty::read_from_path(path) else {
+    let Some(tagged) = read_tagged(path) else {
         return;
     };
     let duration = tagged.properties().duration().as_secs_f64();
@@ -986,9 +1079,18 @@ pub(crate) fn stored_cover(path: &Path) -> Option<(String, PathBuf)> {
 }
 
 fn stored_cover_paths(path: &Path, covers: &Path) -> Option<(String, String)> {
-    let tagged = lofty::read_from_path(path).ok()?;
+    let tagged = read_tagged(path)?;
     let tag = tagged.primary_tag()?;
     store_cover(tag, covers)
+}
+
+/// `read_from_path` trusts the extension. osu! audio has none, so guess from the bytes.
+fn read_tagged(path: &Path) -> Option<lofty::file::TaggedFile> {
+    if path.extension().is_some() {
+        return lofty::read_from_path(path).ok();
+    }
+    let mut file = fs::File::open(path).ok()?;
+    lofty::read_from(&mut file).ok()
 }
 
 fn paint_cue_covers(files: &mut [MusicFile]) {
@@ -1018,7 +1120,15 @@ fn store_cover(tag: &lofty::tag::Tag, covers: &Path) -> Option<(String, String)>
         .iter()
         .find(|picture| picture.pic_type() == PictureType::CoverFront)
         .or_else(|| tag.pictures().first())?;
-    let bytes = picture.data();
+    store_cover_bytes(picture.data(), covers)
+}
+
+fn store_image_file(path: &Path, covers: &Path) -> Option<(String, String)> {
+    let bytes = fs::read(path).ok()?;
+    store_cover_bytes(&bytes, covers)
+}
+
+fn store_cover_bytes(bytes: &[u8], covers: &Path) -> Option<(String, String)> {
     if bytes.is_empty() {
         return None;
     }
@@ -1157,6 +1267,105 @@ mod tests {
         let groups = group_folder_drop(&files, &sources);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].indexes.len(), files.len());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn extensionless_audio_is_imported_from_its_header() {
+        let root = std::env::temp_dir().join(format!("muzeeka-raw-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let audio = root.join("47b895484e7751f3ab429694ff6dbf21");
+        let junk = root.join("not-audio");
+        std::fs::write(&audio, b"ID3\x03\x00\x00\x00\x00\x00\x00").unwrap();
+        std::fs::write(&junk, b"hello").unwrap();
+        let files = scan_paths(&[
+            audio.to_string_lossy().to_string(),
+            junk.to_string_lossy().to_string(),
+        ]);
+        assert_eq!(files.len(), 1, "{files:?}");
+        assert_eq!(files[0].extension, "mp3");
+        let mut tagged = files.clone();
+        tagged[0].title = Some("from the file".into());
+        let audio_text = audio.to_string_lossy().to_string();
+        fill_blank_names(
+            &mut tagged,
+            &[BlankName {
+                path: &audio_text,
+                title: "from the map",
+                artist: "cYsmix",
+                cover: "",
+            }],
+        );
+        assert_eq!(tagged[0].title.as_deref(), Some("from the file"));
+        assert_eq!(tagged[0].artist.as_deref(), Some("cYsmix"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn background_fills_a_blank_cover_and_leaves_an_existing_one() {
+        let root = std::env::temp_dir().join(format!("muzeeka-bg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let covers = root.join("covers");
+        std::fs::create_dir_all(&covers).unwrap();
+        let image = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            2,
+            2,
+            image::Rgb([12, 34, 56]),
+        ));
+        let mut bytes = Vec::new();
+        image
+            .write_to(&mut std::io::Cursor::new(&mut bytes), ImageFormat::Jpeg)
+            .unwrap();
+        let background = root.join("bg");
+        std::fs::write(&background, &bytes).unwrap();
+        let background_text = background.to_string_lossy().to_string();
+        let mut open = vec![file(r"D:\osu\song")];
+        apply_labels(
+            &mut open,
+            &[BlankName {
+                path: r"D:\osu\song",
+                title: "",
+                artist: "",
+                cover: &background_text,
+            }],
+            &covers,
+        );
+        let thumb = open[0].cover_path.as_deref().expect("cover");
+        assert!(thumb.contains("thumb.webp"), "{thumb}");
+        assert!(Path::new(thumb).is_file());
+        assert!(Path::new(open[0].cover_path_full.as_deref().unwrap()).is_file());
+
+        let mut kept = vec![file(r"D:\osu\song")];
+        kept[0].cover_path = Some("already".into());
+        apply_labels(
+            &mut kept,
+            &[BlankName {
+                path: r"D:\osu\song",
+                title: "map",
+                artist: "",
+                cover: &background_text,
+            }],
+            &covers,
+        );
+        assert_eq!(kept[0].cover_path.as_deref(), Some("already"));
+        assert_eq!(kept[0].title.as_deref(), Some("map"));
+
+        let junk = root.join("not-image");
+        std::fs::write(&junk, b"hello").unwrap();
+        let junk_text = junk.to_string_lossy().to_string();
+        let mut bare = vec![file(r"D:\osu\other")];
+        apply_labels(
+            &mut bare,
+            &[BlankName {
+                path: r"D:\osu\other",
+                title: "",
+                artist: "",
+                cover: &junk_text,
+            }],
+            &covers,
+        );
+        assert!(bare[0].cover_path.is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -12,6 +12,7 @@ pub mod main_window;
 pub mod menu;
 pub mod paths;
 pub mod playback;
+pub mod plugins;
 pub mod reorder;
 pub mod search_bar;
 pub mod session;
