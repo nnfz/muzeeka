@@ -1,6 +1,6 @@
 //! Recent lines from `log.info` / `log.error`, shown on the plugin card.
 //! The same line is kept once: turning a plugin off and on used to stack
-//! its startup note ("папка osu!: …") under the previous copy.
+//! its startup note ("папка osu!lazer: …") under the previous copy.
 
 use std::collections::{HashSet, VecDeque};
 
@@ -69,15 +69,15 @@ mod tests {
     #[test]
     fn a_startup_note_is_shown_once_after_the_plugin_starts_again() {
         let id = "test.osu-log-dedup";
-        push("info", id, "папка osu!: C:\\osu");
-        push("info", id, "в картах 193 песен, добавляю 1 новых в плейлист osu!");
-        push("info", id, "папка osu!: C:\\osu");
-        push("info", id, "папка osu!: C:\\osu");
+        push("info", id, "папка osu!lazer: C:\\osu");
+        push("info", id, "в картах 193 песен, добавляю 1 новых в плейлист osu!lazer");
+        push("info", id, "папка osu!lazer: C:\\osu");
+        push("info", id, "папка osu!lazer: C:\\osu");
         assert_eq!(
             recent(id),
             vec![
-                "info: в картах 193 песен, добавляю 1 новых в плейлист osu!".to_string(),
-                "info: папка osu!: C:\\osu".to_string(),
+                "info: в картах 193 песен, добавляю 1 новых в плейлист osu!lazer".to_string(),
+                "info: папка osu!lazer: C:\\osu".to_string(),
             ]
         );
     }

@@ -21,7 +21,9 @@ use files::{
 use muzeeka_plugin::{MuzeekaHost, MUZEEKA_PLUGIN_ABI};
 use songs::{survey, Song};
 
-const PLAYLIST: &str = "osu!";
+const PLAYLIST: &str = "osu!lazer";
+/// Playlist name from before the plugin was renamed. Adopted once.
+const LEGACY_PLAYLIST: &str = "osu!lazer";
 const BATCH: usize = 8;
 
 static STOP: AtomicBool = AtomicBool::new(false);
@@ -40,7 +42,10 @@ pub extern "C" fn muzeeka_plugin_start(host: *const MuzeekaHost) -> c_int {
     let host = unsafe { *host };
     STOP.store(false, Ordering::SeqCst);
     let data_dir = read_data_dir(&host);
-    match thread::Builder::new().name("osu-lazer".into()).spawn(move || run(host, data_dir)) {
+    match thread::Builder::new()
+        .name("osu-lazer".into())
+        .spawn(move || run(host, data_dir))
+    {
         Ok(handle) => {
             *WORKER.lock().unwrap_or_else(|err| err.into_inner()) = Some(handle);
             0
@@ -105,15 +110,19 @@ fn sync_once(
 ) -> Result<(), String> {
     let data_dir = find_data_dir(data_dir_setting)?;
     if !*announced_dir {
-        log(host, false, &format!("папка osu!: {}", data_dir.display()));
+        log(
+            host,
+            false,
+            &format!("папка osu!lazer: {}", data_dir.display()),
+        );
         *announced_dir = true;
     }
     let realm_path = data_dir.join("client.realm");
-    let stamp = file_stamp(&realm_path).ok_or_else(|| {
-        format!("не удалось прочитать {}", realm_path.display())
-    })?;
+    let stamp = file_stamp(&realm_path)
+        .ok_or_else(|| format!("не удалось прочитать {}", realm_path.display()))?;
     let plugin_dir = plugin_data_dir()?;
     let mut saved = load_state(&plugin_dir);
+    adopt_playlist_name(host, &mut saved, &plugin_dir)?;
     let empty = playlist_is_empty(host)?;
     if empty {
         if !saved.imported.is_empty() && !*attempted_while_empty {
@@ -258,13 +267,48 @@ fn playlist_is_empty(host: &MuzeekaHost) -> Result<bool, String> {
     if STOP.load(Ordering::SeqCst) {
         return Ok(false);
     }
-    let payload = serde_json::json!({ "name": PLAYLIST }).to_string();
-    let value = host.call("library.ensurePlaylist", &payload)?;
+    let value = ensure_playlist(host, PLAYLIST)?;
     let count = value
         .get("trackCount")
         .and_then(|item| item.as_u64())
         .unwrap_or(0);
     Ok(count == 0)
+}
+
+/// The first builds called the playlist "osu!". Rename that row once so a new
+/// empty "osu!lazer" is not created beside it.
+fn adopt_playlist_name(
+    host: &MuzeekaHost,
+    saved: &mut Saved,
+    plugin_dir: &Path,
+) -> Result<(), String> {
+    if saved.renamed || STOP.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    let legacy = ensure_playlist(host, LEGACY_PLAYLIST)?;
+    let id = legacy
+        .get("id")
+        .and_then(|item| item.as_str())
+        .unwrap_or("")
+        .trim();
+    if id.is_empty() {
+        return Err("плейлист osu!lazer не создался".into());
+    }
+    let name = legacy
+        .get("name")
+        .and_then(|item| item.as_str())
+        .unwrap_or("");
+    if !name.eq_ignore_ascii_case(PLAYLIST) {
+        let payload = serde_json::json!({ "id": id, "name": PLAYLIST }).to_string();
+        host.call("library.renamePlaylist", &payload)?;
+    }
+    saved.renamed = true;
+    save_state(plugin_dir, saved)
+}
+
+fn ensure_playlist(host: &MuzeekaHost, name: &str) -> Result<serde_json::Value, String> {
+    let payload = serde_json::json!({ "name": name }).to_string();
+    host.call("library.ensurePlaylist", &payload)
 }
 
 fn prepare_audio(
@@ -300,16 +344,13 @@ fn prepare_audio(
         }
         let saved = imported.get(&song.hash).map(String::as_str);
         let legacy = saved.and_then(|saved| legacy_copy(&audio_dir, saved, &src));
-        let already = !refill
-            && saved.is_some_and(|saved| same_path(saved, &src))
-            && legacy.is_none();
+        let already =
+            !refill && saved.is_some_and(|saved| same_path(saved, &src)) && legacy.is_none();
         let background = background_path(&files_dir, song);
         let cover_known = covers
             .get(&song.hash)
             .is_some_and(|stored| stored == &song.background_hash);
-        let need_cover = background.is_some()
-            && !cover_known
-            && !tried_covers.contains(&song.hash);
+        let need_cover = background.is_some() && !cover_known && !tried_covers.contains(&song.hash);
         if already && !need_cover {
             continue;
         }
@@ -469,20 +510,17 @@ fn read_data_dir(host: &MuzeekaHost) -> String {
 }
 
 fn read_realm(path: &Path) -> Result<Vec<u8>, String> {
-    let mut file = fs::File::open(path)
-        .map_err(|err| format!("не открыть {}: {err}", path.display()))?;
-    let len = file
-        .metadata()
-        .map(|meta| meta.len())
-        .unwrap_or(0);
+    let mut file =
+        fs::File::open(path).map_err(|err| format!("не открыть {}: {err}", path.display()))?;
+    let len = file.metadata().map(|meta| meta.len()).unwrap_or(0);
     if len < 24 || len > 512 * 1024 * 1024 {
         return Err(format!("странный размер client.realm ({len} байт)"));
     }
     let mut bytes = vec![0u8; len as usize];
     file.read_exact(&mut bytes)
         .map_err(|err| format!("не прочитать {}: {err}", path.display()))?;
-    let mut check = fs::File::open(path)
-        .map_err(|err| format!("не открыть {}: {err}", path.display()))?;
+    let mut check =
+        fs::File::open(path).map_err(|err| format!("не открыть {}: {err}", path.display()))?;
     let mut header = [0u8; 16];
     check
         .read_exact(&mut header)
@@ -495,7 +533,12 @@ fn read_realm(path: &Path) -> Result<Vec<u8>, String> {
 
 fn file_stamp(path: &Path) -> Option<(u128, u64)> {
     let meta = fs::metadata(path).ok()?;
-    let modified = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_millis();
+    let modified = meta
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_millis();
     Some((modified, meta.len()))
 }
 
@@ -503,8 +546,10 @@ struct Saved {
     imported: HashMap<String, String>,
     /// Audio hash → background hash. Empty string means the map has no background.
     covers: HashMap<String, String>,
-    /// The osu! playlist was deleted. Put every known song back.
+    /// The osu!lazer playlist was deleted. Put every known song back.
     refill: bool,
+    /// The old playlist name "osu!" was already renamed.
+    renamed: bool,
 }
 
 fn load_state(dir: &Path) -> Saved {
@@ -513,6 +558,7 @@ fn load_state(dir: &Path) -> Saved {
             imported: HashMap::new(),
             covers: HashMap::new(),
             refill: false,
+            renamed: false,
         };
     };
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
@@ -520,12 +566,20 @@ fn load_state(dir: &Path) -> Saved {
             imported: HashMap::new(),
             covers: HashMap::new(),
             refill: false,
+            renamed: false,
         };
     };
     Saved {
         imported: string_map(value.get("imported")),
         covers: string_map(value.get("covers")),
-        refill: value.get("refill").and_then(|item| item.as_bool()).unwrap_or(false),
+        refill: value
+            .get("refill")
+            .and_then(|item| item.as_bool())
+            .unwrap_or(false),
+        renamed: value
+            .get("renamed")
+            .and_then(|item| item.as_bool())
+            .unwrap_or(false),
     }
 }
 
@@ -545,6 +599,7 @@ fn save_state(dir: &Path, saved: &Saved) -> Result<(), String> {
         "imported": map_value(&saved.imported),
         "covers": map_value(&saved.covers),
         "refill": saved.refill,
+        "renamed": saved.renamed,
     }))
     .map_err(|err| err.to_string())?;
     fs::write(dir.join("imported.json"), text)
@@ -574,7 +629,10 @@ mod tests {
         let src = root.join("ab").join("hash");
         fs::create_dir_all(src.parent().unwrap()).unwrap();
         fs::write(&src, b"x").unwrap();
-        assert_eq!(legacy_copy(&audio, "Song.mp3", &src).as_deref(), Some(copy.as_path()));
+        assert_eq!(
+            legacy_copy(&audio, "Song.mp3", &src).as_deref(),
+            Some(copy.as_path())
+        );
         assert!(legacy_copy(&audio, &src.display().to_string(), &src).is_none());
         let outside = root.join("Song.mp3");
         fs::write(&outside, b"x").unwrap();
@@ -641,10 +699,20 @@ mod tests {
 
         covers.clear();
         let tried = HashSet::from([audio_hash.clone()]);
-        let (prepared, _) =
-            prepare_audio(&root, &plugin, &[track.clone()], &imported, &mut covers, &tried, false)
-                .unwrap();
-        assert!(prepared.is_empty(), "a failed cover is not sent again this process");
+        let (prepared, _) = prepare_audio(
+            &root,
+            &plugin,
+            &[track.clone()],
+            &imported,
+            &mut covers,
+            &tried,
+            false,
+        )
+        .unwrap();
+        assert!(
+            prepared.is_empty(),
+            "a failed cover is not sent again this process"
+        );
 
         let bare = song(&audio_hash, "");
         let mut covers = HashMap::new();

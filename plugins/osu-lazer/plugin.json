@@ -1,9 +1,9 @@
 {
   "id": "user.osu-lazer",
-  "name": "osu!",
+  "name": "osu!lazer",
   "version": "0.1.0",
   "author": "muzeeka",
-  "description": "Играет музыку из карт osu! в плейлисте osu!, не копируя файлы. Если у песни нет обложки, ставит фон карты. Новые карты появляются сами. Если удалить плейлист, он собирается снова.",
+  "description": "Играет музыку из карт osu!lazer в плейлисте osu!lazer, не копируя файлы. Если у песни нет обложки, ставит фон карты. Новые карты появляются сами. Если удалить плейлист, он собирается снова.",
   "main": "osu_lazer.dll",
   "runtime": "native",
   "enabled_by_default": true,
@@ -12,7 +12,7 @@
     {
       "key": "data_dir",
       "type": "string",
-      "label": "osu! data folder",
+      "label": "osu!lazer data folder",
       "description": "Folder that contains client.realm and files. Leave empty to use %AppData%\\osu.",
       "default": ""
     }

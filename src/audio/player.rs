@@ -573,6 +573,10 @@ pub struct Player {
     /// read its atomics without taking the player lock or hopping to the BASS
     /// thread ten times a second.
     chain: &'static DspChain,
+    /// Play-count and per-track speed. Separate from `PlayerInner` so the hook
+    /// can hop back onto the BASS thread after `record_play_stat`'s caller has
+    /// already released that lock.
+    play_hook: Arc<Mutex<Option<Arc<dyn Fn(&str) + Send + Sync>>>>,
 }
 
 impl Player {
@@ -652,7 +656,14 @@ impl Player {
             source_active: Arc::new(AtomicBool::new(false)),
             bass_ready: Arc::new(AtomicBool::new(false)),
             chain,
+            play_hook: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Called after a file opens or a gapless segment starts. The hook runs on
+    /// the caller thread, which is never the BASS thread.
+    pub fn set_play_hook(&self, hook: Option<Arc<dyn Fn(&str) + Send + Sync>>) {
+        *self.play_hook.lock() = hook;
     }
 
     /// Focused main window → hot UI updates; unfocused (game in foreground) → cold.
@@ -1541,8 +1552,11 @@ impl Player {
     }
 
     /// Persist foobar-style play count for `track_path` (best-effort).
-    fn record_play_stat(&self, _track_path: &str) {
-        // TODO: wire play stats to library database once ported
+    fn record_play_stat(&self, track_path: &str) {
+        let hook = self.play_hook.lock().clone();
+        if let Some(hook) = hook {
+            hook(track_path);
+        }
     }
 
     fn refresh_pending_next(inner: &mut PlayerInner) {
@@ -4809,6 +4823,16 @@ impl Player {
     /// Uses a fixed-duration BASS attribute slide (FREQ or TEMPO) so the change is
     /// sample-accurate and always takes the same intentional time.
     pub fn set_playback_rate(&self, rate: f32) -> Result<(), String> {
+        self.apply_playback_rate(rate, PLAYBACK_RATE_RAMP_MS)
+    }
+
+    /// Snap to `rate` with no slide. Track changes use this so the new file does
+    /// not spend a second gliding away from the previous track's speed.
+    pub fn set_playback_rate_immediate(&self, rate: f32) -> Result<(), String> {
+        self.apply_playback_rate(rate, 0)
+    }
+
+    fn apply_playback_rate(&self, rate: f32, ramp_ms: u32) -> Result<(), String> {
         let rate = rate.clamp(0.25, 2.0);
         self.run_on_bass_thread(move |inner| {
             inner.playback_rate = rate;
@@ -4842,8 +4866,7 @@ impl Player {
                 return Ok(());
             }
 
-            // Always full ramp so presets and settle feel consistent — not "too fast".
-            Self::reapply_at_rate_with_slide(inner, rate, PLAYBACK_RATE_RAMP_MS);
+            Self::reapply_at_rate_with_slide(inner, rate, ramp_ms);
             inner.applied_playback_rate = rate;
             Ok(())
         })

@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -9,6 +11,7 @@ use gpui::{
     WindowBounds, WindowControlArea, WindowHandle, WindowOptions,
 };
 
+use crate::ui::properties::{CloseProperties, PropertiesWindow, SaveProperties};
 use crate::ui::session::{self, Session, TrackId};
 use crate::ui::settings::SettingsWindow;
 use crate::ui::text_field::TextField;
@@ -39,9 +42,11 @@ pub struct MainWindow {
     pub(crate) focus: FocusHandle,
     pub(crate) use_ui_font: bool,
     settings_window: Option<WindowHandle<SettingsWindow>>,
-    /// Track the accent was sampled from. `None` until the first pass.
-    /// `Some(None)` means nothing is loaded, so the accent is the default purple.
-    accent_source: Option<Option<TrackId>>,
+    /// One properties window per set of paths. The same track focuses the one already open.
+    properties: HashMap<String, WindowHandle<PropertiesWindow>>,
+    /// Track and cover the accent was sampled from. The cover path is part of
+    /// the key so replacing art on the current track recolors the window.
+    accent_source: Option<(Option<TrackId>, Option<PathBuf>)>,
     /// Bumped on every sample so a slow cover decode cannot paint over a newer track.
     accent_epoch: u64,
     /// The restored row is scrolled into view once the list has a real height.
@@ -129,9 +134,6 @@ enum PopMenu {
     },
     Rename {
         id: String,
-    },
-    Properties {
-        id: TrackId,
     },
 }
 
@@ -465,6 +467,7 @@ impl MainWindow {
             focus,
             use_ui_font,
             settings_window: None,
+            properties: HashMap::new(),
             accent_source: None,
             accent_epoch: 0,
             revealed_current: false,
@@ -869,10 +872,11 @@ impl MainWindow {
                 track.and_then(|track| track.cover.clone()),
             )
         };
-        if self.accent_source == Some(track_id) {
+        let source = (track_id, cover.clone());
+        if self.accent_source.as_ref() == Some(&source) {
             return;
         }
-        self.accent_source = Some(track_id);
+        self.accent_source = Some(source);
         self.accent_epoch = self.accent_epoch.wrapping_add(1);
         let epoch = self.accent_epoch;
         let Some(path) = cover.filter(|path| path.is_file()) else {
@@ -977,6 +981,35 @@ impl MainWindow {
         let existing = self.settings_window;
         cx.defer_in(window, move |this, _window, cx| {
             this.settings_window = SettingsWindow::open(session, use_ui_font, existing, cx);
+        });
+    }
+
+    pub(crate) fn open_properties(
+        &mut self,
+        ids: Vec<TrackId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let paths = {
+            let session = self.session.read(cx);
+            ids.iter()
+                .filter_map(|id| session.track(*id).map(|track| track.path.clone()))
+                .collect::<Vec<_>>()
+        };
+        if paths.is_empty() {
+            return;
+        }
+        let key = crate::ui::properties::properties_key(&paths);
+        self.menu = PopMenu::None;
+        self.armed_ui = None;
+        cx.notify();
+        let session = self.session.clone();
+        let use_ui_font = self.use_ui_font;
+        let existing = self.properties.get(&key).copied();
+        cx.defer_in(window, move |this, _window, cx| {
+            if let Some(handle) = PropertiesWindow::open(session, ids, use_ui_font, existing, cx) {
+                this.properties.insert(key, handle);
+            }
         });
     }
 }
@@ -1470,25 +1503,18 @@ impl MainWindow {
         if !self.menu.is_open() {
             return div().into_any_element();
         }
-        if let PopMenu::Properties { id } = self.menu {
-            return self.properties_layer(id, cx);
-        }
         // Rename edits the playlist title in its own row, not in a popup.
         if matches!(self.menu, PopMenu::None | PopMenu::Rename { .. }) {
             return div().into_any_element();
         }
         let at = match self.menu {
             PopMenu::Track { at, .. } | PopMenu::Playlist { at, .. } => at,
-            PopMenu::None | PopMenu::Rename { .. } | PopMenu::Properties { .. } => {
-                return div().into_any_element()
-            }
+            PopMenu::None | PopMenu::Rename { .. } => return div().into_any_element(),
         };
         let panel = match self.menu.clone() {
             PopMenu::Track { .. } => self.track_menu(window, cx),
             PopMenu::Playlist { .. } => self.playlist_menu(window, cx),
-            PopMenu::None | PopMenu::Rename { .. } | PopMenu::Properties { .. } => {
-                return div().into_any_element()
-            }
+            PopMenu::None | PopMenu::Rename { .. } => return div().into_any_element(),
         };
         div()
             .absolute()
@@ -1604,9 +1630,8 @@ impl MainWindow {
                 crate::ui::menu::Tone::Normal,
                 "Properties",
                 cx,
-                move |this, _, cx| {
-                    this.menu = PopMenu::Properties { id };
-                    cx.notify();
+                move |this, window, cx| {
+                    this.open_properties(vec![id], window, cx);
                 },
             ),
             self.bind_menu(
@@ -1815,91 +1840,6 @@ impl MainWindow {
         self.menu_frame("playlist-menu", Scroller::Menu, 200., items, window, cx)
     }
 
-    fn properties_layer(&mut self, id: TrackId, cx: &mut Context<Self>) -> AnyElement {
-        let Some(track) = self.session.read(cx).track(id).cloned() else {
-            return div().into_any_element();
-        };
-        let file = crate::ui::menu::file_on_disk(&track.path).to_string();
-        let cue = track.path.contains("#cue:");
-        div()
-            .absolute()
-            .size_full()
-            .child(
-                crate::ui::menu::backdrop("properties-backdrop")
-                    .bg(gpui::rgba(0x00000099))
-                    .on_drop(
-                        cx.listener(|this, paths: &gpui::ExternalPaths, window, cx| {
-                            this.receive_file_drop(paths, false, window.mouse_position(), cx);
-                        }),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, window, cx| this.close_menu(window, cx)),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(|this, _, window, cx| this.close_menu(window, cx)),
-                    ),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .top(px(72.))
-                    .w_full()
-                    .flex()
-                    .justify_center()
-                    .child(
-                        div()
-                            .id("properties-card")
-                            .occlude()
-                            .w(px(420.))
-                            .p(px(16.))
-                            .flex()
-                            .flex_col()
-                            .gap(px(8.))
-                            .rounded(px(6.))
-                            .bg(theme::bg_elevated())
-                            .border_1()
-                            .border_color(theme::border())
-                            .shadow_md()
-                            .on_drop(cx.listener(
-                                |this, paths: &gpui::ExternalPaths, window, cx| {
-                                    this.receive_file_drop(
-                                        paths,
-                                        true,
-                                        window.mouse_position(),
-                                        cx,
-                                    );
-                                },
-                            ))
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            .child(
-                                div()
-                                    .text_size(px(13.))
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .child("Properties"),
-                            )
-                            .child(property_line("Title", &track.title))
-                            .child(property_line("Artist", &track.artist))
-                            .child(property_line("Album", &track.album))
-                            .child(property_line(
-                                "Duration",
-                                &session::format_time(track.duration),
-                            ))
-                            .child(property_line("File", &file))
-                            .when(cue, |card| card.child(property_line("Cue", &track.path)))
-                            .child(self.bind_menu(
-                                "properties-close",
-                                crate::ui::menu::Tone::Normal,
-                                "Close",
-                                cx,
-                                |this, window, cx| this.close_menu(window, cx),
-                            )),
-                    ),
-            )
-            .into_any_element()
-    }
-
     fn header(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let error = self.session.read(cx).playback_error.clone();
         let show_downloads = self.downloads_shown(cx);
@@ -1985,26 +1925,6 @@ pub(crate) fn alt_wheel_layer(session: gpui::Entity<Session>) -> impl IntoElemen
     .size_full()
 }
 
-fn property_line(label: &str, value: &str) -> AnyElement {
-    let value = if value.is_empty() {
-        "—".to_string()
-    } else {
-        value.to_string()
-    };
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(2.))
-        .child(
-            div()
-                .text_size(px(11.))
-                .text_color(theme::text_muted())
-                .child(label.to_string()),
-        )
-        .child(div().text_size(px(13.)).child(value))
-        .into_any_element()
-}
-
 pub fn bind_keys(cx: &mut App) {
     use gpui::KeyBinding;
     crate::ui::text_field::bind_text_keys(cx);
@@ -2017,6 +1937,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-up", VolumeUp, Some("!TextInput")),
         KeyBinding::new("ctrl-down", VolumeDown, Some("!TextInput")),
         KeyBinding::new("f2", RenamePlaylist, Some("!TextInput")),
+        KeyBinding::new("ctrl-s", SaveProperties, None),
+        KeyBinding::new("escape", CloseProperties, Some("Properties && !TextInput")),
     ]);
 }
 

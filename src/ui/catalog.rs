@@ -9,7 +9,7 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
 use crate::ui::session::{LibraryView, Playlist, RepeatMode, Track, TrackId};
 
@@ -212,11 +212,33 @@ CREATE TABLE IF NOT EXISTS app_state (
     playback_position REAL,
     was_playing INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS playback_stats (
+    path_key TEXT PRIMARY KEY,
+    play_count INTEGER NOT NULL DEFAULT 0,
+    first_played_unix INTEGER,
+    last_played_unix INTEGER
+);
+CREATE TABLE IF NOT EXISTS track_prefs (
+    path_key TEXT PRIMARY KEY,
+    playback_rate REAL,
+    video_bg_path TEXT,
+    video_bg_tried INTEGER
+);
 ";
 
 fn ensure_schema(db: &Connection) -> Result<(), String> {
     db.execute_batch(SCHEMA)
-        .map_err(|error| format!("Could not create the library database: {error}"))
+        .map_err(|error| format!("Could not create the library database: {error}"))?;
+    // Older track_prefs rows from the Tauri app may lack the video columns.
+    // A duplicate-column error means the column is already there.
+    for statement in [
+        "ALTER TABLE track_prefs ADD COLUMN playback_rate REAL",
+        "ALTER TABLE track_prefs ADD COLUMN video_bg_path TEXT",
+        "ALTER TABLE track_prefs ADD COLUMN video_bg_tried INTEGER",
+    ] {
+        let _ = db.execute(statement, []);
+    }
+    Ok(())
 }
 
 fn ensure_app_state_row(db: &Connection) -> Result<(), String> {
@@ -826,6 +848,351 @@ fn cover_rows(tracks: &[Track], ids: &[TrackId]) -> Vec<(i64, String)> {
         rows.push((id.0 as i64, cover_id));
     }
     rows
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PlaybackStats {
+    pub play_count: u32,
+    pub first_played_unix: Option<i64>,
+    pub last_played_unix: Option<i64>,
+}
+
+fn pref_key(path: &str) -> String {
+    crate::ui::paths::path_key(path.trim())
+}
+
+/// Count one play start. Keyed by the track path, including a `#cue:` suffix.
+pub fn record_play(db: &Connection, track_path: &str) -> Result<(), String> {
+    let key = pref_key(track_path);
+    if key.is_empty() {
+        return Ok(());
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    db.execute(
+        "INSERT INTO playback_stats(path_key, play_count, first_played_unix, last_played_unix)
+         VALUES (?1, 1, ?2, ?2)
+         ON CONFLICT(path_key) DO UPDATE SET
+            play_count = play_count + 1,
+            first_played_unix = COALESCE(first_played_unix, excluded.first_played_unix),
+            last_played_unix = excluded.last_played_unix",
+        rusqlite::params![key, now],
+    )
+    .map_err(|error| format!("Could not save play stats: {error}"))?;
+    Ok(())
+}
+
+pub fn playback_stats(db: &Connection, track_path: &str) -> Result<PlaybackStats, String> {
+    let key = pref_key(track_path);
+    if key.is_empty() {
+        return Ok(PlaybackStats::default());
+    }
+    let stats = db
+        .query_row(
+            "SELECT play_count, first_played_unix, last_played_unix
+               FROM playback_stats WHERE path_key = ?1",
+            [&key],
+            |row| {
+                Ok(PlaybackStats {
+                    play_count: row.get::<_, i64>(0)?.max(0) as u32,
+                    first_played_unix: row.get(1)?,
+                    last_played_unix: row.get(2)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| format!("Could not read play stats: {error}"))?;
+    Ok(stats.unwrap_or_default())
+}
+
+pub fn track_playback_rate(db: &Connection, track_path: &str) -> Result<Option<f32>, String> {
+    let key = pref_key(track_path);
+    if key.is_empty() {
+        return Ok(None);
+    }
+    let rate: Option<f64> = db
+        .query_row(
+            "SELECT playback_rate FROM track_prefs WHERE path_key = ?1",
+            [&key],
+            |row| row.get::<_, Option<f64>>(0),
+        )
+        .optional()
+        .map_err(|error| format!("Could not read playback speed: {error}"))?
+        .flatten();
+    Ok(rate.and_then(|rate| {
+        if rate.is_finite() && rate > 0.0 {
+            Some((rate as f32).clamp(0.25, 2.0))
+        } else {
+            None
+        }
+    }))
+}
+
+pub fn set_track_playback_rate(
+    db: &Connection,
+    track_path: &str,
+    rate: Option<f32>,
+) -> Result<(), String> {
+    let key = pref_key(track_path);
+    if key.is_empty() {
+        return Err("Empty track path".into());
+    }
+    match rate {
+        Some(rate) if rate.is_finite() => {
+            let clamped = rate.clamp(0.25, 2.0);
+            db.execute(
+                "INSERT INTO track_prefs(path_key, playback_rate) VALUES (?1, ?2)
+                 ON CONFLICT(path_key) DO UPDATE SET playback_rate = excluded.playback_rate",
+                rusqlite::params![key, clamped as f64],
+            )
+            .map_err(|error| format!("Could not save playback speed: {error}"))?;
+        }
+        _ => {
+            db.execute(
+                "UPDATE track_prefs SET playback_rate = NULL WHERE path_key = ?1",
+                [&key],
+            )
+            .map_err(|error| format!("Could not clear playback speed: {error}"))?;
+            db.execute(
+                "DELETE FROM track_prefs
+                  WHERE path_key = ?1 AND playback_rate IS NULL
+                    AND video_bg_path IS NULL AND video_bg_tried IS NULL",
+                [&key],
+            )
+            .map_err(|error| format!("Could not clear playback speed: {error}"))?;
+        }
+    }
+    Ok(())
+}
+
+pub fn track_video_bg(db: &Connection, track_path: &str) -> Result<Option<String>, String> {
+    let key = pref_key(track_path);
+    if key.is_empty() {
+        return Ok(None);
+    }
+    let stored: Option<String> = db
+        .query_row(
+            "SELECT video_bg_path FROM track_prefs WHERE path_key = ?1",
+            [&key],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(|error| format!("Could not read video background: {error}"))?
+        .flatten();
+    let Some(path) = stored.map(|path| path.trim().to_string()).filter(|path| !path.is_empty())
+    else {
+        return Ok(None);
+    };
+    if !Path::new(&path).is_file() {
+        let _ = set_track_video_bg(db, track_path, None);
+        return Ok(None);
+    }
+    Ok(Some(path))
+}
+
+pub fn set_track_video_bg(
+    db: &Connection,
+    track_path: &str,
+    video_path: Option<&str>,
+) -> Result<(), String> {
+    let key = pref_key(track_path);
+    if key.is_empty() {
+        return Err("Empty track path".into());
+    }
+    let value = video_path
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(str::to_string);
+    db.execute(
+        "INSERT INTO track_prefs(path_key, video_bg_path) VALUES (?1, ?2)
+         ON CONFLICT(path_key) DO UPDATE SET video_bg_path = excluded.video_bg_path",
+        rusqlite::params![key, value],
+    )
+    .map_err(|error| format!("Could not save video background: {error}"))?;
+    db.execute(
+        "DELETE FROM track_prefs
+          WHERE path_key = ?1 AND playback_rate IS NULL
+            AND video_bg_path IS NULL AND video_bg_tried IS NULL",
+        [&key],
+    )
+    .map_err(|error| format!("Could not save video background: {error}"))?;
+    Ok(())
+}
+
+pub fn track_video_bg_tried(db: &Connection, track_path: &str) -> Result<bool, String> {
+    let key = pref_key(track_path);
+    if key.is_empty() {
+        return Ok(false);
+    }
+    let tried: Option<i64> = db
+        .query_row(
+            "SELECT video_bg_tried FROM track_prefs WHERE path_key = ?1",
+            [&key],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .optional()
+        .map_err(|error| format!("Could not read video background: {error}"))?
+        .flatten();
+    Ok(tried.unwrap_or(0) != 0)
+}
+
+pub fn set_track_video_bg_tried(db: &Connection, track_path: &str) -> Result<(), String> {
+    let key = pref_key(track_path);
+    if key.is_empty() {
+        return Err("Empty track path".into());
+    }
+    db.execute(
+        "INSERT INTO track_prefs(path_key, video_bg_tried) VALUES (?1, 1)
+         ON CONFLICT(path_key) DO UPDATE SET video_bg_tried = 1",
+        [&key],
+    )
+    .map_err(|error| format!("Could not save video background: {error}"))?;
+    Ok(())
+}
+
+pub fn library_db_path() -> PathBuf {
+    app_data_dir().join("library.db")
+}
+
+/// A second connection for background work. The UI session keeps its own.
+pub(crate) fn open_library() -> Result<Connection, String> {
+    let db = Connection::open_with_flags(
+        library_db_path(),
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+    )
+    .map_err(|error| format!("Failed to open the library: {error}"))?;
+    db.busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|error| error.to_string())?;
+    Ok(db)
+}
+
+/// Title and artist stored for this playback path, including a `#cue:` row.
+pub(crate) fn labels_for_playback_path(
+    db: &Connection,
+    playback_path: &str,
+) -> Option<(String, String)> {
+    let want = crate::ui::paths::path_key(playback_path);
+    if want.is_empty() {
+        return None;
+    }
+    let mut roots = HashMap::new();
+    let mut statement = db.prepare("SELECT id, path FROM library_roots").ok()?;
+    let listed = statement
+        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+        .ok()?;
+    for row in listed.flatten() {
+        roots.insert(row.0, row.1);
+    }
+    let mut statement = db
+        .prepare("SELECT root_id, rel_path, title, artist FROM tracks")
+        .ok()?;
+    let listed = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, Option<i64>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .ok()?;
+    for (root_id, rel_path, title, artist) in listed.flatten() {
+        let path = resolve_path(&roots, root_id, &rel_path);
+        if crate::ui::paths::path_key(&path) == want {
+            return Some((title.unwrap_or_default(), artist.unwrap_or_default()));
+        }
+    }
+    None
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LibraryFields {
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub genre: Option<String>,
+    pub year: Option<u32>,
+    pub track_number: Option<u32>,
+}
+
+pub(crate) fn library_fields(db: &Connection, id: i64) -> Result<LibraryFields, String> {
+    db.query_row(
+        "SELECT title, artist, album, genre, year, track_number FROM tracks WHERE id = ?1",
+        [id],
+        |row| {
+            let year: Option<i64> = row.get(4)?;
+            let track_number: Option<i64> = row.get(5)?;
+            Ok(LibraryFields {
+                title: row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                artist: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                album: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                genre: row.get(3)?,
+                year: year.and_then(|year| u32::try_from(year).ok()).filter(|year| *year > 0),
+                track_number: track_number
+                    .and_then(|number| u32::try_from(number).ok())
+                    .filter(|number| *number > 0),
+            })
+        },
+    )
+    .optional()
+    .map_err(|error| format!("Could not read track: {error}"))
+    .map(|row| row.unwrap_or_default())
+}
+
+pub(crate) fn set_cover_id(db: &Connection, id: i64, cover_id: &str) -> Result<(), String> {
+    db.execute(
+        "UPDATE tracks SET cover_id = ?1 WHERE id = ?2",
+        rusqlite::params![cover_id, id],
+    )
+    .map_err(|error| format!("Could not update cover: {error}"))?;
+    Ok(())
+}
+
+/// Cached lyrics file for these tags, when one is on disk and not cleared.
+pub fn lyrics_path_for(title: &str, artist: &str, album: &str, duration_secs: f64) -> Option<PathBuf> {
+    if title.trim().is_empty() && artist.trim().is_empty() {
+        return None;
+    }
+    let key = lyrics_cache_key(title, artist, album, duration_secs);
+    let dir = app_data_dir().join("lyrics");
+    if dir.join(format!("{key}.cleared")).is_file() {
+        return None;
+    }
+    let path = dir.join(format!("{key}{LYRICS_HIT_SUFFIX}"));
+    path.is_file().then_some(path)
+}
+
+pub fn update_track_core(
+    db: &Connection,
+    id: i64,
+    title: &str,
+    artist: &str,
+    album: &str,
+    genre: Option<&str>,
+    year: Option<u32>,
+    track_number: Option<u32>,
+    cover_id: Option<&str>,
+) -> Result<(), String> {
+    db.execute(
+        "UPDATE tracks
+            SET title = ?1, artist = ?2, album = ?3, genre = ?4, year = ?5, track_number = ?6,
+                cover_id = COALESCE(?7, cover_id)
+          WHERE id = ?8",
+        rusqlite::params![
+            title,
+            artist,
+            album,
+            genre,
+            year.map(|year| year as i64),
+            track_number.map(|number| number as i64),
+            cover_id,
+            id,
+        ],
+    )
+    .map_err(|error| format!("Could not update track: {error}"))?;
+    Ok(())
 }
 
 fn path_key(path: &str) -> String {

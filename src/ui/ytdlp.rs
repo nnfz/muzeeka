@@ -989,6 +989,176 @@ fn starts_with_ignore_ascii(text: &str, prefix: &str) -> bool {
         && text.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
 }
 
+pub(crate) fn auto_video_bg_enabled() -> bool {
+    let raw = fs::read_to_string(settings_path()).unwrap_or_default();
+    let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+        return false;
+    };
+    match value.get("auto_video_bg") {
+        Some(Value::Bool(enabled)) => *enabled,
+        Some(Value::String(text)) => text == "1" || text.eq_ignore_ascii_case("true"),
+        _ => value
+            .get("auto_video_bg_enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    }
+}
+
+pub(crate) fn store_auto_video_bg(enabled: bool) -> Result<(), String> {
+    let path = settings_path();
+    let current = fs::read_to_string(&path).unwrap_or_else(|_| "{}".into());
+    let raw = if current.trim().is_empty() {
+        "{}"
+    } else {
+        current.as_str()
+    };
+    let mut parsed: Value = serde_json::from_str(raw).unwrap_or_else(|_| Value::Object(Default::default()));
+    let object = parsed
+        .as_object_mut()
+        .ok_or_else(|| "settings.json is not an object".to_string())?;
+    object.insert("auto_video_bg".into(), Value::Bool(enabled));
+    object.insert("auto_video_bg_enabled".into(), Value::Bool(enabled));
+    let text = serde_json::to_string_pretty(&parsed).map_err(|error| error.to_string())?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    fs::write(path, text).map_err(|error| error.to_string())
+}
+
+/// Stable clip path for a track. The hash matches the old player's `DefaultHasher` of the path.
+pub(crate) fn video_bg_output(track_path: &str) -> PathBuf {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    track_path.hash(&mut hasher);
+    catalog::app_data_dir()
+        .join("video_backgrounds")
+        .join(format!("{:016x}.mp4", hasher.finish()))
+}
+
+/// Search YouTube and store a 15-second silent clip at `output_path`.
+/// Always downloads. Callers decide whether a previous attempt should block this.
+pub(crate) fn download_video_bg_clip(
+    artist: &str,
+    title: &str,
+    output_path: &Path,
+) -> Result<(), String> {
+    let artist = artist.trim();
+    let title = title.trim();
+    if artist.is_empty() || title.is_empty() {
+        return Err("Track needs an artist and a title to search YouTube".into());
+    }
+    let binary = ytdlp_path().ok_or_else(missing_ytdlp)?;
+    let query = format!("ytsearch5:{artist} {title} -topic");
+    let temp_video = std::env::temp_dir().join(format!(
+        "muzeeka_bg_{}.mp4",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or(0)
+    ));
+    let mut args = base_args();
+    args.extend([
+        "--format".into(),
+        "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]".into(),
+        "--merge-output-format".into(),
+        "mp4".into(),
+        "--no-playlist".into(),
+        "-o".into(),
+        temp_video.to_string_lossy().to_string(),
+        query,
+    ]);
+    let output = run_captured(&binary, &args)?;
+    if !output.status.success() {
+        let _ = fs::remove_file(&temp_video);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("yt-dlp failed");
+        return Err(detail.to_string());
+    }
+    if !temp_video.is_file() {
+        return Err("Video download succeeded but the file is missing".into());
+    }
+    let ffmpeg_bin = find_tool("ffmpeg").ok_or_else(|| "ffmpeg was not found".to_string())?;
+    let ffprobe_bin = find_tool("ffprobe").ok_or_else(|| "ffprobe was not found".to_string())?;
+    let probe = run_tool(
+        &ffprobe_bin,
+        &[
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            &temp_video.to_string_lossy(),
+        ],
+    );
+    let probe = match probe {
+        Ok(probe) => probe,
+        Err(error) => {
+            let _ = fs::remove_file(&temp_video);
+            return Err(error);
+        }
+    };
+    let duration: f64 = String::from_utf8_lossy(&probe.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0.0);
+    if duration < 15.0 {
+        let _ = fs::remove_file(&temp_video);
+        return Err(format!("Video is too short ({duration:.1}s, need at least 15s)"));
+    }
+    let start = ((duration - 15.0) / 2.0).max(0.0);
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("Could not create the video folder: {error}"))?;
+    }
+    let extract = run_tool(
+        &ffmpeg_bin,
+        &[
+            "-y",
+            "-ss",
+            &format!("{start:.3}"),
+            "-i",
+            &temp_video.to_string_lossy(),
+            "-t",
+            "15",
+            "-map",
+            "0:v:0",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-avoid_negative_ts",
+            "make_zero",
+            &output_path.to_string_lossy(),
+        ],
+    );
+    let _ = fs::remove_file(&temp_video);
+    let extract = extract?;
+    if !extract.status.success() || !output_path.is_file() {
+        return Err("ffmpeg could not cut the video clip".into());
+    }
+    Ok(())
+}
+
+fn run_tool(binary: &Path, args: &[&str]) -> Result<std::process::Output, String> {
+    let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+    let mut command = Command::new(binary);
+    command
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    muzeeka::audio::process_util::hide_console(&mut command);
+    command
+        .output()
+        .map_err(|error| format!("Could not run {}: {error}", binary.display()))
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|error| error.into_inner())
 }

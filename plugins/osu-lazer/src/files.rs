@@ -107,7 +107,7 @@ pub fn find_data_dir(setting: &str) -> Result<PathBuf, String> {
         tried.push(path.display().to_string());
     }
     Err(format!(
-        "не нашёл osu! (смотрел {}). Укажите папку в Data folder",
+        "не нашёл osu!lazer (смотрел {}). Укажите папку в Data folder",
         tried.join(", ")
     ))
 }

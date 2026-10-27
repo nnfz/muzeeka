@@ -27,6 +27,22 @@ fn attach_bar_drag(
         .external_drag_payload(crate::ui::item_drag::file_drag_payload)
 }
 
+fn attach_track_menu(
+    element: gpui::Stateful<gpui::Div>,
+    cx: &mut Context<MainWindow>,
+) -> gpui::Stateful<gpui::Div> {
+    element.on_mouse_down(
+        MouseButton::Right,
+        cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
+            cx.stop_propagation();
+            let Some(id) = this.session.read(cx).current_track().map(|track| track.id) else {
+                return;
+            };
+            this.open_track_menu(id, event.position, window, cx);
+        }),
+    )
+}
+
 fn limit_label(text: &str) -> String {
     if text.chars().count() <= TRANSPORT_LABEL_CHARS {
         return text.to_string();
@@ -151,6 +167,7 @@ impl MainWindow {
             Some(drag) => attach_bar_drag(cover_el, drag, cx),
             None => cover_el,
         };
+        let cover_el = attach_track_menu(cover_el, cx);
         let title_el = div()
             .id("transport-title")
             .text_size(px(12.))
@@ -163,6 +180,7 @@ impl MainWindow {
             Some(drag) => attach_bar_drag(title_el, drag, cx),
             None => title_el,
         };
+        let title_el = attach_track_menu(title_el, cx);
         div()
             .flex()
             .flex_1()

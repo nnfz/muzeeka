@@ -5,6 +5,9 @@
 //! written back into `library.db`, in `app_state`.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use std::thread;
 
 use serde::{Deserialize, Serialize};
 
@@ -20,6 +23,8 @@ pub struct Engine {
     player: Player,
     /// Set when the saved rack could not be applied. Playback still starts.
     pub warning: Option<String>,
+    /// Settings speed used when a track has no override. The play hook reads it.
+    fallback_rate: Arc<AtomicU32>,
 }
 
 /// The audio page of `settings.json`: the live rack, speed, and saved presets.
@@ -134,12 +139,18 @@ impl Engine {
             .set_volume(volume.clamp(0.0, 1.0))
             .map_err(|error| format!("Volume was not applied: {error}"))?;
         player.start_position_emitter(sink);
+        let fallback_rate = Arc::new(AtomicU32::new(rack.playback_rate.to_bits()));
+        install_library_hook(&player, Arc::clone(&fallback_rate));
         eprintln!(
             "[audio] BASS ready, {} DSP slot{}",
             rack.chain.len(),
             if rack.chain.len() == 1 { "" } else { "s" }
         );
-        Ok(Self { player, warning })
+        Ok(Self {
+            player,
+            warning,
+            fallback_rate,
+        })
     }
 
     pub fn apply_chain(&self, slots: Vec<ChainSlotSettings>) -> Result<(), String> {
@@ -148,6 +159,31 @@ impl Engine {
 
     pub fn set_rate(&self, rate: f32) -> Result<(), String> {
         self.player.set_playback_rate(rate)
+    }
+
+    pub fn set_rate_immediate(&self, rate: f32) -> Result<(), String> {
+        self.player.set_playback_rate_immediate(rate)
+    }
+
+    pub fn set_fallback_rate(&self, rate: f32) {
+        let rate = if rate.is_finite() {
+            rate.clamp(0.25, 2.0)
+        } else {
+            1.0
+        };
+        self.fallback_rate.store(rate.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn current_path(&self) -> Option<String> {
+        self.player.get_state().current_file
+    }
+
+    pub fn clone_player(&self) -> Player {
+        self.player.clone()
+    }
+
+    pub fn detect_bpm(&self, path: &str) -> Result<f32, String> {
+        muzeeka::audio::bpm::detect_bpm_for_path(&self.player, path)
     }
 
     pub fn set_pitch(&self, enabled: bool) -> Result<(), String> {
@@ -482,6 +518,62 @@ pub(crate) fn merge_audio_json(raw: &str, rack: &AudioRack) -> Result<String, St
         serde_json::to_value(&rack.chain_presets).map_err(|error| error.to_string())?,
     );
     serde_json::to_string_pretty(&value).map_err(|error| error.to_string())
+}
+
+fn install_library_hook(player: &Player, fallback: Arc<AtomicU32>) {
+    let player_for_hook = player.clone();
+    player.set_play_hook(Some(Arc::new(move |path| {
+        on_track_started(&player_for_hook, &fallback, path);
+    })));
+}
+
+fn on_track_started(player: &Player, fallback: &AtomicU32, path: &str) {
+    let Ok(db) = catalog::open_library() else {
+        return;
+    };
+    let _ = catalog::record_play(&db, path);
+    let rate = catalog::track_playback_rate(&db, path)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| f32::from_bits(fallback.load(Ordering::Relaxed)));
+    let _ = player.set_playback_rate_immediate(rate);
+    let path = path.to_string();
+    thread::spawn(move || maybe_auto_video(&path));
+}
+
+/// Auto video respects the setting, an existing file, and a previous miss.
+/// A manual Search in Properties does not come through here.
+fn maybe_auto_video(path: &str) {
+    if path.trim().is_empty() || !crate::ui::ytdlp::auto_video_bg_enabled() {
+        return;
+    }
+    let Ok(db) = catalog::open_library() else {
+        return;
+    };
+    if catalog::track_video_bg(&db, path)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return;
+    }
+    if catalog::track_video_bg_tried(&db, path).unwrap_or(true) {
+        return;
+    }
+    let Some((title, artist)) = catalog::labels_for_playback_path(&db, path) else {
+        return;
+    };
+    if title.trim().is_empty() || artist.trim().is_empty() {
+        return;
+    }
+    if catalog::set_track_video_bg_tried(&db, path).is_err() {
+        return;
+    }
+    let output = crate::ui::ytdlp::video_bg_output(path);
+    if crate::ui::ytdlp::download_video_bg_clip(&artist, &title, &output).is_err() {
+        return;
+    }
+    let _ = catalog::set_track_video_bg(&db, path, Some(&output.to_string_lossy()));
 }
 
 #[cfg(test)]

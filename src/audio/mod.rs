@@ -1,7 +1,9 @@
 // Audio engine module
 
 pub mod bass;
+pub mod bpm;
 pub mod biquad;
+pub mod cover_write;
 pub mod cue;
 pub mod dev_log;
 pub mod discord_rpc;
@@ -16,6 +18,8 @@ pub mod metadata;
 pub mod mix_filter;
 pub mod output_tap;
 pub mod player;
+pub mod tag_table;
+pub mod tech;
 pub mod process_util;
 pub mod stream_debug;
 // pub mod unison;  // TODO: needs lyrics module (lrc_to_ttml, track_identity_matches, etc.)

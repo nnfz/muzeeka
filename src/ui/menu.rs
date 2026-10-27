@@ -216,6 +216,53 @@ if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
     Ok(path)
 }
 
+fn dialog_path(script: &str) -> Result<Option<PathBuf>, String> {
+    let output = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-STA",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            script,
+        ])
+        .output()
+        .map_err(|error| format!("Could not open the file dialog: {error}"))?;
+    if !output.status.success() && output.stdout.is_empty() {
+        let detail = String::from_utf8_lossy(&output.stderr);
+        let detail = detail.trim();
+        if detail.is_empty() {
+            return Err("Could not open the file dialog".into());
+        }
+        return Err(format!("Could not open the file dialog: {detail}"));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let path = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .next_back()
+        .map(PathBuf::from);
+    Ok(path)
+}
+
+/// `Ok(None)` is a cancelled dialog.
+pub fn pick_file(title: &str, filter: &str) -> Result<Option<PathBuf>, String> {
+    let script = format!(
+        r#"
+Add-Type -AssemblyName System.Windows.Forms
+$dialog = New-Object System.Windows.Forms.OpenFileDialog
+$dialog.Title = '{title}'
+$dialog.Filter = '{filter}'
+$dialog.Multiselect = $false
+if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {{
+  Write-Output $dialog.FileName
+}}
+"#
+    );
+    dialog_path(&script)
+}
+
 /// `Ok(None)` is a cancelled dialog.
 pub fn pick_image() -> Result<Option<PathBuf>, String> {
     let script = r#"

@@ -333,7 +333,7 @@ impl SettingsWindow {
                         "Automatically download 15-second YouTube clips for track backgrounds",
                         video,
                         cx,
-                        |session| session.auto_video_bg = !session.auto_video_bg,
+                        |session| session.toggle_auto_video_bg(),
                     ))
                     .child(self.density_row(density, cx))
                     .child(self.shuffle_row(order, cx)),

@@ -132,6 +132,9 @@ impl Session {
         } else {
             1.0
         };
+        if let Some(engine) = &self.engine {
+            engine.set_fallback_rate(self.rack.playback_rate);
+        }
     }
 
     pub(crate) fn commit_rate(&mut self) {

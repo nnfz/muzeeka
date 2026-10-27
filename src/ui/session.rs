@@ -258,6 +258,8 @@ pub struct Session {
     search_folds: Vec<SearchFold>,
     /// Live output. Absent in tests and when BASS failed to open.
     pub(crate) engine: Option<Engine>,
+    /// Playback path whose per-track speed was last applied. A new file snaps again.
+    rated_path: Option<String>,
     /// Effect rack, speed, and presets from settings.json.
     pub rack: AudioRack,
     /// When the current file was handed to BASS.
@@ -379,7 +381,7 @@ impl Session {
             shuffle_order: Vec::new(),
             rng: 0x1234_5678,
             discord_rpc: true,
-            auto_video_bg: false,
+            auto_video_bg: crate::ui::ytdlp::auto_video_bg_enabled(),
             order_mode: OrderMode::Shuffle,
             playlist_density: PlaylistDensity::Normal,
             playback_error: None,
@@ -390,6 +392,7 @@ impl Session {
             playlist_of: HashMap::new(),
             search_folds: Vec::new(),
             engine: None,
+            rated_path: None,
             rack: AudioRack::flat(),
             armed_at: None,
             heard_to: library.position,
@@ -433,6 +436,7 @@ impl Session {
             playlist_of: HashMap::new(),
             search_folds: Vec::new(),
             engine: None,
+            rated_path: None,
             rack: AudioRack::flat(),
             armed_at: None,
             heard_to: 0.0,
@@ -492,6 +496,7 @@ impl Session {
             playlist_of: HashMap::new(),
             search_folds: Vec::new(),
             engine: None,
+            rated_path: None,
             rack: AudioRack::flat(),
             armed_at: None,
             heard_to: 0.0,
@@ -579,6 +584,138 @@ impl Session {
     /// Changes when the rows of a view can change. Position updates do not.
     pub fn list_epoch(&self) -> u64 {
         self.list_epoch
+    }
+
+    pub(crate) fn toggle_auto_video_bg(&mut self) {
+        self.auto_video_bg = !self.auto_video_bg;
+        if let Err(error) = crate::ui::ytdlp::store_auto_video_bg(self.auto_video_bg) {
+            self.push_notice(error);
+        }
+    }
+
+    pub(crate) fn apply_saved_tags(
+        &mut self,
+        id: TrackId,
+        title: String,
+        artist: String,
+        album: String,
+    ) {
+        let Some(&index) = self.index_by_id.get(&id) else {
+            return;
+        };
+        let duration = self
+            .tracks
+            .get(index)
+            .map(|track| track.duration)
+            .unwrap_or(0.0);
+        if let Some(track) = self.tracks.get_mut(index) {
+            track.title = title;
+            track.artist = artist;
+            track.album = album;
+            track.lyrics = catalog::lyrics_path_for(
+                &track.title,
+                &track.artist,
+                &track.album,
+                duration,
+            );
+        }
+        let Some(track) = self.tracks.get(index) else {
+            return;
+        };
+        let title = track.title.to_lowercase();
+        let artist = track.artist.to_lowercase();
+        let album = track.album.to_lowercase();
+        if let Some(fold) = self.search_folds.iter_mut().find(|fold| fold.id == id) {
+            fold.title = title;
+            fold.artist = artist;
+            fold.album = album;
+        } else {
+            self.search_folds.push(SearchFold {
+                id,
+                title,
+                artist,
+                album,
+            });
+        }
+        self.list_epoch = self.list_epoch.wrapping_add(1);
+    }
+
+    pub(crate) fn apply_cover_paths(&mut self, ids: &[TrackId], cover: Option<PathBuf>) {
+        for id in ids {
+            let Some(&index) = self.index_by_id.get(id) else {
+                continue;
+            };
+            if let Some(track) = self.tracks.get_mut(index) {
+                track.cover = cover.clone();
+            }
+        }
+        self.list_epoch = self.list_epoch.wrapping_add(1);
+    }
+
+    pub(crate) fn refresh_lyrics(&mut self, id: TrackId) {
+        let Some(&index) = self.index_by_id.get(&id) else {
+            return;
+        };
+        if let Some(track) = self.tracks.get_mut(index) {
+            track.lyrics = catalog::lyrics_path_for(
+                &track.title,
+                &track.artist,
+                &track.album,
+                track.duration,
+            );
+        }
+    }
+
+    pub(crate) fn ids_for_audio_file(&self, audio_path: &str) -> Vec<TrackId> {
+        let want = crate::ui::paths::path_key(crate::ui::menu::file_on_disk(audio_path));
+        if want.is_empty() {
+            return Vec::new();
+        }
+        self.tracks
+            .iter()
+            .filter(|track| {
+                crate::ui::paths::path_key(crate::ui::menu::file_on_disk(&track.path)) == want
+            })
+            .map(|track| track.id)
+            .collect()
+    }
+
+    pub(crate) fn plays_path(&self, path: &str) -> bool {
+        self.current_track()
+            .is_some_and(|track| track.path == path)
+    }
+
+    pub(crate) fn push_engine_rate(&mut self, rate: f32, immediate: bool) {
+        let Some(engine) = &self.engine else {
+            return;
+        };
+        let result = if immediate {
+            engine.set_rate_immediate(rate)
+        } else {
+            engine.set_rate(rate)
+        };
+        if let Err(error) = result {
+            self.push_notice(format!("Playback rate was not applied: {error}"));
+        }
+    }
+
+    fn rate_for_path(&self, path: &str) -> f32 {
+        self.db
+            .as_ref()
+            .and_then(|db| catalog::track_playback_rate(db, path).ok().flatten())
+            .unwrap_or(self.rack.playback_rate)
+    }
+
+    fn sync_track_rate(&mut self) {
+        let Some(path) = self.engine.as_ref().and_then(|engine| engine.current_path()) else {
+            return;
+        };
+        if self.rated_path.as_deref() == Some(path.as_str()) {
+            return;
+        }
+        let rate = self.rate_for_path(&path);
+        self.rated_path = Some(path);
+        self.push_engine_rate(rate, true);
     }
 
     pub fn current_track(&self) -> Option<&Track> {
@@ -2213,6 +2350,7 @@ impl Session {
         let expired = self.expire_playback_error();
         if self.engine.is_some() {
             let changed = self.poll_output();
+            self.sync_track_rate();
             if self.playing {
                 self.remember_playback(false);
             }
@@ -2331,6 +2469,11 @@ impl Session {
         self.armed_at = Some(Instant::now());
         self.heard_to = resume_at;
         self.hold = false;
+        let rate = self.rate_for_path(&path);
+        self.rated_path = Some(path.clone());
+        if let Some(engine) = self.engine.as_ref() {
+            let _ = engine.set_rate_immediate(rate);
+        }
         let played = self.engine.as_ref().expect("engine").play(&path, queue);
         if let Err(error) = played {
             self.playing = false;
