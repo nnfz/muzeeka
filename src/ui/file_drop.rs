@@ -1,9 +1,3 @@
-//! Explorer drops on the main window.
-//!
-//! The OS owns the drag, so Ctrl is read with GetAsyncKeyState. Zone hit
-//! rectangles come from the previous frame: canvas prepaint records them
-//! after the view has already rendered.
-
 use std::time::{Duration, Instant};
 
 use gpui::{
@@ -44,17 +38,10 @@ pub(crate) struct FileDropState {
     last_key: Option<String>,
     last_at: Option<Instant>,
     scanning: bool,
-    /// Every dragged path is a file. Folders keep the create-playlist hint.
-    /// Set once, when the drag enters: the paths do not change after that.
     files_only: bool,
-    /// Rows in the open list, from the last track-list render.
-    /// A drag move must not rebuild that list.
     track_count: usize,
-    /// Row boundary in the track list where a file drop will land.
     track_slot: Option<usize>,
-    /// The open gap is a track reorder, not an Explorer file slot.
     reorder_rows: bool,
-    /// Visual gap. The list reads this while the spring is still moving.
     gap: GapMotion,
     gap_clock: bool,
     gap_at: Instant,
@@ -88,14 +75,12 @@ impl Default for FileDropState {
     }
 }
 
-/// One spring shared by the dashed strip and every shifted row.
 struct GapMotion {
     index: f32,
     index_v: f32,
     open: f32,
     open_v: f32,
     engaged: bool,
-    /// A dropped file already occupies the hole, so the gap must not ease shut over it.
     snap: bool,
 }
 
@@ -116,7 +101,6 @@ fn spring_state(position: f32, velocity: f32) -> SpringState {
     SpringState { position, velocity }
 }
 
-/// Advances the gap. Returns whether another frame is needed.
 fn step_gap(motion: &mut GapMotion, target: Option<f32>, dt: f32, reduce: bool) -> bool {
     let config = MainWindow::smooth_config();
     let dt = if dt.is_finite() { dt.max(0.) } else { 0. };
@@ -178,14 +162,10 @@ fn step_gap(motion: &mut GapMotion, target: Option<f32>, dt: f32, reduce: bool) 
     }
 }
 
-/// Track row height, header, and the list's top padding. The slot math has to
-/// match `track_list`.
 const TRACK_ROW_H: f32 = 52.;
 const TRACK_HEADER_H: f32 = 36.;
 const TRACK_LIST_PAD: f32 = 8.;
 
-/// Index of the gap for a pointer `y` pixels into the list body. `count` is the
-/// number of tracks. The result is `0..=count`.
 fn insertion_index(y: f32, count: usize) -> usize {
     if count == 0 || y < TRACK_ROW_H * 0.5 {
         return 0;
@@ -207,7 +187,6 @@ fn zero_bounds() -> Bounds<Pixels> {
 fn ctrl_down() -> bool {
     #[cfg(windows)]
     {
-        // High bit means the key is down. The drag does not deliver modifiers.
         unsafe {
             GetAsyncKeyState(0x11) < 0 || GetAsyncKeyState(0xA2) < 0 || GetAsyncKeyState(0xA3) < 0
         }
@@ -249,7 +228,6 @@ impl FileDropState {
             .map(str::to_owned)
     }
 
-    /// Playlist row under the pointer, without cloning, while a file drag is in import mode.
     fn lit_row_id_at(
         &self,
         active: bool,
@@ -287,7 +265,6 @@ impl MainWindow {
             return;
         }
         let position = event.event.position;
-        // Paths stay the ones captured when the drag entered the window.
         if !self.file_drop.active {
             let files_only = {
                 let paths = event.drag(cx).paths();
@@ -388,7 +365,6 @@ impl MainWindow {
         let import_mode = ctrl || files_only;
         let target = self.file_drop.row_at();
         let slot = self.file_drop.track_slot;
-        // The new row is inserted into this hole. Easing the gap shut would stack on top of it.
         if files_only && zone == DropZone::Tracks && slot.is_some() {
             self.file_drop.gap.snap = true;
         }
@@ -592,7 +568,6 @@ impl MainWindow {
         self.file_drop.sidebar_lit()
     }
 
-    /// Steps the track-list gap. The logical slot stays on the cursor; this only eases the drawing.
     pub(crate) fn tick_drop_motion(&mut self, window: &mut Window, reduce_motion: bool) {
         let target = self.file_drop.track_slot.map(|slot| slot as f32);
         let now = Instant::now();
@@ -613,7 +588,6 @@ impl MainWindow {
         }
     }
 
-    /// How tall the open gap is. A file slot is one row. A reorder gap is shorter.
     pub(crate) fn gap_span(&self) -> f32 {
         if self.file_drop.reorder_rows {
             crate::ui::item_drag::REORDER_GAP
@@ -657,7 +631,6 @@ impl MainWindow {
             .find_map(|(id, _, bounds)| bounds.contains(&position).then(|| id.clone()))
     }
 
-    /// Row centers in sidebar content space, top to bottom.
     pub(crate) fn playlist_slot_centers(&self) -> Vec<f32> {
         let top = self.file_drop.list_bounds.top().as_f32();
         let scroll = -self.sidebar_scroll.offset().y.as_f32();
@@ -673,7 +646,6 @@ impl MainWindow {
         centers
     }
 
-    /// Visual insertion index and how far the gap has opened, while it is on screen.
     pub(crate) fn drop_gap(&self) -> Option<(f32, f32)> {
         if !self.file_drop.gap.engaged {
             None

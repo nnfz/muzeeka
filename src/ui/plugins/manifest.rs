@@ -32,7 +32,6 @@ pub struct PluginManifest {
     pub description: String,
     #[serde(default = "default_main")]
     pub main: String,
-    /// `"js"` or `"native"`. If omitted, taken from `main` (`.dll` → native).
     #[serde(default)]
     pub runtime: Option<String>,
     #[serde(default)]
@@ -59,7 +58,6 @@ impl Default for SettingKind {
     }
 }
 
-/// One field the host can render in Settings without a custom UI page.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginSettingSpec {
     pub key: String,
@@ -73,7 +71,6 @@ pub struct PluginSettingSpec {
     pub min: Option<f64>,
     #[serde(default)]
     pub max: Option<f64>,
-    /// Snap a slider. Ignored for other kinds.
     #[serde(default)]
     pub step: Option<f64>,
     #[serde(default)]
@@ -154,7 +151,11 @@ pub enum PluginRuntime {
 
 impl PluginManifest {
     pub fn runtime(&self) -> PluginRuntime {
-        match self.runtime.as_deref().map(|s| s.trim().to_ascii_lowercase()) {
+        match self
+            .runtime
+            .as_deref()
+            .map(|s| s.trim().to_ascii_lowercase())
+        {
             Some(s) if s == "native" || s == "dll" => PluginRuntime::Native,
             Some(s) if s == "js" || s == "javascript" => PluginRuntime::Js,
             _ => {
@@ -213,7 +214,10 @@ impl PluginManifest {
                 return Err(format!("Empty settings key in {}", self.id));
             }
             if !seen.insert(spec.key.clone()) {
-                return Err(format!("Duplicate settings key '{}' in {}", spec.key, self.id));
+                return Err(format!(
+                    "Duplicate settings key '{}' in {}",
+                    spec.key, self.id
+                ));
             }
         }
         Ok(())

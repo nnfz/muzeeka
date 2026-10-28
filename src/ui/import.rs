@@ -1,8 +1,3 @@
-//! Scan dropped audio into the shared library database.
-//!
-//! The scanner walks folders, expands `.cue` sheets, and upserts rows with the
-//! same path keys the Tauri app already uses.
-
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -39,25 +34,22 @@ pub struct DropSource {
 
 #[derive(Clone, Debug)]
 pub enum ImportKind {
-    /// One playlist per dropped folder. Loose files share one "Playlist N".
-    Folders { sources: Vec<DropSource> },
-    /// Ctrl-drop onto an existing playlist row, or a drop onto the open playlist.
+    Folders {
+        sources: Vec<DropSource>,
+    },
     Playlist {
         id: String,
         label: String,
         sources: Vec<DropSource>,
-        /// Index in the open list. `None` appends.
         at: Option<usize>,
     },
-    /// Track list while All tracks or Liked is showing, and the drop is a folder.
-    NewPlaylist { sources: Vec<DropSource> },
-    /// A loose audio file dropped on All tracks or Liked. It joins the library list.
+    NewPlaylist {
+        sources: Vec<DropSource>,
+    },
     Library {
         sources: Vec<DropSource>,
-        /// Index in All tracks. `None` appends.
         at: Option<usize>,
     },
-    /// Files yt-dlp just wrote.
     Download {
         named: Option<String>,
         configured_id: Option<String>,
@@ -68,7 +60,6 @@ pub enum ImportKind {
 pub struct ImportReport {
     pub toast: String,
     pub open_id: Option<String>,
-    /// Persist this id as `download_playlist_id` when it was resolved now.
     pub remember_download_playlist: Option<String>,
 }
 
@@ -87,7 +78,6 @@ pub fn scan_paths(paths: &[String]) -> Vec<MusicFile> {
         }
         let walk_root = paths::extended_path(&path);
         if path.is_dir() || walk_root.is_dir() {
-            // No depth cap: a folder imported as a playlist includes every nested folder.
             for entry in WalkDir::new(&walk_root)
                 .follow_links(true)
                 .into_iter()
@@ -326,7 +316,6 @@ fn tracks_word(count: usize) -> &'static str {
     }
 }
 
-/// Group scanned files the way a sidebar folder drop does.
 fn group_folder_drop(files: &[MusicFile], sources: &[DropSource]) -> Vec<Group> {
     let dirs: Vec<&DropSource> = sources.iter().filter(|source| source.is_dir).collect();
     if dirs.is_empty() {
@@ -819,8 +808,6 @@ fn build_files(paths: Vec<PathBuf>) -> Vec<MusicFile> {
         match extension_of(path).as_deref() {
             Some("cue") => cue_paths.push(path.clone()),
             Some(ext) if is_audio(ext) => audio_paths.push(path.clone()),
-            // osu!lazer stores beatmap audio with no extension. The header says
-            // what it is, and playback opens that same file.
             None if sniff_extension(path).is_some() => audio_paths.push(path.clone()),
             _ => {}
         }
@@ -894,7 +881,6 @@ fn is_audio(ext: &str) -> bool {
     AUDIO_EXTENSIONS.contains(&ext)
 }
 
-/// Extensionless audio. A named extension that is not audio stays ignored.
 fn sniff_extension(path: &Path) -> Option<String> {
     if extension_of(path).is_some() {
         return None;
@@ -931,11 +917,9 @@ pub(crate) struct BlankName<'a> {
     pub path: &'a str,
     pub title: &'a str,
     pub artist: &'a str,
-    /// Image used only when the file has no embedded cover.
     pub cover: &'a str,
 }
 
-/// Uses the label only where the file has no title, artist, or cover of its own.
 pub(crate) fn fill_blank_names(files: &mut [MusicFile], labels: &[BlankName<'_>]) {
     let covers = catalog::app_data_dir().join("covers");
     apply_labels(files, labels, &covers);
@@ -1069,7 +1053,6 @@ fn parse_year(text: &str) -> Option<u32> {
     }
 }
 
-/// Read the embedded cover once and store the same files the importer uses.
 pub(crate) fn stored_cover(path: &Path) -> Option<(String, PathBuf)> {
     let covers = catalog::app_data_dir().join("covers");
     let _ = fs::create_dir_all(&covers);
@@ -1084,7 +1067,6 @@ fn stored_cover_paths(path: &Path, covers: &Path) -> Option<(String, String)> {
     store_cover(tag, covers)
 }
 
-/// `read_from_path` trusts the extension. osu! audio has none, so guess from the bytes.
 fn read_tagged(path: &Path) -> Option<lofty::file::TaggedFile> {
     if path.extension().is_some() {
         return lofty::read_from_path(path).ok();

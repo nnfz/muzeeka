@@ -43,6 +43,7 @@ base64 = "0.22"
 
 # Utilities
 regex = "1"
+roxmltree = "0.21"
 cue-rw = "0.2"
 num-rational = "0.4"
 encoding_rs = "0.8"
@@ -71,6 +72,11 @@ embed-resource = "3.0"
 
 [profile.dev]
 opt-level = 1
+
+# Dependencies (GPUI above all) are slow unoptimized. They rarely rebuild,
+# so this costs one longer first build.
+[profile.dev.package."*"]
+opt-level = 3
 
 [profile.release]
 lto = "thin"

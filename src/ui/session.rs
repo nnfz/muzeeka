@@ -1,8 +1,3 @@
-// UI session for the main window.
-//
-// The track list is the library in `%APPDATA%\com.nnfz.muzeeka`. `Session::open`
-// plays through BASS. `preview` and `empty` keep the clock so tests stay quiet.
-
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
@@ -30,10 +25,8 @@ pub struct Track {
     pub album: String,
     pub duration: f64,
     pub liked: bool,
-    /// Absolute file path, including a `#cue:N` suffix when the row is a cue entry.
     pub path: String,
     pub cover: Option<PathBuf>,
-    /// Cached `.ttml` in the shared lyrics folder, when this track has one.
     pub lyrics: Option<PathBuf>,
 }
 
@@ -42,14 +35,11 @@ pub struct Playlist {
     pub id: String,
     pub name: String,
     pub track_ids: Vec<TrackId>,
-    /// Picture shown in the sidebar. A user cover, or the first track's cover.
     pub cover: Option<PathBuf>,
-    /// `playlists.cover_path` when the user set one. Empty means the picture is a fallback.
     pub cover_path: Option<String>,
     pub mix_mode: bool,
 }
 
-/// A library row the download manager can scroll into view.
 pub(crate) struct TrackSpot {
     pub track_id: TrackId,
     pub view: LibraryView,
@@ -80,12 +70,9 @@ impl RepeatMode {
     }
 }
 
-/// How tracks are chosen once the shuffle button is on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OrderMode {
-    /// One shuffled copy of the queue. Previous and next walk that copy.
     Shuffle,
-    /// Every previous and next picks a track. Nothing is remembered.
     Random,
 }
 
@@ -97,7 +84,6 @@ impl OrderMode {
         }
     }
 
-    /// `settings.json` still stores the old smart/normal names. Both mean shuffle.
     pub fn from_setting(value: Option<&str>) -> Self {
         match value {
             Some("random") => Self::Random,
@@ -173,7 +159,6 @@ pub enum SettingsSection {
     About,
 }
 
-/// How regular playlists are drawn in the sidebar. All tracks and Liked stay compact.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlaylistDensity {
     Normal,
@@ -223,8 +208,6 @@ impl SettingsSection {
 
 pub struct Session {
     tracks: Vec<Track>,
-    /// Liked view order. Independent of library order, so a like drag does not
-    /// reshuffle All tracks.
     liked_order: Vec<TrackId>,
     pub playlists: Vec<Playlist>,
     pub view: LibraryView,
@@ -237,41 +220,26 @@ pub struct Session {
     pub repeat: RepeatMode,
     pub sort: Option<Sort>,
     pub queue: Vec<TrackId>,
-    /// Shuffled copy of `queue`. Only [`OrderMode::Shuffle`] walks it.
     shuffle_order: Vec<TrackId>,
     rng: u32,
     pub discord_rpc: bool,
     pub auto_video_bg: bool,
     pub order_mode: OrderMode,
     pub playlist_density: PlaylistDensity,
-    /// Failed to open the current file, or save the library. Shown beside search.
     pub playback_error: Option<String>,
     playback_error_until: Option<Instant>,
-    /// Full audio files that also have `#cue:` rows. Hidden from search and All.
     cue_containers: HashSet<TrackId>,
-    /// Bumped when the visible track set changes. Playback position does not.
     list_epoch: u64,
     index_by_id: HashMap<TrackId, usize>,
     playlist_of: HashMap<TrackId, String>,
-    /// Lowercased title, artist, and album, parallel to `tracks`.
-    /// Built once so a search does not allocate a folded copy of every hit.
     search_folds: Vec<SearchFold>,
-    /// Live output. Absent in tests and when BASS failed to open.
     pub(crate) engine: Option<Engine>,
-    /// Playback path whose per-track speed was last applied. A new file snaps again.
     rated_path: Option<String>,
-    /// Effect rack, speed, and presets from settings.json.
     pub rack: AudioRack,
-    /// When the current file was handed to BASS.
     armed_at: Option<Instant>,
-    /// Furthest playhead seen on this file. A decoder that stops by rewinding
-    /// to zero still counts as the end once this is near the duration.
     heard_to: f64,
-    /// User pressed pause. A stopped stream must not advance past that.
     hold: bool,
-    /// Playlist the queue was started from. Empty for All tracks and Liked.
     playing_playlist: Option<String>,
-    /// Last successful write of `app_state`. Position updates are throttled.
     playback_saved_at: Option<Instant>,
     playback_stamp: Option<PlaybackStamp>,
     db: Option<Connection>,
@@ -292,8 +260,6 @@ struct SearchFold {
 }
 
 impl Session {
-    /// Real library from the shared app-data folder. A missing database is
-    /// created empty. Sample tracks stay in [`Self::preview`] for tests.
     pub fn open() -> Self {
         let mut session = match catalog::load() {
             Ok(library) => Self::from_library(library),
@@ -330,7 +296,6 @@ impl Session {
         session
     }
 
-    /// Appends a line to the header error, beside search.
     pub(crate) fn push_notice(&mut self, line: String) {
         let line = match self.playback_error.take() {
             Some(existing) => format!("{existing} {line}"),
@@ -339,8 +304,6 @@ impl Session {
         self.note_playback_error(line);
     }
 
-    /// Replace the header playback error. It expires on its own, and a later
-    /// successful open clears it immediately.
     pub(crate) fn note_playback_error(&mut self, line: String) {
         self.playback_error = Some(line);
         self.playback_error_until = Some(Instant::now() + PLAYBACK_ERROR_TTL);
@@ -546,7 +509,6 @@ impl Session {
         self.list_epoch = self.list_epoch.wrapping_add(1);
     }
 
-    /// Drop likes that no longer exist and append newly liked rows at the end.
     fn sync_liked_order(&mut self) {
         let liked: HashSet<TrackId> = self
             .tracks
@@ -581,7 +543,6 @@ impl Session {
         self.tracks.iter().filter(|track| track.liked).count()
     }
 
-    /// Changes when the rows of a view can change. Position updates do not.
     pub fn list_epoch(&self) -> u64 {
         self.list_epoch
     }
@@ -612,12 +573,8 @@ impl Session {
             track.title = title;
             track.artist = artist;
             track.album = album;
-            track.lyrics = catalog::lyrics_path_for(
-                &track.title,
-                &track.artist,
-                &track.album,
-                duration,
-            );
+            track.lyrics =
+                catalog::lyrics_path_for(&track.title, &track.artist, &track.album, duration);
         }
         let Some(track) = self.tracks.get(index) else {
             return;
@@ -657,12 +614,8 @@ impl Session {
             return;
         };
         if let Some(track) = self.tracks.get_mut(index) {
-            track.lyrics = catalog::lyrics_path_for(
-                &track.title,
-                &track.artist,
-                &track.album,
-                track.duration,
-            );
+            track.lyrics =
+                catalog::lyrics_path_for(&track.title, &track.artist, &track.album, track.duration);
         }
     }
 
@@ -681,8 +634,7 @@ impl Session {
     }
 
     pub(crate) fn plays_path(&self, path: &str) -> bool {
-        self.current_track()
-            .is_some_and(|track| track.path == path)
+        self.current_track().is_some_and(|track| track.path == path)
     }
 
     pub(crate) fn push_engine_rate(&mut self, rate: f32, immediate: bool) {
@@ -707,7 +659,11 @@ impl Session {
     }
 
     fn sync_track_rate(&mut self) {
-        let Some(path) = self.engine.as_ref().and_then(|engine| engine.current_path()) else {
+        let Some(path) = self
+            .engine
+            .as_ref()
+            .and_then(|engine| engine.current_path())
+        else {
             return;
         };
         if self.rated_path.as_deref() == Some(path.as_str()) {
@@ -729,7 +685,6 @@ impl Session {
         }
     }
 
-    /// Play is available, and whether previous and next have somewhere to go.
     pub fn taskbar_flags(&self) -> (bool, bool, bool, bool) {
         let (has_prev, has_next) = self.can_navigate();
         let can_play = self.current.is_some() || !self.queue.is_empty();
@@ -750,7 +705,6 @@ impl Session {
         let deck = self.shuffled_deck();
         let repeat_all = self.repeat == RepeatMode::All;
         let order = self.play_order();
-        // Repeat-one restarts the open track, so next still has somewhere to go.
         let has_next =
             self.repeat == RepeatMode::One || step_forward(order, current, repeat_all).is_some();
         let has_prev =
@@ -846,9 +800,6 @@ impl Session {
             .collect()
     }
 
-    /// Hit ids for the search dropdown, in library order. Empty when the query
-    /// has no text or is a media URL. Unlike [`Self::visible_tracks`], this
-    /// ignores the open library view. Does not clone track bodies.
     pub fn search_ids(&self, query: &str) -> Vec<TrackId> {
         if !has_search_text(query) {
             return Vec::new();
@@ -864,8 +815,6 @@ impl Session {
             .collect()
     }
 
-    /// Track ids that belong to a playlist whose name contains `name`.
-    /// `None` means the query has no playlist filter.
     fn playlist_filter_ids(&self, name: Option<&str>) -> Option<HashSet<TrackId>> {
         let name = name?;
         let needle = name.to_lowercase();
@@ -886,8 +835,6 @@ impl Session {
         &self.tracks
     }
 
-    /// Playlist that should open for this track. `prefer` wins when the track
-    /// is still in it, otherwise the first playlist that contains the track.
     pub(crate) fn playlist_home(
         &self,
         id: TrackId,
@@ -908,8 +855,6 @@ impl Session {
             .map(|playlist| (playlist.id.clone(), playlist.name.clone()))
     }
 
-    /// Where a downloaded file should scroll into view.
-    /// Stays on the open list when the track is already there.
     pub(crate) fn spot_for_path(&self, path: &str) -> Option<TrackSpot> {
         let key = crate::ui::paths::path_key(path);
         let track = self
@@ -919,14 +864,11 @@ impl Session {
         Some(self.spot_in_open_view(track.id))
     }
 
-    /// Where "Go to track" should scroll. Stays on the open list when this
-    /// track is already there, and opens All tracks otherwise.
     pub(crate) fn spot_for_track(&self, id: TrackId) -> Option<TrackSpot> {
         self.track(id)?;
         Some(self.spot_in_open_view(id))
     }
 
-    /// Sidebar rows to blink with the track, when it lives in more than one playlist.
     pub(crate) fn playlists_to_flash(&self, id: TrackId) -> Vec<String> {
         let ids: Vec<String> = self
             .playlists
@@ -980,8 +922,6 @@ impl Session {
         }
     }
 
-    /// Start `id` inside its playlist, the same way a row in that playlist does.
-    /// `prefer` wins when the track is still in that playlist.
     pub(crate) fn play_track(&mut self, id: TrackId, prefer: Option<&str>) {
         if self.track(id).is_none() {
             return;
@@ -1036,7 +976,6 @@ impl Session {
             None => ("", trimmed),
         };
         let token_lower = token.to_lowercase();
-        // The filter menu opens only while the current word starts with '@'.
         if !token_lower.starts_with('@') {
             return Vec::new();
         }
@@ -1057,7 +996,6 @@ impl Session {
                 .collect();
         }
 
-        // Short and long names. Bare `@p` stays in this list so `@playlist` is still offered.
         let modifiers = [
             ("@a", "Search artist", "@a "),
             ("@t", "Search title", "@t "),
@@ -1199,7 +1137,6 @@ impl Session {
         self.rebuild_indexes();
     }
 
-    /// Copies one library track onto a playlist. Already-present tracks stay put.
     pub fn add_to_playlist(&mut self, playlist_id: &str, track: TrackId) -> bool {
         let Some(playlist) = self
             .playlists
@@ -1226,7 +1163,6 @@ impl Session {
         true
     }
 
-    /// Removes a track from a playlist. The file stays in the library.
     pub fn remove_from_playlist(&mut self, playlist_id: &str, track: TrackId) {
         let Some(playlist) = self
             .playlists
@@ -1252,9 +1188,6 @@ impl Session {
         self.rebuild_indexes();
     }
 
-    /// Reorder the open list. The pointer index is in the order on screen,
-    /// including a column sort. The sort is cleared, because that screen order
-    /// becomes the stored order.
     pub(crate) fn reorder_view(&mut self, moving: &[TrackId], insert_at: usize) -> bool {
         let displayed = self.displayed_ids();
         let next = crate::ui::reorder::reorder_at_boundary(&displayed, moving, insert_at);
@@ -1299,7 +1232,6 @@ impl Session {
         true
     }
 
-    /// Add tracks to a playlist. Tracks already there are left where they are.
     pub(crate) fn copy_tracks(&mut self, ids: &[TrackId], target: &str) -> usize {
         if !self.playlists.iter().any(|playlist| playlist.id == target) {
             return 0;
@@ -1310,9 +1242,6 @@ impl Session {
             .count()
     }
 
-    /// Move tracks onto a playlist. Ctrl is the copy path. A move out of a
-    /// playlist takes the rows with it. A move out of Liked unlikes them.
-    /// A move out of All takes them out of every other playlist.
     pub(crate) fn move_tracks(
         &mut self,
         ids: &[TrackId],
@@ -1379,7 +1308,6 @@ impl Session {
         count
     }
 
-    /// Sidebar order. `insert_at` is a boundary in the current playlist list.
     pub(crate) fn reorder_playlists(&mut self, moving: &[String], insert_at: usize) -> bool {
         let ids: Vec<String> = self
             .playlists
@@ -1418,8 +1346,6 @@ impl Session {
             .collect()
     }
 
-    /// Library order with the visible rows replaced by `visible`, hidden rows
-    /// staying in their slots. Cue parents stay put while All tracks move.
     fn spliced_library_order(&self, visible: &[TrackId]) -> Vec<TrackId> {
         let visible_set: HashSet<TrackId> = visible.iter().copied().collect();
         let mut upcoming = visible.iter().copied();
@@ -1447,14 +1373,12 @@ impl Session {
         }
     }
 
-    /// Playlist whose queue is playing, when playback started from one.
     pub(crate) fn bars_playlist(&self) -> Option<&str> {
         self.playing
             .then(|| self.playing_playlist.as_deref())
             .flatten()
     }
 
-    /// Where a transport-bar drag should move or copy from.
     pub(crate) fn drag_source(&self) -> LibraryView {
         if let Some(id) = &self.playing_playlist {
             return LibraryView::Playlist(id.clone());
@@ -1676,8 +1600,6 @@ impl Session {
         }
     }
 
-    /// Writes scanned files into the open library and refreshes the in-memory lists.
-    /// Playback keeps the current file when that row is still present.
     pub fn import_dropped(
         &mut self,
         files: &[MusicFile],
@@ -1703,7 +1625,6 @@ impl Session {
         self.db.is_some()
     }
 
-    /// Drops in-memory rows staged before a scan when the database write fails.
     pub(crate) fn reload_lists(&mut self) -> Result<(), String> {
         let open = match &self.view {
             LibraryView::Playlist(id) => Some(id.clone()),
@@ -1718,9 +1639,6 @@ impl Session {
         Ok(())
     }
 
-    /// Shows dropped audio in the open list before tags are read.
-    /// A file dropped on All tracks stays in that list. A file dropped on a
-    /// playlist opens that playlist and appends the row.
     pub(crate) fn stage_dropped_files(
         &mut self,
         paths: &[String],
@@ -1776,7 +1694,6 @@ impl Session {
         self.rebuild_indexes();
     }
 
-    /// Inserts `id` at `at` when that index is set. Returns whether the row was new.
     fn link_staged(&mut self, playlist_id: Option<&str>, id: TrackId, at: Option<usize>) -> bool {
         let Some(playlist_id) = playlist_id else {
             let Some(at) = at else {
@@ -1984,8 +1901,6 @@ impl Session {
         self.position = 0.0;
         self.playing = true;
         self.playing_playlist = self.active_playlist_id();
-        // A new playlist gets a new shuffle. The same queue keeps its order,
-        // so previous and next still walk the deck after another track is opened.
         if self.shuffled_deck() && (!same_queue || !self.order_matches()) {
             self.rebuild_shuffle();
         }
@@ -1996,8 +1911,6 @@ impl Session {
         self.remember_playback(true);
     }
 
-    /// Start `id` from its first track. Shuffle starts on a random track instead.
-    /// The open library page stays put; next and previous still walk this playlist.
     pub fn play_playlist(&mut self, id: &str) {
         let Some(ids) = self
             .playlists
@@ -2029,7 +1942,6 @@ impl Session {
         }
     }
 
-    /// Put the saved track back into a queue so next and previous still have a list.
     fn restore_queue(&mut self) {
         let Some(current) = self.current else {
             return;
@@ -2063,9 +1975,6 @@ impl Session {
         }
     }
 
-    /// Write the open track and playhead into `app_state`.
-    /// A forced write runs on track changes, seek, and exit. The playhead
-    /// itself is stored at most every few seconds.
     fn remember_playback(&mut self, force: bool) {
         if self.db.is_none() {
             return;
@@ -2113,7 +2022,6 @@ impl Session {
         }
     }
 
-    /// The transport button only turns the saved order on or off.
     pub fn toggle_shuffle(&mut self) {
         self.shuffle = !self.shuffle;
         self.sync_shuffle_order();
@@ -2121,7 +2029,6 @@ impl Session {
         self.remember_playback(true);
     }
 
-    /// Settings pick Shuffle or Random. The transport switch stays as it is.
     pub fn set_order_mode(&mut self, mode: OrderMode) {
         if self.order_mode == mode {
             return;
@@ -2168,7 +2075,6 @@ impl Session {
         left == right
     }
 
-    /// Repeat applies to the song that is already open.
     pub fn cycle_repeat(&mut self) {
         self.repeat = self.repeat.next();
         self.refresh_gapless();
@@ -2215,7 +2121,6 @@ impl Session {
     }
 
     pub fn prev(&mut self) {
-        // Random never restarts the open track. Forward and back are both a new pick.
         if self.position > 2.0 && !self.random_jumps() {
             self.position = 0.0;
             self.playing = true;
@@ -2305,7 +2210,20 @@ impl Session {
         self.remember_playback(true);
     }
 
-    /// Move the playhead by a number of seconds, clamped to the current track.
+    pub fn seek_to(&mut self, seconds: f64) {
+        let Some(id) = self.current else {
+            return;
+        };
+        let duration = self.duration_of(id);
+        if duration <= 0.0 {
+            return;
+        }
+        self.position = seconds.clamp(0.0, duration);
+        self.heard_to = self.position;
+        self.output_seek(self.position);
+        self.remember_playback(true);
+    }
+
     pub fn seek_by(&mut self, seconds: f64) {
         let Some(id) = self.current else {
             return;
@@ -2344,8 +2262,6 @@ impl Session {
         self.remember_playback(true);
     }
 
-    /// Advances playback. With BASS attached, the position comes from the
-    /// engine. Without it, this is the preview clock used by tests.
     pub fn tick(&mut self, dt: f64) -> bool {
         let expired = self.expire_playback_error();
         if self.engine.is_some() {
@@ -2417,8 +2333,6 @@ impl Session {
             );
             match snap.state {
                 PlaybackState::Playing if !self.hold => self.playing = true,
-                // A paused frame no longer blocks the following stop from
-                // advancing. Pause itself stays off until the user resumes.
                 PlaybackState::Paused if output_settled(self.armed_at, duration) => {
                     self.playing = false;
                 }
@@ -2426,8 +2340,6 @@ impl Session {
             }
             return changed;
         }
-        // Stopped right after open, or for a glitch in the middle, is not the
-        // end. A decoder that rewinds to zero at the real end still advances.
         if let Some(path) = snap.current_file.as_deref() {
             if let Some(id) = self.track_id_for_path(path) {
                 if self.current != Some(id) {
@@ -2548,9 +2460,6 @@ impl Session {
         }
     }
 
-    /// Current track plus the next few, so BASS can open the follower early.
-    /// Repeat-one stays on this file. A shuffled deck follows `shuffle_order`.
-    /// Random does not preload, because the next pick does not exist yet.
     fn output_queue(&self, id: TrackId) -> Vec<GaplessTrack> {
         let ids = self.upcoming_ids(id);
         let mut queue = Vec::new();
@@ -2575,7 +2484,6 @@ impl Session {
         gapless_window(self.play_order(), id, self.repeat == RepeatMode::All)
     }
 
-    /// Any queue track except the one that is open, when there is another.
     fn pick_random(&mut self, current: TrackId) -> Option<TrackId> {
         let len = self.queue.len();
         if len == 0 {
@@ -2619,7 +2527,6 @@ impl Session {
         (self.position / track.duration).clamp(0.0, 1.0) as f32
     }
 
-    /// Library duration, or the length BASS just measured when the file had none.
     fn duration_of(&mut self, id: TrackId) -> f64 {
         let stored = self.track(id).map(|track| track.duration).unwrap_or(0.0);
         if stored > 0.0 {
@@ -2636,8 +2543,6 @@ impl Session {
         live
     }
 
-    /// osu! files have no extension, so the first import stored no length.
-    /// Keep the length BASS reports and the seek bar can move.
     fn remember_duration(&mut self, id: TrackId, seconds: f64) {
         if !seconds.is_finite() || seconds < 0.5 {
             return;
@@ -2677,7 +2582,6 @@ struct ParsedQuery {
     text: String,
 }
 
-/// `@p=` or `@playlist=` plus the playlist name typed after the equals sign.
 fn playlist_value_prefix(token: &str) -> Option<(&str, &str)> {
     if let Some(name) = token.strip_prefix("@playlist=") {
         Some(("@playlist=", name.trim()))
@@ -2732,7 +2636,6 @@ fn matches_query(track: &Track, query: &ParsedQuery) -> bool {
     }
 }
 
-/// Same rules as [`matches_query`], on the folded strings from load time.
 fn fold_matches(fold: &SearchFold, query: &ParsedQuery) -> bool {
     if query.text.is_empty() {
         return true;
@@ -2776,7 +2679,6 @@ fn step_back(order: &[TrackId], id: TrackId, wrap: bool) -> Option<TrackId> {
     }
 }
 
-/// Current id plus up to three followers. A one-track repeat does not preload itself.
 fn gapless_window(order: &[TrackId], id: TrackId, repeat_all: bool) -> Vec<TrackId> {
     if order.is_empty() {
         return vec![id];
@@ -2807,7 +2709,6 @@ fn gapless_window(order: &[TrackId], id: TrackId, repeat_all: bool) -> Vec<Track
 
 const PLAYBACK_ERROR_TTL: Duration = Duration::from_secs(8);
 
-/// Taskbar and window caption: `artist - title | muzeeka`.
 pub fn format_window_title(artist: &str, title: &str) -> String {
     let artist = artist.trim();
     let title = title.trim();
@@ -2819,8 +2720,6 @@ pub fn format_window_title(artist: &str, title: &str) -> String {
     }
 }
 
-/// One Alt+wheel notch, as a fraction of full volume. Positive is louder.
-/// A notch is one event: Windows reports several lines, and that still counts as 1%.
 pub(crate) fn volume_wheel_step(delta_y: f32) -> Option<f32> {
     if delta_y > 0.0 {
         Some(0.01)
@@ -2831,7 +2730,6 @@ pub(crate) fn volume_wheel_step(delta_y: f32) -> Option<f32> {
     }
 }
 
-/// True when a stopped stream is the end of the file, including a rewind to zero.
 pub(crate) fn playback_reached_end(heard: f64, position: f64, duration: f64) -> bool {
     if !duration.is_finite() || duration <= 0.0 {
         return false;
@@ -2842,7 +2740,6 @@ pub(crate) fn playback_reached_end(heard: f64, position: f64, duration: f64) -> 
     heard + 0.75 >= duration && position < 1.5
 }
 
-/// Long tracks ignore a stop in the first 1.5s. Short tracks may end sooner.
 fn output_settled(armed_at: Option<Instant>, duration: f64) -> bool {
     let Some(at) = armed_at else {
         return true;
@@ -2870,7 +2767,6 @@ pub fn format_time(secs: f64) -> String {
     }
 }
 
-/// Time left on the open track, drawn with a leading minus (`-1:35`).
 pub fn format_remaining(position: f64, duration: f64) -> String {
     let left = if position.is_finite() && duration.is_finite() {
         (duration - position).max(0.0)
@@ -2880,7 +2776,6 @@ pub fn format_remaining(position: f64, duration: f64) -> String {
     format!("-{}", format_time(left))
 }
 
-/// `settings.json` key `remaining_time`: `"1"` counts down, anything else elapsed.
 pub(crate) fn load_remaining_time() -> bool {
     let path = catalog::app_data_dir().join("settings.json");
     let Ok(raw) = fs::read_to_string(path) else {
@@ -2912,23 +2807,16 @@ pub fn looks_like_url(query: &str) -> bool {
         || value.contains("youtu.be")
 }
 
-/// A query that should open the results plate: some search text, and not a URL.
-/// `@artist` or `@p=Focus` alone have no text, so the plate stays hidden.
 pub fn has_search_text(query: &str) -> bool {
     !looks_like_url(query) && !parse_query(query).text.is_empty()
 }
 
-/// What Tab should do with the open search plate.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SearchTab {
-    /// Replace the query with this suggestion.
     Complete(String),
-    /// Open this result the way "Go to track" does.
     Reveal(TrackId),
 }
 
-/// The highlighted suggestion wins. Otherwise that track result, when the plate lists tracks.
-/// An index past the end stays on the last row.
 pub(crate) fn search_tab(session: &Session, query: &str, index: usize) -> Option<SearchTab> {
     if looks_like_url(query) {
         return None;
@@ -2946,7 +2834,6 @@ pub(crate) fn search_tab(session: &Session, query: &str, index: usize) -> Option
     Some(SearchTab::Reveal(ids[pick]))
 }
 
-/// Move a highlight through `len` rows. Stops at the ends. `None` when there is nothing to pick.
 pub(crate) fn step_pick(len: usize, current: usize, delta: i32) -> Option<usize> {
     if len == 0 {
         return None;
@@ -3040,7 +2927,10 @@ impl Session {
                 snap.volume,
             )
         } else {
-            let duration = self.current_track().map(|track| track.duration).unwrap_or(0.0);
+            let duration = self
+                .current_track()
+                .map(|track| track.duration)
+                .unwrap_or(0.0);
             (
                 self.playing,
                 !self.playing && self.current.is_some(),
@@ -3275,12 +3165,16 @@ impl Session {
         self.repeat_label().to_string()
     }
 
-    pub(crate) fn plugin_cover_bytes(&self, path: &str) -> Result<Option<(Vec<u8>, String)>, String> {
+    pub(crate) fn plugin_cover_bytes(
+        &self,
+        path: &str,
+    ) -> Result<Option<(Vec<u8>, String)>, String> {
         let path = std::path::Path::new(path);
         if !path.is_file() {
             return Ok(None);
         }
-        let bytes = std::fs::read(path).map_err(|error| format!("Failed to read cover: {error}"))?;
+        let bytes =
+            std::fs::read(path).map_err(|error| format!("Failed to read cover: {error}"))?;
         Ok(Some((bytes, cover_mime(path))))
     }
 
@@ -3425,8 +3319,11 @@ impl Session {
                     [id.0 as i64],
                 )
                 .map_err(|error| format!("Could not delete track: {error}"))?;
-                db.execute("DELETE FROM liked_tracks WHERE track_id = ?1", [id.0 as i64])
-                    .map_err(|error| format!("Could not delete track: {error}"))?;
+                db.execute(
+                    "DELETE FROM liked_tracks WHERE track_id = ?1",
+                    [id.0 as i64],
+                )
+                .map_err(|error| format!("Could not delete track: {error}"))?;
                 db.execute("DELETE FROM tracks WHERE id = ?1", [id.0 as i64])
                     .map_err(|error| format!("Could not delete track: {error}"))?;
             }
@@ -3454,7 +3351,6 @@ impl Session {
         Ok(())
     }
 
-    /// Scan is done by the caller. This writes the rows and refreshes the lists.
     pub(crate) fn plugin_import(
         &mut self,
         files: &[muzeeka::MusicFile],
@@ -3689,8 +3585,6 @@ fn fresh_playlist_id(playlists: &[Playlist]) -> String {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        // The playhead is written at most every few seconds. Closing the
-        // window is the last chance to store the position the throttle skipped.
         self.remember_playback(true);
     }
 }
@@ -3856,7 +3750,6 @@ mod tests {
             .collect();
         assert_eq!(named, vec!["@playlist=Focus "]);
 
-        // Tab takes the first row: a tag, or a playlist name.
         assert_eq!(
             session
                 .suggestions("@ti")
@@ -4684,12 +4577,21 @@ mod tests {
             .plugin_remove_tracks(&created.id, &[r"C:\Games\Ost\boss.flac".into()])
             .unwrap();
         assert_eq!(removed, 1);
-        assert_eq!(session.plugin_playlist(&created.id).unwrap().tracks.len(), 1);
+        assert_eq!(
+            session.plugin_playlist(&created.id).unwrap().tracks.len(),
+            1
+        );
 
         session.plugin_clear_playlist(&created.id).unwrap();
-        assert!(session.plugin_playlist(&created.id).unwrap().tracks.is_empty());
+        assert!(session
+            .plugin_playlist(&created.id)
+            .unwrap()
+            .tracks
+            .is_empty());
 
-        session.plugin_rename_playlist(&created.id, "Celeste OST").unwrap();
+        session
+            .plugin_rename_playlist(&created.id, "Celeste OST")
+            .unwrap();
         assert_eq!(
             session.plugin_playlist(&created.id).unwrap().name,
             "Celeste OST"

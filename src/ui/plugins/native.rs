@@ -32,7 +32,6 @@ struct NativeCallCtx {
 }
 
 struct LiveNative {
-    /// Keep last so `stop` can still run while the library is loaded.
     _lib: Library,
     stop: unsafe extern "C" fn(),
     _host: Box<MuzeekaHost>,

@@ -1,9 +1,3 @@
-//! Track properties. A separate window, same chrome as Settings.
-//!
-//! Metadata edits tags (and the library row). Details is read-only. Lyrics
-//! uses the shared cache. Speed and the video background stay in app prefs;
-//! BPM is written into the file.
-
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -156,9 +150,7 @@ impl PropertiesWindow {
                 is_minimizable: false,
                 ..Default::default()
             },
-            move |_window, cx| {
-                cx.new(|cx| Self::new(session, ids, use_ui_font, cx))
-            },
+            move |_window, cx| cx.new(|cx| Self::new(session, ids, use_ui_font, cx)),
         )
         .ok()
     }
@@ -237,7 +229,14 @@ impl PropertiesWindow {
                 false,
                 watch_text(host.clone()),
             ),
-            bpm_field: text_field(cx, "properties-bpm", "BPM", host.clone(), false, ignore_text),
+            bpm_field: text_field(
+                cx,
+                "properties-bpm",
+                "BPM",
+                host.clone(),
+                false,
+                ignore_text,
+            ),
             search_menu: None,
             search_open: false,
             tech: AudioTechInfo::default(),
@@ -496,7 +495,9 @@ impl PropertiesWindow {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { write_cover_blocking(&snap, &bytes, mime.as_deref(), &siblings) })
+                .spawn(
+                    async move { write_cover_blocking(&snap, &bytes, mime.as_deref(), &siblings) },
+                )
                 .await;
             let _ = this.update(cx, |view, cx| {
                 view.cover_busy = false;
@@ -988,13 +989,11 @@ impl PropertiesWindow {
                 match result {
                     Ok(path) => {
                         view.video_path = path.clone();
-                        view.extra_status = Some(
-                            if path.is_some() {
-                                "Video background set".into()
-                            } else {
-                                "Video background removed".into()
-                            },
-                        );
+                        view.extra_status = Some(if path.is_some() {
+                            "Video background set".into()
+                        } else {
+                            "Video background removed".into()
+                        });
                     }
                     Err(error) => view.extra_error = Some(error),
                 }
@@ -1162,7 +1161,7 @@ impl PropertiesWindow {
                     )
                     .on_mouse_up(
                         MouseButton::Left,
-                        cx.listener(|this, _: &gpui::MouseUpEvent, window, cx| {
+                        cx.listener(|this, _: &gpui::MouseUpEvent, window, _cx| {
                             if this.armed("properties-close") {
                                 window.remove_window();
                             }
@@ -1270,7 +1269,9 @@ impl PropertiesWindow {
             .iter()
             .filter(|row| !row.value.trim().is_empty())
             .count();
-        let cue = snap.as_ref().is_some_and(|snap| is_cue_track_path(&snap.path));
+        let cue = snap
+            .as_ref()
+            .is_some_and(|snap| is_cue_track_path(&snap.path));
         let stream = snap.as_ref().is_some_and(|snap| is_stream_url(&snap.path));
         let cover = snap.as_ref().and_then(|snap| {
             self.session
@@ -1278,7 +1279,11 @@ impl PropertiesWindow {
                 .track(snap.id)
                 .and_then(|track| track.cover.clone())
         });
-        let tech_line = tech_summary(&self.tech, snap.as_ref().map(|snap| snap.duration).unwrap_or(0.0), snap.as_ref().map(|snap| snap.path.as_str()).unwrap_or(""));
+        let tech_line = tech_summary(
+            &self.tech,
+            snap.as_ref().map(|snap| snap.duration).unwrap_or(0.0),
+            snap.as_ref().map(|snap| snap.path.as_str()).unwrap_or(""),
+        );
         let rows = self.rows.clone();
         let mut list = Vec::new();
         for row in &rows {
@@ -1399,7 +1404,7 @@ impl PropertiesWindow {
             .into_any_element()
     }
 
-    fn tag_row(&mut self, row: &TagTableRow, cx: &mut Context<Self>) -> AnyElement {
+    fn tag_row(&mut self, row: &TagTableRow, _cx: &mut Context<Self>) -> AnyElement {
         let multiline = is_multiline_field(&row.id);
         let value = if row.read_only {
             div()
@@ -1483,13 +1488,7 @@ impl PropertiesWindow {
                                     .text_color(theme::text_muted())
                                     .child(label),
                             )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.))
-                                    .text_size(px(12.))
-                                    .child(value),
-                            )
+                            .child(div().flex_1().min_w(px(0.)).text_size(px(12.)).child(value))
                     }))
                     .into_any_element()
             }))
@@ -1520,12 +1519,41 @@ impl PropertiesWindow {
                     .flex()
                     .flex_wrap()
                     .gap(px(8.))
-                    .child(self.button("lyrics-find", if busy { "Searching…".into() } else { "Find".into() }, !busy, false, cx, |this, cx| this.find_lyrics(cx)))
-                    .child(self.button("lyrics-import", "Import…".into(), !busy, false, cx, |this, cx| this.import_lyrics(cx)))
-                    .child(self.button("lyrics-clear", "Clear".into(), !busy, false, cx, |this, cx| this.clear_lyrics(cx)))
+                    .child(self.button(
+                        "lyrics-find",
+                        if busy {
+                            "Searching…".into()
+                        } else {
+                            "Find".into()
+                        },
+                        !busy,
+                        false,
+                        cx,
+                        |this, cx| this.find_lyrics(cx),
+                    ))
+                    .child(self.button(
+                        "lyrics-import",
+                        "Import…".into(),
+                        !busy,
+                        false,
+                        cx,
+                        |this, cx| this.import_lyrics(cx),
+                    ))
+                    .child(self.button(
+                        "lyrics-clear",
+                        "Clear".into(),
+                        !busy,
+                        false,
+                        cx,
+                        |this, cx| this.clear_lyrics(cx),
+                    ))
                     .child(self.button(
                         "lyrics-save",
-                        if busy { "Saving…".into() } else { "Save".into() },
+                        if busy {
+                            "Saving…".into()
+                        } else {
+                            "Save".into()
+                        },
                         !busy,
                         true,
                         cx,
@@ -1667,10 +1695,21 @@ impl PropertiesWindow {
                             .border_color(theme::border())
                             .child(field),
                     )
-                    .child(self.button(id, "Suggestions".into(), !suggestions.is_empty(), open, cx, move |this, cx| {
-                        this.search_menu = if this.search_menu == Some(slot) { None } else { Some(slot) };
-                        cx.notify();
-                    })),
+                    .child(self.button(
+                        id,
+                        "Suggestions".into(),
+                        !suggestions.is_empty(),
+                        open,
+                        cx,
+                        move |this, cx| {
+                            this.search_menu = if this.search_menu == Some(slot) {
+                                None
+                            } else {
+                                Some(slot)
+                            };
+                            cx.notify();
+                        },
+                    )),
             )
             .when(open, |col| {
                 let suggestions = suggestions.to_vec();
@@ -1683,34 +1722,50 @@ impl PropertiesWindow {
                         .bg(theme::bg_elevated())
                         .border_1()
                         .border_color(theme::border())
-                        .children(suggestions.into_iter().enumerate().map(|(index, suggestion)| {
-                            let id = SharedString::from(format!("suggest-{label}-{index}"));
-                            let value = suggestion.clone();
-                            div()
-                                .id(id)
-                                .h(px(28.))
-                                .px(px(8.))
-                                .flex()
-                                .items_center()
-                                .text_size(px(12.))
-                                .cursor_pointer()
-                                .hover(|style| style.bg(theme::hover()))
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _: &gpui::MouseDownEvent, _, cx| {
-                                        cx.stop_propagation();
-                                        let value = value.clone();
-                                        match slot {
-                                            SearchSlot::Title => this.search_title.update(cx, |field, cx| field.replace_text(&value, cx)),
-                                            SearchSlot::Artist => this.search_artist.update(cx, |field, cx| field.replace_text(&value, cx)),
-                                            SearchSlot::Album => this.search_album.update(cx, |field, cx| field.replace_text(&value, cx)),
-                                        }
-                                        this.search_menu = None;
-                                        cx.notify();
-                                    }),
-                                )
-                                .child(suggestion)
-                        })),
+                        .children(suggestions.into_iter().enumerate().map(
+                            |(index, suggestion)| {
+                                let id = SharedString::from(format!("suggest-{label}-{index}"));
+                                let value = suggestion.clone();
+                                div()
+                                    .id(id)
+                                    .h(px(28.))
+                                    .px(px(8.))
+                                    .flex()
+                                    .items_center()
+                                    .text_size(px(12.))
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(theme::hover()))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(
+                                            move |this, _: &gpui::MouseDownEvent, _, cx| {
+                                                cx.stop_propagation();
+                                                let value = value.clone();
+                                                match slot {
+                                                    SearchSlot::Title => {
+                                                        this.search_title.update(cx, |field, cx| {
+                                                            field.replace_text(&value, cx)
+                                                        })
+                                                    }
+                                                    SearchSlot::Artist => this
+                                                        .search_artist
+                                                        .update(cx, |field, cx| {
+                                                            field.replace_text(&value, cx)
+                                                        }),
+                                                    SearchSlot::Album => {
+                                                        this.search_album.update(cx, |field, cx| {
+                                                            field.replace_text(&value, cx)
+                                                        })
+                                                    }
+                                                }
+                                                this.search_menu = None;
+                                                cx.notify();
+                                            },
+                                        ),
+                                    )
+                                    .child(suggestion)
+                            },
+                        )),
                 )
             })
             .into_any_element()
@@ -2027,7 +2082,10 @@ impl PropertiesWindow {
         cx: &mut Context<Self>,
         save: bool,
     ) -> AnyElement {
-        let text = error.clone().or(success).unwrap_or_else(|| muted.to_string());
+        let text = error
+            .clone()
+            .or(success)
+            .unwrap_or_else(|| muted.to_string());
         let danger = error.is_some();
         div()
             .flex()
@@ -2051,14 +2109,25 @@ impl PropertiesWindow {
                 div()
                     .flex()
                     .gap(px(8.))
-                    .child(self.button("properties-dismiss", "Close".into(), true, false, cx, |this, cx| {
-                        this.pending_close = true;
-                        cx.notify();
-                    }))
+                    .child(self.button(
+                        "properties-dismiss",
+                        "Close".into(),
+                        true,
+                        false,
+                        cx,
+                        |this, cx| {
+                            this.pending_close = true;
+                            cx.notify();
+                        },
+                    ))
                     .when(save, |row| {
                         row.child(self.button(
                             "properties-save",
-                            if self.saving { "Saving…".into() } else { "Save".into() },
+                            if self.saving {
+                                "Saving…".into()
+                            } else {
+                                "Save".into()
+                            },
                             !self.saving && !self.loading,
                             true,
                             cx,
@@ -2104,7 +2173,9 @@ impl Render for PropertiesWindow {
             .size_full()
             .bg(theme::bg_deep())
             .text_color(theme::text())
-            .when(self.use_ui_font, |root| root.font_family(theme::FONT_FAMILY))
+            .when(self.use_ui_font, |root| {
+                root.font_family(theme::FONT_FAMILY)
+            })
             .key_context("Properties")
             .track_focus(&self.focus)
             .on_action(cx.listener(|this, _: &SaveProperties, _, cx| this.save_shortcut(cx)))
@@ -2237,19 +2308,16 @@ fn row_field(
     })
 }
 
-fn escape_cb(
-    host: gpui::Entity<PropertiesWindow>,
-) -> impl Fn(&mut Window, &mut App) + 'static {
+fn escape_cb(host: gpui::Entity<PropertiesWindow>) -> impl Fn(&mut Window, &mut App) + 'static {
     move |window, app| {
-        let menu = host
-            .update(app, |view, cx| {
-                if view.search_menu.take().is_some() {
-                    cx.notify();
-                    true
-                } else {
-                    false
-                }
-            });
+        let menu = host.update(app, |view, cx| {
+            if view.search_menu.take().is_some() {
+                cx.notify();
+                true
+            } else {
+                false
+            }
+        });
         if !menu {
             window.remove_window();
         }
@@ -2418,7 +2486,9 @@ fn load_blocking(snaps: &[Snap]) -> LoadResult {
             }
         }
     }
-    result.rate = catalog::track_playback_rate(&db, &primary.path).ok().flatten();
+    result.rate = catalog::track_playback_rate(&db, &primary.path)
+        .ok()
+        .flatten();
     result.video = catalog::track_video_bg(&db, &primary.path).ok().flatten();
     let bpm = tag_write_path(&primary.path)
         .ok()
@@ -2466,7 +2536,10 @@ fn merge_tables(tables: &[Vec<TagTableRow>]) -> (Vec<TagTableRow>, HashSet<Strin
     let mut mixed = HashSet::new();
     let mut rows = Vec::new();
     for id in order {
-        let Some(prototype) = tables.iter().find_map(|table| table.iter().find(|row| row.id == id)) else {
+        let Some(prototype) = tables
+            .iter()
+            .find_map(|table| table.iter().find(|row| row.id == id))
+        else {
             continue;
         };
         let values = tables
@@ -2660,7 +2733,11 @@ fn write_one(
     }
 }
 
-fn apply_changed(base: &[TagTableRow], edited: &[TagTableRow], changed: &HashSet<String>) -> Vec<TagTableRow> {
+fn apply_changed(
+    base: &[TagTableRow],
+    edited: &[TagTableRow],
+    changed: &HashSet<String>,
+) -> Vec<TagTableRow> {
     let mut rows = base.to_vec();
     for edit in edited {
         if edit.read_only || !changed.contains(&edit.id) {
@@ -2742,30 +2819,45 @@ fn tech_summary(tech: &AudioTechInfo, duration: f64, path: &str) -> String {
     }
 }
 
-fn detail_groups(tech: &AudioTechInfo, snap: Option<&Snap>) -> Vec<(&'static str, Vec<(&'static str, String)>)> {
+fn detail_groups(
+    tech: &AudioTechInfo,
+    snap: Option<&Snap>,
+) -> Vec<(&'static str, Vec<(&'static str, String)>)> {
     let path = snap.map(|snap| snap.path.as_str()).unwrap_or("");
     let disk = tech
         .file_path
         .clone()
         .unwrap_or_else(|| file_on_disk(path).to_string());
-    let folder = tech.folder_name.clone().filter(|folder| !folder.is_empty()).unwrap_or_else(|| {
-        let cleaned = file_on_disk(path);
-        let index = cleaned.rfind(['\\', '/']).unwrap_or(0);
-        if index == 0 {
-            String::new()
-        } else {
-            cleaned[..index].to_string()
-        }
-    });
+    let folder = tech
+        .folder_name
+        .clone()
+        .filter(|folder| !folder.is_empty())
+        .unwrap_or_else(|| {
+            let cleaned = file_on_disk(path);
+            let index = cleaned.rfind(['\\', '/']).unwrap_or(0);
+            if index == 0 {
+                String::new()
+            } else {
+                cleaned[..index].to_string()
+            }
+        });
     vec![
         (
             "Location",
             vec![
-                ("File name", dash(tech.file_name.as_deref().unwrap_or(&file_name(path)))),
+                (
+                    "File name",
+                    dash(tech.file_name.as_deref().unwrap_or(&file_name(path))),
+                ),
                 ("Folder name", dash(&folder)),
                 ("File path", dash(&disk)),
                 ("Subsong index", subsong_index(path).to_string()),
-                ("File size", tech.file_size.map(format_bytes).unwrap_or_else(|| "—".into())),
+                (
+                    "File size",
+                    tech.file_size
+                        .map(format_bytes)
+                        .unwrap_or_else(|| "—".into()),
+                ),
                 ("Modified", format_unix(tech.modified_unix)),
                 ("Created", format_unix(tech.created_unix)),
             ],
@@ -2781,10 +2873,31 @@ fn detail_groups(tech: &AudioTechInfo, snap: Option<&Snap>) -> Vec<(&'static str
                         .map(|seconds| session::format_time(seconds).to_string())
                         .unwrap_or_else(|| "—".into()),
                 ),
-                ("Sample rate", tech.sample_rate_hz.map(|rate| format!("{rate} Hz")).unwrap_or_else(|| "—".into())),
-                ("Channels", tech.channels.map(|channels| channels.to_string()).unwrap_or_else(|| "—".into())),
-                ("Bit depth", tech.bit_depth.filter(|bits| *bits > 0).map(|bits| bits.to_string()).unwrap_or_else(|| "—".into())),
-                ("Bitrate", tech.bitrate_kbps.map(|rate| format!("{rate} kbps")).unwrap_or_else(|| "—".into())),
+                (
+                    "Sample rate",
+                    tech.sample_rate_hz
+                        .map(|rate| format!("{rate} Hz"))
+                        .unwrap_or_else(|| "—".into()),
+                ),
+                (
+                    "Channels",
+                    tech.channels
+                        .map(|channels| channels.to_string())
+                        .unwrap_or_else(|| "—".into()),
+                ),
+                (
+                    "Bit depth",
+                    tech.bit_depth
+                        .filter(|bits| *bits > 0)
+                        .map(|bits| bits.to_string())
+                        .unwrap_or_else(|| "—".into()),
+                ),
+                (
+                    "Bitrate",
+                    tech.bitrate_kbps
+                        .map(|rate| format!("{rate} kbps"))
+                        .unwrap_or_else(|| "—".into()),
+                ),
                 ("Codec", dash(tech.codec.as_deref().unwrap_or(""))),
                 ("Encoding", dash(tech.encoding.as_deref().unwrap_or(""))),
                 ("Tool", dash(tech.tool.as_deref().unwrap_or(""))),
@@ -2795,7 +2908,10 @@ fn detail_groups(tech: &AudioTechInfo, snap: Option<&Snap>) -> Vec<(&'static str
         (
             "Playback Statistics",
             vec![
-                ("Play count", format_play_count(tech.play_count.unwrap_or(0))),
+                (
+                    "Play count",
+                    format_play_count(tech.play_count.unwrap_or(0)),
+                ),
                 ("First played", format_unix(tech.first_played_unix)),
                 ("Last played", format_unix(tech.last_played_unix)),
             ],
@@ -2994,7 +3110,9 @@ fn strip_feat_tail(value: &str) -> String {
         cut = Some(cut.map_or(index, |prev: usize| prev.min(index)));
     }
     match cut {
-        Some(index) => squash(value[..index].trim_end_matches(|ch: char| matches!(ch, '(' | '[' | ' '))),
+        Some(index) => {
+            squash(value[..index].trim_end_matches(|ch: char| matches!(ch, '(' | '[' | ' ')))
+        }
         None => value.to_string(),
     }
 }

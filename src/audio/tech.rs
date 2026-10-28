@@ -1,5 +1,3 @@
-//! Stream and file details for the track properties window.
-
 use std::fs;
 use std::path::Path;
 use std::time::SystemTime;
@@ -9,7 +7,6 @@ use lofty::file::{AudioFile, TaggedFileExt};
 use lofty::probe::Probe;
 use lofty::tag::ItemKey;
 
-/// Technical audio and file details for Properties → Details.
 #[derive(Debug, Clone, Default)]
 pub struct AudioTechInfo {
     pub bitrate_kbps: Option<u32>,
@@ -80,7 +77,6 @@ fn fill_fs_fields(path: &Path, info: &mut AudioTechInfo) {
     }
 }
 
-/// Probe stream and filesystem details. Cover art is not read.
 pub fn read_audio_tech_info(path: &Path) -> AudioTechInfo {
     let mut info = AudioTechInfo::default();
     fill_fs_fields(path, &mut info);
@@ -127,7 +123,10 @@ pub fn read_audio_tech_info(path: &Path) -> AudioTechInfo {
         }
     }
 
-    if let Some(tag) = tagged_file.primary_tag().or_else(|| tagged_file.first_tag()) {
+    if let Some(tag) = tagged_file
+        .primary_tag()
+        .or_else(|| tagged_file.first_tag())
+    {
         info.tool = tag
             .get_string(ItemKey::EncoderSoftware)
             .or_else(|| tag.get_string(ItemKey::EncodedBy))
@@ -142,7 +141,9 @@ pub fn read_audio_tech_info(path: &Path) -> AudioTechInfo {
             match item.value() {
                 lofty::tag::ItemValue::Text(text) | lofty::tag::ItemValue::Locator(text) => {
                     let upper = text.to_ascii_uppercase();
-                    upper.contains("FILE \"") && upper.contains("TRACK ") && upper.contains("INDEX ")
+                    upper.contains("FILE \"")
+                        && upper.contains("TRACK ")
+                        && upper.contains("INDEX ")
                 }
                 _ => false,
             }

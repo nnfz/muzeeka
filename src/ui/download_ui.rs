@@ -1,17 +1,3 @@
-//! Media-link cards under the search field, and the download manager.
-//!
-//! A pasted link leaves the field and becomes its own card. Cards stack with
-//! the newest on top, and search results render above them. Several cards can
-//! probe and download at once. yt-dlp runs in the background, then the files
-//! go through the same library import as a file drop.
-//!
-//! The button beside search opens the same jobs plus finished downloads from
-//! this session and earlier ones. A finished row scrolls that track into its
-//! playlist and blinks it in the list. It does not play. Play sits on the cover.
-//! Clear and the × on a row only hide it here. The button hides when nothing
-//! is downloading and no finished row is left. A job that is already downloading
-//! leaves the card under the field and stays in this panel.
-
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
@@ -24,7 +10,7 @@ use gpui::{
 };
 
 use crate::ui::cover::cover_art;
-use crate::ui::icons::icon;
+use crate::ui::icons::{self, icon};
 use crate::ui::import::{self, ImportKind};
 use crate::ui::main_window::MainWindow;
 use crate::ui::paths;
@@ -33,12 +19,7 @@ use crate::ui::theme;
 use crate::ui::ytdlp::{self, JobSnap, Probe};
 
 const MISSING_YTDLP: &str = "yt-dlp was not found. Place yt-dlp.exe in bin next to Muzeeka.";
-/// Pause while a link is typed. A paste replaces the field and commits at once.
 const TYPE_PAUSE: Duration = Duration::from_millis(320);
-
-const NOTE: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="#efefef" d="M9 17.5a2.5 2.5 0 1 1-2-2.45V5.2l12-2v10.15a2.5 2.5 0 1 1-2-2.45V6.1l-8 1.35V17.5z"/></svg>"##;
-const ARROW: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="#efefef" d="M11 3h2v9.2l3.3-3.3 1.4 1.4L12 16.1 6.3 10.3l1.4-1.4L11 12.2V3zM5 19h14v2H5z"/></svg>"##;
-const SPINNER: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><circle cx="8" cy="2.2" r="1.7" fill="#efefef"/><circle cx="12.4" cy="4.6" r="1.45" fill="#efefef" opacity=".8"/><circle cx="13.8" cy="8.8" r="1.2" fill="#efefef" opacity=".55"/><circle cx="11.2" cy="12.4" r="1.05" fill="#efefef" opacity=".35"/><circle cx="7.2" cy="13.6" r="0.9" fill="#efefef" opacity=".2"/></svg>"##;
 
 struct DownloadJob {
     id: u64,
@@ -79,26 +60,6 @@ impl DownloadJob {
         }
     }
 
-    fn label(&self) -> String {
-        if let Some(success) = &self.success {
-            return success.clone();
-        }
-        if self.downloading || self.importing {
-            return format!("{:.0}%", self.percent);
-        }
-        if self.probing {
-            return "Checking…".into();
-        }
-        "Download".into()
-    }
-
-    /// Probe, ready, and error cards stay under the field so a download can
-    /// be started or dismissed. Once it is running or finished, the manager
-    /// is the only place it is drawn.
-    fn shows_under_search(&self) -> bool {
-        !self.downloading && !self.importing && self.success.is_none()
-    }
-
     fn disabled(&self, ytdlp_missing: bool) -> bool {
         self.probing
             || self.downloading
@@ -109,21 +70,15 @@ impl DownloadJob {
 }
 
 pub(crate) struct DownloadState {
-    /// Newest card first, so a new link sits under the field and older cards drop.
     jobs: Vec<DownloadJob>,
     next_id: u64,
     ytdlp_ready: Option<bool>,
-    /// Link text from the previous search change. A paste is not an append.
     last_query: String,
     pending_urls: Vec<String>,
     pending_at: Option<Instant>,
-    /// The manager panel beside the search button.
     pub(crate) open: bool,
-    /// This pointer press already closed the panel. Mouse up must not open it.
     pub(crate) close_press: bool,
-    /// Finished files, newest first. Written to disk so they survive a restart.
     history: Vec<SavedDownload>,
-    /// Path keys the user removed from this list. Folder backfill skips them.
     hidden: Vec<String>,
     history_gen: u64,
     listed: Option<ListedCache>,
@@ -202,7 +157,6 @@ impl Default for DownloadState {
 }
 
 impl DownloadState {
-    /// Finished rows from earlier runs, plus anything dismissed since.
     pub(crate) fn load() -> Self {
         let mut state = Self::default();
         let (history, hidden) = read_store();
@@ -213,29 +167,7 @@ impl DownloadState {
     }
 }
 
-struct CardSnap {
-    id: u64,
-    title: Option<String>,
-    second: Option<(String, bool)>,
-    thumb: Option<PathBuf>,
-    probing: bool,
-    label: String,
-    disabled: bool,
-    success: bool,
-    show_cancel: bool,
-    show_dismiss: bool,
-}
-
 impl MainWindow {
-    pub(crate) fn has_download_cards(&self) -> bool {
-        self.download
-            .jobs
-            .iter()
-            .any(DownloadJob::shows_under_search)
-    }
-
-    /// The field was cleared without `on_change`. Drop the typed-link pause
-    /// so the next paste is not treated as a continuation.
     pub(crate) fn note_search_cleared(&mut self) {
         self.download.last_query.clear();
         self.download.pending_urls.clear();
@@ -244,8 +176,6 @@ impl MainWindow {
         self.search_pick_query.clear();
     }
 
-    /// A finished link leaves the field and opens a card. Typing keeps the
-    /// text until the pause, so a half-written URL is not taken.
     pub(crate) fn note_download_query(&mut self, text: &str, cx: &mut Context<Self>) {
         let trimmed = text.trim().to_string();
         let previous = std::mem::replace(&mut self.download.last_query, trimmed.clone());
@@ -305,21 +235,6 @@ impl MainWindow {
         dirty
     }
 
-    pub(crate) fn download_cards(&mut self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
-        let missing = self.download.ytdlp_ready == Some(false);
-        let snaps: Vec<CardSnap> = self
-            .download
-            .jobs
-            .iter()
-            .filter(|job| job.shows_under_search())
-            .map(|job| card_snap(job, missing))
-            .collect();
-        snaps
-            .into_iter()
-            .map(|snap| self.download_card(snap, cx))
-            .collect()
-    }
-
     fn commit_urls(&mut self, urls: Vec<String>, cx: &mut Context<Self>) {
         if urls.is_empty() {
             return;
@@ -332,23 +247,27 @@ impl MainWindow {
         }
         self.download.pending_urls.clear();
         self.download.pending_at = None;
-        // Reverse so the first link of this paste stays nearest the field.
+
+        let mut added = false;
         for url in urls.into_iter().rev() {
-            self.enqueue_download(url, cx);
+            added |= self.enqueue_download(url, cx);
+        }
+        if added {
+            self.download.open = true;
         }
         self.download.last_query.clear();
         self.search
             .update(cx, |field, cx| field.replace_text("", cx));
     }
 
-    fn enqueue_download(&mut self, url: String, cx: &mut Context<Self>) {
+    fn enqueue_download(&mut self, url: String, cx: &mut Context<Self>) -> bool {
         if self
             .download
             .jobs
             .iter()
             .any(|job| job.url == url && job.success.is_none())
         {
-            return;
+            return false;
         }
         if self.download.ytdlp_ready.is_none() {
             self.download.ytdlp_ready = Some(ytdlp::ytdlp_available());
@@ -359,183 +278,15 @@ impl MainWindow {
         if self.download.ytdlp_ready == Some(false) {
             job.error = Some(MISSING_YTDLP.into());
             self.download.jobs.insert(0, job);
-            return;
+            return true;
         }
         self.download.jobs.insert(0, job);
         self.start_probe(id, cx);
+        true
     }
 
     fn job_mut(&mut self, id: u64) -> Option<&mut DownloadJob> {
         self.download.jobs.iter_mut().find(|job| job.id == id)
-    }
-
-    fn download_card(&mut self, snap: CardSnap, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let id = snap.id;
-        div()
-            .id(("download-card", id))
-            .occlude()
-            .on_drop(
-                cx.listener(|this, paths: &gpui::ExternalPaths, window, cx| {
-                    this.receive_file_drop(paths, true, window.mouse_position(), cx);
-                }),
-            )
-            .w_full()
-            .flex_shrink_0()
-            .flex()
-            .items_center()
-            .gap(px(12.))
-            .px(px(12.))
-            .py(px(10.))
-            .min_h(px(64.))
-            .rounded_md()
-            .bg(theme::bg_elevated())
-            .border_1()
-            .border_color(theme::border())
-            .shadow_md()
-            .child(card_body(&snap))
-            .child(self.card_actions(&snap, cx))
-            .into_any_element()
-    }
-
-    fn card_actions(&mut self, snap: &CardSnap, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let id = snap.id;
-        div()
-            .flex()
-            .flex_shrink_0()
-            .items_center()
-            .gap(px(6.))
-            .when(snap.show_cancel, |row| {
-                row.child(self.cancel_button(id, cx))
-            })
-            .child(self.download_button(snap, cx))
-            .when(snap.show_dismiss, |row| {
-                row.child(self.dismiss_button(id, cx))
-            })
-            .into_any_element()
-    }
-
-    fn cancel_button(&mut self, id: u64, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let arm_id = format!("download-cancel-{id}");
-        let release_id = arm_id.clone();
-        div()
-            .id(("download-cancel", id))
-            .flex()
-            .items_center()
-            .justify_center()
-            .h(px(34.))
-            .px(px(14.))
-            .rounded_sm()
-            .bg(gpui::rgba(0xffffff0f))
-            .whitespace_nowrap()
-            .text_size(px(11.))
-            .font_weight(gpui::FontWeight::SEMIBOLD)
-            .text_color(theme::text_secondary())
-            .cursor_pointer()
-            .child("Cancel")
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _: &gpui::MouseDownEvent, _, cx| {
-                    cx.stop_propagation();
-                    this.arm(arm_id.clone(), false);
-                }),
-            )
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(move |this, _: &gpui::MouseUpEvent, _, cx| {
-                    if !this.armed(&release_id) {
-                        return;
-                    }
-                    this.cancel_download(id, cx);
-                }),
-            )
-            .into_any_element()
-    }
-
-    fn dismiss_button(&mut self, id: u64, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let arm_id = format!("download-x-{id}");
-        let release_id = arm_id.clone();
-        div()
-            .id(("download-x", id))
-            .flex()
-            .items_center()
-            .justify_center()
-            .size(px(34.))
-            .rounded_sm()
-            .text_size(px(16.))
-            .text_color(theme::text_muted())
-            .cursor_pointer()
-            .hover(|style| style.bg(theme::hover()).text_color(theme::text()))
-            .child("×")
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _: &gpui::MouseDownEvent, _, cx| {
-                    cx.stop_propagation();
-                    this.arm(arm_id.clone(), false);
-                }),
-            )
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(move |this, _: &gpui::MouseUpEvent, _, cx| {
-                    if !this.armed(&release_id) {
-                        return;
-                    }
-                    this.dismiss_download(id, cx);
-                }),
-            )
-            .into_any_element()
-    }
-
-    fn download_button(&mut self, snap: &CardSnap, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let id = snap.id;
-        let disabled = snap.disabled;
-        let success = snap.success;
-        let label = snap.label.clone();
-        let arm_id = format!("download-go-{id}");
-        let release_id = arm_id.clone();
-        div()
-            .id(("download-go", id))
-            .flex()
-            .items_center()
-            .justify_center()
-            .gap(px(6.))
-            .h(px(34.))
-            .px(px(14.))
-            .rounded_sm()
-            .whitespace_nowrap()
-            .bg(if success {
-                gpui::rgb(0x22c55e)
-            } else {
-                theme::accent()
-            })
-            .text_size(px(11.))
-            .font_weight(gpui::FontWeight::SEMIBOLD)
-            .text_color(theme::white())
-            .when(disabled, |button| button.opacity(0.5).cursor_default())
-            .when(!disabled, |button| button.cursor_pointer())
-            .when(!success, |button| {
-                button.child(icon(ARROW, theme::white(), px(14.)))
-            })
-            .child(label)
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _: &gpui::MouseDownEvent, _, cx| {
-                    cx.stop_propagation();
-                    if this.job_disabled(id) {
-                        return;
-                    }
-                    this.arm(arm_id.clone(), false);
-                }),
-            )
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(move |this, _: &gpui::MouseUpEvent, _, cx| {
-                    if !this.armed(&release_id) || this.job_disabled(id) {
-                        return;
-                    }
-                    this.begin_download(id, cx);
-                }),
-            )
-            .into_any_element()
     }
 
     fn job_disabled(&self, id: u64) -> bool {
@@ -821,7 +572,6 @@ impl MainWindow {
         .detach();
     }
 
-    /// The header button stays only while a job is running or a finished row is still listed.
     pub(crate) fn downloads_shown(&mut self, cx: &Context<Self>) -> bool {
         self.inflight_count() > 0 || !self.downloaded_listing(cx).is_empty()
     }
@@ -836,14 +586,12 @@ impl MainWindow {
             .flex_shrink_0()
             .child(toggle)
             .when_some(panel, |wrap, panel| {
-                // Pin the anchor to the button. A row would otherwise place it
-                // beside the icon, and the old 36px offset sat too far below.
                 wrap.child(
                     div().absolute().top(px(0.)).left(px(0.)).child(
                         deferred(
                             anchored()
                                 .anchor(Anchor::TopLeft)
-                                .offset(point(px(0.), px(34.)))
+                                .offset(point(px(0.), px(4. + 32.)))
                                 .snap_to_window_with_margin(px(8.))
                                 .child(panel),
                         )
@@ -877,7 +625,7 @@ impl MainWindow {
             .when(open, |button| button.bg(theme::hover()))
             .hover(|style| style.bg(theme::hover()))
             .child(icon(
-                ARROW,
+                icons::ARROW,
                 if count > 0 {
                     theme::accent()
                 } else {
@@ -914,9 +662,6 @@ impl MainWindow {
                 if event.button != MouseButton::Left {
                     return;
                 }
-                // Registered before the deferred panel, so this runs before the
-                // outside-click handler. Stopping keeps that handler from closing
-                // the panel and this release from opening it again.
                 cx.stop_propagation();
                 let was_open = this.download.open;
                 let (open, close_press, arm) =
@@ -968,9 +713,6 @@ impl MainWindow {
                     return;
                 }
                 this.download.open = false;
-                // This press shut the panel, including a press on the button that
-                // this handler saw first. Mouse up must not open it again.
-                // Mouse up clears the flag, so the next press can open.
                 this.download.close_press = true;
                 this.armed_ui = None;
                 cx.notify();
@@ -1044,7 +786,6 @@ impl MainWindow {
             .child(self.download_panel_close(cx))
     }
 
-    /// Finished sits on its own strip, with Clear on the same line.
     fn finished_bar(&mut self, count: usize, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .h(px(FINISHED_H))
@@ -1270,6 +1011,7 @@ impl MainWindow {
             .flex_shrink_0()
             .items_center()
             .justify_center()
+            .gap(px(6.))
             .h(px(26.))
             .px(px(8.))
             .rounded_sm()
@@ -1278,6 +1020,7 @@ impl MainWindow {
             .font_weight(gpui::FontWeight::SEMIBOLD)
             .text_color(theme::white())
             .cursor_pointer()
+            .child(icon(icons::ARROW, theme::white(), px(12.)))
             .child("Download")
             .on_mouse_down(
                 MouseButton::Left,
@@ -1537,7 +1280,6 @@ impl MainWindow {
         self.persist_history();
     }
 
-    /// Drop one finished row. The file stays in the library.
     fn dismiss_finished(&mut self, path: &str, cx: &mut Context<Self>) {
         conceal(&mut self.download.history, &mut self.download.hidden, path);
         self.persist_history();
@@ -1545,7 +1287,6 @@ impl MainWindow {
         cx.notify();
     }
 
-    /// Drop every finished row, including older files in the download folder.
     fn clear_finished(&mut self, cx: &mut Context<Self>) {
         let root = ytdlp::effective_download_folder();
         let paths: Vec<String> = {
@@ -1581,8 +1322,6 @@ impl MainWindow {
     }
 }
 
-/// A press on the downloads button.
-/// Returns `(open, close_press, arm_open)`.
 fn download_button_press(open: bool, close_press: bool) -> (bool, bool, bool) {
     if open || close_press {
         (false, true, false)
@@ -1591,149 +1330,8 @@ fn download_button_press(open: bool, close_press: bool) -> (bool, bool, bool) {
     }
 }
 
-/// Mouse up opens the panel only when this press armed it and did not close it.
 fn download_button_release(close_press: bool, armed: bool) -> bool {
     !close_press && armed
-}
-
-fn card_snap(job: &DownloadJob, ytdlp_missing: bool) -> CardSnap {
-    let meta = job.probe.as_ref().map(probe_meta).unwrap_or_default();
-    let second = if let Some(error) = job.error.clone() {
-        Some((error, true))
-    } else if job.downloading || job.importing {
-        let status = job.status.clone();
-        if status.is_empty() {
-            (!meta.is_empty()).then_some((meta, false))
-        } else {
-            Some((status, false))
-        }
-    } else if !meta.is_empty() {
-        Some((meta, false))
-    } else {
-        None
-    };
-    CardSnap {
-        id: job.id,
-        title: job.probe.as_ref().map(|probe| probe.title.clone()),
-        second,
-        thumb: job.thumb.clone(),
-        probing: job.probing,
-        label: job.label(),
-        disabled: job.disabled(ytdlp_missing),
-        success: job.success.is_some(),
-        show_cancel: job.downloading && !job.importing && job.job.is_some(),
-        show_dismiss: !job.importing,
-    }
-}
-
-fn card_body(snap: &CardSnap) -> gpui::AnyElement {
-    if let Some(title) = &snap.title {
-        return div()
-            .flex()
-            .flex_1()
-            .min_w(px(0.))
-            .h(px(44.))
-            .items_center()
-            .gap(px(10.))
-            .child(probe_thumb(snap.thumb.clone()))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .justify_center()
-                    .gap(px(2.))
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .line_height(px(16.))
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(theme::text())
-                            .truncate()
-                            .child(title.clone()),
-                    )
-                    .when_some(snap.second.clone(), |col, (text, error)| {
-                        col.child(
-                            div()
-                                .text_size(px(11.))
-                                .line_height(px(14.))
-                                .text_color(if error {
-                                    gpui::rgb(0xf87171)
-                                } else {
-                                    theme::text_secondary()
-                                })
-                                .truncate()
-                                .child(text),
-                        )
-                    }),
-            )
-            .into_any_element();
-    }
-    if snap.probing {
-        return placeholder(snap.id, false, "Recognizing link…", true);
-    }
-    if let Some((error, _)) = &snap.second {
-        return placeholder(snap.id, true, error, false);
-    }
-    placeholder(snap.id, false, "Media link detected", false)
-}
-
-fn probe_thumb(path: Option<PathBuf>) -> gpui::AnyElement {
-    if let Some(path) = path {
-        return img(path)
-            .size(px(44.))
-            .flex_shrink_0()
-            .rounded(px(4.))
-            .object_fit(ObjectFit::Cover)
-            .into_any_element();
-    }
-    div()
-        .size(px(44.))
-        .flex_shrink_0()
-        .rounded(px(4.))
-        .bg(theme::bg_surface())
-        .flex()
-        .items_center()
-        .justify_center()
-        .child(icon(NOTE, theme::text_muted(), px(16.)))
-        .into_any_element()
-}
-
-fn placeholder(id: u64, error: bool, text: &str, spin: bool) -> gpui::AnyElement {
-    div()
-        .flex()
-        .flex_1()
-        .min_w(px(0.))
-        .h(px(44.))
-        .items_center()
-        .gap(px(8.))
-        .text_size(px(11.))
-        .text_color(if error {
-            gpui::rgb(0xf87171)
-        } else {
-            theme::text_secondary()
-        })
-        .when(spin, |row| {
-            row.child(
-                svg()
-                    .data(SPINNER)
-                    .text_color(theme::accent())
-                    .size(px(14.))
-                    .flex_shrink_0()
-                    .with_animation(
-                        ("download-spin", id),
-                        Animation::new(Duration::from_millis(700)).repeat(),
-                        |glyph, phase| {
-                            glyph.with_transformation(Transformation::rotate(gpui::radians(
-                                phase * std::f32::consts::TAU,
-                            )))
-                        },
-                    ),
-            )
-        })
-        .child(div().min_w(px(0.)).truncate().child(text.to_string()))
-        .into_any_element()
 }
 
 fn probe_meta(probe: &Probe) -> String {
@@ -1790,7 +1388,7 @@ const HISTORY_LIMIT: usize = 300;
 const FOLDER_LIMIT: usize = 200;
 const HIDDEN_LIMIT: usize = 2000;
 const PANEL_W: f32 = 340.;
-const ACTIVE_ROW: f32 = 70.;
+const ACTIVE_ROW: f32 = 65.;
 const ACTIVE_IDLE: f32 = 48.;
 const DONE_ROW: f32 = 48.;
 const SECTION_H: f32 = 28.;
@@ -1815,6 +1413,13 @@ fn active_snap(job: &DownloadJob, ytdlp_missing: bool) -> ActiveSnap {
         } else {
             job.status.clone()
         }
+    } else if let Some(meta) = job
+        .probe
+        .as_ref()
+        .map(probe_meta)
+        .filter(|meta| !meta.is_empty())
+    {
+        meta
     } else {
         "Ready".into()
     };
@@ -1853,7 +1458,7 @@ fn manager_thumb(path: Option<PathBuf>, spin: bool, id: u64) -> gpui::AnyElement
         .when(spin, |slot| {
             slot.child(
                 svg()
-                    .data(SPINNER)
+                    .data(icons::SPINNER)
                     .text_color(theme::accent())
                     .size(px(14.))
                     .with_animation(
@@ -1868,7 +1473,7 @@ fn manager_thumb(path: Option<PathBuf>, spin: bool, id: u64) -> gpui::AnyElement
             )
         })
         .when(!spin, |slot| {
-            slot.child(icon(NOTE, theme::text_muted(), px(14.)))
+            slot.child(icon(icons::NOTE, theme::text_muted(), px(14.)))
         })
         .into_any_element()
 }
@@ -1907,7 +1512,7 @@ fn progress_track(percent: f32) -> gpui::AnyElement {
     let fraction = (percent / 100.0).clamp(0.0, 1.0);
     div()
         .w_full()
-        .h(px(8.))
+        .h(px(3.))
         .flex_shrink_0()
         .rounded_full()
         .overflow_hidden()
@@ -1922,7 +1527,6 @@ fn progress_track(percent: f32) -> gpui::AnyElement {
         .into_any_element()
 }
 
-/// The number is drawn on its own, so a long status line cannot clip it.
 fn progress_caption(status: &str) -> String {
     let status = status.trim();
     if status.is_empty() {
@@ -2135,8 +1739,6 @@ fn listed_from_track(
     }
 }
 
-/// A library file counts as a download when it lives in the download folder.
-/// A sibling whose name only starts with the folder name does not.
 fn under_root(path: &str, root: &str) -> bool {
     let root = root.trim().trim_end_matches(['/', '\\']);
     if root.is_empty() || path.trim().is_empty() {
@@ -2158,7 +1760,6 @@ fn history_path() -> PathBuf {
     crate::ui::catalog::app_data_dir().join("download-history.json")
 }
 
-/// Older builds stored a bare array. The current file is `{ history, hidden }`.
 fn parse_store(text: &str) -> (Vec<SavedDownload>, Vec<String>) {
     let text = text.trim();
     if text.is_empty() {
@@ -2207,7 +1808,6 @@ fn write_store(history: &[SavedDownload], hidden: &[String]) {
     }
 }
 
-/// Hide one path from the manager. The audio file is left where it is.
 fn conceal(history: &mut Vec<SavedDownload>, hidden: &mut Vec<String>, path: &str) {
     let key = paths::path_key(path);
     history.retain(|row| paths::path_key(&row.path) != key);
@@ -2218,8 +1818,6 @@ fn conceal(history: &mut Vec<SavedDownload>, hidden: &mut Vec<String>, path: &st
     }
 }
 
-/// Every whitespace-separated token must be a specific media link.
-/// A bare host stays in the field so a half-typed URL is not taken.
 fn media_urls(text: &str) -> Vec<String> {
     let parts: Vec<&str> = text.split_whitespace().collect();
     if parts.is_empty() {
@@ -2359,23 +1957,6 @@ mod tests {
         );
         assert_eq!(super::progress_caption(""), "Downloading…");
         assert_eq!(super::progress_caption("45%"), "Downloading…");
-    }
-
-    #[test]
-    fn in_progress_job_is_not_a_card() {
-        let mut job = super::DownloadJob::new(1, "https://youtu.be/abc12345678".into());
-        assert!(job.shows_under_search());
-        job.downloading = true;
-        assert!(!job.shows_under_search());
-        job.downloading = false;
-        job.importing = true;
-        assert!(!job.shows_under_search());
-        job.importing = false;
-        job.success = Some("Done".into());
-        assert!(!job.shows_under_search());
-        job.success = None;
-        job.error = Some("failed".into());
-        assert!(job.shows_under_search());
     }
 
     fn sample_track(id: u32, title: &str, path: &str) -> crate::ui::session::Track {

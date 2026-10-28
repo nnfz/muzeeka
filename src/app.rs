@@ -1,5 +1,3 @@
-// Main application state and window management
-
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -59,7 +57,6 @@ impl Render for MuzeekaApp {
     }
 }
 
-// Actions for keyboard shortcuts
 pub struct TogglePlayPause;
 impl_actions!(app, [TogglePlayPause]);
 

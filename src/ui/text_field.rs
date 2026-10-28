@@ -1,14 +1,10 @@
-// Single-line field, adapted from the GPUI text-input example.
-// Handles IME, selection, and clipboard so search works for any keyboard layout.
-
 use std::ops::Range;
 use std::rc::Rc;
 
 use gpui::prelude::*;
 use gpui::{
     actions, div, fill, point, px, relative, size, App, Bounds, ClipboardItem, Context,
-    CursorStyle, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler,
-    FocusHandle,
+    CursorStyle, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler, FocusHandle,
     GlobalElementId, InspectorElementId, InteractiveElement, IntoElement, LayoutId, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement, Pixels, Point,
     ShapedLine, SharedString, Styled, TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window,
@@ -53,14 +49,9 @@ pub struct TextField {
     on_change: Rc<dyn Fn(&str, &mut Window, &mut App)>,
     on_escape: Rc<dyn Fn(&mut Window, &mut App)>,
     on_submit: Rc<dyn Fn(&str, &mut Window, &mut App)>,
-    /// Returns whether Tab was used. False leaves the key for whoever else wants it.
-    /// The text is passed in so the handler does not read this field while it is updating.
     on_tab: Rc<dyn Fn(&str, &mut Window, &mut App) -> bool>,
-    /// Up and down in the search field. `delta` is -1 or 1. False leaves the key alone.
     on_pick: Rc<dyn Fn(&str, i32, &mut Window, &mut App) -> bool>,
-    /// Arrow bindings apply only while this is set, so a rename field keeps them.
     picks: bool,
-    /// Lyrics and comment rows. Off for search and rename, which stay one line.
     multiline: bool,
     line_starts: Vec<usize>,
     line_layouts: Vec<ShapedLine>,
@@ -100,7 +91,6 @@ impl TextField {
         }
     }
 
-    /// Keep newlines. Enter inserts a line break instead of submitting.
     pub fn multiline(mut self) -> Self {
         self.multiline = true;
         self
@@ -119,7 +109,6 @@ impl TextField {
         self.on_tab = Rc::new(accept);
     }
 
-    /// Up and down choose a search row. The query is passed in so this field stays unread.
     pub fn set_on_pick(
         &mut self,
         pick: impl Fn(&str, i32, &mut Window, &mut App) -> bool + 'static,
@@ -132,8 +121,6 @@ impl TextField {
         self.on_escape = Rc::new(escape);
     }
 
-    /// Replaces the value without telling `on_change`. Used when a pasted link
-    /// moves into a download card.
     pub fn replace_text(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
         let text = text.into();
         let end = text.len();
@@ -160,12 +147,10 @@ impl TextField {
         cx.notify();
     }
 
-    /// Clears the value without `on_change`.
     pub fn clear(&mut self, cx: &mut Context<Self>) {
         self.replace_text("", cx);
     }
 
-    /// Highlight the whole value so the next key replaces the name.
     pub fn select_all_text(&mut self, cx: &mut Context<Self>) {
         self.selected_range = 0..self.content.len();
         self.selection_reversed = false;
@@ -385,8 +370,7 @@ impl TextField {
             .get(next + 1)
             .copied()
             .unwrap_or(self.content.len());
-        let end = if boundary > start && self.content.as_bytes().get(boundary - 1) == Some(&b'\n')
-        {
+        let end = if boundary > start && self.content.as_bytes().get(boundary - 1) == Some(&b'\n') {
             boundary - 1
         } else {
             boundary
@@ -475,7 +459,7 @@ impl TextField {
             px(16.)
         };
         let y = (position.y - bounds.top() + self.scroll_y).max(px(0.));
-        let mut index = (y.as_f32() / line_h.as_f32().max(1.0)).floor() as usize;
+        let index = (y.as_f32() / line_h.as_f32().max(1.0)).floor() as usize;
         if index >= self.line_starts.len() {
             return self.content.len();
         }
@@ -491,8 +475,7 @@ impl TextField {
             .get(index + 1)
             .copied()
             .unwrap_or(self.content.len());
-        let end = if boundary > start && self.content.as_bytes().get(boundary - 1) == Some(&b'\n')
-        {
+        let end = if boundary > start && self.content.as_bytes().get(boundary - 1) == Some(&b'\n') {
             boundary - 1
         } else {
             boundary
@@ -683,7 +666,10 @@ impl EntityInputHandler for TextField {
             let layout = self.line_layouts.get(line)?;
             let y = bounds.top() - self.scroll_y + self.line_h * line as f32;
             return Some(Bounds::from_corners(
-                point(bounds.left() + layout.x_for_index(range.start.saturating_sub(start)), y),
+                point(
+                    bounds.left() + layout.x_for_index(range.start.saturating_sub(start)),
+                    y,
+                ),
                 point(
                     bounds.left() + layout.x_for_index(range.end.saturating_sub(start)),
                     y + self.line_h,
@@ -1077,16 +1063,13 @@ impl TextElement {
         let mut selections = Vec::new();
         if !placeholder && !selected_range.is_empty() {
             for (index, start) in line_starts.iter().enumerate() {
-                let boundary = line_starts
-                    .get(index + 1)
-                    .copied()
-                    .unwrap_or(source.len());
-                let line_end = if boundary > *start && source.as_bytes().get(boundary - 1) == Some(&b'\n')
-                {
-                    boundary - 1
-                } else {
-                    boundary
-                };
+                let boundary = line_starts.get(index + 1).copied().unwrap_or(source.len());
+                let line_end =
+                    if boundary > *start && source.as_bytes().get(boundary - 1) == Some(&b'\n') {
+                        boundary - 1
+                    } else {
+                        boundary
+                    };
                 let sel_start = selected_range.start.max(*start);
                 let sel_end = selected_range.end.min(line_end);
                 if sel_start >= sel_end {
@@ -1096,10 +1079,7 @@ impl TextElement {
                 let layout = &lines[index];
                 selections.push(fill(
                     Bounds::from_corners(
-                        point(
-                            bounds.left() + layout.x_for_index(sel_start - start),
-                            y,
-                        ),
+                        point(bounds.left() + layout.x_for_index(sel_start - start), y),
                         point(
                             bounds.left() + layout.x_for_index(sel_end - start),
                             y + line_h,
@@ -1141,7 +1121,6 @@ impl TextElement {
             blanks: empty,
         }
     }
-
 }
 
 impl gpui::Render for TextField {
@@ -1165,7 +1144,9 @@ impl gpui::Render for TextField {
             .cursor(CursorStyle::IBeam)
             .text_size(px(12.))
             .text_color(theme::text())
-            .when(self.multiline, |field| field.items_start().overflow_hidden())
+            .when(self.multiline, |field| {
+                field.items_start().overflow_hidden()
+            })
             .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::delete))
             .on_action(cx.listener(Self::left))

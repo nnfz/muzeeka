@@ -13,7 +13,6 @@ use super::manifest::{
 };
 use super::model::ImportRequest;
 
-/// Shared services plugins call into. Per-plugin permissions and directory are passed on each dispatch.
 #[derive(Clone)]
 pub struct PluginHost {
     pub control: Arc<dyn PlayerControl>,
@@ -209,8 +208,10 @@ impl PluginHost {
                     .and_then(Value::as_f64)
                     .ok_or("setOutputVolume: missing volume")?
                     .clamp(0.0, 1.0) as f32;
-                Ok(serde_json::to_value(control.set_output_volume(&id, volume)?)
-                    .unwrap_or(Value::Null))
+                Ok(
+                    serde_json::to_value(control.set_output_volume(&id, volume)?)
+                        .unwrap_or(Value::Null),
+                )
             }
             "audio.removeOutput" => {
                 require(perms, AUDIO_OUTPUT)?;
@@ -352,8 +353,6 @@ fn import_request(args: &Value, require_playlist: bool) -> Result<ImportRequest,
     })
 }
 
-/// `{path, title, artist, cover}` entries. A missing list is fine.
-/// A cover-only label is kept. An empty label is dropped.
 fn labels_arg(args: &Value) -> Vec<crate::ui::plugins::model::ImportLabel> {
     let Some(list) = args.get("labels").and_then(Value::as_array) else {
         return Vec::new();
@@ -442,16 +441,19 @@ fn parse_serve_opts(args: &Value, plugin_dir: &Path) -> Result<ServeOpts, String
         #[serde(default)]
         mount: Vec<String>,
     }
-    let raw: Raw =
-        serde_json::from_value(args.clone()).map_err(|error| format!("http.serve options: {error}"))?;
-    let static_dir = raw.static_dir.filter(|value| !value.trim().is_empty()).map(|rel| {
-        let path = PathBuf::from(rel);
-        if path.is_absolute() {
-            path
-        } else {
-            plugin_dir.join(path)
-        }
-    });
+    let raw: Raw = serde_json::from_value(args.clone())
+        .map_err(|error| format!("http.serve options: {error}"))?;
+    let static_dir = raw
+        .static_dir
+        .filter(|value| !value.trim().is_empty())
+        .map(|rel| {
+            let path = PathBuf::from(rel);
+            if path.is_absolute() {
+                path
+            } else {
+                plugin_dir.join(path)
+            }
+        });
     Ok(ServeOpts {
         port: sanitize_port(raw.port.unwrap_or(DEFAULT_HTTP_PORT)),
         static_dir,
@@ -466,7 +468,10 @@ mod tests {
     #[test]
     fn paths_accept_one_string_or_a_list() {
         let one = json!({ "path": "C:/Games/a.flac" });
-        assert_eq!(paths_arg(&one).unwrap(), vec!["C:/Games/a.flac".to_string()]);
+        assert_eq!(
+            paths_arg(&one).unwrap(),
+            vec!["C:/Games/a.flac".to_string()]
+        );
         let many = json!({ "paths": ["a.mp3", " ", "b.mp3"] });
         assert_eq!(
             paths_arg(&many).unwrap(),

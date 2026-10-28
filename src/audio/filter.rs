@@ -1,17 +1,3 @@
-// Resonant low-pass / high-pass for the DSP rack.
-//
-// Same RBJ biquads the Mix Transition preview uses (`biquad.rs`), but with the Q
-// exposed: `mix_filter.rs` hardcodes 0.707 because it is sweeping cutoffs
-// automatically, whereas a filter you place in a rack by hand is only interesting
-// if you can make it squelch.
-//
-// Realtime notes (mirrors equalizer.rs / limiter.rs):
-// - Coefficients + channel count live in ArcSwap so the audio callback never
-//   waits on UI writes.
-// - Only IIR memory (`states`) uses a Mutex — mutated every buffer.
-// - f32 / i16 process paths are duplicated on purpose so the hot loop stays free
-//   of format branches.
-
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -21,26 +7,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::audio::biquad::{highpass_coeffs, lowpass_coeffs, BiquadCoeffs, BiquadState};
 
-/// LP at or above this counts as fully open — that stage bypasses.
 pub const LP_OPEN_HZ: f32 = 20000.0;
-/// HP at or below this counts as fully open — that stage bypasses.
 pub const HP_OPEN_HZ: f32 = 20.0;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FilterSettings {
     pub enabled: bool,
-    /// Low-pass cutoff in Hz. `LP_OPEN_HZ` = open.
     pub lp_hz: f32,
-    /// High-pass cutoff in Hz. `HP_OPEN_HZ` = open.
     pub hp_hz: f32,
-    /// Q for both stages. 0.707 is flat Butterworth; higher peaks at the cutoff.
     pub resonance: f32,
 }
 
 impl Default for FilterSettings {
     fn default() -> Self {
-        // Both stages open, so dropping a fresh Filter into the rack is inaudible
-        // until the user actually moves a cutoff.
         Self {
             enabled: false,
             lp_hz: LP_OPEN_HZ,
@@ -54,8 +33,6 @@ impl FilterSettings {
     pub fn clamp(mut self) -> Self {
         self.lp_hz = self.lp_hz.clamp(HP_OPEN_HZ, LP_OPEN_HZ);
         self.hp_hz = self.hp_hz.clamp(HP_OPEN_HZ, LP_OPEN_HZ);
-        // Above ~8 a self-resonant sweep can add 18+ dB at the cutoff, which is
-        // past "character" and into clipping the mixer on its own.
         self.resonance = self.resonance.clamp(0.5, 8.0);
         self
     }
@@ -69,7 +46,6 @@ impl FilterSettings {
     }
 }
 
-/// Immutable DSP parameters published atomically to the audio thread.
 struct FilterRuntimeSnapshot {
     channels: usize,
     lp_on: bool,
@@ -90,7 +66,6 @@ impl Default for FilterRuntimeSnapshot {
     }
 }
 
-/// One filter instance in the rack. Lives behind an `Arc` in `ChainSlot`.
 pub struct FilterDspContext {
     settings: RwLock<FilterSettings>,
     enabled: AtomicBool,
@@ -99,8 +74,6 @@ pub struct FilterDspContext {
     channels: AtomicU32,
     process_count: AtomicU64,
     runtime: ArcSwap<FilterRuntimeSnapshot>,
-    /// Per-channel LP and HP memory. `Vec<(lp, hp)>` keeps the pair together so a
-    /// channel-count change resizes both at once.
     states: Mutex<Vec<(BiquadState, BiquadState)>>,
 }
 
@@ -147,7 +120,6 @@ impl FilterDspContext {
         *self.states.lock() =
             vec![(BiquadState::default(), BiquadState::default()); chans as usize];
         self.coeffs_dirty.store(true, Ordering::Release);
-        // Publish matching channel count immediately so the next buffer is consistent.
         self.rebuild_coeffs_if_needed();
     }
 
@@ -180,10 +152,6 @@ impl FilterDspContext {
         }));
     }
 
-    /// Process interleaved 32-bit float PCM.
-    ///
-    /// Intentionally separate from `process_buffer_i16` so the hot loop stays free
-    /// of format branches and inlines cleanly.
     pub fn process_buffer_f32(&self, samples: &mut [f32]) {
         if !self.enabled.load(Ordering::Acquire) {
             return;
@@ -191,8 +159,6 @@ impl FilterDspContext {
         self.rebuild_coeffs_if_needed();
 
         let snap = self.runtime.load_full();
-        // Both stages open is the common case for a freshly added filter — do not
-        // burn a mutex and a full pass to multiply by 1.
         if (!snap.lp_on && !snap.hp_on) || snap.channels == 0 || samples.is_empty() {
             return;
         }
@@ -200,7 +166,6 @@ impl FilterDspContext {
         let channels = snap.channels;
         let mut states = self.states.lock();
         if states.len() != channels {
-            // Mid-reconfigure race: skip this buffer rather than panic / desync.
             return;
         }
 
@@ -217,14 +182,11 @@ impl FilterDspContext {
                 if snap.lp_on {
                     x = lp.process(x, &snap.lp);
                 }
-                // Resonance can overshoot well past unity; leave the ceiling to a
-                // limiter downstream but keep it inside float sanity.
                 samples[idx] = x.clamp(-4.0, 4.0) as f32;
             }
         }
     }
 
-    /// Process interleaved 16-bit PCM. Duplicated vs f32 — see `process_buffer_f32`.
     pub fn process_buffer_i16(&self, samples: &mut [i16]) {
         if !self.enabled.load(Ordering::Acquire) {
             return;
@@ -273,9 +235,6 @@ mod tests {
         ctx
     }
 
-    /// Interleaved stereo: both channels carry the same tone. Feeding a mono
-    /// buffer to a 2-channel context would make each channel step two samples at a
-    /// time, so a per-channel biquad would see twice the frequency asked for.
     fn sine(frames: usize, hz: f64) -> Vec<f32> {
         let mut out = Vec::with_capacity(frames * 2);
         for i in 0..frames {
@@ -286,7 +245,6 @@ mod tests {
         out
     }
 
-    /// RMS over the tail only: the first few ms are the filter's own settling.
     fn tail_rms(samples: &[f32]) -> f64 {
         let start = samples.len() / 2;
         let tail = &samples[start..];
@@ -294,7 +252,6 @@ mod tests {
         (sum / tail.len() as f64).sqrt()
     }
 
-    /// A 200 Hz low-pass must kill 5 kHz and leave 100 Hz essentially alone.
     #[test]
     fn lowpass_kills_treble_passes_bass() {
         let ctx = context(FilterSettings {
@@ -313,7 +270,6 @@ mod tests {
             "5 kHz survived a 200 Hz LP: {wet_high:.5} vs dry {dry_high:.5}"
         );
 
-        // Fresh instance so the previous run's IIR memory does not carry over.
         let ctx = context(FilterSettings {
             enabled: true,
             lp_hz: 200.0,
@@ -330,7 +286,6 @@ mod tests {
         );
     }
 
-    /// High-pass is the mirror image — 100 Hz goes, 5 kHz stays.
     #[test]
     fn highpass_kills_bass_passes_treble() {
         let ctx = context(FilterSettings {
@@ -364,8 +319,6 @@ mod tests {
         );
     }
 
-    /// Both stages open must be bit-exact dry, not "close enough" — that is what
-    /// makes adding a Filter to the rack safe before you touch anything.
     #[test]
     fn wide_open_is_bit_exact_dry() {
         let ctx = context(FilterSettings {
@@ -381,8 +334,6 @@ mod tests {
         assert_eq!(ctx.process_count(), 0, "open filter still ran the loop");
     }
 
-    /// Resonance is the reason this exists: at the cutoff, high Q must be louder
-    /// than flat Q.
     #[test]
     fn resonance_peaks_at_the_cutoff() {
         let flat = context(FilterSettings {

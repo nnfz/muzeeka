@@ -1,10 +1,3 @@
-//! Plugin threads talk to [`Session`](crate::ui::session::Session) through this queue.
-//!
-//! The library connection lives on the GPUI thread. A call from a plugin worker
-//! waits until that thread runs it. A call that is already on the UI thread,
-//! inside [`enter`], runs immediately. [`drain`] also runs queued calls, so a
-//! plugin `stop` that joins its own workers cannot deadlock the window.
-
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::sync::mpsc;
@@ -38,10 +31,6 @@ pub fn session() -> Option<Entity<Session>> {
     SESSION.lock().clone()
 }
 
-/// Run `body` while plugin calls on this thread can touch `cx`.
-///
-/// The pointer is only read on this thread, and only until `body` returns.
-/// `cx` itself is not used again until then.
 pub fn enter<T>(cx: &mut App, body: impl FnOnce() -> T) -> T {
     let ptr = cx as *mut App;
     let previous = APP.with(|slot| slot.replace(ptr));
@@ -84,8 +73,6 @@ pub fn drain(cx: &mut App, session: &Entity<Session>) {
     }
 }
 
-/// Block until `rx` answers, running queued plugin calls in between.
-/// Used while a plugin starts or stops on the UI thread.
 pub fn wait_on_ui<T>(rx: &mpsc::Receiver<T>, timeout: Duration) -> Result<T, String> {
     if !on_ui_thread() {
         return rx
@@ -121,9 +108,7 @@ fn drain_from_tls() {
     drain(cx, &session);
 }
 
-fn call_inline<T>(
-    f: impl FnOnce(&mut Session) -> Result<T, String>,
-) -> Result<T, String> {
+fn call_inline<T>(f: impl FnOnce(&mut Session) -> Result<T, String>) -> Result<T, String> {
     if BUSY.get() {
         return Err("Plugin host was called again while the library was busy".into());
     }

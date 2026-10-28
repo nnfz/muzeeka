@@ -1,8 +1,3 @@
-//! Plugin host: JS and native DLLs, plus the player HTTP API.
-//!
-//! Plugins live in `plugins/<name>/plugin.json`. Settings and the enabled flag
-//! are stored under `%APPDATA%\com.nnfz.muzeeka`, same as the previous app.
-
 mod bridge;
 mod control;
 mod host;
@@ -19,15 +14,17 @@ mod registry;
 use gpui::{App, Entity};
 use serde_json::Value;
 
+pub use http_server::HttpStatus;
 pub use manifest::{PluginRuntime, PluginSettingSpec, SettingKind};
 pub use model::ImportRequest;
-pub use http_server::HttpStatus;
 pub use registry::PluginInfo;
 
 use crate::ui::session::Session;
 
-/// Start the host and keep draining plugin calls from the UI thread.
-pub fn attach(session: Entity<Session>, cx: &mut gpui::Context<crate::ui::main_window::MainWindow>) {
+pub fn attach(
+    session: Entity<Session>,
+    cx: &mut gpui::Context<crate::ui::main_window::MainWindow>,
+) {
     bridge::set_session(session);
     bridge::enter(cx, registry::boot);
     cx.spawn(async move |view, async_cx| loop {

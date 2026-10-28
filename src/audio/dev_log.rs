@@ -1,6 +1,3 @@
-// In-app developer log. Replaces the Tauri build's `app.emit("dev:log", …)` with
-// a plain listener list so the log can be rendered by the GPUI view directly.
-
 use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -27,8 +24,6 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Register a callback invoked for every new log line. `fn` pointers only, so it
-/// can live in a `static` without a leak.
 pub fn subscribe(listener: fn(&LogLine)) {
     LISTENERS
         .lock()

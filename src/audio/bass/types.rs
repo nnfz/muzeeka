@@ -1,10 +1,6 @@
-// BASS audio library constants and types
-// Reference: https://www.un4seen.com/doc/
-
 #![allow(dead_code, non_upper_case_globals)]
 
 // ── Handle types ──────────────────────────────────────────────────────────────
-/// BASS stream / channel handle (HSTREAM, HCHANNEL, etc.)
 pub type HSTREAM = u32;
 pub type HCHANNEL = u32;
 pub type HPLUGIN = u32;
@@ -51,10 +47,6 @@ pub const BASS_ERROR_ENDED: i32 = 45;
 pub const BASS_ERROR_BUSY: i32 = 46;
 pub const BASS_ERROR_UNKNOWN: i32 = -1;
 
-/// Typed BASS error for matching without parsing strings.
-///
-/// Raw `BASS_ERROR_*` constants remain for documentation and FFI comparison;
-/// prefer this enum at call sites.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BassError {
     Ok,
@@ -237,7 +229,6 @@ impl std::fmt::Display for BassError {
 
 impl std::error::Error for BassError {}
 
-/// Human-readable error description for a raw BASS error code.
 pub fn bass_error_to_string(code: i32) -> &'static str {
     BassError::from(code).message()
 }
@@ -246,41 +237,26 @@ pub fn bass_error_to_string(code: i32) -> &'static str {
 pub const BASS_STREAM_PRESCAN: DWORD = 0x20000;
 pub const BASS_STREAM_AUTOFREE: DWORD = 0x40000;
 pub const BASS_STREAM_DECODE: DWORD = 0x200000;
-/// Internet stream: download in blocks instead of the whole file.
 pub const BASS_STREAM_BLOCK: DWORD = 0x100000;
-/// Internet stream: retrieve extra HTTP/ICY status headers.
 pub const BASS_STREAM_STATUS: DWORD = 0x800000;
 pub const BASS_UNICODE: DWORD = 0x80000000;
 pub const BASS_SAMPLE_FLOAT: DWORD = 256;
-/// Downmix to mono when creating a stream (good for analysis).
 pub const BASS_SAMPLE_MONO: DWORD = 2;
-/// File I/O on a worker thread so the WASAPI/mixer callback never blocks on disk.
 pub const BASS_ASYNCFILE: DWORD = 0x4000_0000;
 
-/// ICY (SHOUTcast) metadata tag: `StreamTitle='...';StreamUrl='...';`
 pub const BASS_TAG_META: DWORD = 0x10000;
-/// ICY (SHOUTcast) response headers: null-separated `name: value` lines.
 pub const BASS_TAG_ICY: DWORD = 0x14000;
-/// HTTP response headers (same layout as ICY).
 pub const BASS_TAG_HTTP: DWORD = 0x15000;
-/// OGG comments (`TITLE=...` NUL-separated).
 pub const BASS_TAG_OGG: DWORD = 2;
-/// MP4/iTunes tags (`©nam=...` NUL-separated).
 pub const BASS_TAG_MP4: DWORD = 7;
 
-/// Shoutcast metadata received.
 pub const BASS_SYNC_META: DWORD = 4;
-/// OGG bitstream info changed.
 pub const BASS_SYNC_OGG_CHANGE: DWORD = 12;
 
 // ── ChannelGetData flags ─────────────────────────────────────────────────────
-/// Request floating-point PCM (OR with byte length).
 pub const BASS_DATA_FLOAT: DWORD = 0x4000_0000;
-/// Query how many bytes are already decoded/buffered (`buffer` is ignored).
 pub const BASS_DATA_AVAILABLE: DWORD = 0;
 
-/// `BASS_StreamCreate` proc: push stream, fed via `BASS_StreamPutData`.
-/// (`(STREAMPROC*)-1` in bass.h.)
 pub const STREAMPROC_PUSH: *const std::ffi::c_void = -1isize as *const std::ffi::c_void;
 
 // ── Position mode ─────────────────────────────────────────────────────────────
@@ -299,35 +275,21 @@ pub const BASS_ATTRIB_VOL: DWORD = 2;
 pub const BASS_ATTRIB_PAN: DWORD = 3;
 pub const BASS_ATTRIB_BUFFER: DWORD = 13;
 
-// ── Config options (numeric values from bass.h) ──────────────────────────────
 pub const BASS_CONFIG_BUFFER: DWORD = 0;
 pub const BASS_CONFIG_UPDATEPERIOD: DWORD = 1;
-/// Pass 32-bit float to every DSP callback.
 pub const BASS_CONFIG_FLOATDSP: DWORD = 9;
-/// Internet connection timeout in milliseconds.
 pub const BASS_CONFIG_NET_TIMEOUT: DWORD = 11;
-/// Download buffer length for internet streams, in milliseconds (default 5000).
 pub const BASS_CONFIG_NET_BUFFER: DWORD = 12;
-/// Percent of [`BASS_CONFIG_NET_BUFFER`] to pre-buffer before `StreamCreateURL` returns (default 75).
 pub const BASS_CONFIG_NET_PREBUF: DWORD = 15;
-/// HTTP User-Agent string (via `BASS_SetConfigPtr`).
 pub const BASS_CONFIG_NET_AGENT: DWORD = 16;
-/// How many playlist entries `StreamCreateURL` should follow (1 = first URL).
 pub const BASS_CONFIG_NET_PLAYLIST: DWORD = 21;
-/// WASAPI/device buffer length in milliseconds. Must be set before `BASS_Init`.
 pub const BASS_CONFIG_DEV_BUFFER: DWORD = 27;
-/// Enable ICY metadata on internet streams (default 1). Unknown on some BASS builds.
 pub const BASS_CONFIG_NET_META: DWORD = 29;
-/// Stall timeout while reading an internet stream, in milliseconds (0 = no timeout).
 pub const BASS_CONFIG_NET_READTIMEOUT: DWORD = 37;
-/// Async file read-ahead size in bytes (default 65536).
 pub const BASS_CONFIG_ASYNCFILE_BUFFER: DWORD = 45;
-/// Keep the output device running even while nothing is playing.
 pub const BASS_CONFIG_DEV_NONSTOP: DWORD = 50;
-/// WASAPI/device update period in milliseconds. Must be set before `BASS_Init`.
 pub const BASS_CONFIG_DEV_PERIOD: DWORD = 53;
 
-/// `BASS_StreamGetFilePosition` modes.
 pub const BASS_FILEPOS_DOWNLOAD: DWORD = 1;
 pub const BASS_FILEPOS_BUFFER: DWORD = 5;
 pub const BASS_FILEPOS_CONNECTED: DWORD = 4;
@@ -352,7 +314,6 @@ pub const BASS_FX_FREESOURCE: DWORD = 0x10000;
 pub const BASS_ATTRIB_TEMPO: DWORD = 0x10000;
 pub const BASS_ATTRIB_TEMPO_PITCH: DWORD = 0x10001;
 pub const BASS_ATTRIB_TEMPO_FREQ: DWORD = 0x10002;
-/// SoundTouch option: reduce clicks when tempo changes (TRUE/FALSE as 1.0/0.0).
 pub const BASS_ATTRIB_TEMPO_OPTION_PREVENT_CLICK: DWORD = 0x10016;
 
 // ── Output devices ──────────────────────────────────────────────────────────
@@ -368,7 +329,6 @@ pub struct BassDeviceInfo {
     pub flags: DWORD,
 }
 
-/// `BASS_INFO` from bass.h — device mix format after `BASS_Init`.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct BassInfo {
@@ -404,7 +364,6 @@ pub const BASS_MIXER_RESUME: DWORD = 0x1000;
 pub const BASS_MIXER_CHAN_NORAMPIN: DWORD = 0x800000;
 pub const BASS_MIXER_CHAN_BUFFER: DWORD = 0x2000;
 pub const BASS_MIXER_CHAN_PAUSE: DWORD = 0x20000;
-/// Downmix surround sources to the mixer's channel count.
 pub const BASS_MIXER_CHAN_DOWNMIX: DWORD = 0x400000;
 
 // ── Music (modules / trackers) ────────────────────────────────────────────────
@@ -414,8 +373,6 @@ pub const BASS_MUSIC_RAMP: DWORD = 0x200;
 pub const BASS_MUSIC_PRESCAN: DWORD = 0x2000;
 
 // ── BASS_CHANNELINFO ──────────────────────────────────────────────────────────
-// Contains a raw `filename` pointer owned by BASS. Intentionally !Send/!Sync so
-// the compiler keeps it on the calling thread (always under the player mutex).
 #[repr(C)]
 #[derive(Debug, Clone)]
 pub struct BassChannelInfo {

@@ -53,9 +53,6 @@ pub fn set_background_mode(background: bool) {
             return;
         }
 
-        // Only the calling UI thread. Dropping the *process* class to
-        // BELOW_NORMAL used to starve BASS's WASAPI/update threads whenever a
-        // game or encode saturated the CPU, which other players don't do.
         const THREAD_PRIORITY_BELOW_NORMAL: i32 = -1;
         const THREAD_PRIORITY_NORMAL: i32 = 0;
         unsafe {

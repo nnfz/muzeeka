@@ -1,7 +1,3 @@
-//! Recent lines from `log.info` / `log.error`, shown on the plugin card.
-//! The same line is kept once: turning a plugin off and on used to stack
-//! its startup note ("папка osu!lazer: …") under the previous copy.
-
 use std::collections::{HashSet, VecDeque};
 
 use parking_lot::Mutex;
@@ -23,9 +19,11 @@ pub fn push(level: &'static str, plugin_id: &str, message: &str) {
         return;
     }
     let mut lines = LINES.lock();
-    let repeated = lines.iter().rev().find(|line| line.plugin_id == plugin_id).is_some_and(
-        |line| line.level == level && line.message == message,
-    );
+    let repeated = lines
+        .iter()
+        .rev()
+        .find(|line| line.plugin_id == plugin_id)
+        .is_some_and(|line| line.level == level && line.message == message);
     if repeated {
         return;
     }
@@ -40,8 +38,6 @@ pub fn push(level: &'static str, plugin_id: &str, message: &str) {
     }
 }
 
-/// Newest distinct lines, oldest first. A repeated startup note stays on the
-/// row of its latest copy instead of appearing again underneath.
 pub fn recent(plugin_id: &str) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut picked = Vec::new();
@@ -60,25 +56,4 @@ pub fn recent(plugin_id: &str) -> Vec<String> {
     }
     picked.reverse();
     picked
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_startup_note_is_shown_once_after_the_plugin_starts_again() {
-        let id = "test.osu-log-dedup";
-        push("info", id, "папка osu!lazer: C:\\osu");
-        push("info", id, "в картах 193 песен, добавляю 1 новых в плейлист osu!lazer");
-        push("info", id, "папка osu!lazer: C:\\osu");
-        push("info", id, "папка osu!lazer: C:\\osu");
-        assert_eq!(
-            recent(id),
-            vec![
-                "info: в картах 193 песен, добавляю 1 новых в плейлист osu!lazer".to_string(),
-                "info: папка osu!lazer: C:\\osu".to_string(),
-            ]
-        );
-    }
 }

@@ -1,13 +1,3 @@
-//! Energy-envelope BPM detection via BASS decode streams.
-//!
-//! Pipeline:
-//! 1. Open a decode stream (float mono → float stereo → 16-bit)
-//! 2. Pull mono PCM from several windows across the file
-//! 3. Per window: energy envelope → onset → autocorrelation + IOI histogram
-//! 4. Vote across windows, refine lag, fold tempo octave, snap for tags
-//!
-//! Runs on the player's BASS thread. Results are cached by path + mtime + size.
-
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -21,18 +11,13 @@ use super::player::Player;
 // ── Range / hop ──────────────────────────────────────────────────────────────
 const MIN_BPM: f32 = 70.0;
 const MAX_BPM: f32 = 180.0;
-/// Energy hop in mono samples (~5.8 ms @ 44.1 kHz).
 const HOP: usize = 256;
-/// Common song-tempo band used for outlier rescue.
 const SWEET_BPM_LO: f32 = 95.0;
 const SWEET_BPM_HI: f32 = 150.0;
 
 // ── Multi-window layout ──────────────────────────────────────────────────────
-/// Length of each analysis window (seconds).
 const WINDOW_SECS: f64 = 18.0;
-/// Relative start positions in the track (0 = start, 1 = end).
 const WINDOW_FRACS: [f64; 3] = [0.12, 0.42, 0.70];
-/// Skip absolute intro even on short files.
 const MIN_START_SKIP_SECS: f64 = 4.0;
 
 // ── Onset / peak thresholds ──────────────────────────────────────────────────
@@ -51,7 +36,6 @@ const BAR_BONUS_SCALE: f32 = 0.20;
 const OCTAVE_DOWN_RATIO: f32 = 0.70;
 const SWEET_ALT_CORR_RATIO: f32 = 0.45;
 const SWEET_ALT_BEST_RATIO: f32 = 0.40;
-/// Only consider /2 when result is this high *and* half lands in a musical band.
 const HIGH_BPM_CUTOFF: f32 = 168.0;
 const HIGH_BPM_HALF_MIN: f32 = 95.0;
 const HIGH_BPM_HALF_RATIO: f32 = 0.65;
@@ -66,7 +50,6 @@ const PRIOR_SCALE: f32 = 0.70;
 const SNAP_INT_TOL: f32 = 0.4;
 
 // ── Vote ─────────────────────────────────────────────────────────────────────
-/// Candidates within this many BPM count as the same vote bin.
 const VOTE_CLUSTER_BPM: f32 = 1.25;
 
 // ── Cache ────────────────────────────────────────────────────────────────────
@@ -112,18 +95,12 @@ fn cache_put(path: &str, bpm: f32) {
     let Some(key) = file_cache_key(path) else {
         return;
     };
-    bpm_cache().lock().insert(
-        path.to_string(),
-        CacheEntry {
-            key,
-            bpm,
-        },
-    );
+    bpm_cache()
+        .lock()
+        .insert(path.to_string(), CacheEntry { key, bpm });
 }
 
 // ── Public API ───────────────────────────────────────────────────────────────
-
-/// Detect BPM for an on-disk audio file (cached by path + mtime + size).
 pub fn detect_bpm_for_path(player: &Player, path: &str) -> Result<f32, String> {
     let path = path.trim().to_string();
     if path.is_empty() {
@@ -145,15 +122,7 @@ pub fn detect_bpm_for_path(player: &Player, path: &str) -> Result<f32, String> {
     Ok(bpm)
 }
 
-/// Find beat-grid phase (seconds) so sticks land on kicks / strong onsets.
-///
-/// `offset` is in [0, beat_period): first beat of the grid at that time from
-/// track start. Uses onset energy under a fixed BPM (from tags or detection).
-pub fn detect_beat_offset_for_path(
-    player: &Player,
-    path: &str,
-    bpm: f32,
-) -> Result<f64, String> {
+pub fn detect_beat_offset_for_path(player: &Player, path: &str, bpm: f32) -> Result<f64, String> {
     let path = path.trim().to_string();
     if path.is_empty() {
         return Err("Empty audio path".into());
@@ -170,15 +139,10 @@ pub fn detect_beat_offset_for_path(
     player.with_bass(move |bass| detect_beat_offset_with_bass(bass, &path_for_bass, bpm))
 }
 
-fn detect_beat_offset_with_bass(
-    bass: &BassLibrary,
-    path: &str,
-    bpm: f32,
-) -> Result<f64, String> {
+fn detect_beat_offset_with_bass(bass: &BassLibrary, path: &str, bpm: f32) -> Result<f64, String> {
     let (handle, _mode) = open_decode(bass, path)?;
     let result = (|| {
         let info = decode_info(bass, handle)?;
-        // Prefer a mid-track window (kicks usually clearer than intro).
         let start = window_starts_secs(info.total_secs)
             .get(1)
             .copied()
@@ -193,18 +157,11 @@ fn detect_beat_offset_with_bass(
         }
         let local = estimate_beat_offset(&mono, info.sample_rate, bpm)
             .ok_or_else(|| "Could not estimate beat phase".to_string())?;
-        // Local offset is relative to the analysis window start — convert to
-        // absolute track time mod beat, then fold into [0, beat).
         let beat = 60.0 / bpm as f64;
         let abs = start + local;
         let mut off = abs.rem_euclid(beat);
-        // Prefer small offsets near 0 for display stability.
-        if off > beat * 0.5 {
-            // Keep in [0, beat) — no change needed for phase equivalence, but
-            // leave as rem_euclid result so first stick after 0 is consistent.
-        }
+        if off > beat * 0.5 {}
         let _ = off;
-        // Re-score absolute phase against a second window if possible.
         if let Some(&start2) = window_starts_secs(info.total_secs).first() {
             if (start2 - start).abs() > 1.0 {
                 let pos2 = bass.channel_seconds2bytes(handle, start2);
@@ -213,12 +170,9 @@ fn detect_beat_offset_with_bass(
                     .is_ok()
                 {
                     if let Ok(mono2) = pull_mono(bass, handle, &info, max_mono) {
-                        if let Some(local2) =
-                            estimate_beat_offset(&mono2, info.sample_rate, bpm)
-                        {
+                        if let Some(local2) = estimate_beat_offset(&mono2, info.sample_rate, bpm) {
                             let abs2 = start2 + local2;
                             let off2 = abs2.rem_euclid(beat);
-                            // Average circularly on the beat circle.
                             let a = off * std::f64::consts::TAU / beat;
                             let b = off2 * std::f64::consts::TAU / beat;
                             let mx = a.cos() + b.cos();
@@ -237,7 +191,6 @@ fn detect_beat_offset_with_bass(
     result
 }
 
-/// Phase in [0, beat_period) maximizing onset energy under fixed BPM.
 fn estimate_beat_offset(mono: &[f32], sample_rate: u32, bpm: f32) -> Option<f64> {
     if mono.len() < sample_rate as usize / 2 || sample_rate < 8000 {
         return None;
@@ -261,7 +214,6 @@ fn estimate_beat_offset(mono: &[f32], sample_rate: u32, bpm: f32) -> Option<f64>
         let mut t = phase_hops;
         while (t as usize) + 1 < onset.len() {
             let i = t.round() as usize;
-            // Small neighborhood — kick hits a bit wide.
             let mut local = onset[i] as f64;
             if i > 0 {
                 local = local.max(onset[i - 1] as f64 * 0.6);
@@ -298,10 +250,7 @@ fn open_decode(bass: &BassLibrary, path: &str) -> Result<(u32, &'static str), St
             bass::BASS_STREAM_DECODE | bass::BASS_SAMPLE_FLOAT | bass::BASS_SAMPLE_MONO,
             "float+mono",
         ),
-        (
-            bass::BASS_STREAM_DECODE | bass::BASS_SAMPLE_FLOAT,
-            "float",
-        ),
+        (bass::BASS_STREAM_DECODE | bass::BASS_SAMPLE_FLOAT, "float"),
         (bass::BASS_STREAM_DECODE, "default-16bit"),
     ];
     let mut last_err = String::from("Failed to open decode stream");
@@ -346,7 +295,6 @@ fn decode_info(bass: &BassLibrary, handle: u32) -> Result<DecodeInfo, String> {
     })
 }
 
-/// Pull up to `max_mono` mono samples from the current stream position.
 fn pull_mono(
     bass: &BassLibrary,
     handle: u32,
@@ -357,7 +305,6 @@ fn pull_mono(
     let mut float_chunk = vec![0f32; 8192 * info.chans];
     let mut i16_chunk = vec![0i16; 8192 * info.chans];
 
-    // Bound iterations by remaining samples (not a magic fixed pull count).
     let chunk_frames = 8192usize;
     let max_pulls = (max_mono / chunk_frames).saturating_add(8).max(8);
 
@@ -413,7 +360,6 @@ fn pull_mono(
 
 fn window_starts_secs(total_secs: f64) -> Vec<f64> {
     if total_secs <= WINDOW_SECS + MIN_START_SKIP_SECS {
-        // Short file — single window from the start (tiny skip if possible).
         let start = if total_secs > WINDOW_SECS + 1.0 {
             MIN_START_SKIP_SECS.min(total_secs * 0.05)
         } else {
@@ -436,7 +382,8 @@ fn detect_bpm_with_bass(bass: &BassLibrary, path: &str) -> Result<f32, String> {
 
     let result = (|| {
         let info = decode_info(bass, handle)?;
-        let max_mono = ((WINDOW_SECS * info.sample_rate as f64) as usize).max(info.sample_rate as usize / 2);
+        let max_mono =
+            ((WINDOW_SECS * info.sample_rate as f64) as usize).max(info.sample_rate as usize / 2);
         let starts = window_starts_secs(info.total_secs);
 
         let mut estimates: Vec<f32> = Vec::with_capacity(starts.len());
@@ -465,14 +412,11 @@ fn detect_bpm_with_bass(bass: &BassLibrary, path: &str) -> Result<f32, String> {
         }
 
         if estimates.is_empty() {
-            return Err(
-                "Could not detect a stable BPM — try tapping instead".to_string(),
-            );
+            return Err("Could not detect a stable BPM — try tapping instead".to_string());
         }
 
-        let bpm = vote_bpm(&estimates).ok_or_else(|| {
-            "Could not detect a stable BPM — try tapping instead".to_string()
-        })?;
+        let bpm = vote_bpm(&estimates)
+            .ok_or_else(|| "Could not detect a stable BPM — try tapping instead".to_string())?;
         Ok(bpm)
     })();
 
@@ -486,7 +430,6 @@ fn detect_bpm_with_bass(bass: &BassLibrary, path: &str) -> Result<f32, String> {
     result
 }
 
-/// Cluster window estimates and pick the strongest bin (median of that bin).
 fn vote_bpm(estimates: &[f32]) -> Option<f32> {
     if estimates.is_empty() {
         return None;
@@ -495,7 +438,6 @@ fn vote_bpm(estimates: &[f32]) -> Option<f32> {
         return Some(estimates[0]);
     }
 
-    // Greedy clustering by proximity.
     let mut used = vec![false; estimates.len()];
     let mut best_cluster: Vec<f32> = Vec::new();
 
@@ -514,7 +456,6 @@ fn vote_bpm(estimates: &[f32]) -> Option<f32> {
                 used[j] = true;
             }
         }
-        // Also merge members within tolerance of cluster mean (second pass).
         let mean = cluster.iter().sum::<f32>() / cluster.len() as f32;
         for j in 0..estimates.len() {
             if used[j] {
@@ -551,8 +492,6 @@ fn cluster_spread(c: &[f32]) -> f32 {
 }
 
 // ── Core analysis (per window) ───────────────────────────────────────────────
-
-/// Envelope → autocorrelation + IOI histogram BPM estimate for one mono window.
 pub fn estimate_bpm(mono: &[f32], sample_rate: u32) -> Option<f32> {
     if mono.len() < sample_rate as usize / 2 || sample_rate < 8000 {
         return None;
@@ -580,7 +519,16 @@ pub fn estimate_bpm(mono: &[f32], sample_rate: u32) -> Option<f32> {
         hist_peak,
     )?;
     lag = walk_octave_down(lag, hop_rate, max_lag, &corr_scores);
-    refine_and_fold(lag, hop_rate, min_lag, max_lag, &corr_scores, &hist_sm, hist_peak, best_corr)
+    refine_and_fold(
+        lag,
+        hop_rate,
+        min_lag,
+        max_lag,
+        &corr_scores,
+        &hist_sm,
+        hist_peak,
+        best_corr,
+    )
 }
 
 fn compute_energy_envelope(mono: &[f32]) -> Option<Vec<f32>> {
@@ -762,15 +710,7 @@ fn score_candidates(
     }
 }
 
-fn walk_octave_down(
-    mut lag: usize,
-    hop_rate: f32,
-    max_lag: usize,
-    corr_scores: &[f32],
-) -> usize {
-    // Only step to a slower period when that tempo stays musically plausible.
-    // Pure click trains have strong corr at 2×lag (→ half BPM); without a floor
-    // this collapses 160 → 80.
+fn walk_octave_down(mut lag: usize, hop_rate: f32, max_lag: usize, corr_scores: &[f32]) -> usize {
     loop {
         let lag2 = lag * 2;
         if lag2 > max_lag {
@@ -842,7 +782,6 @@ fn refine_and_fold(
 
     if bpm > HIGH_BPM_CUTOFF {
         if let Some(half) = fold_bpm_range(bpm * 0.5) {
-            // Avoid collapsing real 160–167 tracks to 80–83.
             if half >= HIGH_BPM_HALF_MIN {
                 let lag_h = bpm_to_lag(half, hop_rate, min_lag, max_lag);
                 let lag_b = bpm_to_lag(bpm, hop_rate, min_lag, max_lag);
@@ -988,7 +927,6 @@ mod tests {
 
     #[test]
     fn prefers_160_over_80_for_fast_clicks() {
-        // Strong 160 BPM click train — should not collapse to 80.
         let sr = 44100u32;
         let mono = synth_clicks(sr, 160.0, 25.0);
         let est = estimate_bpm(&mono, sr).expect("bpm");

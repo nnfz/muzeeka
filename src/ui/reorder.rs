@@ -1,13 +1,6 @@
-//! In-list reorder math, shared by track rows and the playlist sidebar.
-//!
-//! The insert index is a boundary in the original list. Rows that are moving
-//! and sit before that boundary are removed first, so the gap the pointer is
-//! aiming at does not slide out from under it.
-
 use std::collections::HashSet;
 use std::hash::Hash;
 
-/// Move `moving` as a block, keeping the order those items already have.
 pub(crate) fn reorder_at_boundary<T>(items: &[T], moving: &[T], insert_index: usize) -> Vec<T>
 where
     T: Clone + Eq + Hash,
@@ -43,7 +36,6 @@ where
     next
 }
 
-/// Insert slot `0..=count` from a y inside the list. `row_h` is the row pitch.
 pub(crate) fn slot_from_y(y: f32, count: usize, row_h: f32) -> usize {
     if count == 0 || row_h <= 0. {
         return 0;
@@ -56,7 +48,6 @@ pub(crate) fn slot_from_y(y: f32, count: usize, row_h: f32) -> usize {
     }
 }
 
-/// Keep the previous slot until the pointer has crossed the shared boundary.
 pub(crate) fn stabilize_slot(
     next: usize,
     prev: Option<usize>,
@@ -82,11 +73,6 @@ pub(crate) fn stabilize_slot(
     next
 }
 
-/// How many rows `row` moves when the single row `from` is inserted at `slot`.
-///
-/// `slot` is a boundary in the original list, `0..=count`. The dragged row and
-/// the rows that slide into its place share one result, so a live preview can
-/// offset every row without rebuilding the element order.
 pub(crate) fn single_row_shift(row: usize, from: usize, slot: usize) -> i32 {
     let removed_before = usize::from(from < slot);
     let dest = slot.saturating_sub(removed_before);
@@ -98,7 +84,6 @@ pub(crate) fn single_row_shift(row: usize, from: usize, slot: usize) -> i32 {
     new_index as i32 - row as i32
 }
 
-/// Index of `row` after moving `from` to `slot`. Out-of-range inputs stay put.
 pub(crate) fn index_after_move(row: usize, from: usize, slot: usize, count: usize) -> usize {
     if count == 0 || from >= count || row >= count {
         return row.min(count.saturating_sub(1));
@@ -111,7 +96,6 @@ pub(crate) fn index_after_move(row: usize, from: usize, slot: usize, count: usiz
     }
 }
 
-/// Playlist insert boundary from frozen row centers, in content space.
 pub(crate) fn playlist_slot(
     y: f32,
     centers: &[f32],

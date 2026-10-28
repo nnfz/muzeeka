@@ -304,7 +304,6 @@ impl MainWindow {
                         },
                     )
             })
-            // The playing playlist's bars live on the cover, not beside the name.
             .when(bars && !hovered, |mark| {
                 mark.child(
                     div()
@@ -321,7 +320,6 @@ impl MainWindow {
             .into_any_element()
     }
 
-    /// Cover with the same hover play button as a playlist. `on_play` starts the track.
     pub(crate) fn cover_with_play(
         &self,
         key: &str,
@@ -401,7 +399,6 @@ impl MainWindow {
             .into_any_element()
     }
 
-    /// Right-side control that scrolls a track into view without playing it.
     pub(crate) fn go_to_track_button(
         &self,
         key: &str,
@@ -501,8 +498,8 @@ impl MainWindow {
                     .size_full()
                     .overflow_y_scroll()
                     .track_scroll(&self.sidebar_scroll)
-                    .on_scroll_wheel(cx.listener(
-                        |this, event: &gpui::ScrollWheelEvent, window, cx| {
+                    .on_scroll(cx.listener(
+                        |this, event: &gpui::ScrollEvent, window, cx| {
                             this.note_scroll(
                                 crate::ui::main_window::Scroller::Sidebar,
                                 event,
@@ -751,7 +748,6 @@ impl MainWindow {
                             .when(
                                 show_bars && !editing && density == PlaylistDensity::Nano,
                                 |row| {
-                                    // Nano has no cover, so the bars keep their spot by the name.
                                     let bars_key =
                                         SharedString::from(format!("playlist-eq-{}", playlist.id));
                                     row.child(div().ml(px(8.)).flex_shrink_0().child(
@@ -773,11 +769,6 @@ impl MainWindow {
                                     }
                                 },
                             );
-                        // The row is out of flow. Without a frozen slot height the
-                        // flex column shrinks every row to fit, so the list never
-                        // overflows and the wheel has nothing to scroll.
-                        // Neighbors ease into the hole. The dragged row stays put:
-                        // its preview is pinned to the pointer, not sprung.
                         let slide_id = SharedString::from(format!("{element_id}-slide"));
                         div()
                             .relative()
@@ -800,8 +791,6 @@ impl MainWindow {
                                     )),
                             )
                             .child(if held.is_some() {
-                                // The held row keeps its look and rides the pointer. Deferred
-                                // so it paints above the rows it passes instead of under them.
                                 deferred(
                                     div()
                                         .absolute()
@@ -849,8 +838,6 @@ impl MainWindow {
     }
 }
 
-/// Layout height of a playlist row. The sliding visual is taken out of flow,
-/// so the slot has to keep this height or the list collapses.
 fn playlist_slot_h(density: PlaylistDensity) -> f32 {
     match density {
         // py 6 + cover 38.

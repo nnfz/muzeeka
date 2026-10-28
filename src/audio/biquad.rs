@@ -1,10 +1,3 @@
-//! Shared RBJ-cookbook biquad primitives.
-//!
-//! Extracted from `mix_filter.rs` so the DSP-chain `Filter` effect can reuse the
-//! exact same math the Mix Transition preview has been shipping. `equalizer.rs`
-//! keeps its own peaking / high-shelf coefficients — different formulas, and its
-//! hot loop is tuned around them.
-
 use std::f64::consts::PI;
 
 #[derive(Clone, Copy)]
@@ -18,7 +11,6 @@ pub struct BiquadCoeffs {
 
 impl Default for BiquadCoeffs {
     fn default() -> Self {
-        // Unity / bypass
         Self {
             b0: 1.0,
             b1: 0.0,

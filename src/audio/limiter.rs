@@ -1,33 +1,3 @@
-// Loudness stage for the mixer output — a look-ahead brickwall limiter, plus an
-// opt-in hard-clip mode for when clean is not the point.
-//
-// Sits after the equalizer in the mixer's DSP chain. `gain_db` pushes the whole
-// signal in (up to +12 dB). What happens at the ceiling depends on `clip`:
-//
-//   - `clip == false` (limiter): the ceiling is held without ever squaring off a
-//     peak. Gets loud and dense, stays clean. See the guarantee below.
-//   - `clip == true` (hard clip): peaks are simply chopped at the ceiling. No
-//     look-ahead, no gain movement, no added latency — the harmonics that
-//     chopping generates *are* the sound. This is distortion, on purpose.
-//
-// How the limiter's ceiling is actually guaranteed:
-//   - Output is delayed by a `LOOKAHEAD_MS` ring, so at frame n the detector
-//     already knows the peaks up to n while it is only emitting frame n−D.
-//   - The applied gain is a *sliding minimum* of the per-sample target gain over
-//     that window, so it has already reached its lowest value D frames before the
-//     peak it was computed for reaches the output.
-//   - A one-pole smoother (τ = D/4, ~98 % settled across the window) keeps gain
-//     movement click-free without letting the peak escape; a final clamp catches
-//     the ~2 % residual.
-//
-// Realtime notes (mirrors equalizer.rs):
-// - Gain / ceiling / release / clip live in ArcSwap so the audio callback never
-//   waits on UI writes.
-// - Delay ring + envelope + detector deque live in a Mutex — mutated every buffer
-//   in limiter mode, untouched in clip mode (which needs no history).
-// - f32 / i16 process paths are duplicated on purpose, like the EQ, so the hot
-//   loop stays free of format branches.
-
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -36,27 +6,18 @@ use arc_swap::ArcSwap;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 
-/// How far ahead the peak detector sees. 3 ms is enough for the gain to slew
-/// down transparently and short enough not to smear transients.
 const LOOKAHEAD_MS: f64 = 3.0;
 
-/// Attack time as a fraction of the look-ahead window. τ = D/4 leaves the
-/// smoother ~98 % settled (1 − e⁻⁴) by the time the peak reaches the output.
 const ATTACK_WINDOW_DIVISOR: f64 = 4.0;
 
-/// Gain reduction floor reported to the meter.
 const METER_FLOOR_DB: f64 = 40.0;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LimiterSettings {
     pub enabled: bool,
-    /// Pre-limiter gain in dB (0..+12) — how hard the signal is pushed in.
     pub gain_db: f32,
-    /// Output ceiling in dBFS. 0 = absolute brickwall at full scale.
     pub ceiling_db: f32,
-    /// Release time in ms — how fast the limiter gain recovers after a peak.
     pub release_ms: f32,
-    /// Hard clip at the ceiling instead of limiting. Distortion on purpose.
     #[serde(default)]
     pub clip: bool,
 }
@@ -87,18 +48,13 @@ fn db_to_linear(db: f64) -> f64 {
     10f64.powf(db / 20.0)
 }
 
-/// Immutable DSP parameters published atomically to the audio thread.
 struct LimiterRuntimeSnapshot {
     channels: usize,
     drive_linear: f64,
     ceiling_linear: f64,
-    /// Look-ahead in frames (also the output delay).
     delay_frames: usize,
-    /// One-pole coefficient for downward gain movement.
     attack_coeff: f64,
-    /// One-pole coefficient for recovery.
     release_coeff: f64,
-    /// Chop peaks at the ceiling instead of pulling the gain down.
     clip: bool,
 }
 
@@ -116,17 +72,11 @@ impl Default for LimiterRuntimeSnapshot {
     }
 }
 
-/// Delay ring + detector window. Sized for one stream configuration.
 struct LimiterState {
-    /// Interleaved delay line, `delay_frames * channels` long.
     ring: Vec<f64>,
     write_pos: usize,
-    /// Smoothed gain (linear, 1.0 = no reduction).
     envelope: f64,
-    /// Monotonic deque of `(frame, target_gain)` for the sliding minimum.
-    /// Never grows past `delay_frames + 1`, so it does not allocate mid-buffer.
     window: VecDeque<(u64, f64)>,
-    /// Frame counter driving the window; wraps harmlessly after ~13 M years.
     frame: u64,
 }
 
@@ -142,7 +92,6 @@ impl LimiterState {
         }
     }
 
-    /// Drop stale audio so re-enabling does not replay a few ms of old signal.
     fn reset(&mut self) {
         self.ring.fill(0.0);
         self.write_pos = 0;
@@ -152,17 +101,14 @@ impl LimiterState {
     }
 }
 
-/// Thread-safe limiter context. One instance per rack slot, driven by `dsp_chain`.
 pub struct LimiterDspContext {
     settings: RwLock<LimiterSettings>,
     enabled: AtomicBool,
     params_dirty: AtomicBool,
-    /// Set when the limiter is switched on — the next buffer clears stale state.
     reset_pending: AtomicBool,
     sample_rate_hz: AtomicU32,
     channels: AtomicUsize,
     process_count: AtomicU64,
-    /// Latest gain reduction in dB, as f64 bits — polled by the UI meter.
     reduction_db: AtomicU64,
     runtime: ArcSwap<LimiterRuntimeSnapshot>,
     state: Mutex<LimiterState>,
@@ -190,8 +136,6 @@ impl LimiterDspContext {
         }
     }
 
-    /// Zero the meter. Called when the chain leaves the mixer: no callback will
-    /// run to clear it, so the reading would sit at its last value forever.
     pub fn clear_meter(&self) {
         self.reduction_db.store(0f64.to_bits(), Ordering::Relaxed);
     }
@@ -200,7 +144,6 @@ impl LimiterDspContext {
         self.process_count.load(Ordering::Relaxed)
     }
 
-    /// Gain reduction currently applied, in dB (0 = limiter idle).
     pub fn reduction_db(&self) -> f64 {
         f64::from_bits(self.reduction_db.load(Ordering::Relaxed))
     }
@@ -218,16 +161,12 @@ impl LimiterDspContext {
             *guard = s;
             changed
         };
-        // Clip mode never writes the delay ring, so coming back into limiter mode
-        // would otherwise emit whatever stale audio was last left in it.
         if turning_on || mode_changed {
             self.reset_pending.store(true, Ordering::Release);
         }
         self.params_dirty.store(true, Ordering::Release);
     }
 
-    /// Sample format is the chain's business (`dsp_chain.rs` decides once per
-    /// buffer for the whole rack), so this only takes rate and channel count.
     pub fn configure_stream(&self, sample_rate: u32, channels: u32) {
         let chans = channels.max(1) as usize;
         let rate = if sample_rate > 0 { sample_rate } else { 44100 };
@@ -237,7 +176,6 @@ impl LimiterDspContext {
         let delay_frames = Self::delay_frames_for(rate);
         *self.state.lock() = LimiterState::new(delay_frames, chans);
         self.params_dirty.store(true, Ordering::Release);
-        // Publish matching channel count immediately so the next buffer is consistent.
         self.rebuild_params_if_needed();
     }
 
@@ -255,7 +193,6 @@ impl LimiterDspContext {
         let channels = self.channels.load(Ordering::Acquire).max(1);
         let delay_frames = Self::delay_frames_for(sample_rate);
 
-        // One-pole coefficients: y += (x − y) · c, with c = 1 − e^(−1/τ_samples).
         let attack_tau = (delay_frames as f64 / ATTACK_WINDOW_DIVISOR).max(1.0);
         let release_tau = (settings.release_ms as f64 / 1000.0 * sample_rate as f64).max(1.0);
 
@@ -270,7 +207,6 @@ impl LimiterDspContext {
         }));
     }
 
-    /// Publish the buffer's worst gain reduction for the UI meter.
     fn publish_reduction(&self, min_gain: f64) {
         let db = if min_gain >= 1.0 {
             0.0
@@ -280,11 +216,6 @@ impl LimiterDspContext {
         self.reduction_db.store(db.to_bits(), Ordering::Relaxed);
     }
 
-    /// Process interleaved 32-bit float PCM.
-    /// Samples are promoted to f64 for processing, then truncated back to f32.
-    ///
-    /// Intentionally separate from `process_buffer_i16` (not a shared generic body)
-    /// so the hot loop stays free of format branches and inlines cleanly.
     pub fn process_buffer_f32(&self, samples: &mut [f32]) {
         if !self.enabled.load(Ordering::Acquire) {
             return;
@@ -300,16 +231,12 @@ impl LimiterDspContext {
 
         self.process_count.fetch_add(1, Ordering::Relaxed);
 
-        // Clip mode needs no history, so it skips the mutex and the delay ring
-        // entirely — and with it the 3 ms of latency the look-ahead costs.
         if snap.clip {
             let mut worst = 1.0f64;
             for s in samples.iter_mut() {
                 let driven = *s as f64 * snap.drive_linear;
                 let mag = driven.abs();
                 if mag > snap.ceiling_linear {
-                    // How much of the peak got chopped, as a gain ratio, so the
-                    // meter reads the same units as the limiter's reduction.
                     let kept = snap.ceiling_linear / mag;
                     if kept < worst {
                         worst = kept;
@@ -323,7 +250,6 @@ impl LimiterDspContext {
 
         let mut state = self.state.lock();
         if state.ring.len() != snap.delay_frames * channels {
-            // Mid-reconfigure race: skip this buffer rather than desync the delay.
             return;
         }
         if self.reset_pending.swap(false, Ordering::AcqRel) {
@@ -363,10 +289,6 @@ impl LimiterDspContext {
         self.publish_reduction(min_gain);
     }
 
-    /// Process interleaved 16-bit PCM.
-    /// Samples are promoted to f64 for processing, then quantized back to i16.
-    ///
-    /// Duplicated vs f32 path on purpose — see `process_buffer_f32`.
     pub fn process_buffer_i16(&self, samples: &mut [i16]) {
         if !self.enabled.load(Ordering::Acquire) {
             return;
@@ -382,7 +304,6 @@ impl LimiterDspContext {
 
         self.process_count.fetch_add(1, Ordering::Relaxed);
 
-        // See `process_buffer_f32` — clip mode is lock-free and latency-free.
         if snap.clip {
             let mut worst = 1.0f64;
             for s in samples.iter_mut() {
@@ -444,13 +365,6 @@ impl LimiterDspContext {
 }
 
 impl LimiterState {
-    /// Feed one frame's peak to the detector and return the gain to apply to the
-    /// sample leaving the delay line.
-    ///
-    /// `window` holds the target gain for every frame still inside the look-ahead,
-    /// pruned to a monotonic increasing sequence — so its front is the minimum over
-    /// `[frame − delay, frame]`. That is exactly the set of samples whose peaks the
-    /// gain must already account for, which is what stops a transient escaping.
     #[inline]
     fn step(&mut self, snap: &LimiterRuntimeSnapshot, peak: f64) -> f64 {
         let target = if peak > snap.ceiling_linear {
@@ -500,8 +414,6 @@ mod tests {
         ctx
     }
 
-    /// The whole point: +12 dB of drive must not produce a single sample over the
-    /// ceiling, and must still push the output right up against it.
     #[test]
     fn hard_drive_never_exceeds_ceiling() {
         let ctx = context(LimiterSettings {
@@ -521,7 +433,6 @@ mod tests {
                 *s = (2.0 * PI * 60.0 * t).sin() as f32;
             }
             ctx.process_buffer_f32(&mut buf);
-            // Skip the first block: the delay line is still priming with silence.
             if block > 0 {
                 for &s in &buf {
                     peak = peak.max(s.abs());
@@ -533,7 +444,6 @@ mod tests {
         assert!(peak > 0.98, "limiter left too much headroom: {peak:.6}");
     }
 
-    /// A transient after silence must not escape — this is what the look-ahead buys.
     #[test]
     fn transient_does_not_escape_lookahead() {
         let ctx = context(LimiterSettings {
@@ -545,9 +455,8 @@ mod tests {
         });
 
         let mut buf = [0.0f32; 2048];
-        ctx.process_buffer_f32(&mut buf); // prime the delay line with silence
+        ctx.process_buffer_f32(&mut buf);
 
-        // Silence, then an instant full-scale hit.
         let mut hit = [0.0f32; 2048];
         for (i, s) in hit.iter_mut().enumerate() {
             if i >= 1024 {
@@ -559,7 +468,6 @@ mod tests {
         assert!(peak <= 1.0, "transient escaped the limiter: {peak:.6}");
     }
 
-    /// Below the ceiling with no drive, the limiter is a pure delay — same values out.
     #[test]
     fn quiet_signal_passes_unchanged() {
         let ctx = context(LimiterSettings {
@@ -570,7 +478,6 @@ mod tests {
             clip: false,
         });
 
-        // Constant level, so the delay does not shift what we compare against.
         let mut buf = [0.01f32; 2048];
         ctx.process_buffer_f32(&mut buf);
         buf = [0.01f32; 2048];
@@ -582,8 +489,6 @@ mod tests {
         assert!(ctx.reduction_db() < 0.01, "meter showed phantom reduction");
     }
 
-    /// Clip mode squares peaks off at the ceiling from the very first sample —
-    /// no delay line to prime, so unlike the limiter tests block 0 counts.
     #[test]
     fn clip_squares_peaks_immediately() {
         let ctx = context(LimiterSettings {
@@ -601,7 +506,6 @@ mod tests {
         let expected_first = (buf[0] as f64 * 10.0_f64.powf(12.0 / 20.0)) as f32;
         ctx.process_buffer_f32(&mut buf);
 
-        // Zero latency: sample 0 is sample 0, driven — not a delayed zero.
         assert!(
             (buf[0] - expected_first).abs() < 1.0e-6,
             "clip mode added latency: {} vs {expected_first}",
@@ -614,7 +518,6 @@ mod tests {
             "clip missed the ceiling: {peak:.6}"
         );
 
-        // Flat tops are the tell: +12 dB on a 0.5 sine pins most of each half-cycle.
         let pinned = buf.iter().filter(|s| s.abs() >= 1.0 - 1.0e-6).count();
         assert!(
             pinned > buf.len() / 4,

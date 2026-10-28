@@ -1,5 +1,3 @@
-// CUE sheet parser — expands album image files into virtual tracks.
-
 use cue_rw::{CUEFile, CUETimeStamp, CUETrack};
 use num_rational::Rational32;
 use parking_lot::Mutex;
@@ -11,10 +9,6 @@ use std::time::SystemTime;
 
 use crate::audio::metadata;
 use crate::library::MusicFile;
-
-// ── Short-lived path caches (mtime-invalidated) ───────────────────────────────
-// repair_track / resolve_playback hit the same album CUE once per track; cache
-// companion lookup + full expand so a 15-track multi-file album pays once.
 
 struct CompanionCacheEntry {
     parent_mtime: Option<SystemTime>,
@@ -45,7 +39,6 @@ fn path_cache_key(path: &Path) -> String {
     path.to_string_lossy().to_lowercase()
 }
 
-/// Files only, sorted — one `read_dir` reused by resolve / companion lookups.
 fn list_files_in_dir(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     if let Ok(entries) = fs::read_dir(dir) {
@@ -77,8 +70,6 @@ pub fn is_cue_sheet_path(path: &str) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("cue"))
 }
 
-/// True for network audio locations the BASS URL streamer can open
-/// (HTTP / HTTPS radio and web streams).
 pub fn is_stream_url(path: &str) -> bool {
     let p = path.trim();
     p.len() > 8
@@ -103,12 +94,6 @@ pub fn parse_virtual_cue_path(path: &str) -> Option<(String, u32)> {
     Some((audio, track_no))
 }
 
-/// Find a CUE sheet that sits next to an audio image.
-///
-/// Supports both common layouts:
-/// - `album.cue` beside `album.flac`
-/// - `album.flac.cue` beside `album.flac` (Exact Audio Copy and similar)
-/// - multi-file rips: any `*.cue` in the same folder that references this audio
 pub fn companion_cue_for_audio(audio_path: &Path) -> Option<PathBuf> {
     let parent = audio_path.parent()?;
     let key = path_cache_key(audio_path);
@@ -149,10 +134,8 @@ fn companion_cue_for_audio_uncached(audio_path: &Path, parent: &Path) -> Option<
         }
     }
 
-    // One directory listing for case-insensitive name match + multi-file FILE scan.
     let listing = list_files_in_dir(parent);
 
-    // Case-insensitive match on Windows (FAT/NTFS folder listings can differ in case).
     #[cfg(windows)]
     {
         let targets: Vec<String> = candidates
@@ -172,7 +155,6 @@ fn companion_cue_for_audio_uncached(audio_path: &Path, parent: &Path) -> Option<
         }
     }
 
-    // Multi-file album: `Не пара.cue` next to `01. ….m4a` — match by FILE list inside the sheet.
     let audio_name = audio_path
         .file_name()
         .map(|n| n.to_string_lossy().to_lowercase())?;
@@ -207,7 +189,6 @@ fn companion_cue_for_audio_uncached(audio_path: &Path, parent: &Path) -> Option<
                 {
                     return Some(cue_path);
                 }
-                // Resolved path match (ALAC → m4a) — reuse folder listing.
                 if let Some(resolved) = resolve_audio_file_with_listing(parent, file_name, &listing)
                 {
                     if same_path_key(&resolved, audio_path) {
@@ -239,7 +220,6 @@ fn expanded_track_for_audio(audio_path: &str, track_no: u32) -> Option<MusicFile
         .nth(track_no.saturating_sub(1) as usize)
 }
 
-/// Expand with mtime cache — shared by repair_track / resolve_playback per album CUE.
 fn expand_cue_file_cached(cue_path: &Path, resolve_covers: bool) -> Vec<MusicFile> {
     let key = path_cache_key(cue_path);
     let cue_mtime = path_mtime(cue_path);
@@ -265,9 +245,6 @@ fn expand_cue_file_cached(cue_path: &Path, resolve_covers: bool) -> Vec<MusicFil
     tracks
 }
 
-/// Fill missing CUE metadata on a playlist track loaded from disk.
-/// Always refreshes INDEX bounds / duration from the companion sheet when possible
-/// so multi-file lengths match the CUE (not the full container file).
 pub fn repair_track(track: &mut MusicFile) -> bool {
     if is_cue_track_path(&track.path) {
         if let Some((audio, track_no)) = parse_virtual_cue_path(&track.path) {
@@ -278,7 +255,6 @@ pub fn repair_track(track: &mut MusicFile) -> bool {
                     track.cue_end_secs,
                     track.duration_secs,
                 );
-                // Prefer full expanded entry (path + INDEX bounds + duration).
                 *track = expanded;
                 return before
                     != (
@@ -296,7 +272,6 @@ pub fn repair_track(track: &mut MusicFile) -> bool {
     }
 
     if is_cue_sheet_path(&track.path) {
-        // Caller should expand full sheet; single-track fallback only.
         if let Some(expanded) = expand_cue_file(Path::new(&track.path)).into_iter().next() {
             *track = expanded;
             return true;
@@ -305,15 +280,12 @@ pub fn repair_track(track: &mut MusicFile) -> bool {
     false
 }
 
-/// Resolve the real audio file and optional CUE segment for playback.
 pub fn resolve_playback(
     track_path: &str,
     audio_path: Option<&str>,
     cue_start: Option<f64>,
     cue_end: Option<f64>,
 ) -> Result<PlaybackTarget, String> {
-    // Radio / web streams: the URL itself is the audio source — no file checks,
-    // no CUE expansion. Never attempt to seek inside a live stream.
     if is_stream_url(track_path) {
         return Ok(PlaybackTarget {
             audio_path: track_path.trim().to_string(),
@@ -336,8 +308,6 @@ pub fn resolve_playback(
                 .or(expanded.audio_path.clone())
                 .unwrap_or(audio);
 
-            // Explicit caller bounds win (mix preview / seek into a segment).
-            // Fall back to INDEX times from the sheet when the caller did not override.
             return Ok(PlaybackTarget {
                 audio_path: resolved_audio,
                 cue_start: cue_start.or(expanded.cue_start_secs),
@@ -345,7 +315,6 @@ pub fn resolve_playback(
             });
         }
 
-        // Companion .cue missing/unreadable, but playlist already has segment bounds.
         if cue_start.is_some() {
             return Ok(PlaybackTarget {
                 audio_path: resolved_from_args.unwrap_or(audio),
@@ -387,7 +356,6 @@ pub fn resolve_playback(
     if Path::new(track_path).is_file() {
         return Ok(PlaybackTarget {
             audio_path: track_path.to_string(),
-            // Honour optional segment bounds (mix preview / partial play).
             cue_start,
             cue_end,
         });
@@ -418,21 +386,17 @@ fn track_index_start(track: &CUETrack) -> Option<f64> {
         .map(|(_, ts)| timestamp_secs(*ts))
 }
 
-/// Read a CUE sheet as text. EAC/Foobar sheets are often Windows-1251 (Cyrillic),
-/// not UTF-8 — plain `read_to_string` rejects those and the import silently drops.
 fn read_cue_text(cue_path: &Path) -> Option<String> {
     let bytes = fs::read(cue_path).ok()?;
     if bytes.is_empty() {
         return None;
     }
 
-    // UTF-8 (with optional BOM)
     if let Ok(text) = std::str::from_utf8(&bytes) {
         let text = text.strip_prefix('\u{feff}').unwrap_or(text);
         return Some(text.to_string());
     }
 
-    // Windows-1251 — very common for Russian EAC rips
     {
         let (cow, _enc, had_errors) = encoding_rs::WINDOWS_1251.decode(&bytes);
         if !had_errors || cow.contains("FILE") || cow.contains("TRACK") {
@@ -440,7 +404,6 @@ fn read_cue_text(cue_path: &Path) -> Option<String> {
         }
     }
 
-    // Windows-1252 / Latin-1 fallback (Western EAC)
     {
         let (cow, _, _) = encoding_rs::WINDOWS_1252.decode(&bytes);
         if cow.contains("FILE") || cow.contains("TRACK") {
@@ -448,34 +411,9 @@ fn read_cue_text(cue_path: &Path) -> Option<String> {
         }
     }
 
-    // Last resort: lossy UTF-8 so we at least try to parse
     Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-/// Exact Audio Copy multi-file CUE layout puts the next track's INDEX 01 *after*
-/// the next FILE line, outside any TRACK block. cue-rw rejects that as InvalidTag.
-/// Rewrite to a conventional shape: each FILE owns its TRACK with INDEX 01.
-///
-/// Before:
-/// ```text
-/// FILE "01.flac" WAVE
-///   TRACK 01 AUDIO
-///     INDEX 01 00:00:00
-///   TRACK 02 AUDIO
-///     INDEX 00 03:00:00
-/// FILE "02.flac" WAVE
-///     INDEX 01 00:00:00
-/// ```
-///
-/// After:
-/// ```text
-/// FILE "01.flac" WAVE
-///   TRACK 01 AUDIO
-///     INDEX 01 00:00:00
-/// FILE "02.flac" WAVE
-///   TRACK 02 AUDIO
-///     INDEX 01 00:00:00
-/// ```
 fn normalize_eac_multifile_cue(content: &str) -> String {
     let lines: Vec<&str> = content.lines().collect();
     if lines.is_empty() {
@@ -483,7 +421,6 @@ fn normalize_eac_multifile_cue(content: &str) -> String {
     }
 
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
-    // Track header lines (TRACK + body) waiting for their FILE + INDEX 01.
     let mut pending_track: Option<Vec<String>> = None;
     let mut i = 0usize;
 
@@ -495,12 +432,10 @@ fn normalize_eac_multifile_cue(content: &str) -> String {
             out.push(line.to_string());
             i += 1;
 
-            // Orphan INDEX/FLAGS lines that belong to the pending TRACK.
             let mut orphans: Vec<String> = Vec::new();
             while i < lines.len() {
                 let next = lines[i];
                 let next_trim = next.trim();
-                // Still indented body, but not a new TRACK / top-level tag.
                 if next.starts_with("  ")
                     && !next_trim.starts_with("TRACK ")
                     && !next.starts_with("FILE ")
@@ -517,12 +452,10 @@ fn normalize_eac_multifile_cue(content: &str) -> String {
             }
 
             if let Some(mut track_lines) = pending_track.take() {
-                // Drop INDEX 00 (pregap of previous file) — start of this file is INDEX 01.
                 track_lines.retain(|l| {
                     let t = l.trim();
                     !t.starts_with("INDEX 00") && !t.starts_with("INDEX 0 ")
                 });
-                // Prefer INDEX 01 from the orphan block after FILE.
                 let has_idx1 = orphans
                     .iter()
                     .any(|l| l.trim().starts_with("INDEX 01") || l.trim().starts_with("INDEX 1 "));
@@ -534,7 +467,6 @@ fn normalize_eac_multifile_cue(content: &str) -> String {
                     for o in &orphans {
                         let t = o.trim();
                         if t.starts_with("INDEX 01") || t.starts_with("INDEX 1 ") {
-                            // Normalize indent under TRACK.
                             track_lines.push(format!("    {t}"));
                         }
                     }
@@ -542,19 +474,16 @@ fn normalize_eac_multifile_cue(content: &str) -> String {
                     .iter()
                     .any(|l| l.trim().starts_with("INDEX 01") || l.trim().starts_with("INDEX 1 "))
                 {
-                    // No index at all — assume start of file.
                     track_lines.push("    INDEX 01 00:00:00".to_string());
                 }
                 out.extend(track_lines);
             } else {
-                // No pending track — keep orphans as-is (unusual but non-destructive).
                 out.extend(orphans);
             }
             continue;
         }
 
         if trimmed.starts_with("TRACK ") {
-            // Flush previous pending without a dedicated FILE (single-image cues).
             if let Some(track_lines) = pending_track.take() {
                 out.extend(track_lines);
             }
@@ -570,7 +499,6 @@ fn normalize_eac_multifile_cue(content: &str) -> String {
                 {
                     break;
                 }
-                // Indented track body.
                 if next.starts_with("  ") || next.starts_with('\t') {
                     track_lines.push(next.to_string());
                     i += 1;
@@ -585,7 +513,6 @@ fn normalize_eac_multifile_cue(content: &str) -> String {
                 let t = l.trim();
                 t.starts_with("INDEX 01") || t.starts_with("INDEX 1 ")
             });
-            // Only INDEX 00 → wait for next FILE's INDEX 01 (EAC multi-file).
             if !has_idx1 {
                 pending_track = Some(track_lines);
             } else {
@@ -594,7 +521,6 @@ fn normalize_eac_multifile_cue(content: &str) -> String {
             continue;
         }
 
-        // Top-level metadata / REM / blank.
         out.push(line.to_string());
         i += 1;
     }
@@ -623,7 +549,6 @@ fn parse_cue_content(raw: &str, cue_path: &Path) -> Option<(CUEFile, PathBuf)> {
     Some((cue, cue_dir))
 }
 
-/// Audio extensions we may substitute when CUE says `.ALAC` / `.WAV` but disk has `.m4a` etc.
 const AUDIO_EXT_FALLBACKS: &[&str] = &[
     "m4a", "mp4", "alac", "flac", "wav", "aiff", "aif", "ape", "wv", "opus", "ogg", "mp3", "wma",
 ];
@@ -639,15 +564,12 @@ fn resolve_audio_file_with_listing(
     resolve_audio_file_from_listing(file_name, listing)
 }
 
-/// Exact path + extension substitution (no `read_dir`).
 fn resolve_audio_file_direct(cue_dir: &Path, file_name: &str) -> Option<PathBuf> {
     let candidate = cue_dir.join(file_name);
     if candidate.is_file() {
         return Some(canonicalize_or(candidate));
     }
 
-    // Same stem, different extension (EAC often writes FILE "...ALAC" ALAC while
-    // the rip is actually ".m4a" / ".flac").
     let stem = Path::new(file_name)
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
@@ -663,7 +585,6 @@ fn resolve_audio_file_direct(cue_dir: &Path, file_name: &str) -> Option<PathBuf>
     None
 }
 
-/// Case-insensitive / prefix heuristics against a pre-read folder listing.
 fn resolve_audio_file_from_listing(file_name: &str, listing: &[PathBuf]) -> Option<PathBuf> {
     let target = file_name.to_lowercase();
     let stem = Path::new(file_name)
@@ -672,7 +593,6 @@ fn resolve_audio_file_from_listing(file_name: &str, listing: &[PathBuf]) -> Opti
         .unwrap_or_else(|| file_name.to_string());
     let stem_lower = stem.to_lowercase();
 
-    // Case-insensitive exact name.
     for path in listing {
         if path
             .file_name()
@@ -684,7 +604,6 @@ fn resolve_audio_file_from_listing(file_name: &str, listing: &[PathBuf]) -> Opti
         }
     }
 
-    // Case-insensitive stem match.
     for path in listing {
         let Some(entry_stem) = path.file_stem().map(|s| s.to_string_lossy().to_lowercase()) else {
             continue;
@@ -702,7 +621,6 @@ fn resolve_audio_file_from_listing(file_name: &str, listing: &[PathBuf]) -> Opti
         }
     }
 
-    // Leading track-number prefix: "01. Title.ALAC" → any "01.*" audio in the folder.
     if let Some((num, _)) = stem.split_once(|c: char| !c.is_ascii_digit()) {
         if !num.is_empty() {
             let prefix = format!("{num}.");
@@ -753,26 +671,22 @@ fn end_secs_for_track(
     audio_duration
 }
 
-/// Parse `INDEX 00 mm:ss:ff` / `INDEX 01 mm:ss:ff` → seconds.
 fn parse_index_line_secs(line: &str) -> Option<(u8, f64)> {
     let t = line.trim();
     if !t.starts_with("INDEX ") {
         return None;
     }
     let mut parts = t.split_whitespace();
-    let _ = parts.next()?; // INDEX
+    let _ = parts.next()?;
     let idx: u8 = parts.next()?.parse().ok()?;
     let ts = parts.next()?;
     let mut hms = ts.split(':');
     let mm: f64 = hms.next()?.parse().ok()?;
     let ss: f64 = hms.next()?.parse().ok()?;
-    let ff: f64 = hms.next()?.parse().ok()?; // frames @ 75/s
+    let ff: f64 = hms.next()?.parse().ok()?;
     Some((idx, mm * 60.0 + ss + ff / 75.0))
 }
 
-/// EAC multi-file sheets put `INDEX 00` of track N under FILE N-1 — that time is the
-/// true CD length of track N-1 (often a few seconds shorter than the m4a/ALAC file).
-/// Returns one optional end (seconds from file start) per TRACK in sheet order.
 fn extract_multifile_index00_ends(content: &str) -> Vec<Option<f64>> {
     let mut ends: Vec<Option<f64>> = Vec::new();
     let mut track_count = 0usize;
@@ -785,7 +699,6 @@ fn extract_multifile_index00_ends(content: &str) -> Vec<Option<f64>> {
             continue;
         }
         if let Some((0, secs)) = parse_index_line_secs(t) {
-            // INDEX 00 on TRACK k ends TRACK k-1 (1-based): ends[k-2]
             if track_count >= 2 {
                 let prev = track_count - 2;
                 if prev < ends.len() && ends[prev].is_none() {
@@ -797,18 +710,10 @@ fn extract_multifile_index00_ends(content: &str) -> Vec<Option<f64>> {
     ends
 }
 
-/// Expand a .cue file into virtual `MusicFile` entries (one per TRACK).
-///
-/// - **Single image** (many TRACK share one FILE): `audio#cue:N` + INDEX start/end
-/// - **Multi-file** (one FILE per TRACK, e.g. Не пара): plain audio path, but
-///   `cue_start`/`cue_end` from INDEX so duration/gapless match the sheet (INDEX 00),
-///   not the full container length of the m4a/ALAC file.
 pub fn expand_cue_file(cue_path: &Path) -> Vec<MusicFile> {
     expand_cue_file_cached(cue_path, true)
 }
 
-/// Import variant: preserve all CUE identity/timing while deferring expensive
-/// embedded-cover extraction until a track becomes visible.
 pub fn expand_cue_file_fast(cue_path: &Path) -> Vec<MusicFile> {
     expand_cue_file_cached(cue_path, false)
 }
@@ -821,7 +726,6 @@ fn expand_cue_file_impl(cue_path: &Path, resolve_covers: bool) -> Vec<MusicFile>
     let content = raw.strip_prefix('\u{feff}').unwrap_or(raw.as_str());
     let index00_ends = extract_multifile_index00_ends(content);
 
-    // Parse from already-loaded text — avoid a second disk read + normalize pass.
     let (cue, cue_dir) = match parse_cue_content(content, cue_path) {
         Some(value) => value,
         None => return Vec::new(),
@@ -839,7 +743,6 @@ fn expand_cue_file_impl(cue_path: &Path, resolve_covers: bool) -> Vec<MusicFile>
         .map(|(file_id, track)| ((*file_id), track))
         .collect();
 
-    // How many TRACK rows reference each FILE id.
     let mut tracks_per_file: Vec<usize> = vec![0; cue.files.len()];
     for (file_id, _) in &track_refs {
         if *file_id < tracks_per_file.len() {
@@ -847,7 +750,6 @@ fn expand_cue_file_impl(cue_path: &Path, resolve_covers: bool) -> Vec<MusicFile>
         }
     }
 
-    // One folder listing for all track FILE resolutions in this sheet.
     let listing = list_files_in_dir(&cue_dir);
 
     let mut result = Vec::with_capacity(track_refs.len());
@@ -905,13 +807,11 @@ fn expand_cue_file_impl(cue_path: &Path, resolve_covers: bool) -> Vec<MusicFile>
             .clone()
             .unwrap_or_else(|| format!("Track {}", index + 1));
 
-        // One TRACK per FILE starting at 0 → multi-file rip (separate audio per song).
         let single_file_track =
             tracks_per_file.get(*file_id).copied().unwrap_or(0) == 1 && start <= 0.05;
 
         let (path, audio_path_field, cue_start_secs, cue_end_secs, duration_secs) =
             if single_file_track {
-                // Prefer INDEX 00 length from the sheet (gapless cut), fall back to file tags.
                 let cue_end = index00_ends
                     .get(index)
                     .copied()
@@ -923,7 +823,6 @@ fn expand_cue_file_impl(cue_path: &Path, resolve_covers: bool) -> Vec<MusicFile>
                     .or(audio_meta.duration_secs);
                 let dur = cue_end.map(|e| (e - start).max(0.0));
                 (
-                    // Keep a stable virtual path so playlist repair can re-bind to the sheet.
                     format!("{}{}{}", audio_path_str, CUE_PATH_MARKER, index + 1),
                     Some(audio_path_str),
                     Some(start),
@@ -967,7 +866,6 @@ fn expand_cue_file_impl(cue_path: &Path, resolve_covers: bool) -> Vec<MusicFile>
     result
 }
 
-/// Audio files referenced by parsed CUE sheets (canonical paths).
 pub fn covered_audio_paths(cue_paths: &[PathBuf]) -> Vec<String> {
     let mut covered = Vec::new();
 
@@ -1051,11 +949,9 @@ FILE "03. Three.ALAC" ALAC
             tracks.len(),
             tracks.iter().map(|t| t.title.clone()).collect::<Vec<_>>()
         );
-        // Multi-file: virtual paths + INDEX 00 ends (shorter than full m4a when sheet says so).
         let t0 = &tracks[0];
         assert!(t0.path.contains(CUE_PATH_MARKER));
         assert_eq!(t0.cue_start_secs, Some(0.0));
-        // INDEX 00 01:12:42 ≈ 72.56s — not full file ~74.56s
         let end0 = t0.cue_end_secs.expect("track 1 needs INDEX 00 end");
         assert!(
             (end0 - (1.0 * 60.0 + 12.0 + 42.0 / 75.0)).abs() < 0.05,
@@ -1131,7 +1027,6 @@ FILE "02. Two.ALAC" ALAC
             "track 2 audio: {:?}",
             tracks[1].audio_path
         );
-        // INDEX 00 03:00:00 → end of track 1
         assert_eq!(tracks[0].cue_start_secs, Some(0.0));
         assert_eq!(tracks[0].cue_end_secs, Some(180.0));
         assert_eq!(tracks[0].duration_secs, Some(180.0));
@@ -1149,17 +1044,17 @@ FILE "02. Two.ALAC" ALAC
         write_text(
             &base.join("album.cue"),
             r#"PERFORMER "Test Artist"
-TITLE "Test Album"
-FILE "album.flac" WAVE
-  TRACK 01 AUDIO
-    TITLE "First Song"
-    PERFORMER "Test Artist"
-    INDEX 01 00:00:00
-  TRACK 02 AUDIO
-    TITLE "Second Song"
-    PERFORMER "Test Artist"
-    INDEX 01 02:00:00
-"#,
+            TITLE "Test Album"
+            FILE "album.flac" WAVE
+              TRACK 01 AUDIO
+                TITLE "First Song"
+                PERFORMER "Test Artist"
+                INDEX 01 00:00:00
+              TRACK 02 AUDIO
+                TITLE "Second Song"
+                PERFORMER "Test Artist"
+                INDEX 01 02:00:00
+            "#,
         );
 
         let tracks = expand_cue_file(&base.join("album.cue"));
@@ -1201,21 +1096,20 @@ FILE "album.flac" WAVE
 
         let audio = base.join("album.flac");
         write_bytes(&audio, &[1, 2, 3]);
-        // Exact Audio Copy style: audio.flac.cue (not audio.cue)
         write_text(
             &base.join("album.flac.cue"),
             r#"PERFORMER "Artist"
-TITLE "Album"
-FILE "album.flac" WAVE
-  TRACK 01 AUDIO
-    TITLE "One"
-    PERFORMER "Artist"
-    INDEX 01 00:00:00
-  TRACK 02 AUDIO
-    TITLE "Two"
-    PERFORMER "Artist"
-    INDEX 01 01:00:00
-"#,
+            TITLE "Album"
+            FILE "album.flac" WAVE
+                TRACK 01 AUDIO
+                TITLE "One"
+                PERFORMER "Artist"
+                INDEX 01 00:00:00
+                TRACK 02 AUDIO
+                TITLE "Two"
+                PERFORMER "Artist"
+                INDEX 01 01:00:00
+            "#,
         );
 
         let companion = companion_cue_for_audio(&audio).expect("find .flac.cue");
@@ -1227,7 +1121,6 @@ FILE "album.flac" WAVE
         let tracks = expand_cue_file(&companion);
         assert_eq!(tracks.len(), 2, "expand via .flac.cue companion");
 
-        // Prefer expanded virtual path (may include \\?\ canonicalize prefix on Windows).
         let path = tracks[1].path.clone();
         let target = resolve_playback(&path, tracks[1].audio_path.as_deref(), None, None)
             .expect("resolve via companion .flac.cue");
@@ -1246,15 +1139,15 @@ FILE "album.flac" WAVE
         write_text(
             &base.join("album.cue"),
             r#"PERFORMER "Artist"
-TITLE "Album"
-FILE "album.ape" WAVE
-  TRACK 01 AUDIO
-    TITLE "One"
-    INDEX 01 00:00:00
-  TRACK 02 AUDIO
-    TITLE "Two"
-    INDEX 01 02:59:43
-"#,
+            TITLE "Album"
+            FILE "album.ape" WAVE
+              TRACK 01 AUDIO
+                TITLE "One"
+                INDEX 01 00:00:00
+              TRACK 02 AUDIO
+                TITLE "Two"
+                INDEX 01 02:59:43
+            "#,
         );
 
         let tracks = expand_cue_file(&base.join("album.cue"));
@@ -1280,39 +1173,39 @@ FILE "album.ape" WAVE
         write_text(
             &base.join("MADDY_MURK - GLYANTSEVIY.cue"),
             r#"PERFORMER "MADDY_MURK"
-TITLE "GLYANTSEVIY"
-FILE "MADDY_MURK - GLYANTSEVIY.ape" WAVE
-  TRACK 01 AUDIO
-    TITLE "DVOROVIY VOIN"
-    INDEX 01 00:00:00
-  TRACK 02 AUDIO
-    TITLE "MI MASTERA MESHAT"
-    INDEX 01 02:59:43
-  TRACK 03 AUDIO
-    TITLE "BEHA SEMEROCHKA MOYA"
-    INDEX 01 06:01:43
-  TRACK 04 AUDIO
-    TITLE "MUTNIY MMM"
-    INDEX 01 09:01:71
-  TRACK 05 AUDIO
-    TITLE "GLYANTSEVIY"
-    INDEX 01 12:05:27
-  TRACK 06 AUDIO
-    TITLE "YUNOST"
-    INDEX 01 15:05:01
-  TRACK 07 AUDIO
-    TITLE "PLESEN"
-    INDEX 01 18:06:16
-  TRACK 08 AUDIO
-    TITLE "DYM"
-    INDEX 01 21:05:65
-  TRACK 09 AUDIO
-    TITLE "LADA VESTA"
-    INDEX 01 23:45:08
-  TRACK 10 AUDIO
-    TITLE "POLITSEISKAYA"
-    INDEX 01 26:40:07
-"#,
+            TITLE "GLYANTSEVIY"
+            FILE "MADDY_MURK - GLYANTSEVIY.ape" WAVE
+              TRACK 01 AUDIO
+                TITLE "DVOROVIY VOIN"
+                INDEX 01 00:00:00
+              TRACK 02 AUDIO
+                TITLE "MI MASTERA MESHAT"
+                INDEX 01 02:59:43
+              TRACK 03 AUDIO
+                TITLE "BEHA SEMEROCHKA MOYA"
+                INDEX 01 06:01:43
+              TRACK 04 AUDIO
+                TITLE "MUTNIY MMM"
+                INDEX 01 09:01:71
+              TRACK 05 AUDIO
+                TITLE "GLYANTSEVIY"
+                INDEX 01 12:05:27
+              TRACK 06 AUDIO
+                TITLE "YUNOST"
+                INDEX 01 15:05:01
+              TRACK 07 AUDIO
+                TITLE "PLESEN"
+                INDEX 01 18:06:16
+              TRACK 08 AUDIO
+                TITLE "DYM"
+                INDEX 01 21:05:65
+              TRACK 09 AUDIO
+                TITLE "LADA VESTA"
+                INDEX 01 23:45:08
+              TRACK 10 AUDIO
+                TITLE "POLITSEISKAYA"
+                INDEX 01 26:40:07
+            "#,
         );
 
         let tracks = expand_cue_file(&base.join("MADDY_MURK - GLYANTSEVIY.cue"));

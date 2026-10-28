@@ -1,8 +1,3 @@
-//! Path keys shared with the Tauri library database.
-//!
-//! UI paths stay absolute. SQLite stores a root plus a relative path, and
-//! `path_key` is the stable lookup (`r{id}:{rel}` or the absolute key).
-
 use std::path::{Component, Path, PathBuf};
 
 fn strip_extended_prefix(path: &str) -> &str {
@@ -20,7 +15,6 @@ pub fn is_stream_url(path: &str) -> bool {
             || path.as_bytes()[..8].eq_ignore_ascii_case(b"https://"))
 }
 
-/// Split `file#cue:N` into the file and the `#cue:N` suffix.
 pub fn split_cue(path: &str) -> (&str, Option<&str>) {
     match path.find("#cue:") {
         Some(index) => (&path[..index], Some(&path[index..])),
@@ -28,7 +22,6 @@ pub fn split_cue(path: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// Equality key: strip `\\?\`, use `\` on Windows, lowercase.
 pub fn path_key(path: &str) -> String {
     if is_stream_url(path) {
         return path.trim().to_lowercase();
@@ -48,7 +41,6 @@ pub fn storage_path_key(root_id: Option<i64>, rel_path: &str) -> String {
     }
 }
 
-/// Collapse `.` / `..` without touching the filesystem. Stream URLs stay as-is.
 pub fn normalize_display_path(path: &str) -> String {
     if is_stream_url(path) {
         return path.trim().to_string();
@@ -72,7 +64,6 @@ pub fn normalize_display_path(path: &str) -> String {
     }
 }
 
-/// Relative path of `absolute` under `root`, keeping a `#cue:` suffix.
 pub fn to_relative(root: &str, absolute: &str) -> Option<String> {
     let (abs_base, cue) = split_cue(absolute);
     let root_key = path_key(root);
@@ -105,7 +96,6 @@ pub fn to_relative(root: &str, absolute: &str) -> Option<String> {
     })
 }
 
-/// Folder or file name, without a `\\?\` prefix or a trailing slash.
 pub fn basename(path: &str) -> String {
     let mut cleaned = strip_extended_prefix(path.trim());
     cleaned = cleaned.trim_end_matches(['/', '\\']);
@@ -119,14 +109,11 @@ pub fn basename(path: &str) -> String {
         .to_string()
 }
 
-/// Prefix used to group a dropped folder with the files scanned from it.
 pub fn normalize_prefix(path: &str) -> String {
     let (base, _) = split_cue(path);
     path_key(base).trim_end_matches(['\\', '/']).to_string()
 }
 
-/// `\\?\` form so a folder walk is not cut off at 260 characters.
-/// Nested album folders regularly pass that, and then the whole subtree is skipped.
 pub fn extended_path(path: &Path) -> PathBuf {
     if !cfg!(windows) {
         return path.to_path_buf();

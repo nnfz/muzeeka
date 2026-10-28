@@ -1,6 +1,4 @@
-//! Audio settings, matching the web rack: chain, equalizer, filter, limiter,
-//! presets, playback speed, and the pitch switch. Sliders apply live. The file
-//! is patched when the pointer goes up, and only the audio keys are replaced.
+// Audio settings
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -203,7 +201,6 @@ impl Session {
         self.push_chain(true);
     }
 
-    /// `to` is the gap index, including one past the last row.
     pub(crate) fn move_effect(&mut self, id: &str, to: usize) {
         let Some(from) = self.rack.chain.iter().position(|slot| slot.id == id) else {
             return;

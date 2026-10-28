@@ -1,11 +1,3 @@
-//! Full-file waveform peaks for the Mix transition editor.
-//!
-//! A track is decoded through BASS exactly once and folded into a fine,
-//! fixed-resolution peak array that is cached in memory (keyed by path +
-//! mtime + size). Every subsequent request for that track — any zoom level,
-//! any time range, any bin count — is served by slicing/pooling the cached
-//! array, with zero further BASS calls.
-
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::path::Path;
@@ -110,7 +102,6 @@ fn cache_key_for(path: &str) -> Result<CacheKey, String> {
     })
 }
 
-/// Generate waveform peaks for an on-disk audio file (or CUE segment).
 pub fn peaks_for_path(
     player: &Player,
     cache: &WaveformCache,
@@ -175,7 +166,6 @@ pub fn peaks_for_path(
     })
 }
 
-/// Decode the whole file once into a fine, fixed-hop peak array.
 fn decode_fine_waveform(bass: &BassLibrary, path: &str) -> Result<FineWaveform, String> {
     let (handle, _mode) = open_decode(bass, path)?;
 
@@ -261,7 +251,6 @@ fn decode_fine_waveform(bass: &BassLibrary, path: &str) -> Result<FineWaveform, 
     result
 }
 
-/// Pool (or interpolate) the cached fine peak array down/up into `bins` covering [start, end].
 fn pool_peaks(fine: &FineWaveform, start: f64, end: f64, bins: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; bins];
     if fine.peaks.is_empty() {

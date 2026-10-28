@@ -2,10 +2,6 @@ use std::path::PathBuf;
 
 use crate::ui::catalog;
 
-/// One plugins folder. Drop a directory with `plugin.json` in here.
-///
-/// A dev build uses the repo `plugins/` next to `Cargo.toml`.
-/// A packaged build, where that path does not exist, uses `plugins/` next to the exe.
 pub fn plugins_dir() -> PathBuf {
     let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("plugins");
     if repo.is_dir() {

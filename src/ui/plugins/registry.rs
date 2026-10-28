@@ -176,8 +176,6 @@ impl PluginRegistry {
                     .start(id, source, permissions, dir, self.host.clone())
             }
             PluginRuntime::Native => {
-                // start() may spawn workers that call back into the player.
-                // Run it off the UI thread and keep draining those calls.
                 let native = Arc::clone(&self.native);
                 let host = self.host.clone();
                 let id = id.to_string();
@@ -395,4 +393,3 @@ fn scan_dir(root: &Path, out: &mut HashMap<String, LoadedPlugin>) {
         }
     }
 }
-

@@ -1,5 +1,3 @@
-//! Embed a front cover into an audio file.
-
 use std::fs;
 use std::path::Path;
 
@@ -58,7 +56,10 @@ fn mime_to_id3_str(mime: &MimeType) -> String {
     }
 }
 
-fn prepare_cover_bytes(data: &[u8], mime_hint: Option<&str>) -> Result<(Vec<u8>, MimeType), String> {
+fn prepare_cover_bytes(
+    data: &[u8],
+    mime_hint: Option<&str>,
+) -> Result<(Vec<u8>, MimeType), String> {
     if data.is_empty() {
         return Err("Empty cover image".to_string());
     }
@@ -168,9 +169,7 @@ fn replace_audio_file(tmp: &Path, dest: &Path) -> Result<(), String> {
     }
     match fs::remove_file(dest) {
         Ok(()) => fs::rename(tmp, dest).map_err(|error| {
-            format!(
-                "Failed to move tagged file into place ({error}). Stop playback and try again."
-            )
+            format!("Failed to move tagged file into place ({error}). Stop playback and try again.")
         }),
         Err(error) => Err(format!(
             "Cannot replace audio file ({error}). If the track is playing, stop it and try again."
@@ -178,7 +177,6 @@ fn replace_audio_file(tmp: &Path, dest: &Path) -> Result<(), String> {
     }
 }
 
-/// Embed cover art. A temp copy is used when the playing file cannot be rewritten in place.
 pub fn write_track_cover(path: &Path, data: &[u8], mime_hint: Option<&str>) -> Result<(), String> {
     let (bytes, mime) = prepare_cover_bytes(data, mime_hint)?;
     match write_cover_into_file(path, &bytes, &mime) {
@@ -205,7 +203,8 @@ pub fn write_track_cover(path: &Path, data: &[u8], mime_hint: Option<&str>) -> R
     if tmp.exists() {
         let _ = fs::remove_file(&tmp);
     }
-    fs::copy(path, &tmp).map_err(|error| format!("Failed to copy audio for cover write: {error}"))?;
+    fs::copy(path, &tmp)
+        .map_err(|error| format!("Failed to copy audio for cover write: {error}"))?;
     if let Err(error) = write_cover_into_file(&tmp, &bytes, &mime) {
         let _ = fs::remove_file(&tmp);
         return Err(error);

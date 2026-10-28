@@ -1,12 +1,5 @@
-// Foobar-style full tag table: dump / edit every text field lofty can map.
-
-/// Separator between multiple artists everywhere in the UI.
 pub const ARTIST_SEPARATOR: &str = ", ";
 
-/// Split one tag field into the separate values a tagger packed into it.
-///
-/// Handles NUL (ID3v2.4), `;`, and a slash that has whitespace beside it.
-/// A bare slash stays in the name (`AC/DC`).
 pub fn split_tag_multi_values(text: &str) -> Vec<&str> {
     let mut out: Vec<&str> = Vec::new();
     for chunk in text.split(['\0', ';']) {
@@ -53,20 +46,15 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-/// One row in the properties metadata table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TagTableRow {
-    /// Stable internal id (ItemKey Debug name or freeform id).
     pub id: String,
-    /// Foobar-style display name.
     pub name: String,
     pub value: String,
-    /// Binary / non-editable payload.
     #[serde(default)]
     pub read_only: bool,
 }
 
-/// Core rows always shown (even empty) — foobar's main columns.
 const CORE_FIELDS: &[(ItemKey, &str)] = &[
     (ItemKey::TrackArtist, "Artist Name"),
     (ItemKey::TrackTitle, "Track Title"),
@@ -83,7 +71,6 @@ const CORE_FIELDS: &[(ItemKey, &str)] = &[
     (ItemKey::Comment, "Comment"),
 ];
 
-/// Friendly names for non-core keys (only listed when present in the file).
 const EXTRA_LABELS: &[(ItemKey, &str)] = &[
     (ItemKey::Year, "Year"),
     (ItemKey::CopyrightMessage, "<COPYRIGHT>"),
@@ -124,9 +111,15 @@ const EXTRA_LABELS: &[(ItemKey, &str)] = &[
     (ItemKey::MusicBrainzRecordingId, "MusicBrainz Recording Id"),
     (ItemKey::MusicBrainzTrackId, "MusicBrainz Track Id"),
     (ItemKey::MusicBrainzReleaseId, "MusicBrainz Release Id"),
-    (ItemKey::MusicBrainzReleaseGroupId, "MusicBrainz Release Group Id"),
+    (
+        ItemKey::MusicBrainzReleaseGroupId,
+        "MusicBrainz Release Group Id",
+    ),
     (ItemKey::MusicBrainzArtistId, "MusicBrainz Artist Id"),
-    (ItemKey::MusicBrainzReleaseArtistId, "MusicBrainz Album Artist Id"),
+    (
+        ItemKey::MusicBrainzReleaseArtistId,
+        "MusicBrainz Album Artist Id",
+    ),
     (ItemKey::MusicBrainzWorkId, "MusicBrainz Work Id"),
     (ItemKey::MusicBrainzReleaseType, "MusicBrainz Release Type"),
     (ItemKey::AcoustId, "AcoustID"),
@@ -152,7 +145,6 @@ fn item_key_label(key: ItemKey) -> String {
             return (*name).to_string();
         }
     }
-    // Fallback: Debug name with spaces (TrackArtist -> Track Artist)
     let raw = format!("{key:?}");
     let mut out = String::with_capacity(raw.len() + 4);
     for (i, ch) in raw.chars().enumerate() {
@@ -174,7 +166,6 @@ fn parse_item_key(id: &str) -> Option<ItemKey> {
             return Some(*key);
         }
     }
-    // Keys that may appear on disk but aren't in the label tables above.
     match id {
         "TrackArtists" => Some(ItemKey::TrackArtists),
         "AlbumArtists" => Some(ItemKey::AlbumArtists),
@@ -202,7 +193,6 @@ fn parse_item_key(id: &str) -> Option<ItemKey> {
 }
 
 fn open_tagged(path: &Path) -> Result<lofty::file::TaggedFile, String> {
-    // Always load pictures when opening for write so save doesn't strip APIC/cover.
     read_from_path(path)
         .or_else(|_| {
             Probe::open(path).and_then(|probe| {
@@ -239,11 +229,6 @@ fn primary_or_insert(tagged: &mut lofty::file::TaggedFile) -> Result<&mut Tag, S
         .ok_or_else(|| "No writable tag slot".to_string())
 }
 
-/// Separator used when a field holds several values.
-///
-/// Artist-ish fields use the app-wide comma (`ARTIST_SEPARATOR`) so the properties
-/// table reads the same as the track list and transport. Everything else keeps
-/// foobar's `"; "`, which is what other taggers expect to parse back.
 fn separator_for(key: ItemKey) -> &'static str {
     match key {
         ItemKey::TrackArtist
@@ -256,27 +241,16 @@ fn separator_for(key: ItemKey) -> &'static str {
     }
 }
 
-/// Lyrics embedded in the audio file itself (`LYRICS` / `USLT`), if any.
-///
-/// This is a separate source from the lyrics cache: plenty of files ship with the text
-/// already in their tags, and the properties window has always fallen back to it. The
-/// fullscreen view had no such fallback, so a file whose only lyrics live in its tags
-/// showed text in properties and nothing on screen.
 pub fn read_embedded_lyrics(path: &Path) -> Result<Option<String>, String> {
     let tagged = open_tagged_text_only(path)?;
 
-    // Primary tag first, then the rest: an MP3 may carry both ID3v2 and APE, and the
-    // primary one is what the properties table shows.
     let primary_type = tagged.primary_tag().map(|tag| tag.tag_type());
-    let tags = tagged
-        .primary_tag()
-        .into_iter()
-        .chain(
-            tagged
-                .tags()
-                .iter()
-                .filter(|tag| Some(tag.tag_type()) != primary_type),
-        );
+    let tags = tagged.primary_tag().into_iter().chain(
+        tagged
+            .tags()
+            .iter()
+            .filter(|tag| Some(tag.tag_type()) != primary_type),
+    );
 
     for tag in tags {
         for key in [ItemKey::UnsyncLyrics, ItemKey::Lyrics] {
@@ -295,12 +269,9 @@ pub fn read_embedded_lyrics(path: &Path) -> Result<Option<String>, String> {
     Ok(None)
 }
 
-/// Read every text-ish tag into a foobar-ordered table.
 pub fn read_tag_table(path: &Path) -> Result<Vec<TagTableRow>, String> {
     let tagged = open_tagged_text_only(path)?;
-    let tag = tagged
-        .primary_tag()
-        .or_else(|| tagged.first_tag());
+    let tag = tagged.primary_tag().or_else(|| tagged.first_tag());
 
     let mut values: HashMap<ItemKey, Vec<String>> = HashMap::new();
     if let Some(tag) = tag {
@@ -318,8 +289,6 @@ pub fn read_tag_table(path: &Path) -> Result<Vec<TagTableRow>, String> {
             let key = item.key();
             let entry = values.entry(key).or_default();
             if separator_for(key) == ARTIST_SEPARATOR {
-                // Artist-ish fields get re-split so a NUL-packed ID3v2.4 frame, or a
-                // tagger that wrote `;` / ` / `, still renders one comma list.
                 for part in split_tag_multi_values(text) {
                     if entry.iter().any(|seen| seen.eq_ignore_ascii_case(part)) {
                         continue;
@@ -335,7 +304,6 @@ pub fn read_tag_table(path: &Path) -> Result<Vec<TagTableRow>, String> {
     let mut seen: HashSet<ItemKey> = HashSet::new();
     let mut rows: Vec<TagTableRow> = Vec::new();
 
-    // 1) Core foobar columns — always listed (empty = clearable).
     for (key, name) in CORE_FIELDS {
         seen.insert(*key);
         let value = values
@@ -349,9 +317,6 @@ pub fn read_tag_table(path: &Path) -> Result<Vec<TagTableRow>, String> {
             read_only: false,
         });
     }
-
-    // 2) Everything else only if the file actually has it (no empty junk rows).
-    //    Includes embedded lyrics when present — same as foobar's tag dump.
     let mut extras: Vec<(ItemKey, String)> = values
         .into_iter()
         .filter(|(k, v)| !seen.contains(k) && v.iter().any(|s| !s.trim().is_empty()))
@@ -375,19 +340,16 @@ pub fn read_tag_table(path: &Path) -> Result<Vec<TagTableRow>, String> {
 }
 
 /// Write the table back. Empty values remove the field; non-empty set it.
-/// Pictures and unlisted binary frames are preserved.
 pub fn write_tag_table(path: &Path, rows: &[TagTableRow]) -> Result<(), String> {
     let mut tagged = open_tagged(path)?;
     let tag = primary_or_insert(&mut tagged)?;
 
-    // Collect desired text state.
     let mut desired: HashMap<ItemKey, String> = HashMap::new();
     for row in rows {
         if row.read_only {
             continue;
         }
         let Some(key) = parse_item_key(&row.id) else {
-            // Unknown freeform ids — skip for now (lofty has no generic Unknown key).
             continue;
         };
         let value = row.value.trim();
@@ -398,7 +360,6 @@ pub fn write_tag_table(path: &Path, rows: &[TagTableRow]) -> Result<(), String> 
         }
     }
 
-    // Apply: remove empties, set non-empties.
     for (key, value) in &desired {
         if value.is_empty() {
             tag.remove_key(*key);
@@ -406,8 +367,6 @@ pub fn write_tag_table(path: &Path, rows: &[TagTableRow]) -> Result<(), String> 
         }
 
         if separator_for(*key) == ARTIST_SEPARATOR {
-            // Split the comma list back into repeated fields so collaborators survive
-            // a round-trip instead of collapsing into one glued "A, B" artist.
             let parts: Vec<&str> = value
                 .split(',')
                 .map(str::trim)
@@ -420,12 +379,8 @@ pub fn write_tag_table(path: &Path, rows: &[TagTableRow]) -> Result<(), String> 
             continue;
         }
 
-        // Multi-value joined with "; " becomes a single text field (foobar-like).
         tag.insert_text(*key, value.clone());
     }
-
-    // Also remove keys that existed and were in standard list but missing from payload
-    // (frontend always sends full table, so desired covers all editable rows).
 
     tagged
         .save_to_path(path, WriteOptions::default())
@@ -433,15 +388,12 @@ pub fn write_tag_table(path: &Path, rows: &[TagTableRow]) -> Result<(), String> 
     Ok(())
 }
 
-/// Write BPM into file tags (`Bpm` + `IntegerBpm` for max format compatibility).
-/// Does not touch other fields.
 pub fn write_bpm(path: &Path, bpm: f32) -> Result<(), String> {
     if !bpm.is_finite() || bpm <= 0.0 {
         return Err("Invalid BPM".into());
     }
     let bpm = bpm.clamp(1.0, 999.0);
     let int_bpm = bpm.round().clamp(1.0, 999.0) as u32;
-    // Prefer a clean integer string when close; keep one decimal otherwise.
     let text = if (bpm - int_bpm as f32).abs() < 0.05 {
         format!("{int_bpm}")
     } else {
@@ -458,7 +410,6 @@ pub fn write_bpm(path: &Path, bpm: f32) -> Result<(), String> {
     Ok(())
 }
 
-/// Read BPM from tags (`Bpm` preferred, then `IntegerBpm`).
 pub fn read_bpm(path: &Path) -> Option<f32> {
     let tagged = open_tagged_text_only(path).ok()?;
     let tag = tagged.primary_tag().or_else(|| tagged.first_tag())?;
@@ -476,7 +427,6 @@ pub fn read_bpm(path: &Path) -> Option<f32> {
         .or_else(|| tag.get_string(ItemKey::IntegerBpm).and_then(parse))
 }
 
-/// Core foobar columns filled from a library row (radio streams have no on-disk tags).
 pub fn tag_table_from_core_fields(
     title: Option<&str>,
     artist: Option<&str>,
@@ -513,7 +463,6 @@ pub fn tag_table_from_core_fields(
         .collect()
 }
 
-/// Pull common library fields out of a saved table for SQLite / UI.
 pub fn track_fields_from_table(rows: &[TagTableRow]) -> TrackFieldsFromTable {
     let get = |id: &str| -> Option<String> {
         rows.iter()
@@ -521,13 +470,10 @@ pub fn track_fields_from_table(rows: &[TagTableRow]) -> TrackFieldsFromTable {
             .map(|r| r.value.trim().to_string())
             .filter(|s| !s.is_empty())
     };
-    let year = get("Year")
-        .or_else(|| get("RecordingDate"))
-        .and_then(|s| {
-            // "2020" or "2020-01-01"
-            let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
-            digits.parse().ok().filter(|&y: &u32| y > 0 && y <= 9999)
-        });
+    let year = get("Year").or_else(|| get("RecordingDate")).and_then(|s| {
+        let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+        digits.parse().ok().filter(|&y: &u32| y > 0 && y <= 9999)
+    });
     let track_number = get("TrackNumber").and_then(|s| {
         s.split(['/', '-'])
             .next()

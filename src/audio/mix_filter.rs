@@ -1,9 +1,3 @@
-//! Per-deck low-pass / high-pass for Mix Transition preview.
-//!
-//! Cutoffs are driven from the UI envelope (normalized 0..1 → Hz, matching
-//! the frontend `envelopeVToDisplay` mapping). Outside all filter blocks the
-//! stages bypass so dry audio is unchanged.
-
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use parking_lot::Mutex;
@@ -11,36 +5,27 @@ use parking_lot::Mutex;
 use crate::audio::bass;
 use crate::audio::biquad::{highpass_coeffs, lowpass_coeffs, BiquadCoeffs, BiquadState};
 
-/// Match frontend log mapping for low-pass envelope value → Hz.
 pub fn envelope_v_to_lp_hz(v: f64) -> f64 {
     let x = v.clamp(0.0, 1.0);
     80.0 * (18000.0_f64 / 80.0).powf(x)
 }
 
-/// Match frontend log mapping for high-pass envelope value → Hz.
 pub fn envelope_v_to_hp_hz(v: f64) -> f64 {
     let x = v.clamp(0.0, 1.0);
     20.0 * (8000.0_f64 / 20.0).powf(x)
 }
 
-const FILTER_Q: f64 = 0.707; // Butterworth-ish
-/// LP above this ≈ open (bypass).
+const FILTER_Q: f64 = 0.707;
 const LP_BYPASS_HZ: f32 = 16000.0;
-/// HP below this ≈ open (bypass).
 const HP_BYPASS_HZ: f32 = 28.0;
 
 // ── Context ──────────────────────────────────────────────────────────────────
-
-/// One deck's LP+HP filter state. Lifetime: while the deck source is live.
-/// Owned via `Box` and passed as raw `*mut` into BASS DSP `user`.
 pub struct MixFilterCtx {
     sample_rate_hz: AtomicU32,
     channels: AtomicUsize,
     bytes_per_sample: AtomicU32,
     float_dsp: AtomicBool,
-    /// f32 bits; 0 = bypass LP
     lp_hz_bits: AtomicU32,
-    /// f32 bits; 0 = bypass HP
     hp_hz_bits: AtomicU32,
     lp_enabled: AtomicBool,
     hp_enabled: AtomicBool,
@@ -86,13 +71,11 @@ impl MixFilterCtx {
             *lp = vec![BiquadState::default(); chans];
             *hp = vec![BiquadState::default(); chans];
         }
-        // Force coeff rebuild
         self.last_lp_bits.store(u32::MAX, Ordering::Release);
         self.last_hp_bits.store(u32::MAX, Ordering::Release);
         self.rebuild_coeffs_if_needed();
     }
 
-    /// `None` = bypass that stage.
     pub fn set_targets(&self, lp_hz: Option<f32>, hp_hz: Option<f32>) {
         match lp_hz {
             Some(hz) if hz < LP_BYPASS_HZ => {
@@ -230,7 +213,6 @@ impl MixFilterCtx {
     }
 }
 
-/// BASS DSP callback — user = `*mut MixFilterCtx`.
 pub unsafe extern "system" fn mix_filter_dsp_callback(
     _handle: u32,
     _channel: u32,
@@ -268,8 +250,6 @@ pub unsafe extern "system" fn mix_filter_dsp_callback(
     }
 }
 
-/// Attach filter DSP to a playback channel. Returns (dsp handle, leaked-or-boxed ctx pointer ownership).
-/// The `Box` is returned so the player can free it after removing DSP.
 pub fn attach_mix_filter(
     bass: &bass::BassLibrary,
     channel: u32,
@@ -285,7 +265,6 @@ pub fn attach_mix_filter(
         }
         Err(_) => (44100, 2, true),
     };
-    // Prefer float DSP path (same as EQ).
     ctx.configure(rate, chans, true);
     let user = ctx.as_mut() as *mut MixFilterCtx as *mut std::ffi::c_void;
     let dsp = bass
@@ -293,12 +272,10 @@ pub fn attach_mix_filter(
             channel,
             mix_filter_dsp_callback,
             user,
-            // Run before mixer sum; after tempo if present on this channel.
             0,
             bass::BASS_DSP_FLOAT,
         )
         .or_else(|_| bass.channel_set_dsp(channel, mix_filter_dsp_callback, 0, user))?;
-    // Re-configure if float force failed (rare).
     if float_ch {
         ctx.configure(rate, chans, true);
     }
@@ -314,5 +291,4 @@ pub fn detach_mix_filter(
     if channel != 0 && dsp != 0 {
         let _ = bass.channel_remove_dsp(channel, dsp);
     }
-    // Box dropped here
 }

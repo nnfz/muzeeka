@@ -1,9 +1,3 @@
-// BASS FFI — dynamic loading of bass.dll via libloading
-//
-// We load every function pointer at runtime so the binary doesn't hard-link
-// against bass.dll / bass.lib. This lets us ship the DLL alongside the app
-// and also load addon DLLs (bassflac.dll, etc.) at runtime.
-
 use libloading::{Library, Symbol};
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
@@ -23,9 +17,7 @@ fn cstr(ptr: *const i8) -> String {
         .into_owned()
 }
 
-/// Holds the loaded bass.dll and its resolved function pointers.
 pub struct BassLibrary {
-    // Keep the library alive so function pointers remain valid.
     _lib: Library,
 
     // ── Core functions ────────────────────────────────────────────────────
@@ -48,10 +40,6 @@ pub struct BassLibrary {
         flags: DWORD,
     ) -> HSTREAM,
     bass_stream_free: unsafe extern "system" fn(handle: HSTREAM) -> BOOL,
-    // Internet streams: URL is always a narrow string (no UNICODE form).
-    // Real signature: (url, DWORD offset, DWORD flags, DOWNLOADPROC*, user)
-    // — there is NO length argument (that is StreamCreateFile). Passing a dummy
-    // length put `flags` in the DOWNLOADPROC slot; bass_aac then called it → AV.
     bass_stream_create_url: unsafe extern "system" fn(
         url: *const i8,
         offset: DWORD,
@@ -73,7 +61,6 @@ pub struct BassLibrary {
         length: DWORD,
     ) -> DWORD,
 
-    // Music / tracker modules (MOD, XM, IT, S3M etc.)
     bass_music_load: unsafe extern "system" fn(
         mem: BOOL,
         file: *const u16,
@@ -103,7 +90,7 @@ pub struct BassLibrary {
     bass_channel_get_info:
         unsafe extern "system" fn(handle: DWORD, info: *mut BassChannelInfo) -> BOOL,
     bass_channel_is_active: unsafe extern "system" fn(handle: DWORD) -> DWORD,
-    #[allow(dead_code)] // used by channel_get_level
+    #[allow(dead_code)]
     bass_channel_get_level: unsafe extern "system" fn(handle: DWORD) -> DWORD,
     bass_channel_get_data: unsafe extern "system" fn(
         handle: DWORD,
@@ -122,8 +109,6 @@ pub struct BassLibrary {
     bass_channel_remove_sync: unsafe extern "system" fn(handle: DWORD, sync: DWORD) -> BOOL,
 
     // ── Config / DSP ──────────────────────────────────────────────────────────
-    // DWORD value — BASS_SetConfig is not a float API. Passing f32 10000.0 as the
-    // timeout used to send the *bit pattern* (~13 days) instead of 10000 ms.
     bass_set_config: unsafe extern "system" fn(option: DWORD, value: DWORD) -> BOOL,
     bass_set_config_ptr:
         unsafe extern "system" fn(option: DWORD, value: *const std::ffi::c_void) -> BOOL,
@@ -163,7 +148,7 @@ pub struct BassLibrary {
         Option<unsafe extern "system" fn(channel: DWORD, pos: QWORD, mode: DWORD) -> BOOL>,
     bass_mixer_channel_get_position:
         Option<unsafe extern "system" fn(channel: DWORD, mode: DWORD) -> QWORD>,
-    #[allow(dead_code)] // used by mixer_channel_flags
+    #[allow(dead_code)]
     bass_mixer_channel_flags:
         Option<unsafe extern "system" fn(channel: DWORD, flags: DWORD, mask: DWORD) -> DWORD>,
     bass_split_stream_create: Option<
@@ -176,16 +161,8 @@ pub struct BassLibrary {
     bass_fx_tempo_get_source: Option<unsafe extern "system" fn(chan: HSTREAM) -> DWORD>,
 }
 
-// BassLibrary holds raw FFI function pointers into loaded DLLs. Access is always
-// serialized via `parking_lot::Mutex<PlayerInner>` (BassLibrary is never shared
-// as bare Arc/& without that mutex). We only need Send so the mutex can cross
-// threads; Sync is intentionally not claimed here.
 unsafe impl Send for BassLibrary {}
 
-/// Resolve a function pointer from a loaded library.
-///
-/// # Safety
-/// The caller must ensure the symbol exists and has the correct signature.
 macro_rules! load_fn {
     ($lib:expr, $name:expr) => {{
         let sym: Symbol<*const ()> = $lib
@@ -223,10 +200,6 @@ impl BassLibrary {
         f.ok_or_else(|| "bassmix.dll not loaded".to_string())
     }
 
-    /// Load bass.dll from the given directory.
-    ///
-    /// `bass_dir` should be the folder containing `bass.dll`.
-    /// On debug builds this is typically `src-tauri/bass/`.
     pub fn load(bass_dir: &Path) -> Result<Self, String> {
         let dll_path = bass_dir.join("bass.dll");
         if !dll_path.exists() {
@@ -240,7 +213,6 @@ impl BassLibrary {
             Library::new(&dll_path).map_err(|e| format!("Failed to load bass.dll: {e}"))?
         };
 
-        // Load bassmix for proper gapless (BASS_Mixer_*)
         let mixer_lib = unsafe { Library::new(bass_dir.join("bassmix.dll")).ok() };
         let (
             mixer_create,
@@ -324,7 +296,6 @@ impl BassLibrary {
         }
     }
 
-    /// Load bass_fx.dll directly and resolve tempo FX entry points from it.
     pub fn enable_fx_from_plugin(&mut self, fx_dll_path: &Path) -> bool {
         let fx_lib = match unsafe { Library::new(fx_dll_path) } {
             Ok(lib) => lib,
@@ -351,7 +322,6 @@ impl BassLibrary {
         self.bass_fx_tempo_create.is_some()
     }
 
-    /// Load a BASS format plugin (bassflac.dll, bassape.dll, etc.).
     pub fn plugin_load(&self, path: &str) -> Result<HPLUGIN, String> {
         let wide = to_wide(path);
         let handle = unsafe { (self.bass_plugin_load)(wide.as_ptr(), BASS_UNICODE) };
@@ -364,30 +334,20 @@ impl BassLibrary {
 
     // ── Wrapped safe-ish API ──────────────────────────────────────────────
 
-    /// Initialize BASS output. `device = -1` for default, `freq = 44100` typical.
     pub fn init(&self, device: i32, freq: u32) -> Result<(), String> {
         let ok = unsafe { (self.bass_init)(device, freq, 0, ptr::null_mut(), ptr::null()) };
         self.check(ok)
     }
 
-    /// Free all BASS resources.
     pub fn free(&self) -> Result<(), String> {
         let ok = unsafe { (self.bass_free)() };
         self.check(ok)
     }
 
-    /// Create a stream from a file path (Windows wide-string).
     pub fn stream_create_file(&self, path: &str, flags: DWORD) -> Result<HSTREAM, String> {
         let wide = to_wide(path);
-        let handle = unsafe {
-            (self.bass_stream_create_file)(
-                0, // mem = FALSE (file path, not memory)
-                wide.as_ptr(),
-                0,
-                0,
-                flags | BASS_UNICODE,
-            )
-        };
+        let handle =
+            unsafe { (self.bass_stream_create_file)(0, wide.as_ptr(), 0, 0, flags | BASS_UNICODE) };
         if handle == 0 {
             Err(self.last_error_string())
         } else {
@@ -395,17 +355,11 @@ impl BassLibrary {
         }
     }
 
-    /// Create a decode stream from an internet URL (HTTP/HTTPS radio).
-    /// BLOCK keeps memory bounded for endless streams; the caller must add the
-    /// stream to the mixer and free it via ChannelFree like any decode source.
     #[allow(dead_code)]
     pub fn stream_create_url(&self, url: &str, flags: DWORD) -> Result<HSTREAM, String> {
         self.url_opener().open(url, flags)
     }
 
-    /// Decode push stream — mixer reads this, a worker feeds it with `stream_put_data`.
-    /// Never add an internet URL stream to the mixer directly: `ChannelGetData` on a
-    /// URL decode source blocks BASS's update thread (silence + pause/Ctrl+R hang).
     pub fn stream_create_push(
         &self,
         freq: u32,
@@ -437,7 +391,6 @@ impl BassLibrary {
         }
     }
 
-    /// Bytes already waiting in a decode/internet stream (does not block).
     pub fn channel_data_available(&self, handle: DWORD) -> u32 {
         let got =
             unsafe { (self.bass_channel_get_data)(handle, ptr::null_mut(), BASS_DATA_AVAILABLE) };
@@ -455,9 +408,6 @@ impl BassLibrary {
         }
     }
 
-    /// A tiny, `Send + Copy` handle to just the raw entry points needed to open a
-    /// URL stream. `BASS_StreamCreateURL` blocks during the network connect and must
-    /// run on the BASS thread (never overlapping mixer/poll calls).
     pub fn url_opener(&self) -> UrlStreamOpener {
         UrlStreamOpener {
             create: self.bass_stream_create_url,
@@ -465,18 +415,11 @@ impl BassLibrary {
         }
     }
 
-    /// Raw ICY/HTTP tag block for a URL stream. `tags` is one of
-    /// [`types::BASS_TAG_META`], [`types::BASS_TAG_ICY`], [`types::BASS_TAG_HTTP`].
-    ///
-    /// # Safety
-    /// Must be called on the BASS thread while `handle` is a live URL stream.
     pub unsafe fn channel_get_tags_raw(&self, handle: DWORD, tags: DWORD) -> Option<String> {
         let ptr = (self.bass_channel_get_tags)(handle, tags);
         if ptr.is_null() {
             return None;
         }
-        // BASS returns a NUL-terminated narrow string for META and a
-        // NUL-NUL-terminated list of lines for ICY/HTTP/OGG/MP4.
         let mut len = 0usize;
         let mut p = ptr as *const u8;
         let list = tags != BASS_TAG_META;
@@ -489,15 +432,13 @@ impl BassLibrary {
             len += 1;
             p = p.add(1);
             if len > 64 * 1024 {
-                break; // pathological header block — bail out
+                break;
             }
         }
         let bytes = std::slice::from_raw_parts(ptr as *const u8, len);
         Some(String::from_utf8_lossy(bytes).into_owned())
     }
 
-    /// Copy a BASS tag block from a raw `BASS_ChannelGetTags` pointer.
-    /// Safe to call from a mixtime SYNCPROC.
     pub unsafe fn copy_tag_ptr(ptr: *const std::ffi::c_void, list: bool) -> Option<String> {
         if ptr.is_null() {
             return None;
@@ -547,20 +488,10 @@ impl BassLibrary {
         self.check(ok)
     }
 
-    /// Load a tracker/module (e.g. .it, .xm, .mod, .s3m) using BASS_MusicLoad.
-    /// Many tracker plugins work best (or only) through the music API.
     pub fn music_load(&self, path: &str, flags: DWORD) -> Result<HSTREAM, String> {
         let wide = to_wide(path);
-        let handle = unsafe {
-            (self.bass_music_load)(
-                0, // mem = FALSE
-                wide.as_ptr(),
-                0,
-                0, // length (0 = use all)
-                flags | BASS_UNICODE,
-                0, // freq = 0 (default)
-            )
-        };
+        let handle =
+            unsafe { (self.bass_music_load)(0, wide.as_ptr(), 0, 0, flags | BASS_UNICODE, 0) };
         if handle == 0 {
             Err(self.last_error_string())
         } else {
@@ -583,8 +514,6 @@ impl BassLibrary {
         self.check(ok)
     }
 
-    /// Free a stream or music handle. Tries StreamFree then MusicFree.
-    /// Tempo FX streams are also freed with StreamFree (without FREESOURCE the source stays).
     pub fn channel_free(&self, handle: DWORD) -> Result<(), String> {
         if handle == 0 {
             return Ok(());
@@ -671,12 +600,11 @@ impl BassLibrary {
         unsafe { (self.bass_channel_is_active)(handle) }
     }
 
-    #[allow(dead_code)] // public BASS API surface; not yet used by player
+    #[allow(dead_code)]
     pub fn channel_get_level(&self, handle: DWORD) -> DWORD {
         unsafe { (self.bass_channel_get_level)(handle) }
     }
 
-    /// Soft EOF / empty for decode-channel `ChannelGetData` pulls.
     fn channel_get_data_is_eof(&self, got: DWORD) -> bool {
         if got != DWORD::MAX {
             return got == 0;
@@ -685,8 +613,6 @@ impl BassLibrary {
         matches!(code, BassError::Ended | BassError::Ok | BassError::Decode) || code.code() == 0
     }
 
-    /// Pull float PCM from a decode stream. `buffer` length is in **samples**.
-    /// Returns samples written (0 at EOF).
     pub fn channel_get_data_f32(&self, handle: DWORD, buffer: &mut [f32]) -> Result<usize, String> {
         if buffer.is_empty() {
             return Ok(0);
@@ -712,8 +638,6 @@ impl BassLibrary {
         Ok((got as usize) / std::mem::size_of::<f32>())
     }
 
-    /// Pull 16-bit PCM from a decode stream. `buffer` length is in **samples**.
-    /// Returns samples written (0 at EOF).
     pub fn channel_get_data_i16(&self, handle: DWORD, buffer: &mut [i16]) -> Result<usize, String> {
         if buffer.is_empty() {
             return Ok(0);
@@ -758,8 +682,6 @@ impl BassLibrary {
         self.check(ok)
     }
 
-    /// Internet-stream download/buffer state. `u64::MAX` means the call failed
-    /// (not a file stream, or BASS error).
     pub fn stream_get_file_position(&self, handle: DWORD, mode: DWORD) -> u64 {
         unsafe { (self.bass_stream_get_file_position)(handle, mode) }
     }
@@ -852,7 +774,7 @@ impl BassLibrary {
         }
     }
 
-    #[allow(dead_code)] // public BASS API surface; not yet used by player
+    #[allow(dead_code)]
     pub fn mixer_channel_flags(&self, channel: DWORD, flags: DWORD, mask: DWORD) -> DWORD {
         match self.bass_mixer_channel_flags {
             Some(f) => unsafe { f(channel, flags, mask) },
@@ -860,9 +782,7 @@ impl BassLibrary {
         }
     }
 
-    /// Requires a *decode* source channel. The player's mixer is a playing channel, so
-    /// this returns error 38 for it — extra outputs use [`crate::output_tap`] instead.
-    #[allow(dead_code)] // public BASS API surface; not usable on the playing mixer
+    #[allow(dead_code)]
     pub fn split_stream_create(&self, channel: DWORD, flags: DWORD) -> Result<HSTREAM, String> {
         let f = self.bass_split_stream_create.as_ref().ok_or_else(|| {
             "BASS_Split_StreamCreate is not available (old bassmix.dll?)".to_string()
@@ -900,8 +820,7 @@ impl BassLibrary {
         self.check(ok)
     }
 
-    #[allow(dead_code)] // public BASS API surface; extra outputs create their stream on
-                        // the target device directly (see `crate::output_tap`)
+    #[allow(dead_code)]
     pub fn channel_set_device(&self, handle: DWORD, device: i32) -> Result<(), String> {
         if device < 0 {
             return Err("Invalid output device".into());
@@ -959,9 +878,6 @@ impl BassLibrary {
     }
 }
 
-/// Copyable GetData/PutData entry points for the live-radio feeder thread.
-/// Mixer never calls GetData on the URL handle; this worker does, then pushes
-/// into a `STREAMPROC_PUSH` stream the mixer *does* read.
 #[derive(Clone, Copy)]
 pub struct DataPump {
     get_data: unsafe extern "system" fn(
@@ -979,8 +895,7 @@ pub struct DataPump {
 unsafe impl Send for DataPump {}
 
 impl DataPump {
-    #[allow(dead_code)] // pull/available are the feeder side of the pump; only push and
-                        // queued are used since extra outputs became a DSP tap
+    #[allow(dead_code)]
     pub fn available(&self, handle: DWORD) -> u32 {
         let got = unsafe { (self.get_data)(handle, ptr::null_mut(), BASS_DATA_AVAILABLE) };
         if got == DWORD::MAX {
@@ -990,8 +905,6 @@ impl DataPump {
         }
     }
 
-    /// Pull up to `buf.len()` bytes. `float` ORs `BASS_DATA_FLOAT`.
-    /// Never pass an empty `buf`. Returns 0 if nothing is ready / error.
     #[allow(dead_code)]
     pub fn pull(&self, handle: DWORD, buf: &mut [u8], float: bool) -> u32 {
         if buf.is_empty() {
@@ -1009,10 +922,6 @@ impl DataPump {
         }
     }
 
-    /// Bytes still queued in a `STREAMPROC_PUSH` stream. BASS documents
-    /// `BASS_StreamPutData` with a zero length as a queue-level query that adds nothing —
-    /// more reliable here than `GetData(BASS_DATA_AVAILABLE)`, which reports the playback
-    /// buffer rather than the push backlog.
     pub fn queued(&self, handle: DWORD) -> u32 {
         let got = unsafe { (self.put_data)(handle, ptr::null(), 0) };
         if got == DWORD::MAX {
@@ -1035,9 +944,6 @@ impl DataPump {
     }
 }
 
-/// A copyable, `Send` bundle of just the entry points needed to open a URL stream.
-/// See [`BassLibrary::url_opener`]. Must still be invoked on the BASS thread —
-/// `BASS_StreamCreateURL` is not safe to overlap with mixer/poll calls.
 #[derive(Clone, Copy)]
 pub struct UrlStreamOpener {
     create: unsafe extern "system" fn(
@@ -1050,14 +956,9 @@ pub struct UrlStreamOpener {
     error_get_code: unsafe extern "system" fn() -> i32,
 }
 
-// Only raw fn pointers into an already-loaded, still-alive DLL. Safe to move to
-// another thread; BASS itself is process-global.
 unsafe impl Send for UrlStreamOpener {}
 
 impl UrlStreamOpener {
-    /// Open a URL decode stream. BLOCK keeps memory bounded for endless radio;
-    /// STATUS exposes ICY/HTTP headers. Blocks during the network connect — call
-    /// only on the BASS thread.
     #[allow(dead_code)]
     pub fn open(&self, url: &str, flags: DWORD) -> Result<HSTREAM, String> {
         self.open_proc(url, flags, ptr::null_mut(), ptr::null_mut())

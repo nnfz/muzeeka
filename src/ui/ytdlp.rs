@@ -252,7 +252,6 @@ pub fn remember_download_playlist(id: &str) {
     let _ = set_download_playlist(Some(id));
 }
 
-/// Patches one settings.json key and leaves the rest of the file alone.
 pub(crate) fn merge_setting(raw: &str, key: &str, value: Option<&str>) -> Result<String, String> {
     let raw = if raw.trim().is_empty() { "{}" } else { raw };
     let mut parsed: Value = serde_json::from_str(raw).map_err(|error| error.to_string())?;
@@ -878,8 +877,6 @@ fn find_tool(stem: &str) -> Option<PathBuf> {
     which(&file_name)
 }
 
-/// ffmpeg, ffprobe, and yt-dlp live in `bin` next to the executable.
-/// A copy beside the exe still works. `src/bin` is only searched in debug builds.
 fn tool_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
@@ -1012,7 +1009,8 @@ pub(crate) fn store_auto_video_bg(enabled: bool) -> Result<(), String> {
     } else {
         current.as_str()
     };
-    let mut parsed: Value = serde_json::from_str(raw).unwrap_or_else(|_| Value::Object(Default::default()));
+    let mut parsed: Value =
+        serde_json::from_str(raw).unwrap_or_else(|_| Value::Object(Default::default()));
     let object = parsed
         .as_object_mut()
         .ok_or_else(|| "settings.json is not an object".to_string())?;
@@ -1025,7 +1023,6 @@ pub(crate) fn store_auto_video_bg(enabled: bool) -> Result<(), String> {
     fs::write(path, text).map_err(|error| error.to_string())
 }
 
-/// Stable clip path for a track. The hash matches the old player's `DefaultHasher` of the path.
 pub(crate) fn video_bg_output(track_path: &str) -> PathBuf {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -1036,8 +1033,6 @@ pub(crate) fn video_bg_output(track_path: &str) -> PathBuf {
         .join(format!("{:016x}.mp4", hasher.finish()))
 }
 
-/// Search YouTube and store a 15-second silent clip at `output_path`.
-/// Always downloads. Callers decide whether a previous attempt should block this.
 pub(crate) fn download_video_bg_clip(
     artist: &str,
     title: &str,
@@ -1109,11 +1104,14 @@ pub(crate) fn download_video_bg_clip(
         .unwrap_or(0.0);
     if duration < 15.0 {
         let _ = fs::remove_file(&temp_video);
-        return Err(format!("Video is too short ({duration:.1}s, need at least 15s)"));
+        return Err(format!(
+            "Video is too short ({duration:.1}s, need at least 15s)"
+        ));
     }
     let start = ((duration - 15.0) / 2.0).max(0.0);
     if let Some(parent) = output_path.parent() {
-        fs::create_dir_all(parent).map_err(|error| format!("Could not create the video folder: {error}"))?;
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Could not create the video folder: {error}"))?;
     }
     let extract = run_tool(
         &ffmpeg_bin,

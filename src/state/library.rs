@@ -1,5 +1,3 @@
-// Library state
-
 use std::path::PathBuf;
 
 #[derive(Clone)]
@@ -20,9 +18,7 @@ pub struct LibraryState {
 
 impl LibraryState {
     pub fn new() -> Self {
-        Self {
-            tracks: Vec::new(),
-        }
+        Self { tracks: Vec::new() }
     }
 
     pub fn add_track(&mut self, track: Track) {

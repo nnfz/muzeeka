@@ -1,10 +1,3 @@
-//! Sidecar ICY reader for internet radio.
-//!
-//! BASS_StreamCreateURL with a mixer DECODE source strips in-band ICY metadata
-//! (DOWNLOADPROC sees audio only, BASS_SYNC_META fires with a null pointer).
-//! A second HTTP GET with `Icy-MetaData: 1` parses `icy-metaint` blocks so
-//! `StreamTitle` can reach the UI.
-
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -21,7 +14,6 @@ const SCAN_TAIL: usize = 256;
 
 #[derive(Debug, Default, Clone)]
 pub(crate) struct LiveMetaInbox {
-    /// Bumped on teardown so a dying tap cannot write into the next stream.
     pub gen: u64,
     pub meta: Option<String>,
     pub icy: Option<String>,
@@ -56,9 +48,6 @@ struct IcyParse {
     meta: Vec<u8>,
 }
 
-/// Spawn a background ICY tap. The thread exits after `stop` is set and the
-/// current read unblocks (live audio arrives continuously). Do not join it on
-/// the BASS thread — detach and let it notice `stop`.
 pub(crate) fn spawn(
     url: String,
     inbox: Arc<StdMutex<LiveMetaInbox>>,
@@ -207,7 +196,6 @@ fn tap_once(
             });
         }
 
-        // Alignment-independent fallback: `StreamTitle='…'` is unique in AAC/MP3.
         scan_tail.extend_from_slice(chunk);
         if let Some(title) = scan_stream_title(&scan_tail) {
             publish_title(
@@ -291,8 +279,6 @@ fn decode_icy_bytes(bytes: &[u8]) -> String {
     WINDOWS_1251.decode(bytes).0.trim().to_string()
 }
 
-/// Extract the current track from an ICY metadata block.
-/// `StreamTitle='Artist - Song';StreamUrl='...';`
 pub(crate) fn parse_icy_stream_title(raw: &str) -> Option<String> {
     let key = "StreamTitle=";
     let start = raw.find(key)? + key.len();

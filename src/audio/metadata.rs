@@ -1,11 +1,3 @@
-// Audio metadata extraction module — STUB
-//
-// TODO: Port from src-tauri/src/metadata.rs (2565 lines)
-// - lofty + id3 dual metadata path
-// - FNV-1a content-addressed cover art cache
-// - atomic temp→rename file writes
-// - per-content-id locks for album-art writes
-
 #[derive(Debug, Clone, Default)]
 pub struct TrackMetadata {
     pub file_name: String,

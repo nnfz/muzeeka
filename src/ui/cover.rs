@@ -3,9 +3,6 @@ use std::sync::{Arc, OnceLock};
 
 use gpui::{div, img, prelude::*, px, AnyElement, Image, ImageFormat, IntoElement, ObjectFit};
 
-/// Same 4px as the web `--radius-mini` on track, search, and playlist covers.
-/// The radius has to live on the image: a parent's `overflow_hidden` clips to a
-/// rectangle, so it does not round the sprite.
 const COVER_RADIUS: f32 = 4.;
 
 pub fn cover_art(path: Option<&Path>, size: f32) -> AnyElement {
@@ -13,8 +10,6 @@ pub fn cover_art(path: Option<&Path>, size: f32) -> AnyElement {
         Some(path) => img(path.to_path_buf()),
         None => img(placeholder_image()),
     };
-    // Without aspect_square, Img copies the file's ratio and a wide cover
-    // stretches the slot. Cover then crops that square.
     div()
         .size(px(size))
         .min_w(px(size))

@@ -1,11 +1,9 @@
-// Application state management
-
 use gpui::*;
 use parking_lot::RwLock;
 use std::sync::Arc;
 
-pub mod player;
 pub mod library;
+pub mod player;
 pub mod playlists;
 
 pub struct AppState {

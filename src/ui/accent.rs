@@ -1,17 +1,9 @@
-// Accent sampled from the playing track's cover.
-//
-// The chrome is near-black, so the chosen color is pushed into a narrow
-// lightness band. Hue still comes from the picture. A gray or empty cover
-// leaves the caller on the default purple.
-
 use std::path::Path;
 
 const HUE_BINS: usize = 16;
 const LIGHT_BINS: usize = 3;
 const BINS: usize = HUE_BINS * LIGHT_BINS;
 
-/// RGB hex (`0xRRGGBB`) for `path`, or `None` when the file is not a picture
-/// or has no color that can sit on the dark UI.
 pub fn from_cover(path: &Path) -> Option<u32> {
     let image = image::open(path).ok()?;
     let thumb = image.thumbnail(32, 32).into_rgba8();
@@ -31,7 +23,6 @@ pub(crate) fn from_rgba(bytes: &[u8]) -> Option<u32> {
             continue;
         }
         let (hue, sat, light) = rgb_to_hsl(pixel[0], pixel[1], pixel[2]);
-        // JPEG noise on black and white is slightly tinted. It is not a color.
         if sat < 0.18 || !(0.08..0.94).contains(&light) {
             continue;
         }

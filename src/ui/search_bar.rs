@@ -13,9 +13,7 @@ use crate::ui::session::{self, has_search_text, looks_like_url, Suggestion, Trac
 use crate::ui::theme;
 use crate::ui::ytdlp;
 
-/// Search hit row. Cover is 28px, with 6px of air above and below.
 const SEARCH_ROW_H: f32 = 40.;
-/// Cap for the results scroller. The plate stays this tall once the hits overflow.
 const SEARCH_LIST_MAX_H: f32 = 328.;
 
 impl MainWindow {
@@ -26,7 +24,7 @@ impl MainWindow {
     ) -> impl IntoElement {
         let query = self.search.read(cx).content.clone();
         let focused = self.search.read(cx).focus.is_focused(window);
-        let expanded = focused || !query.is_empty() || self.has_download_cards();
+        let expanded = focused || !query.is_empty();
 
         div()
             .id("search-shell")
@@ -108,10 +106,8 @@ impl MainWindow {
         let media = ytdlp::is_media_url(&query);
         let show_suggestions =
             focused && !suggestions.is_empty() && !looks_like_url(&query) && !media;
-        // Suggestions and results stay one plate. Download cards stack under them.
         let show_results = has_search_text(&query) && suggestions.is_empty() && !media;
-        let cards = self.download_cards(cx);
-        let expanded = focused || !query.is_empty() || !cards.is_empty();
+        let expanded = focused || !query.is_empty();
         let hits = show_results.then(|| self.cached_search_ids(&query, cx));
         if hits.as_ref().is_some_and(|hits| !hits.is_empty()) {
             self.warm_search_scrollbar(window, cx);
@@ -142,7 +138,6 @@ impl MainWindow {
                     self.results_plate(hits, described, result_pick, cx),
                 ))
             })
-            .children(cards)
             .with_spring(
                 "search-suggestions-width",
                 search_width_spring(expanded),
@@ -150,8 +145,6 @@ impl MainWindow {
             )
     }
 
-    /// Tab takes the highlighted suggestion, or opens that result the way "Go to track" does.
-    /// The field is still handling the key, so the edit is deferred until that update ends.
     pub(crate) fn accept_search_suggestion(
         &mut self,
         query: &str,
@@ -183,7 +176,6 @@ impl MainWindow {
         }
     }
 
-    /// Up or down moves the highlight. The first row is selected until an arrow moves it.
     pub(crate) fn move_search_pick(
         &mut self,
         query: &str,
@@ -223,7 +215,6 @@ impl MainWindow {
         }
     }
 
-    /// Highlight for this query. A query that just changed still shows the first row.
     fn picked_index(&self, query: &str, len: usize) -> usize {
         if len == 0 || self.search_pick_query != query {
             return 0;
@@ -231,7 +222,6 @@ impl MainWindow {
         self.search_pick.min(len - 1)
     }
 
-    /// Clear the query and scroll this track into view, without playing it.
     fn go_to_search_track(&mut self, id: TrackId, window: &mut Window, cx: &mut Context<Self>) {
         let Some(spot) = self.session.read(cx).spot_for_track(id) else {
             return;
@@ -437,8 +427,6 @@ impl MainWindow {
                     let hits = Arc::clone(&hits);
                     let entity = entity.clone();
                     entity.update(app, |view, cx| {
-                        // One element per index. A short vec would slide the
-                        // following rows up while the scroll height stayed put.
                         let prepared = {
                             let session = view.session.read(cx);
                             range
@@ -482,8 +470,8 @@ impl MainWindow {
                 .h(px(list_h))
                 .w_full()
                 .track_scroll(&self.search_scroll)
-                .on_scroll_wheel(cx.listener(
-                    |this, event: &gpui::ScrollWheelEvent, window, cx| {
+                .on_scroll(cx.listener(
+                    |this, event: &gpui::ScrollEvent, window, cx| {
                         this.note_scroll(Scroller::Search, event, window, cx);
                     },
                 )),
@@ -591,16 +579,12 @@ impl MainWindow {
     }
 }
 
-/// Collapsed 220px, expanded 480px. Critically damped so the bar eases and
-/// does not overshoot into the window buttons. About a quarter second.
 fn search_width_spring(expanded: bool) -> SpringAnimation<Pixels> {
     let width = if expanded { px(480.) } else { px(220.) };
     let stiffness = 420.;
     SpringAnimation::new(SpringConfig::new(stiffness, 2. * stiffness.sqrt(), 1.)).to(width)
 }
 
-/// Opacity 0→1 and a 6px drop, matching the web search dropdown.
-/// The plate mounts only while it is shown, so `.from(0.)` replays each time.
 fn search_enter_spring() -> SpringAnimation<f32> {
     let stiffness = 420.;
     SpringAnimation::new(SpringConfig::new(stiffness, 2. * stiffness.sqrt(), 1.))
@@ -611,8 +595,6 @@ fn search_enter_spring() -> SpringAnimation<f32> {
 fn fade_in(id: &'static str, plate: gpui::Stateful<gpui::Div>) -> impl IntoElement {
     plate.with_spring(id, search_enter_spring(), |plate, phase| {
         let phase = phase.clamp(0.0, 1.0);
-        // Negative top slides the plate down into its slot. Relative keeps that
-        // slot in the column, so download cards stay underneath.
         plate
             .relative()
             .w_full()

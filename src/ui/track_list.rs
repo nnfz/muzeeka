@@ -17,23 +17,16 @@ const COL_INDEX: f32 = 36.;
 pub(crate) const COL_ALBUM: f32 = 180.;
 const COL_DURATION: f32 = 72.;
 const COL_GAP: f32 = 6.;
-/// Space after the index column. Smaller than the gap between the other columns.
 const INDEX_GAP: f32 = 2.;
 const LIKE_SLOT: f32 = 22.;
 const ALBUM_MIN: f32 = 80.;
 const ALBUM_MAX: f32 = 480.;
-/// Gutter outside the painted track. The header uses the same left inset.
 const SIDE_PAD: f32 = 8.;
 const TRACK_ROW_H: f32 = 52.;
-/// Top padding of the uniform list. The drop strip uses the same inset.
 const TRACK_LIST_PAD: f32 = 8.;
-/// Empty space inside the track, to the right of the duration digits.
 const TRACK_END_PAD: f32 = 12.;
-/// How often the visible playing row reads the mixer levels. The samples
-/// themselves are measured on the audio thread. The library scan stays cached.
 const EQ_FPS: f32 = 30.;
 
-/// Cached rows for the open library view. Playback position is not part of it.
 pub(crate) struct ListedTracks {
     view: session::LibraryView,
     sort: Option<session::Sort>,
@@ -325,7 +318,6 @@ impl MainWindow {
         let Some((origin_x, origin_width)) = self.album_resize else {
             return;
         };
-        // The grip sits on the left edge, so dragging it right shrinks the column.
         let next = (origin_width - (x - origin_x) / px(1.)).clamp(ALBUM_MIN, ALBUM_MAX);
         if (self.album_width - next).abs() < 0.5 {
             return;
@@ -384,7 +376,6 @@ impl MainWindow {
                     this.update(app, |view, cx| {
                         range
                             .filter_map(|row| {
-                                // The extra cell is the room the shifted rows slide into.
                                 if row >= indexes.len() {
                                     return Some(gap_spacer());
                                 }
@@ -404,8 +395,8 @@ impl MainWindow {
                 .py(px(8.))
                 .size_full()
                 .track_scroll(&self.track_scroll)
-                .on_scroll_wheel(cx.listener(
-                    |this, event: &gpui::ScrollWheelEvent, window, cx| {
+                .on_scroll(cx.listener(
+                    |this, event: &gpui::ScrollEvent, window, cx| {
                         this.note_scroll(
                             crate::ui::main_window::Scroller::Tracks,
                             event,
@@ -480,165 +471,152 @@ impl MainWindow {
             .min_h(px(TRACK_ROW_H))
             .max_h(px(TRACK_ROW_H))
             .child(div().w_full().h(px(TRACK_ROW_H)))
-            .child(
-                // The file-drop gap is already eased in `shift`. Neighbors glide into
-                // the hole on a spring; the held row rides the pointer, unsprung.
-                slide_box(
-                    lifted,
-                    shift,
-                    reorder_px,
-                    SharedString::from(format!("track-slide-{}", id.0)),
-                    div()
-                        .id(row_id)
-                        .w_full()
-                        .h_full()
-                        .group(group.clone())
-                        .flex()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .h_full()
-                        .items_center()
-                        .pr(px(TRACK_END_PAD))
-                        .rounded_md()
-                        .cursor_pointer()
-                        .when(lit, |row| row.bg(row_color))
-                        .on_hover(move |over, _, app| {
-                            hover_entity.update(app, |this, cx| {
-                                // A press turns into a drag, and GPUI reports the row as
-                                // unhovered the moment that happens. Keep the wash on the
-                                // row the pointer went down on until it is released.
-                                if !*over && this.press_at.is_some() {
-                                    return;
-                                }
-                                if *over {
-                                    if this.hovered_track != Some(id) {
-                                        this.hovered_track = Some(id);
-                                        cx.notify();
-                                    }
-                                } else if this.hovered_track == Some(id) {
-                                    this.hovered_track = None;
+            .child(slide_box(
+                lifted,
+                shift,
+                reorder_px,
+                SharedString::from(format!("track-slide-{}", id.0)),
+                div()
+                    .id(row_id)
+                    .w_full()
+                    .h_full()
+                    .group(group.clone())
+                    .flex()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .h_full()
+                    .items_center()
+                    .pr(px(TRACK_END_PAD))
+                    .rounded_md()
+                    .cursor_pointer()
+                    .when(lit, |row| row.bg(row_color))
+                    .on_hover(move |over, _, app| {
+                        hover_entity.update(app, |this, cx| {
+                            if !*over && this.press_at.is_some() {
+                                return;
+                            }
+                            if *over {
+                                if this.hovered_track != Some(id) {
+                                    this.hovered_track = Some(id);
                                     cx.notify();
                                 }
+                            } else if this.hovered_track == Some(id) {
+                                this.hovered_track = None;
+                                cx.notify();
+                            }
+                        });
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener({
+                            let play_id = play_id.clone();
+                            move |this, event: &gpui::MouseDownEvent, _, _cx| {
+                                this.press_at = Some(event.position);
+                                this.arm(play_id.clone(), false);
+                            }
+                        }),
+                    )
+                    .on_drag(
+                        crate::ui::item_drag::TrackDrag {
+                            ids: vec![id],
+                            source,
+                            paths: vec![export_path],
+                            from_bar: false,
+                        },
+                        crate::ui::item_drag::spawn_track_ghost(),
+                    )
+                    .external_drag_payload(crate::ui::item_drag::file_drag_payload)
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _: &gpui::MouseUpEvent, _, cx| {
+                            if !this.armed(&play_id) {
+                                return;
+                            }
+                            let queue = queue.as_ref().clone();
+                            this.session.update(cx, |session, cx| {
+                                session.play(id, queue);
+                                cx.notify();
                             });
-                        })
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener({
-                                let play_id = play_id.clone();
-                                move |this, event: &gpui::MouseDownEvent, _, _cx| {
-                                    this.press_at = Some(event.position);
-                                    this.arm(play_id.clone(), false);
-                                }
-                            }),
-                        )
-                        .on_drag(
-                            crate::ui::item_drag::TrackDrag {
-                                ids: vec![id],
-                                source,
-                                paths: vec![export_path],
-                                from_bar: false,
-                            },
-                            crate::ui::item_drag::spawn_track_ghost(),
-                        )
-                        .external_drag_payload(crate::ui::item_drag::file_drag_payload)
-                        .on_mouse_up(
-                            MouseButton::Left,
-                            cx.listener(move |this, _: &gpui::MouseUpEvent, _, cx| {
-                                if !this.armed(&play_id) {
-                                    return;
-                                }
-                                let queue = queue.as_ref().clone();
-                                this.session.update(cx, |session, cx| {
-                                    session.play(id, queue);
-                                    cx.notify();
-                                });
-                            }),
-                        )
-                        .on_mouse_down(
-                            MouseButton::Right,
-                            cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
-                                cx.stop_propagation();
-                                this.open_track_menu(id, event.position, window, cx);
-                            }),
-                        )
-                        .child(self.index_cell(
-                            index,
-                            current,
-                            is_playing,
-                            cx.reduce_motion(),
-                            group,
-                        ))
-                        .child(self.title_cell(&track, current))
-                        .child({
-                            let base_color = if lit { row_color } else { theme::bg_surface() };
-                            let album_fade_id = SharedString::from(format!("track-hover-{}", id.0));
-                            div()
-                                .relative()
-                                .w(px(self.album_width))
-                                .h(px(14.))
-                                .mr(px(COL_GAP))
-                                .flex_shrink_0()
-                                .flex()
-                                .items_center()
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w(px(0.))
-                                        .text_left()
-                                        .text_size(px(12.))
-                                        .line_height(px(14.))
-                                        .text_color(theme::text_muted())
-                                        .whitespace_nowrap()
-                                        .overflow_hidden()
-                                        .child(track.album.clone()),
-                                )
-                                .child(
-                                    div()
-                                        .absolute()
-                                        .top(px(0.))
-                                        .bottom(px(0.))
-                                        .right(px(0.))
-                                        .w(px(24.))
-                                        .with_spring(
-                                            album_fade_id,
-                                            MainWindow::hover_spring(hovered),
-                                            move |overlay, phase| {
-                                                let fade_color = if lit {
-                                                    base_color
-                                                } else {
-                                                    mix_rgba(
-                                                        theme::bg_surface(),
-                                                        theme::hover(),
-                                                        phase.0,
-                                                    )
-                                                };
-                                                let fade_color_transparent = Rgba {
-                                                    a: 0.0,
-                                                    ..fade_color
-                                                };
-                                                overlay.bg(linear_gradient(
-                                                    90.0,
-                                                    linear_color_stop(fade_color_transparent, 0.0),
-                                                    linear_color_stop(fade_color, 1.0),
-                                                ))
-                                            },
-                                        ),
-                                )
-                        })
-                        .child(self.duration_cell(like_id, liked, id, track.duration, cx))
-                        .with_spring(
-                            SharedString::from(format!("track-hover-{}", id.0)),
-                            MainWindow::hover_spring(hovered),
-                            move |row, phase| {
-                                if lit {
-                                    row
-                                } else {
-                                    row.bg(theme::hover().opacity(phase.0))
-                                }
-                            },
-                        ),
-                ),
-            );
+                        }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            this.open_track_menu(id, event.position, window, cx);
+                        }),
+                    )
+                    .child(self.index_cell(index, current, is_playing, cx.reduce_motion(), group))
+                    .child(self.title_cell(&track, current))
+                    .child({
+                        let base_color = if lit { row_color } else { theme::bg_surface() };
+                        let album_fade_id = SharedString::from(format!("track-hover-{}", id.0));
+                        div()
+                            .relative()
+                            .w(px(self.album_width))
+                            .h(px(14.))
+                            .mr(px(COL_GAP))
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .text_left()
+                                    .text_size(px(12.))
+                                    .line_height(px(14.))
+                                    .text_color(theme::text_muted())
+                                    .whitespace_nowrap()
+                                    .overflow_hidden()
+                                    .child(track.album.clone()),
+                            )
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top(px(0.))
+                                    .bottom(px(0.))
+                                    .right(px(0.))
+                                    .w(px(24.))
+                                    .with_spring(
+                                        album_fade_id,
+                                        MainWindow::hover_spring(hovered),
+                                        move |overlay, phase| {
+                                            let fade_color = if lit {
+                                                base_color
+                                            } else {
+                                                mix_rgba(
+                                                    theme::bg_surface(),
+                                                    theme::hover(),
+                                                    phase.0,
+                                                )
+                                            };
+                                            let fade_color_transparent = Rgba {
+                                                a: 0.0,
+                                                ..fade_color
+                                            };
+                                            overlay.bg(linear_gradient(
+                                                90.0,
+                                                linear_color_stop(fade_color_transparent, 0.0),
+                                                linear_color_stop(fade_color, 1.0),
+                                            ))
+                                        },
+                                    ),
+                            )
+                    })
+                    .child(self.duration_cell(like_id, liked, id, track.duration, cx))
+                    .with_spring(
+                        SharedString::from(format!("track-hover-{}", id.0)),
+                        MainWindow::hover_spring(hovered),
+                        move |row, phase| {
+                            if lit {
+                                row
+                            } else {
+                                row.bg(theme::hover().opacity(phase.0))
+                            }
+                        },
+                    ),
+            ));
         if lifted {
             deferred(row).with_priority(1).into_any_element()
         } else {
@@ -700,8 +678,6 @@ impl MainWindow {
     }
 
     fn title_cell(&self, track: &Track, current: bool) -> AnyElement {
-        // Cached `.ttml` is loaded with the track. This window does not draw a
-        // lyric view yet; the read keeps that path on the rendered row.
         let _lyric_file = track.lyrics.as_deref();
         div()
             .flex()
@@ -712,8 +688,6 @@ impl MainWindow {
             .gap(px(10.))
             .child(cover_art(track.cover.as_deref(), 40.))
             .child(
-                // Both lines keep a fixed box. An empty artist, a wrapped
-                // title, or a fallback font must not move the pair in the row.
                 div()
                     .flex()
                     .flex_col()
@@ -817,8 +791,6 @@ impl MainWindow {
                         hot_id,
                         MainWindow::hover_spring(hovered),
                         move |layer, hot| {
-                            // Idle outline and idle fill share one gray. Hover
-                            // tints whichever glyph is showing.
                             let color = mix_rgba(idle, rgb(0xe25555), hot.0);
                             layer
                                 .child(like_glyph(icons::HEART, color, icon_size, 1.0 - t, scale))
@@ -833,8 +805,6 @@ impl MainWindow {
         let hover_id = id.clone();
         let press_id = SharedString::from(format!("{id}-press"));
         let pressed = self.pressed_ui.as_ref() == Some(&id);
-        // List hearts stop the row from arming. The like itself waits for
-        // release. on_click is avoided because it clears the hover wash.
         let on_down = cx.listener(move |this, _: &gpui::MouseDownEvent, _, cx| {
             if stop_row_click {
                 cx.stop_propagation();
@@ -865,7 +835,6 @@ impl MainWindow {
             .on_hover(Self::hover_listener(hover_id, cx))
             .on_mouse_down(MouseButton::Left, on_down)
             .on_mouse_up(MouseButton::Left, on_release);
-        // List rows only toggle. The transport heart also shrinks on press.
         if stop_row_click {
             button.rounded_sm().child(glyphs(1.0)).into_any_element()
         } else {
@@ -919,7 +888,6 @@ fn like_glyph(
         .into_any_element()
 }
 
-/// How far a row slides down while the gap sits at `slot`. `open` is 0..1.
 #[cfg(test)]
 fn row_shift(row: usize, slot: f32, open: f32) -> f32 {
     row_shift_by(row, slot, open, TRACK_ROW_H)
@@ -930,8 +898,6 @@ fn row_shift_by(row: usize, slot: f32, open: f32, span: f32) -> f32 {
     span * along * open.clamp(0.0, 1.0)
 }
 
-/// Box a track row slides in. Neighbors ease toward their slot; the row under
-/// the pointer jumps straight there so the grab point never lags the cursor.
 fn slide_box(
     held: bool,
     shift: f32,
@@ -1026,7 +992,6 @@ mod tests {
         assert!(low[0] > 0.65, "low {low:?}");
         assert!(low[1] < 0.25 && low[2] < 0.2, "low leak {low:?}");
 
-        // A clap / pluck cracks around here. It must leave the bass bar alone.
         let mut hit = muzeeka::audio::levels::BandMeter::new(48_000.0);
         let mid = hit.push_stereo(&tone(2_000.0, 0.3));
         assert!(mid[1] > 0.65, "mid {mid:?}");
@@ -1065,7 +1030,6 @@ mod tests {
 
 fn eq_bar(level: f32) -> AnyElement {
     let level = level.clamp(0.0, 1.0);
-    // A short rest so the mark stays visible in a quiet moment.
     let height = 2.0 + 12.0 * level;
     div()
         .w(px(3.))
@@ -1091,8 +1055,6 @@ pub(crate) fn eq_bars(id: impl Into<gpui::ElementId>, reduce_motion: bool) -> An
     if reduce_motion {
         return paint_levels(row).into_any_element();
     }
-    // The phase is unused. The animation only asks for the next paint so the
-    // bars can follow the mixer. Levels are already computed on the audio thread.
     row.with_animation(
         id,
         Animation::new(Duration::from_millis(1_000))

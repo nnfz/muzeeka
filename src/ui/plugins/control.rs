@@ -1,5 +1,3 @@
-//! Thread-safe front door. HTTP handlers and `host.call` both land here.
-
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -58,9 +56,7 @@ impl PlayerControl for SessionControl {
     fn play(&self, path: &str, playlist_id: Option<&str>) -> Result<(), String> {
         let path = path.to_string();
         let playlist_id = playlist_id.map(str::to_string);
-        bridge::with_session(move |session| {
-            session.plugin_play(&path, playlist_id.as_deref())
-        })
+        bridge::with_session(move |session| session.plugin_play(&path, playlist_id.as_deref()))
     }
 
     fn pause(&self) -> Result<(), String> {
@@ -100,7 +96,10 @@ impl PlayerControl for SessionControl {
 
     fn seek(&self, position: f64) -> Result<(), String> {
         bridge::with_session(move |session| {
-            let duration = session.current_track().map(|track| track.duration).unwrap_or(0.0);
+            let duration = session
+                .current_track()
+                .map(|track| track.duration)
+                .unwrap_or(0.0);
             if duration <= 0.0 {
                 return Ok(());
             }
@@ -239,8 +238,7 @@ impl PlayerControl for SessionControl {
     fn tracks(&self, query: &str) -> Result<Value, String> {
         let query = query.to_string();
         bridge::with_session(move |session| {
-            serde_json::to_value(session.plugin_tracks(&query))
-                .map_err(|error| error.to_string())
+            serde_json::to_value(session.plugin_tracks(&query)).map_err(|error| error.to_string())
         })
     }
 

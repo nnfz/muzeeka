@@ -1,5 +1,3 @@
-// Plugin HTTP listener — static files + optional player REST/SSE API.
-
 use std::convert::Infallible;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::PathBuf;
@@ -203,7 +201,8 @@ impl HttpServer {
                         shutdown_rx,
                         &server,
                     )
-                    .await {
+                    .await
+                    {
                         Ok(()) => {
                             let mut g = server.inner.lock();
                             g.running = false;
@@ -659,10 +658,7 @@ fn sse_stream_response(
     )
 }
 
-fn ndjson_stream_response(
-    controller: Arc<dyn PlayerControl>,
-    interval_ms: u64,
-) -> Response {
+fn ndjson_stream_response(controller: Arc<dyn PlayerControl>, interval_ms: u64) -> Response {
     let stream = stream::unfold(
         StreamPhase::Active {
             controller,
@@ -704,9 +700,7 @@ async fn api_state(State(state): State<AppState>) -> Result<Json<serde_json::Val
     json_value(state.controller.get_state()?)
 }
 
-async fn api_playlists(
-    State(state): State<AppState>,
-) -> Result<Json<serde_json::Value>, AppError> {
+async fn api_playlists(State(state): State<AppState>) -> Result<Json<serde_json::Value>, AppError> {
     json_value(state.controller.playlists()?)
 }
 
@@ -849,7 +843,10 @@ fn collect_paths(paths: Vec<String>, path: Option<String>) -> Result<Vec<String>
         .map(|item| item.trim().to_string())
         .filter(|item| !item.is_empty())
         .collect::<Vec<_>>();
-    if let Some(path) = path.map(|item| item.trim().to_string()).filter(|item| !item.is_empty()) {
+    if let Some(path) = path
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty())
+    {
         out.push(path);
     }
     if out.is_empty() {
@@ -962,10 +959,6 @@ pub fn sanitize_port(port: u16) -> u16 {
     }
 }
 
-/// Ranked IPv4 candidates for LAN access (best first).
-///
-/// Avoids the classic "UDP to 8.8.8.8" trap that picks Clash/Mihomo fake-IP
-/// (198.18.x), VPN tunnels, or VMware host-only adapters instead of Ethernet/Wi‑Fi.
 fn lan_ipv4_candidates() -> Vec<String> {
     let mut scored: Vec<(i32, String)> = Vec::new();
 
@@ -990,7 +983,6 @@ fn lan_ipv4_candidates() -> Vec<String> {
         }
     }
 
-    // Mild hint from default-route interface, but never trust it alone if it's fake-IP/VPN.
     if let Some(ip) = udp_outbound_v4() {
         if is_usable_lan_v4(ip) {
             let s = ip.to_string();
@@ -1101,8 +1093,7 @@ fn score_lan_v4(ip: Ipv4Addr, iface_name: &str) -> i32 {
     }
 
     // Host-only adapters often claim *.1 without being the PC's LAN address.
-    if o[3] == 1 && (name.contains("vmware") || name.contains("virtual") || name.contains("vbox"))
-    {
+    if o[3] == 1 && (name.contains("vmware") || name.contains("virtual") || name.contains("vbox")) {
         score -= 40;
     }
 

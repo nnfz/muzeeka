@@ -1,9 +1,3 @@
-//! The on-disk Muzeeka library.
-//!
-//! The installable app keeps using Tauri's data directory,
-//! `%APPDATA%\com.nnfz.muzeeka`: `library.db`, `covers/`, and `lyrics/`.
-//! Nothing is copied out of that folder.
-
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -32,14 +26,11 @@ pub struct LoadedLibrary {
     pub volume: f32,
     pub shuffle: bool,
     pub repeat: RepeatMode,
-    /// Playlist that owned the queue, when the last track was started from one.
     pub playing_playlist_id: Option<String>,
-    /// True when the process last exited with this track still playing.
     pub was_playing: bool,
     pub db: Connection,
 }
 
-/// Last track, playhead, and the playback switches stored in `app_state`.
 pub(crate) struct PlaybackMemory {
     pub active_playlist_id: Option<String>,
     pub playing_playlist_id: Option<String>,
@@ -51,7 +42,6 @@ pub(crate) struct PlaybackMemory {
     pub was_playing: bool,
 }
 
-/// Tracks and playlists currently stored in `library.db`.
 pub(crate) fn read_lists(db: &Connection) -> Result<(Vec<Track>, Vec<Playlist>), String> {
     let root = app_data_dir();
     let roots = load_roots(db)?;
@@ -75,7 +65,6 @@ pub fn load() -> Result<LoadedLibrary, String> {
     load_db(&root.join("library.db"))
 }
 
-/// Opens `library.db`, creating an empty library when the file is missing.
 fn load_db(db_path: &Path) -> Result<LoadedLibrary, String> {
     let db = Connection::open_with_flags(
         db_path,
@@ -84,6 +73,7 @@ fn load_db(db_path: &Path) -> Result<LoadedLibrary, String> {
     .map_err(|error| format!("Failed to open {}: {error}", db_path.display()))?;
     db.busy_timeout(std::time::Duration::from_secs(5))
         .map_err(|error| error.to_string())?;
+    fast_writes(&db);
     db.pragma_update(None, "foreign_keys", true)
         .map_err(|error| error.to_string())?;
     ensure_schema(&db)?;
@@ -229,8 +219,6 @@ CREATE TABLE IF NOT EXISTS track_prefs (
 fn ensure_schema(db: &Connection) -> Result<(), String> {
     db.execute_batch(SCHEMA)
         .map_err(|error| format!("Could not create the library database: {error}"))?;
-    // Older track_prefs rows from the Tauri app may lack the video columns.
-    // A duplicate-column error means the column is already there.
     for statement in [
         "ALTER TABLE track_prefs ADD COLUMN playback_rate REAL",
         "ALTER TABLE track_prefs ADD COLUMN video_bg_path TEXT",
@@ -372,7 +360,6 @@ fn load_tracks(
     Ok(tracks)
 }
 
-/// Liked rows in the order the user arranged them.
 pub(crate) fn load_liked_order(db: &Connection) -> Result<Vec<TrackId>, String> {
     let mut statement = db
         .prepare("SELECT track_id FROM liked_tracks ORDER BY position, track_id")
@@ -461,7 +448,6 @@ fn playlist_has_mix_mode(db: &Connection) -> bool {
     names.iter().any(|name| name == "mix_mode")
 }
 
-/// Resize a picked image into `playlist_covers/{id}.webp` and return that path.
 pub(crate) fn store_playlist_cover(playlist_id: &str, source: &Path) -> Result<PathBuf, String> {
     if !source.is_file() {
         return Err("Cover image file not found".into());
@@ -642,7 +628,6 @@ fn lyrics_file(
     )
 }
 
-/// Same key as the Tauri lyrics cache: lowercase title, artist, album, rounded seconds.
 pub fn lyrics_cache_key(title: &str, artist: &str, album: &str, duration_secs: f64) -> String {
     let duration = if duration_secs > 0.0 {
         format!("{}", duration_secs.round() as u32)
@@ -703,7 +688,6 @@ fn split_cue(path: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// Match a stored path to a library row. Full path first, then a unique file name.
 fn find_track(tracks: &[Track], current_file: &str) -> Option<TrackId> {
     let key = path_key(current_file);
     if let Some(track) = tracks.iter().find(|track| path_key(&track.path) == key) {
@@ -732,7 +716,6 @@ fn file_name_key(path: &str) -> String {
         .to_lowercase()
 }
 
-/// Audio path without a `#cue:` suffix, lowercased, with slashes normalized.
 pub(crate) fn audio_key(path: &str) -> String {
     let (base, _) = split_cue(path.trim());
     let base = base.strip_prefix(r"\\?\").unwrap_or(base);
@@ -744,8 +727,6 @@ pub(crate) fn cue_base(path: &str) -> Option<&str> {
     cue.is_some().then_some(base)
 }
 
-/// Copy a cover from the full audio row, or from a sibling cue row, onto
-/// cue tracks that were stored without one.
 pub(crate) fn inherit_cue_covers(tracks: &mut [Track]) -> Vec<TrackId> {
     let mut covers: HashMap<String, PathBuf> = HashMap::new();
     for track in tracks.iter() {
@@ -772,7 +753,6 @@ pub(crate) fn inherit_cue_covers(tracks: &mut [Track]) -> Vec<TrackId> {
     filled
 }
 
-/// The full file is a container when the library also has its `#cue:` rows.
 pub(crate) fn cue_container_ids(tracks: &[Track]) -> HashSet<TrackId> {
     let mut bases = HashSet::new();
     for track in tracks {
@@ -790,7 +770,6 @@ pub(crate) fn cue_container_ids(tracks: &[Track]) -> HashSet<TrackId> {
         .collect()
 }
 
-/// Give cue rows the embedded cover of their audio file, and remember it.
 fn backfill_cue_covers(db: &Connection, tracks: &mut [Track]) {
     let filled = inherit_cue_covers(tracks);
     let mut rows = cover_rows(tracks, &filled);
@@ -861,7 +840,6 @@ fn pref_key(path: &str) -> String {
     crate::ui::paths::path_key(path.trim())
 }
 
-/// Count one play start. Keyed by the track path, including a `#cue:` suffix.
 pub fn record_play(db: &Connection, track_path: &str) -> Result<(), String> {
     let key = pref_key(track_path);
     if key.is_empty() {
@@ -981,7 +959,9 @@ pub fn track_video_bg(db: &Connection, track_path: &str) -> Result<Option<String
         .optional()
         .map_err(|error| format!("Could not read video background: {error}"))?
         .flatten();
-    let Some(path) = stored.map(|path| path.trim().to_string()).filter(|path| !path.is_empty())
+    let Some(path) = stored
+        .map(|path| path.trim().to_string())
+        .filter(|path| !path.is_empty())
     else {
         return Ok(None);
     };
@@ -1056,7 +1036,6 @@ pub fn library_db_path() -> PathBuf {
     app_data_dir().join("library.db")
 }
 
-/// A second connection for background work. The UI session keeps its own.
 pub(crate) fn open_library() -> Result<Connection, String> {
     let db = Connection::open_with_flags(
         library_db_path(),
@@ -1065,10 +1044,15 @@ pub(crate) fn open_library() -> Result<Connection, String> {
     .map_err(|error| format!("Failed to open the library: {error}"))?;
     db.busy_timeout(std::time::Duration::from_secs(5))
         .map_err(|error| error.to_string())?;
+    fast_writes(&db);
     Ok(db)
 }
 
-/// Title and artist stored for this playback path, including a `#cue:` row.
+fn fast_writes(db: &Connection) {
+    let _ = db.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()));
+    let _ = db.pragma_update(None, "synchronous", "NORMAL");
+}
+
 pub(crate) fn labels_for_playback_path(
     db: &Connection,
     playback_path: &str,
@@ -1080,7 +1064,9 @@ pub(crate) fn labels_for_playback_path(
     let mut roots = HashMap::new();
     let mut statement = db.prepare("SELECT id, path FROM library_roots").ok()?;
     let listed = statement
-        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
         .ok()?;
     for row in listed.flatten() {
         roots.insert(row.0, row.1);
@@ -1129,7 +1115,9 @@ pub(crate) fn library_fields(db: &Connection, id: i64) -> Result<LibraryFields, 
                 artist: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
                 album: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
                 genre: row.get(3)?,
-                year: year.and_then(|year| u32::try_from(year).ok()).filter(|year| *year > 0),
+                year: year
+                    .and_then(|year| u32::try_from(year).ok())
+                    .filter(|year| *year > 0),
                 track_number: track_number
                     .and_then(|number| u32::try_from(number).ok())
                     .filter(|number| *number > 0),
@@ -1150,8 +1138,12 @@ pub(crate) fn set_cover_id(db: &Connection, id: i64, cover_id: &str) -> Result<(
     Ok(())
 }
 
-/// Cached lyrics file for these tags, when one is on disk and not cleared.
-pub fn lyrics_path_for(title: &str, artist: &str, album: &str, duration_secs: f64) -> Option<PathBuf> {
+pub fn lyrics_path_for(
+    title: &str,
+    artist: &str,
+    album: &str,
+    duration_secs: f64,
+) -> Option<PathBuf> {
     if title.trim().is_empty() && artist.trim().is_empty() {
         return None;
     }

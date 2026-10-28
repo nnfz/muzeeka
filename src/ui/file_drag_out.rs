@@ -1,29 +1,17 @@
-//! Hand a track file to Windows when a drag leaves the window.
-//!
-//! GPUI only promotes that gesture on macOS and Linux. Here the pointer
-//! leaving the window starts an OLE file drag with `DROPEFFECT_COPY`, so
-//! Telegram, Explorer, and the rest can take the file without deleting it.
-
 use std::ffi::OsStr;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static OUTGOING: AtomicBool = AtomicBool::new(false);
 
-/// True while the OLE loop is running, including a drop back onto this window.
 pub(crate) fn is_outgoing() -> bool {
     OUTGOING.load(Ordering::SeqCst)
 }
 
-/// Claim the outgoing drag. A second move must not start another `DoDragDrop`.
 pub(crate) fn try_begin() -> bool {
     !OUTGOING.swap(true, Ordering::SeqCst)
 }
 
-/// Run the drag already claimed by [`try_begin`]. The flag clears when this returns.
-///
-/// Call this outside any `App` borrow. `DoDragDrop` pumps the window, and a
-/// nested mouse or drop message borrows `App` again.
 pub(crate) fn run_armed(paths: &[impl AsRef<Path>]) {
     let _guard = OutgoingGuard;
     let files: Vec<&Path> = paths
@@ -39,7 +27,6 @@ pub(crate) fn run_armed(paths: &[impl AsRef<Path>]) {
     drag_files_win(&bytes);
 }
 
-/// `CF_HDROP` payload: a 20-byte `DROPFILES` header plus UTF-16 paths.
 pub(crate) fn hdrop_bytes(paths: &[impl AsRef<OsStr>]) -> Vec<u8> {
     let mut wide = Vec::<u16>::new();
     for path in paths {
@@ -54,8 +41,6 @@ pub(crate) fn hdrop_bytes(paths: &[impl AsRef<OsStr>]) -> Vec<u8> {
         return Vec::new();
     }
     wide.push(0);
-
-    // DROPFILES is packed: DWORD + POINT + two BOOLs.
     const HEADER: usize = 20;
     let mut bytes = Vec::with_capacity(HEADER + wide.len() * 2);
     bytes.extend_from_slice(&(HEADER as u32).to_le_bytes());
@@ -252,7 +237,6 @@ mod win {
         let source = object.to_interface::<IDropSource>();
         let mut effect = DROPEFFECT(0);
         unsafe {
-            // Already initialized by the window's drop target. A second call is fine.
             let _ = OleInitialize(None);
             let _ = ReleaseCapture();
             let _ = DoDragDrop(&data, &source, DROPEFFECT_COPY, &mut effect);

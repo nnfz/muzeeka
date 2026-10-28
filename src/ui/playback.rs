@@ -1,9 +1,3 @@
-//! BASS output for the GPUI window.
-//!
-//! The effect rack is the one saved by the installable app in
-//! `%APPDATA%\com.nnfz.muzeeka\settings.json`. The last track and playhead are
-//! written back into `library.db`, in `app_state`.
-
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -21,16 +15,10 @@ use crate::ui::catalog;
 
 pub struct Engine {
     player: Player,
-    /// Set when the saved rack could not be applied. Playback still starts.
     pub warning: Option<String>,
-    /// Settings speed used when a track has no override. The play hook reads it.
     fallback_rate: Arc<AtomicU32>,
 }
 
-/// The audio page of `settings.json`: the live rack, speed, and saved presets.
-///
-/// `persist` is false for the preview session and when the file could not be
-/// parsed, so a test or a bad read cannot overwrite the installable app's copy.
 #[derive(Clone)]
 pub struct AudioRack {
     pub chain: Vec<ChainSlotSettings>,
@@ -107,11 +95,9 @@ fn default_pitch_enabled() -> bool {
 }
 
 impl Engine {
-    /// Opens BASS, then installs the saved rack before any file is played.
     pub fn attach(volume: f32, rack: &AudioRack) -> Result<Self, String> {
         let player = Player::new();
         let bass_dir = bass_directory();
-        // BASS delay-loads sibling DLLs from this folder, not from the process cwd.
         pin_dll_directory(&bass_dir);
         player.set_bass_dir(bass_dir);
         player.set_ui_hot(true);
@@ -190,8 +176,6 @@ impl Engine {
         self.player.set_pitch_enabled(enabled)
     }
 
-    /// Limiter gain-reduction meters. Lock-free on the player, so the settings
-    /// window can poll this without waiting on a file open.
     pub fn limiter_readings(&self) -> Vec<(String, f32)> {
         self.player
             .get_dsp_chain_status()
@@ -257,7 +241,6 @@ impl Engine {
         self.player.extra_outputs()
     }
 
-    /// True while this path is the open stream, including a pause fade.
     pub fn holds(&self, path: &str) -> bool {
         let snap = self.snapshot();
         matches!(
@@ -298,8 +281,6 @@ fn bass_directory() -> PathBuf {
     pick_bass_dir(&candidates).unwrap_or_else(|| candidates.into_iter().next().unwrap_or_default())
 }
 
-/// `bass.dll` lives in `bin/bass` next to the executable. A loose copy beside
-/// the exe still works. `src/bin` is only searched in debug builds (`cargo run`).
 fn bass_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
@@ -348,8 +329,6 @@ fn pin_dll_directory(dir: &std::path::Path) {
 }
 
 impl AudioRack {
-    /// Empty rack used by tests and by the window before a file is read.
-    /// Nothing is written back.
     pub fn flat() -> Self {
         Self {
             chain: Vec::new(),
@@ -364,8 +343,6 @@ impl AudioRack {
         }
     }
 
-    /// Reads the installable app's settings. A missing file is an empty rack
-    /// that may be saved later. A file that does not parse is not saved over.
     pub fn load() -> Self {
         let path = catalog::app_data_dir().join("settings.json");
         let backup = path.with_extension("json.bak");
@@ -404,7 +381,6 @@ impl AudioRack {
         rack
     }
 
-    /// Patches the audio keys in `settings.json` and leaves every other key.
     pub fn save(&self) {
         if !self.persist {
             return;
@@ -436,7 +412,6 @@ fn parse_saved_audio(raw: &str) -> Result<AudioRack, String> {
     let mut file: SavedAudioFile = serde_json::from_str(raw).map_err(|error| error.to_string())?;
     let mut chain = match file.dsp_chain.take() {
         Some(chain) => chain,
-        // A file from before the rack stored one EQ and one limiter.
         None => {
             let mut slots = Vec::new();
             if file.equalizer != EqualizerSettings::default() {
@@ -481,8 +456,6 @@ fn parse_saved_audio(raw: &str) -> Result<AudioRack, String> {
     })
 }
 
-/// Rewrites only the audio keys. Other settings (downloads, Discord, plugins)
-/// stay as they were stored.
 pub(crate) fn merge_audio_json(raw: &str, rack: &AudioRack) -> Result<String, String> {
     let mut value: serde_json::Value =
         serde_json::from_str(raw).map_err(|error| error.to_string())?;
@@ -541,8 +514,6 @@ fn on_track_started(player: &Player, fallback: &AtomicU32, path: &str) {
     thread::spawn(move || maybe_auto_video(&path));
 }
 
-/// Auto video respects the setting, an existing file, and a previous miss.
-/// A manual Search in Properties does not come through here.
 fn maybe_auto_video(path: &str) {
     if path.trim().is_empty() || !crate::ui::ytdlp::auto_video_bg_enabled() {
         return;
@@ -550,11 +521,7 @@ fn maybe_auto_video(path: &str) {
     let Ok(db) = catalog::open_library() else {
         return;
     };
-    if catalog::track_video_bg(&db, path)
-        .ok()
-        .flatten()
-        .is_some()
-    {
+    if catalog::track_video_bg(&db, path).ok().flatten().is_some() {
         return;
     }
     if catalog::track_video_bg_tried(&db, path).unwrap_or(true) {

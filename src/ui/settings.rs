@@ -22,11 +22,8 @@ pub struct SettingsWindow {
     focus: FocusHandle,
     section: SettingsSection,
     use_ui_font: bool,
-    /// Control that received the mouse down. Same reason as MainWindow::armed_ui:
-    /// GPUI on_click clears hover for the whole hold.
     armed: Option<gpui::SharedString>,
     audio: audio::AudioUi,
-    /// Name typed while saving an effect or chain preset.
     preset_name: gpui::Entity<TextField>,
     download_menu: bool,
     download_error: Option<String>,
@@ -153,9 +150,6 @@ impl Render for SettingsWindow {
                 MouseButton::Left,
                 cx.listener(|this, event: &gpui::MouseUpEvent, window, cx| {
                     this.end_audio_drag(cx);
-                    // An occluding control (the close button) makes the root
-                    // look unhovered even when the pointer is still inside.
-                    // Dropping the press there cancels the click.
                     let size = window.viewport_size();
                     let inside = event.position.x >= px(0.)
                         && event.position.y >= px(0.)
@@ -201,10 +195,6 @@ impl SettingsWindow {
                     .child("Settings"),
             )
             .child(
-                // Windows hit-tests the first caption area under the cursor.
-                // The header is Drag, so this button has to occlude it and
-                // report Close. A mouse handler that stops the press keeps
-                // the system from posting WM_CLOSE, and the window stays open.
                 div()
                     .id("settings-close")
                     .occlude()

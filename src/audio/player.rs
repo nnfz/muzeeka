@@ -1,8 +1,3 @@
-// Player state management
-//
-// Wraps BASS in a higher-level API that tracks the current track, volume,
-// playback state, and emits Tauri events for position updates.
-
 use std::cell::Cell;
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
@@ -23,7 +18,6 @@ use crate::audio::icy_tap::{self, LiveMetaInbox};
 use crate::audio::mix_filter::{self, MixFilterCtx};
 use crate::audio::output_tap::{self, OutputTap};
 
-/// Next track queued for gapless transition.
 #[derive(Debug, Clone)]
 pub struct GaplessTrack {
     pub track_path: String,
@@ -37,9 +31,6 @@ pub struct TrackChangedPayload {
     pub path: String,
 }
 
-/// ICY now-playing update pushed to the UI while a live radio stream plays.
-/// `path` identifies the station; `title` is the currently announced track
-/// (empty when the station sends none); `station` is the ICY station name.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StreamMetadataPayload {
@@ -48,60 +39,29 @@ pub struct StreamMetadataPayload {
     pub station: Option<String>,
 }
 
-// Spotify-like short musical fades (not on track changes)
 const PAUSE_FADE_MS: u32 = 220;
 const RESUME_FADE_MS: u32 = 180;
-/// Duration of a smooth playback-rate transition (presets, slider settle, etc.).
 const PLAYBACK_RATE_RAMP_MS: u32 = 1000;
 
-// For seek: mute during flush (instant), then short fade-in so the first post-restart
-// sample isn't slammed in at full amplitude.
 const SEEK_DIP_LEVEL: f32 = 0.0;
-/// Fade-in after seek flush — long enough to de-click, short enough to feel instant.
 const SEEK_FADE_IN_MS: u32 = 28;
-/// Manual next/prev / track click: fade OUT the old track before teardown, then fade IN.
-/// Hard mute of a full-volume waveform is the classic switch click; seek doesn't need
-/// this because content continues and the dip is very short.
 const MANUAL_SWITCH_FADE_OUT_MS: u32 = 55;
 const MANUAL_SWITCH_FADE_IN_MS: u32 = 50;
-/// Mixer playback buffer. Larger than the WASAPI period stack so brief
-/// decode/DSP stalls (and Windows scheduling under load) do not underrun.
 const MIXER_BUFFER_SECS: f32 = 0.5;
-/// WASAPI callback interval. 10ms default is too tight when the CPU is busy.
 const DEVICE_PERIOD_MS: u32 = 20;
-/// WASAPI device buffer. Default 30ms underruns under load; ~120ms matches
-/// what desktop players typically use in shared mode.
 const DEVICE_BUFFER_MS: u32 = 120;
-/// Software playback buffer filled by BASS update threads (milliseconds).
 const PLAYBACK_BUFFER_MS: u32 = 500;
-/// How often those update threads wake (milliseconds).
 const UPDATE_PERIOD_MS: u32 = 20;
-/// Read-ahead for `BASS_ASYNCFILE` so disk I/O is not on the WASAPI thread.
 const ASYNCFILE_BUFFER_BYTES: u32 = 262_144;
 
-// Gapless: treat as ended this far before INDEX/file end so the next source is
-// already feeding the mixer while the last buffer of the current track plays out.
-// Keep tight — large values cut multi-file CUE tracks early and feel like "wrong skip".
 const GAPLESS_END_EPSILON_SECS: f64 = 0.025;
-/// Same-image CUE segments may continue without seeking only at the same boundary.
 const CUE_CONTIGUOUS_TOLERANCE_SECS: f64 = 0.075;
-/// How often BASS is polled for gapless / end detection while a source is active.
 const POLL_INTERVAL_MS: u64 = 50;
-/// When nothing is loaded, the poll thread sleeps this long and skips main-thread hops.
 const POLL_IDLE_MS: u64 = 750;
-/// After a manual CUE seek / segment switch, ignore end/stop signals briefly.
 const MANUAL_SEGMENT_SUPPRESS_MS: u64 = 400;
-/// UI position events while the main window is focused (smooth seekbar).
-/// Deliberately slower than POLL_INTERVAL_MS — gapless needs 50ms BASS checks,
-/// but WebView IPC + Svelte updates do not (MediaSlider CSS eases the bar).
 const UI_EMIT_HOT_MS: u64 = 150;
-/// UI position events while unfocused — keeps WebView/GPU quiet during games.
 const UI_EMIT_COLD_MS: u64 = 500;
-/// Re-push Discord RPC timestamps while playing so progress stays in sync.
 const RPC_POSITION_SYNC_MS: u64 = 5000;
-/// After a manual play/seek, a new stream can briefly look "ended". Ignore end
-/// detection for this long on normal-length tracks. Short tracks cap the guard
-/// by their own duration so they can still auto-advance.
 const SPURIOUS_END_GUARD_MS: u64 = 1500;
 
 // ── Playback state enum ───────────────────────────────────────────────────────
@@ -150,71 +110,41 @@ pub struct PositionPayload {
 struct PlayerInner {
     bass: Option<BassLibrary>,
     bass_dir: PathBuf,
-    /// The mixer stream (output). We play/pause this. The DSP rack attaches here.
     mixer_handle: u32,
-    /// Device mix rate used for the mixer (WASAPI shared native rate).
     output_rate: u32,
-    /// The current decode source plugged into the mixer (for the active track).
     current_source: u32,
-    /// Handle of the one DSP that runs the whole effect rack (0 = not attached).
     chain_dsp_handle: u32,
     current_file: Option<String>,
-    /// Resolved on-disk audio path for the active source (gapless detection).
     current_audio_path: Option<String>,
     volume: f32,
     playback_rate: f32,
-    /// Rate last requested on the active decode/tempo channel (BASS may still be sliding to it).
     applied_playback_rate: f32,
-    /// When true, speed changes also shift pitch (BASS_ATTRIB_FREQ). When false, tempo FX preserves pitch.
     pitch_enabled: bool,
-    /// Raw decode handle when `current_source` is a tempo wrapper (otherwise 0).
     current_decode: u32,
     preloaded_decode: u32,
     cue_start: Option<f64>,
     cue_end: Option<f64>,
-    /// After a CUE seek, some BASS/mixer paths report 0-based position (relative to
-    /// the seek point) instead of absolute file time. INDEX end checks must then
-    /// add `cue_start`. Detected right after each segment open/seek.
     cue_pos_relative: bool,
-    /// The effect rack. Ordered inside itself, so this is the only DSP the mixer
-    /// ever sees — see `dsp_chain.rs` for why order is data, not BASS priority.
     chain: &'static DspChain,
-    /// Handles returned by BASS_PluginLoad — keep plugins registered.
     _plugin_handles: Vec<u32>,
-    /// Full play-order queue; index points at the track currently playing.
     gapless_queue: Vec<GaplessTrack>,
     gapless_queue_index: usize,
     pending_next: Option<GaplessTrack>,
     preloaded_source: u32,
     preloaded_audio_path: Option<String>,
-    /// Playlist/virtual path the preload was built for (match this on activate — not only audio path).
     preloaded_track_path: Option<String>,
-    /// Used to invalidate stale scheduled pause actions when user quickly plays new track.
     pause_generation: u64,
-    /// Timestamp (millis since UNIX epoch) when current track play started (for manual plays).
-    /// Prevents spurious early gapless advance right after clicking a track in the current que.
     current_track_start_time: u64,
-    /// Logical pause state. Set immediately on pause() so that get_state() and emitted
-    /// events report paused even while the volume fade is still playing out.
     user_paused: bool,
-    /// Ignore spurious track-end detections while rebuilding playback channels.
     suppress_gapless_until: u64,
-    /// Two-deck mix: outgoing still in mixer until `fade_end_ms`.
     mix_crossfade: Option<MixCrossfadeState>,
-    /// Volume automation on the surviving next deck after dual-deck handoff.
     mix_vol_follow: Option<MixVolFollow>,
-    /// True while Mix Transition window owns the shared BASS device for preview.
-    /// Main UI should ignore player events so library transport doesn't "join" the mix.
     mix_preview_active: bool,
-    /// Saved transition waiting for the playhead to reach its start (playlist mix mode).
     armed_mix: Option<ArmedMix>,
     extra_outputs: Vec<ExtraOutput>,
     extra_devices_inited: Vec<i32>,
     next_extra_id: u64,
-    /// The active source is an internet radio stream (URL). Live sources have
-    /// no length, never auto-advance and ignore seeks.
     live_source: Option<LiveStreamState>,
-    /// Bytes pushed into the live mixer source since open (diagnostics).
     live_bytes_fed: u64,
     live_last_pump_log_ms: u64,
     live_zero_pulls: u32,
@@ -224,15 +154,12 @@ struct PlayerInner {
     live_pcm_chans: u32,
     live_reconnect_after_ms: u64,
     live_meta_sync: u32,
-    /// ICY text copied inside BASS_SYNC_META (GetTags is empty after the callback).
     live_meta_inbox: Arc<StdMutex<LiveMetaInbox>>,
     live_meta_user: usize,
-    /// Sidecar HTTP ICY tap (BASS mixer DECODE never surfaces StreamTitle).
     icy_tap_stop: Option<Arc<AtomicBool>>,
     icy_tap_join: Option<thread::JoinHandle<()>>,
 }
 
-/// Owned by DOWNLOADPROC + META sync `user` until teardown.
 struct LiveMetaUser {
     get_tags: unsafe extern "system" fn(u32, u32) -> *const std::ffi::c_void,
     inbox: Arc<StdMutex<LiveMetaInbox>>,
@@ -247,25 +174,16 @@ struct IcyParse {
     meta: Vec<u8>,
 }
 
-/// Per-live-stream bookkeeping (ICY now-playing, station name, position base).
 #[derive(Debug, Clone)]
 struct LiveStreamState {
-    /// Stream URL (`current_audio_path` while live).
     url: String,
-    /// Wall-clock ms when playback of this stream started (position base).
     started_ms: u64,
-    /// Wall-clock ms accumulated while paused (excluded from position).
     paused_ms: u64,
-    /// Wall-clock ms when the current pause began (0 = not paused).
     pause_started_ms: u64,
-    /// Last ICY `StreamTitle` reported to the UI.
     last_title: Option<String>,
-    /// Last station name (ICY `name` header) reported to the UI.
     last_station: Option<String>,
-    /// Bytes BASS had buffered last time ICY was checked — change ⇒ new metadata.
     #[allow(dead_code)]
     last_probe_bytes: u64,
-    /// Wall ms of the last ICY probe (rate limit).
     last_probe_ms: u64,
 }
 
@@ -283,10 +201,8 @@ impl LiveStreamState {
         }
     }
 
-    /// Seconds of audio played so far: wall-clock since start minus time spent paused.
     fn elapsed_secs(&self, now_ms: u64) -> f64 {
         let gross = now_ms.saturating_sub(self.started_ms);
-        // Include the in-progress pause so the clock freezes while paused.
         let live_pause = if self.pause_started_ms != 0 {
             now_ms.saturating_sub(self.pause_started_ms)
         } else {
@@ -298,14 +214,12 @@ impl LiveStreamState {
         net as f64 / 1000.0
     }
 
-    /// Mark the beginning of a pause (idempotent).
     fn mark_paused(&mut self, now_ms: u64) {
         if self.pause_started_ms == 0 {
             self.pause_started_ms = now_ms;
         }
     }
 
-    /// Accumulate the just-finished pause into `paused_ms` (idempotent).
     fn mark_resumed(&mut self, now_ms: u64) {
         if self.pause_started_ms != 0 {
             self.paused_ms = self
@@ -320,11 +234,7 @@ struct ExtraOutput {
     id: String,
     device: i32,
     name: String,
-    /// Mixer DSP + push stream on the target device. See [`crate::output_tap`] for why
-    /// this is not a `BASS_Split_StreamCreate` splitter.
     tap: OutputTap,
-    /// Gain on this output only, independent of the main mixer volume.
-    /// Kept here so a BASS restart can restore it in `reattach_extra_outputs`.
     volume: f32,
 }
 
@@ -348,7 +258,6 @@ pub struct ExtraOutputInfo {
     pub volume: f32,
 }
 
-/// Automation point: `t` in 0..1 of the segment, `v` gain 0..1.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MixVolPoint {
@@ -356,7 +265,6 @@ pub struct MixVolPoint {
     pub v: f64,
 }
 
-/// Envelope interpolation: straight segments or Catmull-Rom smooth.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum MixEnvCurve {
@@ -365,8 +273,6 @@ pub enum MixEnvCurve {
     Smooth,
 }
 
-/// One automation block on the mix timeline (seconds from preview start).
-/// Used for volume (gain) and filter (cutoff) envelopes.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MixVolSegment {
@@ -377,61 +283,43 @@ pub struct MixVolSegment {
     pub curve: MixEnvCurve,
 }
 
-/// LP/HP DSP attached to one mix deck source.
 struct MixDeckFilter {
     source: u32,
     dsp: u32,
     ctx: Box<MixFilterCtx>,
 }
 
-/// Layered two-deck mix preview — plays exactly as aligned on the timeline.
 struct MixCrossfadeState {
     from_source: u32,
     from_decode: u32,
     to_source: u32,
     to_decode: u32,
-    /// How long the previous deck should run from its cue start (seconds of audio).
-    /// 0 = no previous / already dropped.
     from_duration_secs: f64,
-    /// Inject next when previous has played this many seconds (graph delay). 0 = already in.
     to_delay_secs: f64,
-    /// Original graph delay of next (kept after inject for mix-clock on to).
     to_graph_delay_secs: f64,
     from_cue_start: f64,
-    /// Wall-clock start of this mix session (for silence gaps after prev ends).
     mix_timeline_start_ms: u64,
-    /// When prev was dropped before next's graph time: mix_secs at that moment.
-    /// 0 = prev still alive (or never started).
     from_ended_mix_secs: f64,
-    /// Wall ms when prev was dropped early (0 = n/a).
     from_ended_at_ms: u64,
-    /// Pending next deck not yet in the mixer (to_source==0 until inject).
     pending_to: Option<PendingMixDeck>,
     next_path: String,
     next_audio_path: String,
     next_cue_start: Option<f64>,
     next_cue_end: Option<f64>,
-    /// Mix seconds at which the UI adopts the incoming track (playlist mix mode;
-    /// `None` in the editor preview, which owns its own transport display).
     ui_switch_secs: Option<f64>,
-    /// Set once the UI switch above has been emitted.
     ui_switched: bool,
-    /// Volume envelopes for previous / next decks (mix timeline).
     from_vol: Vec<MixVolSegment>,
     to_vol: Vec<MixVolSegment>,
-    /// Low-pass / high-pass cutoff envelopes (normalized v → Hz in apply).
     from_lp: Vec<MixVolSegment>,
     from_hp: Vec<MixVolSegment>,
     to_lp: Vec<MixVolSegment>,
     to_hp: Vec<MixVolSegment>,
-    /// Speed / rate envelopes (normalized v → 0.5×..2×).
     from_speed: Vec<MixVolSegment>,
     to_speed: Vec<MixVolSegment>,
     from_filter: Option<MixDeckFilter>,
     to_filter: Option<MixDeckFilter>,
 }
 
-/// After previous deck is dropped, keep driving next-deck automation.
 struct MixVolFollow {
     source: u32,
     decode: u32,
@@ -449,19 +337,11 @@ struct PendingMixDeck {
     decode: u32,
 }
 
-/// A saved editor transition armed on the track that is **already playing**.
-///
-/// Playlist mix mode never re-opens the outgoing deck: when the playhead reaches
-/// `start_at_secs` the live `current_source` is adopted as the mix `from` deck, so
-/// the transition begins without a seam. Mix time 0 == `start_at_secs`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ArmedMix {
-    /// Track the transition belongs to — must still be current when it fires.
     pub from_path: String,
-    /// Absolute content seconds on the outgoing track where mix time 0 sits.
     pub start_at_secs: f64,
-    /// How long the outgoing deck keeps playing past mix time 0.
     pub from_duration_secs: f64,
     pub to_path: String,
     #[serde(default)]
@@ -470,14 +350,10 @@ pub struct ArmedMix {
     pub to_cue_start: Option<f64>,
     #[serde(default)]
     pub to_cue_end: Option<f64>,
-    /// Mix seconds before the incoming deck joins the graph.
     #[serde(default)]
     pub to_delay_secs: f64,
-    /// End of the whole saved layout, in mix seconds. Entering later than this
-    /// means the transition is already over.
     #[serde(default)]
     pub span_secs: f64,
-    /// Mix seconds at which the UI should start showing the incoming track.
     #[serde(default)]
     pub ui_switch_secs: f64,
     #[serde(default)]
@@ -498,9 +374,6 @@ pub struct ArmedMix {
     pub to_speed: Vec<MixVolSegment>,
 }
 
-/// Official BASS format plugins that are known to work reliably.
-/// Third-party plugins (e.g. basszxtune.dll or other tracker/chiptune addons)
-/// placed in the bass/ folder will also be auto-detected and attempted.
 const BASS_FORMAT_PLUGINS: &[&str] = &[
     "bass_aac.dll",
     "bassflac.dll",
@@ -514,7 +387,6 @@ const BASS_FORMAT_PLUGINS: &[&str] = &[
     "basscd.dll",
 ];
 
-/// DLLs that should never be loaded via BASS_PluginLoad (they are for mixing, effects, output etc.).
 const NON_FORMAT_BASS_DLLS: &[&str] = &[
     "bass.dll",
     "bassmix.dll",
@@ -523,16 +395,12 @@ const NON_FORMAT_BASS_DLLS: &[&str] = &[
     "basswasapi.dll",
 ];
 
-/// Work item executed serially on the dedicated BASS thread.
 type BassJob = Box<dyn FnOnce() + Send>;
 
 thread_local! {
     static MMCSS_PINNED: Cell<bool> = const { Cell::new(false) };
 }
 
-/// No-op mixer DSP whose only job is to mark BASS's audio callback thread as
-/// Pro Audio. Must be thread-local: a process-wide flag would skip a new
-/// WASAPI thread after a device change.
 unsafe extern "system" fn mmcss_pin_dsp(
     _handle: u32,
     _channel: u32,
@@ -552,37 +420,20 @@ unsafe extern "system" fn mmcss_pin_dsp(
 #[derive(Clone)]
 pub struct Player {
     inner: Arc<Mutex<PlayerInner>>,
-    /// Serializes play/pause/resume/seek so concurrent IPC calls cannot deadlock the main thread.
     ops: Arc<Mutex<()>>,
     app: Arc<RwLock<Option<EventSink>>>,
     bass_thread: Arc<RwLock<Option<thread::ThreadId>>>,
-    /// Jobs for the dedicated BASS thread. All `BASS_*` calls (including the
-    /// blocking `StreamCreateURL` connect) run there — never on the UI thread
-    /// and never overlapping from a Tauri worker.
     bass_jobs: mpsc::Sender<BassJob>,
     discord: Arc<RwLock<Option<DiscordPresence>>>,
-    /// True while the main window is focused — drives UI event rate (games-friendly when false).
     ui_hot: Arc<AtomicBool>,
-    /// True while a decode source is loaded. Position-poll sleeps long and skips
-    /// BASS hops when false (idle app / stopped).
     source_active: Arc<AtomicBool>,
-    /// Set after the first successful `BASS_Init`. Ctrl+R re-calls `player_init`
-    /// and must not hop to the BASS thread (it may be connecting a URL).
     bass_ready: Arc<AtomicBool>,
-    /// Same leaked rack as `PlayerInner::chain`, held here so the settings UI can
-    /// read its atomics without taking the player lock or hopping to the BASS
-    /// thread ten times a second.
     chain: &'static DspChain,
-    /// Play-count and per-track speed. Separate from `PlayerInner` so the hook
-    /// can hop back onto the BASS thread after `record_play_stat`'s caller has
-    /// already released that lock.
     play_hook: Arc<Mutex<Option<Arc<dyn Fn(&str) + Send + Sync>>>>,
 }
 
 impl Player {
     pub fn new() -> Self {
-        // Leaked exactly once: BASS holds a raw `user` pointer to this for the
-        // process lifetime. Individual effects inside it are plain `Arc`s.
         let chain: &'static DspChain = Box::leak(Box::new(DspChain::new()));
         let bass_thread = Arc::new(RwLock::new(None));
         let (bass_jobs, bass_rx) = mpsc::channel::<BassJob>();
@@ -660,13 +511,10 @@ impl Player {
         }
     }
 
-    /// Called after a file opens or a gapless segment starts. The hook runs on
-    /// the caller thread, which is never the BASS thread.
     pub fn set_play_hook(&self, hook: Option<Arc<dyn Fn(&str) + Send + Sync>>) {
         *self.play_hook.lock() = hook;
     }
 
-    /// Focused main window → hot UI updates; unfocused (game in foreground) → cold.
     pub fn set_ui_hot(&self, hot: bool) {
         self.ui_hot.store(hot, Ordering::Relaxed);
     }
@@ -688,14 +536,11 @@ impl Player {
         inner.user_paused = false;
         if let Some(bass) = inner.bass.as_ref() {
             if inner.mixer_handle != 0 {
-                // Cancel the pause fade and stay silent until the new stream is ready.
-                // Restoring volume here leaked ~0.5s of the previous track from the mixer buffer.
                 let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_VOL, 0.0);
             }
         }
     }
 
-    /// Drop buffered audio from the mixer output after removing sources.
     fn flush_mixer_hard(inner: &PlayerInner) {
         if let Some(bass) = inner.bass.as_ref() {
             if inner.mixer_handle != 0 {
@@ -705,21 +550,17 @@ impl Player {
         }
     }
 
-    /// Flush queued samples without leaving playback buffering disabled globally.
     fn restart_mixer_with_buffer(bass: &BassLibrary, mixer: u32) {
         let _ = bass.channel_set_attribute(mixer, bass::BASS_ATTRIB_BUFFER, 0.0);
         let _ = bass.channel_play(mixer, true);
         let _ = bass.channel_set_attribute(mixer, bass::BASS_ATTRIB_BUFFER, MIXER_BUFFER_SECS);
     }
 
-    /// Start mixer volume from silence. Optional short slide prevents edge clicks
-    /// after a hard mute + buffer restart (seek / manual track switch).
     fn set_mixer_volume_from_silence(bass: &BassLibrary, mixer: u32, volume: f32, fade_in_ms: u32) {
         if mixer == 0 {
             return;
         }
         let vol = volume.clamp(0.0, 1.0);
-        // Cancels any in-flight VOL slide from pause/resume/previous seek.
         let _ = bass.channel_set_attribute(mixer, bass::BASS_ATTRIB_VOL, 0.0);
         if vol <= 0.0001 || fade_in_ms == 0 {
             let _ = bass.channel_set_attribute(mixer, bass::BASS_ATTRIB_VOL, vol);
@@ -728,8 +569,6 @@ impl Player {
         let _ = bass.channel_slide_attribute(mixer, bass::BASS_ATTRIB_VOL, vol, fade_in_ms);
     }
 
-    /// Soft-cut currently audible output before tearing sources down.
-    /// Without this, VOL→0 or channel remove mid-waveform is a sharp click.
     fn fade_out_for_manual_switch(inner: &PlayerInner) {
         let Some(bass) = inner.bass.as_ref() else {
             return;
@@ -738,7 +577,6 @@ impl Player {
         if mixer == 0 {
             return;
         }
-        // Already silent (paused after fade, or never started).
         if inner.user_paused || inner.current_source == 0 {
             let _ = bass.channel_set_attribute(mixer, bass::BASS_ATTRIB_VOL, 0.0);
             return;
@@ -750,7 +588,6 @@ impl Player {
             let _ = bass.channel_set_attribute(mixer, bass::BASS_ATTRIB_VOL, 0.0);
             return;
         }
-        // Keep the mixer playing so BASS can process the slide on its update thread.
         if bass.channel_is_active(mixer) != bass::BASS_ACTIVE_PLAYING {
             let _ = bass.channel_play(mixer, false);
         }
@@ -760,7 +597,6 @@ impl Player {
             0.0,
             MANUAL_SWITCH_FADE_OUT_MS,
         );
-        // BASS slides on the audio thread; wait for the ramp (+ one update period).
         std::thread::sleep(Duration::from_millis(MANUAL_SWITCH_FADE_OUT_MS as u64 + 15));
         let _ = bass.channel_set_attribute(mixer, bass::BASS_ATTRIB_VOL, 0.0);
     }
@@ -770,9 +606,6 @@ impl Player {
         track_path: &str,
         playback: &PlaybackTarget,
     ) {
-        // A manual switch ends any transition in flight. Both decks belong to the mix
-        // session, but the fast paths below only ever release `current_source` — the
-        // incoming deck would keep playing underneath the newly opened track.
         Self::clear_mix_crossfade(inner);
 
         if Self::can_gapless_reuse(inner, &playback.audio_path) {
@@ -853,7 +686,6 @@ impl Player {
             .map_err(|_| "BASS thread did not respond".to_string())?
     }
 
-    /// Initialize the BASS audio system. Must be called before any playback.
     pub fn init(&self) -> Result<(), String> {
         if self.bass_ready.load(Ordering::Acquire) {
             return Ok(());
@@ -865,7 +697,6 @@ impl Player {
         result
     }
 
-    /// Run a closure with the live `BassLibrary` on the BASS thread (for analysis etc.).
     pub fn with_bass<F, T>(&self, f: F) -> Result<T, String>
     where
         F: FnOnce(&BassLibrary) -> Result<T, String> + Send + 'static,
@@ -894,8 +725,6 @@ impl Player {
 
         let mut bass = BassLibrary::load(&inner.bass_dir)?;
 
-        // Device period/buffer must be set *before* BASS_Init — afterwards they
-        // only apply to subsequently initialized devices.
         let float_dsp_ok = bass.set_config(bass::BASS_CONFIG_FLOATDSP, 1).is_ok();
         Self::configure_output_device(&bass);
 
@@ -915,13 +744,8 @@ impl Player {
             .filter(|&freq| freq >= 8000)
             .unwrap_or(44100);
 
-        // Internet radio. Mixer never GetData's the URL (we pump on this thread),
-        // so a short READTIMEOUT is only a safety net if we pull with an empty
-        // download buffer — that used to EOF the live stream after ~0.5s.
         let _ = bass.set_config(bass::BASS_CONFIG_NET_META, 1);
         let _ = bass.set_config(bass::BASS_CONFIG_NET_TIMEOUT, 8000);
-        // 0 = wait for the next Icecast block instead of EOF'ing the decode
-        // stream. Mixer pulls at device rate, so this does not drain the buffer.
         let _ = bass.set_config(bass::BASS_CONFIG_NET_READTIMEOUT, 0);
         let _ = bass.set_config(bass::BASS_CONFIG_NET_BUFFER, 8000);
         let _ = bass.set_config(bass::BASS_CONFIG_NET_PREBUF, 20);
@@ -936,14 +760,12 @@ impl Player {
         let fx_dll = inner.bass_dir.join("bass_fx.dll");
         if fx_dll.is_file() {
             let path_str = fx_dll.to_string_lossy().to_string();
-            // Register bass_fx as a BASS plugin (for format support).
             match bass.plugin_load(&path_str) {
                 Ok(handle) => {
                     inner._plugin_handles.push(handle);
                 }
                 Err(error) => eprintln!("BASS FX plugin_load: {error}"),
             }
-            // Load bass_fx.dll directly to resolve tempo FX entry points.
             if bass.enable_fx_from_plugin(&fx_dll) {
                 eprintln!("BASS FX loaded (pitch-preserving tempo available)");
             } else {
@@ -958,8 +780,6 @@ impl Player {
         Ok(())
     }
 
-    /// Playback-buffer seconds plus the device latency. The meter DSP runs at
-    /// render time, which is this far ahead of the speakers.
     fn publish_meter_delay(bass: &BassLibrary, queued_secs: f32) {
         let device_ms = bass
             .get_info()
@@ -970,8 +790,6 @@ impl Player {
         crate::audio::levels::set_output_delay(queued_secs + device_ms as f32 / 1000.0);
     }
 
-    /// WASAPI shared-mode defaults (10ms period / 30ms buffer) underrun when
-    /// the CPU is busy. Other players keep 50–200ms of device buffering.
     fn configure_output_device(bass: &BassLibrary) {
         let _ = bass.set_config(bass::BASS_CONFIG_DEV_PERIOD, DEVICE_PERIOD_MS);
         let _ = bass.set_config(bass::BASS_CONFIG_DEV_BUFFER, DEVICE_BUFFER_MS);
@@ -994,10 +812,8 @@ impl Player {
             return;
         };
 
-        // Collect names we already successfully loaded so we don't duplicate attempts.
         let mut attempted: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-        // 1. Load known official format plugins first (better logging).
         for &plugin in BASS_FORMAT_PLUGINS {
             if attempted.contains(&plugin.to_lowercase()) {
                 continue;
@@ -1022,9 +838,6 @@ impl Player {
             }
         }
 
-        // 2. Auto-detect and load *any* other bass*.dll in the folder.
-        // Tracker plugins (basszxtune.dll and similar) are picked up from bin/bass,
-        // the same folder as bass.dll.
         for entry in entries.flatten() {
             let path = entry.path();
             let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
@@ -1044,7 +857,6 @@ impl Player {
             if NON_FORMAT_BASS_DLLS.iter().any(|&ex| lower == ex) {
                 continue;
             }
-            // Any remaining bass*.dll is a candidate for format plugin (tracker plugins etc.)
             if !lower.starts_with("bass") {
                 continue;
             }
@@ -1057,8 +869,6 @@ impl Player {
                     attempted.insert(lower);
                 }
                 Err(error) => {
-                    // Non-fatal. Many third-party tracker plugins are old and may
-                    // not be compatible with the current bass.dll version.
                     eprintln!("BASS plugin not loaded: {name} ({error})");
                     attempted.insert(lower);
                 }
@@ -1068,17 +878,12 @@ impl Player {
 
     fn create_mixer(inner: &mut PlayerInner) -> Result<(), String> {
         if let Some(bass) = inner.bass.as_ref() {
-            // Steady state: the DSP renders a full mixer buffer ahead of the speakers.
             Self::publish_meter_delay(bass, MIXER_BUFFER_SECS);
         }
         if inner.mixer_handle != 0 {
             return Ok(());
         }
         let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
-        // NONSTOP to keep mixer running (silent) between tracks.
-        // We manage gapless manually by adding next source near end of current (avoids
-        // keeping extra queued decode sources active during long playback, which can
-        // contribute to crackling/underruns over time).
         let flags = bass::BASS_MIXER_NONSTOP | bass::BASS_SAMPLE_FLOAT;
         let rate = if inner.output_rate >= 8000 {
             inner.output_rate
@@ -1087,11 +892,7 @@ impl Player {
         };
         let mixer = bass.mixer_stream_create(rate, 2, flags)?;
         let _ = bass.channel_set_attribute(mixer, bass::BASS_ATTRIB_BUFFER, MIXER_BUFFER_SECS);
-        // First mixer callback runs on BASS's WASAPI thread. Pin MMCSS there even
-        // when the EQ rack is empty (that DSP is otherwise not attached).
         let _ = bass.channel_set_dsp(mixer, mmcss_pin_dsp, i32::MIN + 1, std::ptr::null_mut());
-        // After the effect rack, before the extra-output tap. Reads the mix
-        // that is already in the buffer. Does not pull the decode source.
         crate::audio::levels::set_rate(rate);
         let _ = bass.channel_set_dsp(
             mixer,
@@ -1099,9 +900,7 @@ impl Player {
             -900_000,
             std::ptr::null_mut(),
         );
-        // Start the mixer (it will output silence until sources added, or play when first added).
         bass.channel_play(mixer, false)?;
-        // Set initial volume on mixer
         bass.channel_set_attribute(mixer, bass::BASS_ATTRIB_VOL, inner.volume)?;
         inner.mixer_handle = mixer;
         Self::reattach_extra_outputs(inner);
@@ -1150,8 +949,6 @@ impl Player {
         self.run_on_bass_thread(move |inner| Self::remove_extra_output_inner(inner, &output_id))
     }
 
-    /// Gain for one extra output only. The main output keeps the mixer volume,
-    /// so this never touches what the user hears in their own headphones.
     pub fn set_extra_output_volume(
         &self,
         output_id: &str,
@@ -1199,8 +996,6 @@ impl Player {
             );
         }
         let volume = volume.clamp(0.0, 1.0);
-        // Already attached: keep the output, just move it to the requested gain so a
-        // repeated add acts as "make sure this device plays at this volume".
         if let Some(existing) = inner
             .extra_outputs
             .iter_mut()
@@ -1231,9 +1026,6 @@ impl Player {
 
         Self::ensure_device_inited(inner, device_id)?;
         let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
-        // A splitter would need a decode source, but the mixer is a playing channel
-        // (see `create_mixer`), so `BASS_Split_StreamCreate` fails with error 38.
-        // The tap copies the mixer buffer into a push stream instead.
         let tap = output_tap::attach(bass, inner.mixer_handle, device_id, volume)?;
 
         let id = format!("out-{}", inner.next_extra_id);
@@ -1294,15 +1086,11 @@ impl Player {
     }
 
     fn reattach_extra_outputs(inner: &mut PlayerInner) {
-        // Carry the per-output gain across the restart, otherwise every extra output
-        // would come back at full volume after a device switch or Ctrl+R.
         let devices: Vec<(i32, f32)> = inner
             .extra_outputs
             .iter()
             .map(|o| (o.device, o.volume))
             .collect();
-        // The old mixer is already gone here, so the DSP dies with it; only the push
-        // streams need freeing. Pass mixer 0 to skip the remove-DSP call.
         let taps: Vec<OutputTap> = inner
             .extra_outputs
             .drain(..)
@@ -1350,17 +1138,11 @@ impl Player {
         self.chain.settings()
     }
 
-    /// Rack readout. Deliberately lock-free: the settings UI polls this at ~10 Hz
-    /// for the limiter meter, and a hop to the BASS thread would queue behind
-    /// whatever long operation (stream open, seek) is in flight.
     pub fn get_dsp_chain_status(&self) -> DspChainStatus {
         self.chain.status()
     }
 
     pub fn set_dsp_chain(&self, slots: Vec<ChainSlotSettings>) -> Result<(), String> {
-        // Reorder, add, remove and every slider drag are all just an ArcSwap store
-        // — no BASS call, so no main-thread hop. Only attaching or detaching the
-        // one chain DSP needs the BASS thread.
         let wants_dsp = !slots.is_empty();
         if wants_dsp == self.chain.is_attached() {
             self.chain.apply(&slots);
@@ -1378,8 +1160,6 @@ impl Player {
         Ok(())
     }
 
-    /// Make the mixer's DSP state match the rack: attached iff the rack is
-    /// non-empty. Also called after a mixer rebuild, which drops DSPs silently.
     fn sync_dsp_chain(inner: &mut PlayerInner) {
         if inner.mixer_handle == 0 {
             return;
@@ -1404,11 +1184,6 @@ impl Player {
         inner.chain.set_attached(false);
     }
 
-    /// Attach the rack to the mixer at `BASS_DSP_PRIORITY_FIRST`.
-    ///
-    /// Priority no longer encodes effect order — the rack does that internally —
-    /// so this only needs to be the first DSP the mixer runs, ahead of anything
-    /// else that might be attached later.
     fn attach_chain_to_mixer(inner: &mut PlayerInner) -> Result<(), String> {
         if inner.mixer_handle == 0 {
             return Ok(());
@@ -1440,7 +1215,6 @@ impl Player {
         ) {
             Ok(dsp) => dsp,
             Err(_) => {
-                // Fallback path does not force float, so re-derive the buffer format.
                 inner
                     .chain
                     .set_dsp_float_forced(info.flags & bass::BASS_SAMPLE_FLOAT != 0);
@@ -1467,13 +1241,9 @@ impl Player {
     ) -> Result<(), String> {
         let expected_current = expected_current.map(str::to_string);
         self.run_on_bass_thread(move |inner| {
-            // Mix Transition preview owns the device — don't let main library
-            // gapless queue rebuilds stomp the two-deck session.
             if inner.mix_preview_active {
                 return Ok(());
             }
-            // Queue refreshes are asynchronous. A refresh created for track N must
-            // never replace the queue after playback has already moved to N+1.
             if !Self::queue_refresh_matches(
                 inner.current_file.as_deref(),
                 expected_current.as_deref(),
@@ -1489,7 +1259,6 @@ impl Player {
         })
     }
 
-    /// Play a file. Reuses the open stream when advancing within the same audio image (CUE).
     pub fn play(
         &self,
         track_path: &str,
@@ -1503,23 +1272,10 @@ impl Player {
         let track_path_for_stats = track_path.clone();
         let audio_path = audio_path.map(str::to_string);
 
-        // Internet radio: `BASS_StreamCreateURL` blocks during connect. That call
-        // runs inside `play_inner` on the dedicated BASS thread (not the UI thread),
-        // so the window stays alive while a slow/dead station times out.
-
         let cleared_mix = self.run_on_bass_thread(move |inner| {
             let was_mix = inner.mix_preview_active;
             inner.mix_preview_active = false;
-            // A new manual play invalidates any armed transition; the frontend
-            // re-arms for the new edge once the track is open.
             inner.armed_mix = None;
-            // Install the queue/index only — do NOT preload the next track yet.
-            // Preloading before the current segment is open is wrong for single-image CUE:
-            // the next entry is the same audio file seeked to track 2's offset, and
-            // play_inner's can_use_preloaded (audio path match) would activate that
-            // source for track 1. With cue_start=0 activate_preloaded used to skip
-            // re-seek, so the first track immediately looked "ended" and gapless
-            // advanced to track 2. play_inner refreshes the preload after open.
             inner.gapless_queue = queue;
             inner.gapless_queue_index = 0;
             if let Some(index) = Self::find_gapless_queue_index(inner, &track_path) {
@@ -1533,9 +1289,7 @@ impl Player {
                 cue_end,
             )?;
             inner.user_paused = false;
-            // Record start time for this track (used to guard against early advance after manual que click)
             inner.current_track_start_time = Self::now_millis();
-            // Manual play: don't treat residual BASS "ended" frames as gapless advance.
             inner.suppress_gapless_until = inner
                 .current_track_start_time
                 .saturating_add(MANUAL_SEGMENT_SUPPRESS_MS);
@@ -1544,14 +1298,11 @@ impl Player {
         if cleared_mix {
             self.emit_mix_preview_active(false);
         }
-        // Wake the position poller out of idle sleep for gapless + seekbar.
         self.set_source_active(true);
-        // Count after BASS open succeeds (manual play / plugin / next-prev).
         self.record_play_stat(&track_path_for_stats);
         Ok(())
     }
 
-    /// Persist foobar-style play count for `track_path` (best-effort).
     fn record_play_stat(&self, track_path: &str) {
         let hook = self.play_hook.lock().clone();
         if let Some(hook) = hook {
@@ -1565,8 +1316,6 @@ impl Player {
             .get(inner.gapless_queue_index + 1)
             .cloned();
         if let Some(ref track) = inner.pending_next.clone() {
-            // Never preload a live URL — StreamCreateURL would stall the BASS thread
-            // for a station that isn't playing yet.
             if cue::is_stream_url(&track.audio_path) || cue::is_stream_url(&track.track_path) {
                 Self::clear_preload(inner);
             } else if let Err(error) = Self::preload_next(inner, track) {
@@ -1579,7 +1328,6 @@ impl Player {
 
     fn audio_path_key(path: &str) -> String {
         let p = path.trim();
-        // Windows extended-length prefix breaks naive equality with normal paths.
         let p = p
             .strip_prefix(r"\\?\")
             .or_else(|| p.strip_prefix("//?/"))
@@ -1598,7 +1346,6 @@ impl Player {
         Self::audio_path_key(a) == Self::audio_path_key(b)
     }
 
-    /// Virtual CUE paths (`file#cue:N`) and playlist paths — case/slash-normalized.
     fn same_track_path(a: &str, b: &str) -> bool {
         Self::same_audio_path(a, b)
     }
@@ -1625,10 +1372,6 @@ impl Player {
             && Self::same_track_path(&first.track_path, expected)
     }
 
-    /// Locate the playing entry in the gapless queue.
-    ///
-    /// Never match by bare audio path alone when several CUE tracks share one image —
-    /// that always resolved to index 0 and made gapless "jump" to the wrong track.
     fn find_gapless_queue_index(inner: &PlayerInner, track_path: &str) -> Option<usize> {
         if let Some(index) = inner
             .gapless_queue
@@ -1638,7 +1381,6 @@ impl Player {
             return Some(index);
         }
 
-        // Non-virtual path: allow a unique audio_path / track_path fallback.
         if cue::is_cue_track_path(track_path) {
             return None;
         }
@@ -1656,13 +1398,9 @@ impl Player {
     }
 
     fn can_gapless_reuse(inner: &PlayerInner, audio_path: &str) -> bool {
-        // Two decks are live and `current_audio_path` may already describe the
-        // incoming one (the display switches at the transition midpoint), so seeking
-        // "the open stream" would move the wrong deck. Open the track cleanly.
         if inner.mix_crossfade.is_some() {
             return false;
         }
-        // Live radio is not seekable — re-clicking a station must reconnect.
         if inner.live_source.is_some() || cue::is_stream_url(audio_path) {
             return false;
         }
@@ -1673,10 +1411,6 @@ impl Player {
                 .is_some_and(|current| Self::same_audio_path(current, audio_path))
     }
 
-    /// Preload is only valid for the exact playlist/virtual track it was built for.
-    /// Matching by audio path alone is wrong for single-image CUE albums (all tracks
-    /// share one file) — it activated track N's preload while playing track 1 and
-    /// immediately looked "ended".
     fn can_use_preloaded(inner: &PlayerInner, track_path: &str, _audio_path: &str) -> bool {
         if inner.preloaded_source == 0 {
             return false;
@@ -1684,7 +1418,6 @@ impl Player {
         if let Some(preloaded_track) = inner.preloaded_track_path.as_ref() {
             return Self::same_track_path(preloaded_track, track_path);
         }
-        // Legacy preload without track path: only safe for non-CUE unique files.
         if cue::is_cue_track_path(track_path) {
             return false;
         }
@@ -1693,8 +1426,6 @@ impl Player {
         })
     }
 
-    /// AAC/ALAC in MP4 often has encoder delay at the start (~40–50ms). Skipping it
-    /// on gapless *joins* removes a common hole between multi-file CUE tracks.
     fn gapless_join_start_secs(audio_path: &str, cue_start: Option<f64>) -> f64 {
         let start = cue_start.unwrap_or(0.0).max(0.0);
         if start > 0.001 {
@@ -1706,7 +1437,6 @@ impl Player {
             .unwrap_or("")
             .to_lowercase();
         if matches!(ext.as_str(), "m4a" | "mp4" | "aac" | "alac" | "m4b") {
-            // ~2112 samples @ 44.1 kHz — typical AAC priming.
             return 0.048;
         }
         0.0
@@ -1752,7 +1482,6 @@ impl Player {
             }
             inner.current_source = 0;
         }
-        // Note: do not detach DSP here — it stays on the mixer
         inner.current_audio_path = None;
         inner.cue_start = None;
         inner.cue_end = None;
@@ -1767,8 +1496,6 @@ impl Player {
         }
     }
 
-    /// Signal the sidecar ICY tap to exit. Do not join — the BASS thread must
-    /// not block on a socket read. The tap notices `stop` on the next chunk.
     fn abort_icy_tap(inner: &mut PlayerInner) {
         if let Some(stop) = inner.icy_tap_stop.take() {
             stop.store(true, Ordering::SeqCst);
@@ -1782,7 +1509,6 @@ impl Player {
         }
     }
 
-    /// Start (or restart, if the previous thread exited) the ICY sidecar.
     fn ensure_icy_tap(inner: &mut PlayerInner) {
         let Some(url) = inner.live_source.as_ref().map(|l| l.url.clone()) else {
             return;
@@ -1822,7 +1548,6 @@ impl Player {
         if let Some(bass) = bass {
             mix_filter::detach_mix_filter(bass, slot.source, slot.dsp, slot.ctx);
         }
-        // else ctx dropped with slot
     }
 
     fn clear_mix_crossfade(inner: &mut PlayerInner) {
@@ -1850,7 +1575,6 @@ impl Player {
                 Self::free_playback_channel(bass, src, dec);
             }
         } else {
-            // Drop filter boxes without BASS (process exit).
             drop(mix.from_filter);
             drop(mix.to_filter);
         }
@@ -1873,14 +1597,6 @@ impl Player {
         }
     }
 
-    /// Sample gain 0..1 from automation segments at mix-timeline time `mix_secs`.
-    /// Outside all segments → unity (1.0). Overlapping segments multiply.
-    /// Value to hold when no block covers `mix_secs`.
-    ///
-    /// DAW-style: the last block that already ended keeps its final value, and a
-    /// block still in the future pre-applies its first value. Without this a
-    /// fade-out would snap back to unity the instant its block ends — the
-    /// outgoing track would blare back in right after the mix.
     fn mix_env_hold_v(segments: &[MixVolSegment], mix_secs: f64) -> Option<f32> {
         let mut end_t = f64::NEG_INFINITY;
         let mut end_v = 1.0f32;
@@ -1939,13 +1655,11 @@ impl Player {
         }
     }
 
-    /// Envelope v 0..1 → rate 0.5×..2× (v=0.5 → 1×). Matches frontend `envelopeVToRate`.
     fn envelope_v_to_rate(v: f32) -> f32 {
         let x = v.clamp(0.0, 1.0) as f64;
         (2f64.powf((x - 0.5) * 2.0) as f32).clamp(0.25, 2.0)
     }
 
-    /// Speed multiplier from blocks (outside blocks → 1.0). Overlapping multiply.
     fn mix_speed_at(segments: &[MixVolSegment], mix_secs: f64) -> f32 {
         if segments.is_empty() {
             return 1.0;
@@ -1986,8 +1700,6 @@ impl Player {
             return;
         }
         let r = rate.clamp(0.25, 2.0);
-        // Match normal transport: tempo wrapper → TEMPO %; plain decode → FREQ.
-        // Always target the decode handle for FREQ (never the mixer wrapper).
         if Self::is_tempo_wrapped(bass, source, decode) {
             let _ = Self::slide_tempo_pct(bass, source, r, 0);
         } else {
@@ -2010,7 +1722,6 @@ impl Player {
             return 1.0;
         }
         let x = t.clamp(0.0, 1.0);
-        // Points expected sorted; tolerate unsorted.
         let mut pts: Vec<(f64, f64)> = points
             .iter()
             .map(|p| (p.t.clamp(0.0, 1.0), p.v.clamp(0.0, 1.0)))
@@ -2038,8 +1749,6 @@ impl Player {
         pts[pts.len() - 1].1 as f32
     }
 
-    /// Active filter cutoff at mix time. LP → min of active segments; HP → max.
-    /// `None` = bypass (no block covers this time).
     fn mix_filter_hz_at(
         segments: &[MixVolSegment],
         mix_secs: f64,
@@ -2072,13 +1781,10 @@ impl Player {
         if any {
             Some(val as f32)
         } else {
-            // Hold the neighbouring block's edge value instead of bypassing, so a
-            // filter sweep doesn't jump wide open the moment its block ends.
             Self::mix_env_hold_v(segments, mix_secs).map(|v| map_v(v as f64) as f32)
         }
     }
 
-    /// Drive per-deck volume + LP/HP + speed from mix-timeline automation blocks.
     fn apply_mix_volume_automation(inner: &mut PlayerInner) {
         if inner.bass.is_none() {
             return;
@@ -2103,7 +1809,6 @@ impl Player {
                 let mix = inner.mix_crossfade.as_ref().unwrap();
                 let bass = inner.bass.as_ref().unwrap();
                 let now = Self::now_millis();
-                // Includes silence-gap wall clock after prev ends early.
                 let mix_secs = Self::mix_timeline_secs(mix, bass, now);
                 let base = inner.playback_rate.clamp(0.25, 2.0);
                 let from_g = Self::mix_gain_at(&mix.from_vol, mix_secs);
@@ -2224,11 +1929,6 @@ impl Player {
             return;
         }
         let rate_f = (inner.playback_rate as f64).clamp(0.25, 2.0);
-        // Where the incoming deck belongs relative to the outgoing deck's live decoding
-        // point. The mix clock is wall-clock based and so ignores the mixer buffer, but a
-        // channel plugged into a running mixer joins at the decode point — reading the
-        // outgoing deck there is what keeps the two in step. Recomputed after the add,
-        // since the mixer keeps pulling while the channel is being attached.
         let aligned_abs = |bass: &BassLibrary| -> f64 {
             if from_source == 0 {
                 return to_cue;
@@ -2240,13 +1940,11 @@ impl Player {
                 .map(|abs| abs.max(to_cue))
                 .unwrap_or(to_cue)
         };
-        // Park at the exact graph time before the mixer eats samples.
         if let Some(bass) = inner.bass.as_ref() {
             let at = aligned_abs(bass);
             Self::seek_content_absolute(bass, pending.source, pending.decode, false, at);
         }
         if Self::add_source_to_mixer(inner, pending.source, true).is_ok() {
-            // Gain at inject time (mix clock ≈ to_delay).
             let g = inner
                 .mix_crossfade
                 .as_ref()
@@ -2261,7 +1959,6 @@ impl Player {
                 .is_some_and(|m| !m.to_lp.is_empty() || !m.to_hp.is_empty());
             if let Some(bass) = inner.bass.as_ref() {
                 let _ = bass.channel_set_attribute(pending.source, bass::BASS_ATTRIB_VOL, g);
-                // Re-snap after plug-in (mixer may have advanced a buffer).
                 let at = aligned_abs(bass);
                 Self::seek_content_absolute(bass, pending.source, pending.decode, true, at);
             }
@@ -2274,7 +1971,6 @@ impl Player {
                 None
             };
             if let Some(mix) = inner.mix_crossfade.as_mut() {
-                // Drop any stale to_filter from a prior inject.
                 if let Some(old) = mix.to_filter.take() {
                     if let Some(bass) = inner.bass.as_ref() {
                         mix_filter::detach_mix_filter(bass, old.source, old.dsp, old.ctx);
@@ -2289,16 +1985,10 @@ impl Player {
         }
     }
 
-    /// Mix-timeline seconds since preview start = **wall clock** (1× graph / playhead).
-    ///
-    /// Speed blocks retune audio only so one deck can match the other; automation
-    /// and inject delays stay locked to the layout clock, not content time
-    /// (which would race ahead when rate ≠ 1).
     fn mix_timeline_secs(mix: &MixCrossfadeState, _bass: &BassLibrary, now_ms: u64) -> f64 {
         (now_ms.saturating_sub(mix.mix_timeline_start_ms) as f64 / 1000.0).max(0.0)
     }
 
-    /// Drop previous only; keep pending next so a graph gap (silence) can pass.
     fn drop_mix_from_only(inner: &mut PlayerInner, mix_secs_at_drop: f64) {
         let Some(mix) = inner.mix_crossfade.as_mut() else {
             return;
@@ -2311,7 +2001,6 @@ impl Player {
         let from_filter = mix.from_filter.take();
         mix.from_source = 0;
         mix.from_decode = 0;
-        // Record wall mix-clock at drop (for diagnostics / future use).
         mix.from_ended_mix_secs = mix_secs_at_drop.max(0.0);
         mix.from_ended_at_ms = Self::now_millis();
 
@@ -2321,7 +2010,6 @@ impl Player {
             Self::free_playback_channel(bass, from_src, from_dec);
         }
         if inner.current_source == from_src {
-            // Silence until next inject — mixer stays NONSTOP.
             if mix.to_source != 0 {
                 inner.current_source = mix.to_source;
                 inner.current_decode = mix.to_decode;
@@ -2332,18 +2020,9 @@ impl Player {
         }
     }
 
-    /// Hand the *display* over to the incoming track mid-transition.
-    ///
-    /// Halfway through the transition block the incoming track is the one the listener
-    /// is following, so the UI should say so while the outgoing deck plays its tail
-    /// underneath. Only display-facing state moves: both decks keep running and the
-    /// real handoff still happens in `finish_mix_from_deck`.
-    ///
-    /// Returns the adopted path so the poller emits `player:track-changed` for it.
     fn adopt_mix_next_for_ui(inner: &mut PlayerInner) -> Option<String> {
         let (next_path, next_audio, cue_start, cue_end, to_src, to_dec) = {
             let mix = inner.mix_crossfade.as_mut()?;
-            // Nothing to adopt until the incoming deck is actually audible.
             if mix.ui_switched || mix.to_source == 0 {
                 return None;
             }
@@ -2362,8 +2041,6 @@ impl Player {
         inner.current_audio_path = Some(next_audio);
         inner.cue_start = cue_start;
         inner.cue_end = cue_end;
-        // Same test as `detect_cue_position_mode`, but against the incoming deck:
-        // `current_source` is still the outgoing one until the handoff.
         inner.cue_pos_relative = match (cue_start, inner.bass.as_ref()) {
             (Some(start), Some(bass)) if start > 0.05 => {
                 Self::content_absolute_secs(bass, to_src, to_dec, true) + 0.75 < start
@@ -2373,12 +2050,7 @@ impl Player {
         Some(next_path)
     }
 
-    /// Previous deck finished: drop it, keep next if already playing.
-    /// Does NOT force-inject a pending next before its graph delay — that would
-    /// kill intentional pauses between tracks on the timeline.
-    /// Returns the surviving next path when handoff succeeds.
     fn finish_mix_from_deck(inner: &mut PlayerInner) -> Option<String> {
-        // Only inject pending if its graph time has already arrived.
         let should_inject = inner.mix_crossfade.as_ref().is_some_and(|m| {
             m.pending_to.is_some() && {
                 let now = Self::now_millis();
@@ -2394,7 +2066,6 @@ impl Player {
         }
         let mut mix = inner.mix_crossfade.take()?;
 
-        // Detach prev filter before freeing the channel.
         let from_filter = mix.from_filter.take();
         Self::detach_mix_deck_filter(inner.bass.as_ref(), from_filter);
 
@@ -2407,7 +2078,6 @@ impl Player {
         mix.from_source = 0;
         mix.from_decode = 0;
 
-        // Still waiting for next's graph time — put mix state back without from.
         if mix.pending_to.is_some() && mix.to_source == 0 {
             if mix.from_ended_at_ms == 0 {
                 mix.from_ended_mix_secs = mix.from_duration_secs.max(0.0);
@@ -2428,17 +2098,12 @@ impl Player {
                 .is_some_and(|bass| bass.channel_is_active(to_src) != bass::BASS_ACTIVE_STOPPED);
             if to_live {
                 let next_path = mix.next_path;
-                // Prefer the still-playing next deck as the sole current source so
-                // get_state / end detection no longer key off the dead previous.
                 inner.current_source = to_src;
                 inner.current_decode = to_dec;
                 inner.current_file = Some(next_path.clone());
                 inner.current_audio_path = Some(mix.next_audio_path.clone());
                 inner.cue_start = mix.next_cue_start;
                 inner.cue_end = mix.next_cue_end;
-                // The UI may have adopted this track at the transition midpoint and
-                // already queued what follows it — replacing that with a one-entry
-                // queue here would strand playback at the end of this track.
                 let queue_ready = inner
                     .gapless_queue
                     .get(inner.gapless_queue_index)
@@ -2452,7 +2117,6 @@ impl Player {
                     }];
                     inner.gapless_queue_index = 0;
                 }
-                // Keep automation on next until the track ends.
                 let keep_fx = !mix.to_vol.is_empty()
                     || !mix.to_lp.is_empty()
                     || !mix.to_hp.is_empty()
@@ -2474,15 +2138,12 @@ impl Player {
                     Self::detach_mix_deck_filter(inner.bass.as_ref(), mix.to_filter);
                     inner.mix_vol_follow = None;
                 }
-                // Fresh start clock so the next deck isn't treated as "already
-                // past the spurious-end guard" from the mix open time.
                 let now = Self::now_millis();
                 inner.current_track_start_time = now;
                 inner.suppress_gapless_until = now.saturating_add(MANUAL_SEGMENT_SUPPRESS_MS);
                 Self::detect_cue_position_mode(inner);
                 return Some(next_path);
             }
-            // Next already finished — free it and fall through to full stop.
             Self::detach_mix_deck_filter(inner.bass.as_ref(), mix.to_filter);
             if let Some(bass) = inner.bass.as_ref() {
                 let _ = bass.mixer_channel_remove(to_src);
@@ -2490,7 +2151,6 @@ impl Player {
             }
         }
 
-        // Free pending if still held (shouldn't after inject).
         if let Some(p) = mix.pending_to {
             if let Some(bass) = inner.bass.as_ref() {
                 let _ = bass.mixer_channel_remove(p.source);
@@ -2503,12 +2163,10 @@ impl Player {
         None
     }
 
-    /// True if the mix session is still live (playing or intentional silence gap).
     fn mix_has_active_audio(inner: &PlayerInner) -> bool {
         let Some(mix) = inner.mix_crossfade.as_ref() else {
             return false;
         };
-        // Waiting for delayed next = session still active (silence is intentional).
         if mix.pending_to.is_some() {
             return true;
         }
@@ -2519,17 +2177,11 @@ impl Player {
         live(mix.from_source) || live(mix.to_source)
     }
 
-    /// Arm a saved editor transition on the track that is currently playing.
-    ///
-    /// Nothing happens until the playhead reaches `start_at_secs` — the position
-    /// poller then adopts the live source as the outgoing deck (see
-    /// `start_armed_mix`), so playlist mix mode never restarts the track.
     pub fn arm_mix(&self, mix: ArmedMix) -> Result<(), String> {
         if mix.from_path.trim().is_empty() || mix.to_path.trim().is_empty() {
             return Err("arm_mix: empty track path".to_string());
         }
         self.run_on_bass_thread(move |inner| {
-            // The Mix Transition window owns the device during preview.
             if inner.mix_preview_active {
                 return Ok(());
             }
@@ -2538,7 +2190,6 @@ impl Player {
         })
     }
 
-    /// Drop any armed transition (mix mode off, edge changed, playlist switched).
     pub fn disarm_mix(&self) -> Result<(), String> {
         self.run_on_bass_thread(|inner| {
             inner.armed_mix = None;
@@ -2546,12 +2197,6 @@ impl Player {
         })
     }
 
-    /// End of the saved layout on the mix clock: how late the mix may still be
-    /// entered and still be the transition the user drew.
-    ///
-    /// The frontend sends the layout's own span, which covers a bare transition
-    /// container with no automation in it. Envelope ends are the floor for older
-    /// payloads that predate the field.
     fn armed_mix_span_secs(armed: &ArmedMix) -> f64 {
         let lanes: [&Vec<MixVolSegment>; 8] = [
             &armed.from_vol,
@@ -2570,7 +2215,6 @@ impl Player {
             .fold(armed.span_secs.max(0.0), f64::max)
     }
 
-    /// Has the armed transition reached its start on the outgoing track?
     fn poll_armed_mix(inner: &mut PlayerInner) {
         if inner.mix_preview_active || inner.user_paused || inner.mix_crossfade.is_some() {
             return;
@@ -2592,7 +2236,6 @@ impl Player {
         if inner.current_source == 0 || inner.mixer_handle == 0 {
             return;
         }
-        // Right after a manual play / seek BASS can report the previous position.
         if Self::now_millis() < inner.suppress_gapless_until {
             return;
         }
@@ -2603,10 +2246,6 @@ impl Player {
             if bass.channel_is_active(inner.mixer_handle) != bass::BASS_ACTIVE_PLAYING {
                 return;
             }
-            // Decoding point, not heard point: envelope writes and the incoming deck
-            // both act on the samples the mixer is filling right now, so the mix clock
-            // has to start from that same content position (as it does in the preview,
-            // where both decks are built before the mixer ever runs).
             Self::content_decode_secs(bass, inner.current_source, inner.current_decode)
                 .unwrap_or_else(|| {
                     Self::content_absolute_secs(
@@ -2620,12 +2259,8 @@ impl Player {
         if abs + 0.02 < start_at {
             return;
         }
-        // Poll granularity (and a forward seek into the zone) can land past the
-        // layout origin — enter the mix that far in instead of replaying it late.
         let rate = inner.playback_rate.clamp(0.25, 2.0) as f64;
         let overshoot = ((abs - start_at) / rate).max(0.0);
-        // Seeking clean past the whole layout means the transition is over: firing it
-        // now would only hard-cut to the incoming deck. Let gapless handle the end.
         let span = inner
             .armed_mix
             .as_ref()
@@ -2641,12 +2276,6 @@ impl Player {
         }
     }
 
-    /// Turn the armed transition into a live two-deck mix around the running source.
-    ///
-    /// The outgoing deck is **not** re-opened: `current_source` keeps playing and
-    /// simply becomes `from_source`, so there is no flush click at the cut. Only the
-    /// incoming deck is created here. `overshoot_secs` is how far past mix time 0 the
-    /// poll landed; the mix clock is back-dated by it so the saved layout still lines up.
     fn start_armed_mix(inner: &mut PlayerInner, overshoot_secs: f64) -> Result<(), String> {
         let from_source = inner.current_source;
         let from_decode = inner.current_decode;
@@ -2674,8 +2303,6 @@ impl Player {
         let pitch = inner.pitch_enabled;
         let now = Self::now_millis();
         let rate_f = (rate as f64).clamp(0.25, 2.0);
-        // Late past the incoming deck's entry → open it already that far in.
-        // Graph time is consumed at playback rate, so content advances by rate·time.
         let to_start = to_base + (over - graph_delay).max(0.0) * rate_f;
 
         let decode = Self::create_decode_source(inner, &to_pb.audio_path, to_pb.cue_start)?;
@@ -2683,10 +2310,6 @@ impl Player {
             let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
             Self::wrap_decode_for_rate(bass, decode, rate, pitch)?
         };
-        // Where the incoming deck belongs relative to the outgoing deck's live decoding
-        // point. Re-read at every step rather than reused: opening and rate-wrapping the
-        // stream takes real time and the mixer keeps pulling meanwhile, so seeding from
-        // the poll's estimate is what let the incoming track enter late.
         let aligned_abs = |bass: &BassLibrary| -> f64 {
             Self::content_decode_secs(bass, from_source, from_decode)
                 .map(|from_abs| {
@@ -2696,7 +2319,6 @@ impl Player {
                 .max(to_base)
         };
         if let Some(bass) = inner.bass.as_ref() {
-            // A delayed deck is parked at its own start and re-snapped on injection.
             let at = if delay_left <= 0.001 {
                 aligned_abs(bass)
             } else {
@@ -2705,7 +2327,6 @@ impl Player {
             Self::seek_content_absolute(bass, to_raw, to_raw_decode, false, at);
         }
 
-        // Mixer is already running — the incoming deck joins it mid-flight.
         let mut to_source = 0u32;
         let mut to_decode = 0u32;
         let mut pending_to = None;
@@ -2721,7 +2342,6 @@ impl Player {
             if let Some(bass) = inner.bass.as_ref() {
                 let g = Self::mix_gain_at(&armed.to_vol, over);
                 let _ = bass.channel_set_attribute(to_raw, bass::BASS_ATTRIB_VOL, g);
-                // Re-snap after plug-in: attaching the channel is not instant either.
                 Self::seek_content_absolute(bass, to_raw, to_raw_decode, true, aligned_abs(bass));
             }
         } else {
@@ -2731,7 +2351,6 @@ impl Player {
             });
         }
 
-        // The mix owns both decks now — normal gapless must not race it.
         Self::clear_preload(inner);
         inner.pending_next = None;
         inner.gapless_queue.clear();
@@ -2785,7 +2404,6 @@ impl Player {
             },
             to_graph_delay_secs: graph_delay,
             from_cue_start: from_cue,
-            // Back-date so a late poll doesn't shift the whole saved layout.
             mix_timeline_start_ms: now.saturating_sub((over * 1000.0).round().max(0.0) as u64),
             from_ended_mix_secs: 0.0,
             from_ended_at_ms: 0,
@@ -2807,17 +2425,10 @@ impl Player {
             from_filter,
             to_filter,
         });
-        // Seed gains / cutoffs / rates at the current mix time before the next tick.
         Self::apply_mix_volume_automation(inner);
         Ok(())
     }
 
-    /// Two-deck mix: play as laid out on the timeline.
-    ///
-    /// - `to_delay_secs > 0`: next is later on the mix timeline — start it after that delay at `to_cue_start`.
-    /// - `from_duration_secs`: how long previous keeps playing from its cue start (to end of track).
-    /// - `from_vol` / `to_vol`: optional gain envelopes (mix timeline from preview start).
-    /// - `from_lp` / `from_hp` / `to_lp` / `to_hp`: cutoff envelopes (normalized v → Hz).
     pub fn play_mix_crossfade(
         &self,
         from_path: &str,
@@ -2828,7 +2439,6 @@ impl Player {
         to_audio: Option<&str>,
         to_cue_start: Option<f64>,
         to_cue_end: Option<f64>,
-        // Delay before next deck (later on mix timeline). from_duration: how long prev runs.
         to_delay_secs: f64,
         from_duration_secs: f64,
         from_vol: Vec<MixVolSegment>,
@@ -2848,7 +2458,6 @@ impl Player {
         let to_delay = to_delay_secs.max(0.0);
         let from_dur = from_duration_secs.max(0.0);
         let from_path_for_stats = from_path_owned.clone();
-        // Frontend passes cue_start only when that deck should play from t=0 of preview.
         let enable_from = from_cue_start.is_some();
         let enable_to = to_cue_start.is_some() || to_delay > 0.0;
 
@@ -2868,8 +2477,6 @@ impl Player {
                 Some(cue::resolve_playback(
                     &to_path,
                     to_audio.as_deref(),
-                    // When delayed, start next at the beginning of its audible range
-                    // (caller already set cue_start to 0 or the mapped in-point).
                     to_cue_start,
                     to_cue_end,
                 )?)
@@ -2899,8 +2506,6 @@ impl Player {
             inner.cue_end = None;
             inner.cue_pos_relative = false;
 
-            // Keep mixer STOPPED while we open both decks — if we restart/play
-            // early, prev starts alone and next always sounds late vs the graph.
             if let Some(bass) = inner.bass.as_ref() {
                 if inner.mixer_handle != 0 {
                     let _ =
@@ -2919,7 +2524,6 @@ impl Player {
             let volume = inner.volume;
             let now = Self::now_millis();
 
-            // 1) Open + wrap BOTH sources fully (no mixer yet).
             let mut from_src = 0u32;
             let mut from_tracked = 0u32;
             let mut from_start = 0.0f64;
@@ -2930,7 +2534,6 @@ impl Player {
                     let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
                     Self::wrap_decode_for_rate(bass, decode, rate, pitch)?
                 };
-                // Re-seek after tempo wrap so both decks share a clean start point.
                 if let Some(bass) = inner.bass.as_ref() {
                     Self::seek_content_absolute(bass, src, tracked, false, from_start);
                 }
@@ -2964,11 +2567,9 @@ impl Player {
                 }
             }
 
-            // Initial gains at mix t=0 (envelope start).
             let from_g0 = Self::mix_gain_at(&from_vol, 0.0);
             let to_g0 = Self::mix_gain_at(&to_vol, 0.0);
 
-            // 2) Add active decks while mixer is still paused, then one synchronized start.
             if from_src != 0 {
                 Self::add_source_to_mixer(inner, from_src, true)?;
             }
@@ -2987,11 +2588,9 @@ impl Player {
                 }
                 let _ =
                     bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_VOL, volume);
-                // restart=true: both plugged sources begin the same output clock tick.
                 let _ = bass.channel_play(inner.mixer_handle, true);
             }
 
-            // UI position follows previous while it lives, else next.
             if from_src != 0 {
                 inner.current_source = from_src;
                 inner.current_decode = from_tracked;
@@ -3014,10 +2613,8 @@ impl Player {
                 .map(|p| (p.audio_path.clone(), p.cue_start, p.cue_end))
                 .unwrap_or_default();
 
-            // Graph delay of next is always the original to_delay (even if already injected).
             let graph_delay = if from_src != 0 { to_delay } else { 0.0 };
 
-            // Attach LP/HP DSP only when that deck has filter blocks.
             let from_filter = if from_src != 0 && (!from_lp.is_empty() || !from_hp.is_empty()) {
                 inner
                     .bass
@@ -3034,7 +2631,6 @@ impl Player {
             } else {
                 None
             };
-            // Seed cutoffs at t=0 before first poll.
             if let Some(ref f) = from_filter {
                 f.ctx.set_targets(
                     Self::mix_filter_hz_at(&from_lp, 0.0, mix_filter::envelope_v_to_lp_hz, true),
@@ -3053,10 +2649,7 @@ impl Player {
                 from_decode: from_tracked,
                 to_source: to_src,
                 to_decode: to_tracked,
-                // Drop previous after this much *audio* time (not wall clock).
                 from_duration_secs: if from_src != 0 { from_dur } else { 0.0 },
-                // Use prev deck audio time for inject (not wall clock) so next
-                // lands on the same mix timeline as the waveform.
                 to_delay_secs: if pending_to.is_some() { to_delay } else { 0.0 },
                 to_graph_delay_secs: graph_delay,
                 from_cue_start: from_start,
@@ -3068,8 +2661,6 @@ impl Player {
                 next_audio_path: next_audio,
                 next_cue_start: next_cs,
                 next_cue_end: next_ce,
-                // Editor preview: the Mix Transition window drives its own display,
-                // and the main window is frozen for the duration.
                 ui_switch_secs: None,
                 ui_switched: false,
                 from_vol,
@@ -3083,11 +2674,9 @@ impl Player {
                 from_filter,
                 to_filter,
             });
-            // Only-to preview: mix_crossfade owns vol + filters for the whole session.
             inner.gapless_queue.clear();
             inner.gapless_queue_index = 0;
 
-            // Seed vol / filter / speed automation at t=0 (don't wait for first poll).
             Self::apply_mix_volume_automation(inner);
 
             inner.mix_preview_active = true;
@@ -3110,23 +2699,18 @@ impl Player {
         inner.cue_end = playback.cue_end;
     }
 
-    /// Map a raw BASS position read onto the absolute file timeline (CUE INDEX space).
     fn content_timeline_secs(inner: &PlayerInner, reported_secs: f64) -> f64 {
         let start = inner.cue_start.unwrap_or(0.0);
         let reported = reported_secs.max(0.0);
-        // Prefer the flag when set; also recover if detection lagged after a seek.
         if inner.cue_pos_relative {
             return reported + start;
         }
         if start > 0.05 && reported + 0.35 < start {
-            // Looks segment-relative even if the flag is stale.
             return reported + start;
         }
         reported
     }
 
-    /// After open/seek to a CUE segment, detect whether BASS reports absolute file
-    /// time or 0-based time from the seek point (common with mixer+decode).
     fn detect_cue_position_mode(inner: &mut PlayerInner) {
         let start = inner.cue_start.unwrap_or(0.0);
         if start <= 0.05 || inner.current_source == 0 {
@@ -3137,15 +2721,11 @@ impl Player {
             inner.cue_pos_relative = false;
             return;
         };
-        // Prefer decode-handle read (true content timeline).
         let reported =
             Self::content_absolute_secs(bass, inner.current_source, inner.current_decode, true);
-        // Seek target was `start`; if we read ~0, channel is segment-relative.
-        // Allow a bit of slack for encoder-delay skips (~50ms) and mix latency.
         inner.cue_pos_relative = reported + 0.75 < start;
     }
 
-    /// Seek an already-open source (CUE) to segment without reopening.
     fn apply_segment(
         inner: &mut PlayerInner,
         track_path: &str,
@@ -3153,22 +2733,18 @@ impl Player {
     ) -> Result<(), String> {
         let source = inner.current_source;
         if source == 0 {
-            // fallback
             return Self::open_stream(inner, track_path, playback);
         }
         let target = playback.cue_start.unwrap_or(0.0).max(0.0);
         {
             let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
-            // Content-timeline seek (handles tempo wrappers correctly).
             Self::seek_content_absolute(bass, source, inner.current_decode, true, target);
-            // Make sure mixer is running
             if bass.channel_is_active(inner.mixer_handle) != bass::BASS_ACTIVE_PLAYING {
                 let _ = bass.channel_play(inner.mixer_handle, false);
             }
         }
         Self::apply_segment_metadata(inner, track_path, playback);
         Self::detect_cue_position_mode(inner);
-        // Manual CUE seeks can briefly report the old absolute position → false end.
         inner.suppress_gapless_until =
             Self::now_millis().saturating_add(MANUAL_SEGMENT_SUPPRESS_MS);
         Ok(())
@@ -3183,10 +2759,6 @@ impl Player {
         audio_path: &str,
         cue_start: Option<f64>,
     ) -> Result<u32, String> {
-        // Internet radio / web streams: open a URL decode stream. These have no
-        // finite length, never prescan and are never seeked — return early before
-        // the file-based path below (which waits for a length and honors cue_start).
-        // Runs on the dedicated BASS thread; connect is bounded by NET_TIMEOUT.
         if cue::is_stream_url(audio_path) {
             return Self::open_url_decode(inner, audio_path.trim());
         }
@@ -3226,16 +2798,9 @@ impl Player {
                 | "psg"
         );
 
-        // Tracker files are loaded via BASS_MusicLoad (better compatibility with module plugins).
-        // Regular audio uses StreamCreateFile.
         let flags = if is_tracker {
             bass::BASS_SAMPLE_FLOAT | bass::BASS_MUSIC_DECODE | bass::BASS_MUSIC_RAMPS
         } else {
-            // No PRESCAN on named files: much faster track start and manual switching.
-            // Prescan is only useful for accurate seeking in VBR MP3 without good headers.
-            // Extensionless audio (osu! files) is often that VBR MP3. Without a scan,
-            // BASS reports no length and a seek is ignored.
-            // ASYNCFILE: disk reads happen off the WASAPI callback.
             let mut flags =
                 bass::BASS_SAMPLE_FLOAT | bass::BASS_STREAM_DECODE | bass::BASS_ASYNCFILE;
             if ext.is_empty() {
@@ -3246,11 +2811,8 @@ impl Player {
 
         let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
 
-        // Try the preferred method first. For trackers we prefer MusicLoad because
-        // most module plugins (including many chiptune ones) register via the music API.
         let source = if is_tracker {
             bass.music_load(audio_path, flags).or_else(|e| {
-                // Fallback: some plugins only work through StreamCreateFile
                 if e.contains("unsupported file format") {
                     bass.stream_create_file(
                         audio_path,
@@ -3265,8 +2827,6 @@ impl Player {
         }
         .map_err(|error| format!("{error} — file: {}", audio_path))?;
 
-        // Very short wait so length becomes available quickly, but we don't block long.
-        // This is critical for fast manual play.
         for _ in 0..8 {
             if bass.channel_get_length(source, bass::BASS_POS_BYTE) > 0 {
                 break;
@@ -3280,9 +2840,6 @@ impl Player {
         Ok(source)
     }
 
-    /// Plug a decode/tempo channel into the mixer.
-    /// `norampin = true` for gapless joins (instant); `false` lets BASS ramp the channel
-    /// in (manual track switches — less clicky with non-zero first samples).
     fn add_source_to_mixer(
         inner: &mut PlayerInner,
         source: u32,
@@ -3292,9 +2849,6 @@ impl Player {
         if inner.mixer_handle == 0 {
             return Err("Mixer not created".to_string());
         }
-        // No AUTOFREE: rate/pitch rebuilds re-add the channel; AUTOFREE would free decode
-        // and false-trigger end detection.
-        // DOWNMIX is a no-op for stereo sources and saves surround radio streams.
         let add_flags = if norampin {
             bass::BASS_MIXER_CHAN_NORAMPIN | bass::BASS_MIXER_CHAN_DOWNMIX
         } else {
@@ -3340,8 +2894,6 @@ impl Player {
         }
     }
 
-    /// Icecast/Shoutcast decode streams die if we GetData faster than the
-    /// download. Plug the URL into the mixer and let it pull at device rate.
     fn maybe_reconnect_live_url(inner: &mut PlayerInner) {
         if inner.user_paused {
             return;
@@ -3389,8 +2941,6 @@ impl Player {
         }
     }
 
-    /// Add a live URL decode stream to the mixer. Do not GetData it ourselves —
-    /// draining the download buffer EOF's Icecast after a few seconds.
     fn plug_live_url(
         inner: &mut PlayerInner,
         url_handle: u32,
@@ -3411,12 +2961,6 @@ impl Player {
         Ok((url_handle, 0))
     }
 
-    /// Open an internet radio / web stream as a decode source.
-    ///
-    /// Tries float first (matches the mixer), then integer if the server/codec
-    /// rejects it. After connect, wait briefly so headers/codec are parsed —
-    /// adding an unconfigured DECODE stream to the mixer makes ChannelGetData
-    /// stall the BASS update thread (no audio, Ctrl+R hangs).
     fn open_url_decode(inner: &mut PlayerInner, url: &str) -> Result<u32, String> {
         let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
         crate::audio::stream_debug::log(format!("StreamCreateURL begin {url}"));
@@ -3492,13 +3036,10 @@ impl Player {
         track_path: &str,
         playback: &PlaybackTarget,
     ) -> Result<(), String> {
-        // Teardown previous source (remove from mixer).
         Self::teardown_current(inner);
         Self::clear_preload(inner);
 
         let is_live = cue::is_stream_url(&playback.audio_path);
-        // Flush leftover file audio with silence *before* the URL connect so
-        // ChannelPlay(restart) is not waiting on a stream that has no data yet.
         if is_live {
             Self::flush_mixer_hard(inner);
         }
@@ -3518,8 +3059,6 @@ impl Player {
 
         if let Some(bass) = inner.bass.as_ref() {
             if is_live {
-                // Do not linger at VOL=0: radio has no "first sample click" and a
-                // failed fade-in is indistinguishable from a dead stream.
                 if bass.channel_is_active(inner.mixer_handle) != bass::BASS_ACTIVE_PLAYING {
                     let play_ok = bass.channel_play(inner.mixer_handle, false);
                     crate::audio::stream_debug::log(format!("mixer play(false) → {play_ok:?}"));
@@ -3556,8 +3095,6 @@ impl Player {
         Self::apply_segment_metadata(inner, track_path, playback);
         Self::detect_cue_position_mode(inner);
 
-        // The rack lives on the mixer, which survives track changes — but a
-        // rebuilt mixer would drop the DSP silently.
         Self::sync_dsp_chain(inner);
         Ok(())
     }
@@ -3575,8 +3112,6 @@ impl Player {
             .as_ref()
             .is_some_and(|current| Self::same_audio_path(current, &playback.audio_path))
         {
-            // Same-image CUE transitions reuse the active source. Do not leave a
-            // preload from an older queue around after drag-reordering.
             Self::clear_preload(inner);
             return Ok(());
         }
@@ -3587,12 +3122,9 @@ impl Player {
 
         Self::clear_preload(inner);
 
-        // For gapless joins into AAC/M4A, skip encoder delay so the first samples
-        // aren't silent padding (big contributor to multi-file CUE holes).
         let join_start = Self::gapless_join_start_secs(&playback.audio_path, playback.cue_start);
         let source = Self::create_decode_source(inner, &playback.audio_path, Some(join_start))?;
 
-        // Decode+position only — not in the mixer until the cut.
         let rate = inner.playback_rate;
         let pitch_enabled = inner.pitch_enabled;
         let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
@@ -3611,8 +3143,6 @@ impl Player {
         Ok(())
     }
 
-    /// Open next file and swap into the mixer without a full open_stream hard-restart.
-    /// Used when preload missed (first join) so WAV/CUE still gapless-ish.
     fn open_next_seamless(
         inner: &mut PlayerInner,
         track_path: &str,
@@ -3639,8 +3169,6 @@ impl Player {
                 let _ = bass.mixer_channel_remove(old_source);
                 Self::free_playback_channel(bass, old_source, old_decode);
             }
-            // Leave mixer volume alone: gapless must not re-slam VOL (clicks).
-            // Manual callers re-apply volume with a short fade after this.
             if bass.channel_is_active(inner.mixer_handle) != bass::BASS_ACTIVE_PLAYING {
                 let _ = bass.channel_play(inner.mixer_handle, false);
             }
@@ -3655,7 +3183,6 @@ impl Player {
         Ok(())
     }
 
-    /// Gapless file→file join: add preloaded next, drop current, never restart mixer.
     fn activate_preloaded(
         inner: &mut PlayerInner,
         track_path: &str,
@@ -3665,7 +3192,6 @@ impl Player {
         let matches = Self::can_use_preloaded(inner, track_path, &playback.audio_path);
 
         if preloaded == 0 || !matches {
-            // First join often has no warm preload — still avoid open_stream hard restart.
             return Self::open_next_seamless(inner, track_path, playback);
         }
 
@@ -3673,15 +3199,12 @@ impl Player {
         let old_decode = inner.current_decode;
         let preloaded_decode = inner.preloaded_decode;
 
-        // Snap to segment start before plugging in (content timeline).
         if !cue::is_stream_url(&playback.audio_path) {
             let start = Self::gapless_join_start_secs(&playback.audio_path, playback.cue_start);
             let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
             Self::seek_content_absolute(bass, preloaded, preloaded_decode, false, start.max(0.0));
         }
 
-        // Order: add next (playing) → remove old. Mixer stays running (no play restart).
-        // NORAMPIN: gapless must not ramp; manual path fades mixer VOL around this.
         Self::add_source_to_mixer(inner, preloaded, true)?;
 
         if let Some(bass) = inner.bass.as_ref() {
@@ -3689,8 +3212,6 @@ impl Player {
                 let _ = bass.mixer_channel_remove(old_source);
                 Self::free_playback_channel(bass, old_source, old_decode);
             }
-            // Leave mixer volume alone: gapless must not re-slam VOL (clicks).
-            // Manual callers re-apply volume with a short fade after this.
             if bass.channel_is_active(inner.mixer_handle) != bass::BASS_ACTIVE_PLAYING {
                 let _ = bass.channel_play(inner.mixer_handle, false);
             }
@@ -3732,17 +3253,12 @@ impl Player {
             same_file && Self::cue_segments_are_contiguous(inner.cue_end, playback.cue_start);
 
         if continuous_segment {
-            // Physically adjacent segments in one image stay on the open timeline.
             Self::apply_segment_metadata(inner, &next.track_path, &playback);
             inner.cue_pos_relative = false;
         } else if same_file {
-            // Reordered CUE queues can jump 3 -> 5 or 5 -> 4 inside one image.
-            // Mute and flush before seeking: the mixer can already contain ~0.5s
-            // of the physical neighbour at the old volume.
             Self::flush_mixer_hard(inner);
             Self::apply_segment(inner, &next.track_path, &playback)?;
             if let Some(bass) = inner.bass.as_ref() {
-                // Flush any silence produced between the first reset and the seek.
                 Self::restart_mixer_with_buffer(bass, inner.mixer_handle);
                 Self::set_mixer_volume_from_silence(
                     bass,
@@ -3758,8 +3274,6 @@ impl Player {
 
         inner.gapless_queue_index = next_index;
         inner.user_paused = false;
-        // Reset so the next track gets its own anti-spurious end window
-        // (critical for chains of sub-second tracks).
         inner.current_track_start_time = Self::now_millis();
         Self::refresh_pending_next(inner);
         Ok(next.track_path)
@@ -3772,16 +3286,11 @@ impl Player {
         cue_start: Option<f64>,
         cue_end: Option<f64>,
     ) -> Result<(), String> {
-        // Soft-cut the old track first. Hard VOL=0 / channel remove while still
-        // audible is the click on manual next/prev — seek doesn't hit this path
-        // the same way because content continues under a brief dip.
         Self::fade_out_for_manual_switch(inner);
         Self::cancel_pending_pause(inner);
 
         let playback =
             cue::resolve_playback(track_path, audio_path, cue_start, cue_end).map_err(|error| {
-                // resolve_playback already names the missing file. Appending
-                // `(track: …)` printed the same path twice.
                 if error.contains(track_path) {
                     error
                 } else {
@@ -3792,8 +3301,6 @@ impl Player {
         Self::begin_manual_track_switch(inner, track_path, &playback);
 
         if Self::can_gapless_reuse(inner, &playback.audio_path) {
-            // CUE same-file: seek within the already-open stream (instant, no reopening).
-            // Already faded to silence above.
             if let Some(bass) = inner.bass.as_ref() {
                 if inner.mixer_handle != 0 {
                     let _ =
@@ -3801,10 +3308,6 @@ impl Player {
                 }
             }
             Self::apply_segment(inner, track_path, &playback)?;
-            // Always flush the mixer buffer on a manual track switch.
-            // Even if the mixer is playing, it holds up to buffer_size ms of old audio.
-            // For gapless auto-advance we skip this (seamless), but for manual switches
-            // the user wants the new segment to start immediately.
             if let Some(bass) = inner.bass.as_ref() {
                 Self::restart_mixer_with_buffer(bass, inner.mixer_handle);
                 Self::set_mixer_volume_from_silence(
@@ -3814,13 +3317,10 @@ impl Player {
                     MANUAL_SWITCH_FADE_IN_MS,
                 );
             }
-            // Re-detect after the hard flush — position can look 0-based for a frame.
             Self::detect_cue_position_mode(inner);
         } else if Self::can_use_preloaded(inner, track_path, &playback.audio_path) {
-            // Fast path for manual next/prev when the track was preloaded for gapless.
             Self::activate_preloaded(inner, track_path, &playback)?;
             if let Some(bass) = inner.bass.as_ref() {
-                // Preload path skips open_stream restart — flush stale buffer then soft-in.
                 Self::restart_mixer_with_buffer(bass, inner.mixer_handle);
                 Self::set_mixer_volume_from_silence(
                     bass,
@@ -3845,12 +3345,10 @@ impl Player {
         let start = inner.cue_start.unwrap_or(0.0);
         let reported = reported_secs.max(0.0);
         let relative = if inner.cue_pos_relative || (start > 0.05 && reported + 0.35 < start) {
-            // Channel already counts from segment start.
             reported
         } else {
             (reported - start).max(0.0)
         };
-        // Clamp to known CUE segment so the seekbar never shoots past 100%.
         if let (Some(s), Some(e)) = (inner.cue_start, inner.cue_end) {
             let seg = (e - s).max(0.0);
             if seg > 0.0 {
@@ -3869,7 +3367,6 @@ impl Player {
     }
 
     fn absolute_seek_position(inner: &PlayerInner, relative_secs: f64) -> f64 {
-        // Always target the real file timeline on the decode handle.
         let start = inner.cue_start.unwrap_or(0.0);
         let mut absolute = start + relative_secs.max(0.0);
         if let (Some(start), Some(end)) = (inner.cue_start, inner.cue_end) {
@@ -3892,7 +3389,6 @@ impl Player {
             return;
         }
         if tracked_decode != 0 && tracked_decode != mixer_channel {
-            // Free tempo wrapper first (no FREESOURCE → source is not auto-freed).
             let _ = bass.channel_free(mixer_channel);
             let _ = bass.channel_free(tracked_decode);
             return;
@@ -3929,8 +3425,6 @@ impl Player {
         44100.0
     }
 
-    /// Explicit sample rate for a playback multiplier. Never returns 0: BASS treats
-    /// FREQ=0 as "default" only for SetAttribute; SlideAttribute would ramp to 0 Hz.
     fn freq_rate_target(bass: &BassLibrary, handle: u32, rate: f32) -> f32 {
         Self::base_freq(bass, handle) * rate.max(0.01)
     }
@@ -3940,8 +3434,6 @@ impl Player {
         let _ = bass.channel_set_attribute(handle, bass::BASS_ATTRIB_FREQ, target);
     }
 
-    /// If FREQ is still the BASS default (0), materialize the real base Hz.
-    /// Sliding from 0 would ramp through near-silence instead of from 1.0×.
     fn ensure_explicit_freq(bass: &BassLibrary, handle: u32) {
         match bass.channel_get_attribute(handle, bass::BASS_ATTRIB_FREQ) {
             Ok(freq) if freq > 1.0 => {}
@@ -3986,7 +3478,6 @@ impl Player {
         Ok(())
     }
 
-    /// Read the rate BASS is currently producing (including mid-slide).
     fn read_current_rate(
         bass: &BassLibrary,
         channel: u32,
@@ -4006,13 +3497,11 @@ impl Player {
         let base = Self::base_freq(bass, decode);
         match bass.channel_get_attribute(decode, bass::BASS_ATTRIB_FREQ) {
             Ok(freq) if freq > 1.0 && base > 0.0 => (freq / base).clamp(0.25, 2.0),
-            // 0 = BASS "use default frequency" → rate 1.0
             Ok(freq) if freq <= 1.0 => 1.0,
             _ => fallback,
         }
     }
 
-    /// Mark (or clear) live-radio bookkeeping after a source is plugged in.
     fn sync_live_source(inner: &mut PlayerInner, audio_path: &str) {
         if cue::is_stream_url(audio_path) {
             inner.live_source = Some(LiveStreamState::new(audio_path.to_string()));
@@ -4021,8 +3510,6 @@ impl Player {
         }
     }
 
-    /// Tempo wrappers read-ahead and can stall forever on an endless URL. Live
-    /// radio only ever gets a FREQ rate change, never BASS_FX tempo.
     fn wrap_source_for_playback(
         bass: &BassLibrary,
         decode: u32,
@@ -4040,9 +3527,6 @@ impl Player {
         Self::wrap_decode_for_rate(bass, decode, rate, pitch_enabled)
     }
 
-    /// Build the channel that should be fed into the mixer for the given decode source.
-    /// Returns `(mixer_channel, tracked_decode)` where `tracked_decode` is non-zero only
-    /// when a tempo wrapper owns the underlying decode stream.
     fn wrap_decode_for_rate(
         bass: &BassLibrary,
         decode: u32,
@@ -4052,7 +3536,6 @@ impl Player {
         let _ = bass.channel_set_attribute(decode, bass::BASS_ATTRIB_FREQ, 0.0);
         let _ = bass.channel_set_attribute(decode, bass::BASS_ATTRIB_TEMPO, 0.0);
 
-        // Pitch-coupled (or no FX): change sample rate on the decode stream.
         if pitch_enabled || !bass.has_fx() {
             if (rate - 1.0).abs() >= 0.001 {
                 Self::apply_freq_rate(bass, decode, rate);
@@ -4060,8 +3543,6 @@ impl Player {
             return Ok((decode, 0));
         }
 
-        // Pitch-preserving mode: always keep a tempo wrapper so speed changes never
-        // rebuild the mixer graph mid-playback (rebuilds cause clicks/rattling).
         let tempo = bass.fx_tempo_create(decode, bass::BASS_STREAM_DECODE)?;
         let _ =
             bass.channel_set_attribute(tempo, bass::BASS_ATTRIB_TEMPO_OPTION_PREVENT_CLICK, 1.0);
@@ -4081,12 +3562,7 @@ impl Player {
             .unwrap_or(0)
     }
 
-    /// Read ICY tags from the active live stream and, when the now-playing title
-    /// or the station name changes, return an update payload for the UI. Runs on
-    /// the BASS thread; internally rate-limited so tag reads don't spin every tick.
     fn poll_live_metadata(inner: &mut PlayerInner) -> Option<StreamMetadataPayload> {
-        // Minimum gap between ICY tag reads. Stations announce every track (tens of
-        // seconds); 1s keeps changes near-instant without hammering the decoder.
         const ICY_PROBE_INTERVAL_MS: u64 = 1000;
 
         Self::ensure_icy_tap(inner);
@@ -4225,12 +3701,6 @@ impl Player {
         }
     }
 
-    /// Absolute content position (seconds on the original file timeline).
-    ///
-    /// FREQ and tempo channels use different byte timelines at rate ≠ 1; the
-    /// underlying decode handle can run ahead while filling the mixer. Read the
-    /// mixer-facing channel position, then map its output timeline to content time.
-    /// Using the decode position directly makes one poll cross several CUE bounds.
     fn content_absolute_secs(
         bass: &BassLibrary,
         mixer_channel: u32,
@@ -4240,17 +3710,6 @@ impl Player {
         Self::content_position_secs(bass, mixer_channel, tracked_decode, in_mixer).unwrap_or(0.0)
     }
 
-    /// Content position of a mixer source at the point the mixer has **decoded** to —
-    /// the samples it is filling its playback buffer with, not the ones being heard.
-    ///
-    /// `BASS_Mixer_ChannelGetPosition` deliberately subtracts the mixer's playback
-    /// buffer so it can report what is audible (and rejects `BASS_POS_DECODE`). The
-    /// source's own `BASS_ChannelGetPosition` is the decoding point: the mixer pulls
-    /// the source, so its position is exactly how far the mix has been rendered.
-    ///
-    /// A deck added to a running mixer joins there, and envelope writes land there
-    /// too — both must be aligned against this, not against the heard position, which
-    /// trails it by up to `MIXER_BUFFER_SECS`.
     fn content_decode_secs(
         bass: &BassLibrary,
         mixer_channel: u32,
@@ -4273,7 +3732,6 @@ impl Player {
         } else {
             bass.channel_get_position(mixer_channel, bass::BASS_POS_BYTE)
         };
-        // BASS returns -1 on failure.
         if pos == u64::MAX {
             return None;
         }
@@ -4292,16 +3750,6 @@ impl Player {
         ))
     }
 
-    /// Where the incoming deck must sit, in absolute content seconds, so it lands at
-    /// its graph position relative to the outgoing deck.
-    ///
-    /// Layout rule (identical in preview and playback): content(t) = cue + t·rate,
-    /// with the incoming deck's timeline delayed by `graph_delay`. Substituting the
-    /// outgoing deck's live decoding position for t gives
-    ///
-    ///   to_abs = from_abs + (to_cue − from_cue) − graph_delay·rate
-    ///
-    /// `graph_delay` is consumed at playback rate, so the product uses the real rate.
     fn aligned_mix_deck_abs(
         from_abs: f64,
         from_cue: f64,
@@ -4328,9 +3776,6 @@ impl Player {
         output_secs.max(0.0)
     }
 
-    /// Seek the mixer-facing channel so content is at `abs_secs` on the file timeline.
-    /// Includes `0.0` — CUE track 1 often starts at INDEX 01 00:00:00, and skipping
-    /// that seek left a later preloaded segment position in place.
     fn seek_content_absolute(
         bass: &BassLibrary,
         mixer_channel: u32,
@@ -4348,7 +3793,6 @@ impl Player {
         }
         let clamped = abs_secs.clamp(0.0, (content_len - 0.05).max(0.0));
 
-        // Tempo output timeline is shorter/longer than content; map by fraction.
         let out_len = Self::stream_duration_secs(bass, mixer_channel);
         let seek_secs = if out_len > 0.001 && (out_len - content_len).abs() > 0.02 {
             (clamped / content_len) * out_len
@@ -4364,8 +3808,6 @@ impl Player {
         }
     }
 
-    /// Full reopen of the current track at the same content position.
-    /// Used for pitch topology switches (FREQ ↔ tempo) which cannot be done in place safely.
     fn reopen_current_preserving_position(inner: &mut PlayerInner) -> Result<(), String> {
         let track_path = inner
             .current_file
@@ -4389,8 +3831,6 @@ impl Player {
         let playback =
             cue::resolve_playback(&track_path, audio_path.as_deref(), cue_start, cue_end)?;
 
-        // open_stream tears down old handles (now properly StreamFree'd) and wraps
-        // with the current pitch_enabled / playback_rate.
         Self::open_stream(inner, &track_path, &playback)?;
 
         if inner.live_source.is_some() {
@@ -4409,8 +3849,6 @@ impl Player {
                 let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_VOL, 0.0);
                 let _ = bass.channel_pause(inner.mixer_handle);
             } else {
-                // open_stream already restarted + faded in at segment start; re-seek and
-                // soft-restore so the topology switch itself does not click.
                 let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_VOL, 0.0);
                 Self::restart_mixer_with_buffer(bass, inner.mixer_handle);
                 Self::set_mixer_volume_from_silence(
@@ -4431,7 +3869,6 @@ impl Player {
     }
 
     fn reapply_at_rate_with_slide(inner: &mut PlayerInner, rate: f32, slide_ms: u32) {
-        // Live radio: FREQ only. Tempo wrap / reopen would stall on the URL.
         if inner.live_source.is_some() {
             if let Some(bass) = inner.bass.as_ref() {
                 if inner.current_source != 0 {
@@ -4471,7 +3908,6 @@ impl Player {
             }
             Ok(_) => {}
             Err(_) => {
-                // Topology switch while changing rate: reopen at same position.
                 inner.suppress_gapless_until = Self::now_millis().saturating_add(2500);
                 if let Err(e) = Self::reopen_current_preserving_position(inner) {
                     eprintln!("Rate mode reopen failed: {e}");
@@ -4480,7 +3916,6 @@ impl Player {
         }
 
         if had_preload {
-            // Preload was built under a possibly different topology — rebuild.
             Self::clear_preload(inner);
             Self::refresh_pending_next(inner);
         }
@@ -4495,12 +3930,10 @@ impl Player {
         if let Some(end) = inner.cue_end {
             return end;
         }
-        // Prefer decode length (content timeline) when tempo-wrapped.
         let decode = Self::decode_handle_for_channel(bass, handle, inner.current_decode);
         Self::stream_duration_secs(bass, decode)
     }
 
-    /// `reported_secs` is the raw BASS read (may be absolute or segment-relative).
     fn track_ending(inner: &PlayerInner, bass: &BassLibrary, reported_secs: f64) -> bool {
         if inner.current_source == 0 {
             return false;
@@ -4510,21 +3943,16 @@ impl Player {
             return false;
         }
         let start = inner.cue_start.unwrap_or(0.0);
-        // Degenerate / missing bounds must never auto-fire end (that causes
-        // immediate multi-track skip right after clicking a CUE entry).
         if end <= start + 0.05 {
             return false;
         }
         let timeline = Self::content_timeline_secs(inner, reported_secs);
-        // Must have actually reached the segment — ignore stale high positions
-        // only when they still sit *before* this track's start (previous CUE).
         if start > 0.05 && timeline + 0.5 < start {
             return false;
         }
         timeline + GAPLESS_END_EPSILON_SECS >= end
     }
 
-    /// True when a STOPPED source is a real end-of-track, not a mid-switch glitch.
     fn stream_done_is_real_end(
         inner: &PlayerInner,
         bass: &BassLibrary,
@@ -4537,23 +3965,18 @@ impl Player {
         if inner.user_paused {
             return false;
         }
-        // Source already torn down — poll recovery path; trust after spurious guard.
         if inner.current_source == 0 {
             return true;
         }
         let end = Self::track_end_position(inner, bass, inner.current_source);
         if !end.is_finite() || end <= 0.0 {
-            // Unknown length — trust BASS only after the spurious guard.
             return true;
         }
         let start = inner.cue_start.unwrap_or(0.0);
         let timeline = Self::content_timeline_secs(inner, reported_secs);
-        // Near / past expected end on the content timeline.
         if timeline + 1.25 >= end {
             return start <= 0.05 || timeline + 0.25 >= start;
         }
-        // Some codecs reset position to 0 the moment the decode ends. Fall back
-        // to wall-clock: only accept STOPPED if we've played most of the segment.
         let segment = (end - start).max(0.0);
         if segment <= 0.05 {
             return false;
@@ -4563,7 +3986,6 @@ impl Player {
         age_ms >= min_play_ms.max(POLL_INTERVAL_MS)
     }
 
-    /// Segment length in ms (CUE bounds or full stream). 0 if unknown.
     fn current_segment_duration_ms(inner: &PlayerInner, bass: &BassLibrary) -> u64 {
         if inner.current_source == 0 {
             return 0;
@@ -4577,18 +3999,12 @@ impl Player {
         }
     }
 
-    /// Whether enough time has passed since play() to trust an "ended" signal.
-    /// Long tracks keep a 1.5s anti-spurious window; sub-second tracks use a
-    /// duration-capped window so they can still gapless-advance / emit ended.
     fn past_spurious_end_guard(inner: &PlayerInner, bass: &BassLibrary) -> bool {
         let age = Self::now_millis().saturating_sub(inner.current_track_start_time);
         let segment_ms = Self::current_segment_duration_ms(inner, bass);
         let guard_ms = if segment_ms == 0 {
             SPURIOUS_END_GUARD_MS
         } else {
-            // Allow advance once we've roughly reached the real end (50ms slack),
-            // but never wait longer than the long-track spurious window.
-            // Floor at one poll interval so open-glitch frames are still ignored.
             segment_ms
                 .saturating_sub(50)
                 .clamp(POLL_INTERVAL_MS, SPURIOUS_END_GUARD_MS)
@@ -4598,7 +4014,6 @@ impl Player {
 
     pub fn pause(&self) -> Result<(), String> {
         let _ops = self.ops.lock();
-        // Start the fade-out immediately (Spotify-style smooth tail)
         let (fade_started, gen) = self.run_on_bass_thread(|inner| {
             if inner.mixer_handle != 0 {
                 inner.user_paused = true;
@@ -4622,10 +4037,6 @@ impl Player {
         })?;
 
         if fade_started {
-            // Schedule the actual pause after the fade has played out.
-            // This lets the full musical fade be heard (like Spotify).
-            // We pass the generation so that if user plays a new track in the meantime,
-            // the stale pause does nothing.
             let this = self.clone();
             std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_millis(PAUSE_FADE_MS as u64 + 10));
@@ -4654,7 +4065,6 @@ impl Player {
             let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
             if inner.mixer_handle != 0 {
                 let target = inner.volume;
-                // Force start from silence, play, then musical fade-in (Spotify style)
                 let _ = bass.channel_set_attribute(inner.mixer_handle, bass::BASS_ATTRIB_VOL, 0.0);
                 bass.channel_play(inner.mixer_handle, false)?;
                 bass.channel_slide_attribute(
@@ -4696,8 +4106,6 @@ impl Player {
         Ok(())
     }
 
-    /// Stop playback and free the BASS audio device.
-    /// Called on window close so that audio does not continue playing after the app has exited.
     pub fn shutdown(&self) -> Result<(), String> {
         self.bass_ready.store(false, Ordering::Release);
         self.run_on_bass_thread(|inner| {
@@ -4708,7 +4116,6 @@ impl Player {
                 if inner.mixer_handle != 0 {
                     let _ = bass.channel_stop(inner.mixer_handle);
                 }
-                // Free releases the output device and stops any background audio threads.
                 let _ = bass.free();
             }
             inner.mixer_handle = 0;
@@ -4727,14 +4134,10 @@ impl Player {
         })
     }
 
-    /// Seek to a position in seconds.
-    /// Mute → jump + mixer flush → short fade-in (avoids post-seek clicks).
-    /// While paused, position updates but playback stays paused (arrow keys / scrub).
     pub fn seek(&self, position_secs: f64) -> Result<(), String> {
         let _ops = self.ops.lock();
         self.run_on_bass_thread(move |inner| {
             if inner.live_source.is_some() {
-                // Live radio has no timeline to seek.
                 return Ok(());
             }
             if inner.current_source == 0 || inner.mixer_handle == 0 {
@@ -4755,30 +4158,22 @@ impl Player {
 
             {
                 let bass = inner.bass.as_ref().ok_or("BASS not initialized")?;
-                // Silent through the flush so restart doesn't spit a full-volume edge.
                 let _ = bass.channel_set_attribute(mixer, bass::BASS_ATTRIB_VOL, SEEK_DIP_LEVEL);
 
-                // Content timeline (decode) — correct for tempo wrappers and CUE segments.
                 Self::seek_content_absolute(bass, source, decode, true, absolute_secs);
 
-                // Flush mixer buffer so the new position is heard immediately.
-                // channel_play restarts the mixer — re-pause if we were paused.
                 Self::restart_mixer_with_buffer(bass, mixer);
 
                 if was_paused {
                     let _ = bass.channel_pause(mixer);
-                    // Match post-pause-fade state: silent until resume.
                     let _ = bass.channel_set_attribute(mixer, bass::BASS_ATTRIB_VOL, 0.0);
                 } else {
                     Self::set_mixer_volume_from_silence(bass, mixer, target, SEEK_FADE_IN_MS);
                 }
             }
 
-            // Re-probe absolute vs segment-relative reporting after the seek.
             Self::detect_cue_position_mode(inner);
-            // Don't gapless-advance on a post-seek STOPPED glitch.
             inner.suppress_gapless_until = if seeks_to_segment_end {
-                // Seeking to 100% is an intentional request to advance.
                 0
             } else {
                 Self::now_millis().saturating_add(MANUAL_SEGMENT_SUPPRESS_MS)
@@ -4791,20 +4186,15 @@ impl Player {
         })
     }
 
-    /// Set volume (0.0 — 1.0).
     pub fn set_volume(&self, vol: f32) -> Result<(), String> {
         self.run_on_bass_thread(move |inner| {
             let next = vol.clamp(0.0, 1.0);
-            // Skip no-op writes so bootstrap re-apply after Ctrl+R does not cancel
-            // an in-flight VOL slide or touch the device for nothing.
             if (inner.volume - next).abs() < 0.0005 {
                 return Ok(());
             }
             inner.volume = next;
             if let Some(bass) = inner.bass.as_ref() {
                 if inner.mixer_handle != 0 {
-                    // While paused the mixer is intentionally silent (post fade-out).
-                    // Only store the target — resume() fades back up to inner.volume.
                     if !inner.user_paused {
                         bass.channel_set_attribute(
                             inner.mixer_handle,
@@ -4818,16 +4208,10 @@ impl Player {
         })
     }
 
-    /// Set playback rate (0.25 — 2.0).
-    ///
-    /// Uses a fixed-duration BASS attribute slide (FREQ or TEMPO) so the change is
-    /// sample-accurate and always takes the same intentional time.
     pub fn set_playback_rate(&self, rate: f32) -> Result<(), String> {
         self.apply_playback_rate(rate, PLAYBACK_RATE_RAMP_MS)
     }
 
-    /// Snap to `rate` with no slide. Track changes use this so the new file does
-    /// not spend a second gliding away from the previous track's speed.
     pub fn set_playback_rate_immediate(&self, rate: f32) -> Result<(), String> {
         self.apply_playback_rate(rate, 0)
     }
@@ -4837,17 +4221,11 @@ impl Player {
         self.run_on_bass_thread(move |inner| {
             inner.playback_rate = rate;
 
-            // While a transition runs, both decks are retuned every poll tick from
-            // `playback_rate` × their speed envelope. Re-applying here would fight
-            // that automation, and a topology rebuild would reopen a deck that is
-            // audible right now — the mix picks the new base up on the next tick.
             if inner.mix_crossfade.is_some() || inner.mix_vol_follow.is_some() {
                 inner.applied_playback_rate = rate;
                 return Ok(());
             }
 
-            // Prefer the live attribute (mid-slide). Do not trust applied alone —
-            // a second identical request while still ramping must keep sliding.
             let from = if let Some(bass) = inner.bass.as_ref() {
                 Self::read_current_rate(
                     bass,
@@ -4860,7 +4238,6 @@ impl Player {
             };
 
             if (from - rate).abs() < 0.0005 {
-                // Already there: snap to exact value (cancels any residual slide).
                 Self::reapply_at_rate_with_slide(inner, rate, 0);
                 inner.applied_playback_rate = rate;
                 return Ok(());
@@ -4872,7 +4249,6 @@ impl Player {
         })
     }
 
-    /// When enabled, playback speed also shifts pitch. When disabled, tempo FX preserves pitch.
     pub fn set_pitch_enabled(&self, enabled: bool) -> Result<(), String> {
         self.run_on_bass_thread(move |inner| {
             if inner.pitch_enabled == enabled {
@@ -4881,8 +4257,6 @@ impl Player {
             inner.pitch_enabled = enabled;
             let rate = inner.playback_rate;
 
-            // FREQ ↔ tempo is a graph rebuild. In-place rebuild left the source
-            // STOPPED and gapless advanced the queue — reopen at content position.
             if inner.current_source != 0 {
                 inner.suppress_gapless_until = Self::now_millis().saturating_add(2500);
                 if let Err(e) = Self::reopen_current_preserving_position(inner) {
@@ -4891,7 +4265,6 @@ impl Player {
                 }
             }
 
-            // Preload was built under the old topology — drop and rebuild.
             Self::clear_preload(inner);
             Self::refresh_pending_next(inner);
 
@@ -4909,7 +4282,6 @@ impl Player {
             .unwrap_or(1.0)
     }
 
-    /// Release a stream that finished playing (must run before AUTOFREE-style invalidation).
     pub fn release_ended_stream(&self) {
         let was_mix = if self.on_bass_thread() {
             Self::release_ended_stream_inner(&mut self.inner.lock())
@@ -4922,20 +4294,14 @@ impl Player {
         }
     }
 
-    /// Returns true if a mix-preview session was active (caller should emit).
     fn release_ended_stream_inner(inner: &mut PlayerInner) -> bool {
         Self::teardown_current(inner);
         inner.user_paused = false;
-        // Natural end of mix preview (or any stream) must release device ownership
-        // so the main library is not stuck frozen after Preview finishes.
         let was_mix = inner.mix_preview_active;
         inner.mix_preview_active = false;
-        // Do not stop the mixer here — it allows smoother resume / next play.
-        // Full stop() command will handle explicit stop.
         was_mix
     }
 
-    /// Get a snapshot of the current player state.
     pub fn get_state(&self) -> PlayerStateSnapshot {
         if self.on_bass_thread() {
             return Self::get_state_inner(&mut self.inner.lock());
@@ -4954,15 +4320,9 @@ impl Player {
     }
 
     fn get_state_inner(inner: &mut PlayerInner) -> PlayerStateSnapshot {
-        // Dual-deck mix: current_source may still be the previous track after it
-        // ended, while next is still playing. Prefer any live mix deck so the
-        // poller does not emit track-ended and tear down the surviving deck.
         if inner.mix_crossfade.is_some() && Self::mix_has_active_audio(inner) {
             let mix = inner.mix_crossfade.as_ref().unwrap();
             let bass = inner.bass.as_ref().unwrap();
-            // Once the display has moved to the incoming track (transition midpoint),
-            // position and duration must come from its deck — otherwise the seekbar
-            // shows the outgoing track's clock under the new title.
             let (src, dec) = if mix.ui_switched && mix.to_source != 0 {
                 (mix.to_source, mix.to_decode)
             } else if mix.from_source != 0
@@ -5010,10 +4370,6 @@ impl Player {
             };
         }
 
-        // Live radio stream: no finite length or seek. Position is elapsed wall-clock
-        // since playback started (minus paused time); duration stays 0 so the UI
-        // renders a live indicator instead of a seekbar. A stalled stream still
-        // reports Playing (BASS is buffering) — never Stopped, which would advance.
         if let Some(live) = inner.live_source.as_ref() {
             if inner.current_source != 0 && inner.mixer_handle != 0 && inner.bass.is_some() {
                 let file_name = inner.current_file.as_ref().map(|f| f.clone());
@@ -5062,8 +4418,6 @@ impl Player {
         let src_active: PlaybackState = src_active_raw.into();
         let mixer_active: PlaybackState = mixer_active_raw.into();
 
-        // Mixer with NONSTOP keeps PLAYING (silence) after last source ends.
-        // Report Stopped based on the *source* being gone or ended.
         let source_ended = src_active == PlaybackState::Stopped || inner.current_source == 0;
         let decode =
             Self::decode_handle_for_channel(bass, inner.current_source, inner.current_decode);
@@ -5104,8 +4458,6 @@ impl Player {
                 .to_string()
         });
 
-        // Respect logical user_paused so that pause() reports paused state immediately
-        // (for UI) even while the musical fade-out is still in progress on the mixer.
         let (report_playing, report_paused, report_state) = if inner.user_paused {
             (false, true, PlaybackState::Paused)
         } else {
@@ -5128,7 +4480,6 @@ impl Player {
         }
     }
 
-    /// Load a BASS addon DLL by path (useful for additional tracker plugins).
     pub fn load_addon(&self, path: &str) -> Result<(), String> {
         let path = path.to_string();
         self.run_on_bass_thread(move |inner| {
@@ -5146,21 +4497,10 @@ impl Player {
         })
     }
 
-    /// Poll playback on the BASS thread and emit position / track-ended events.
-    ///
-    /// BASS must only be called from the thread that invoked `BASS_Init` (the
-    /// dedicated `muzeeka-bass` thread). Uses one long-lived worker that hops
-    /// there — never the UI/main thread.
-    ///
-    /// While a source is active, gapless polls at [`POLL_INTERVAL_MS`]. When idle
-    /// (no source), the worker sleeps [`POLL_IDLE_MS`] and **skips** BASS hops
-    /// so the audio thread is not poked 20×/s with an empty player.
-    /// UI position IPC is further throttled via [`UI_EMIT_HOT_MS`] / cold.
     pub fn start_position_emitter(&self, sink: EventSink) {
         let player = self.clone();
         let was_playing = Arc::new(StdMutex::new(false));
         let last_rpc_state = Arc::new(StdMutex::new(None::<PlaybackState>));
-        // Force an immediate position push on the first Playing tick.
         let last_rpc_sync = Arc::new(StdMutex::new(
             Instant::now()
                 .checked_sub(Duration::from_millis(RPC_POSITION_SYNC_MS))
@@ -5174,37 +4514,33 @@ impl Player {
 
         let _ = thread::Builder::new()
             .name("muzeeka-position-poll".into())
-            .spawn(move || {
-                loop {
-                    let active = player.is_source_active();
-                    let sleep_ms = if active {
-                        POLL_INTERVAL_MS
-                    } else {
-                        POLL_IDLE_MS
-                    };
-                    thread::sleep(Duration::from_millis(sleep_ms));
+            .spawn(move || loop {
+                let active = player.is_source_active();
+                let sleep_ms = if active {
+                    POLL_INTERVAL_MS
+                } else {
+                    POLL_IDLE_MS
+                };
+                thread::sleep(Duration::from_millis(sleep_ms));
 
-                    // Still idle after sleep (and play() didn't arm the flag) —
-                    // do not bounce the UI/BASS thread for a no-op poll.
-                    if !player.is_source_active() {
-                        continue;
-                    }
-
-                    let sink_emit = sink.clone();
-                    let player_for_main = player.clone();
-                    let was_for_main = was_playing.clone();
-                    let rpc_for_main = last_rpc_state.clone();
-                    let rpc_sync_for_main = last_rpc_sync.clone();
-                    let ui_emit_for_main = last_ui_emit.clone();
-                    Self::position_poll_tick(
-                        &sink_emit,
-                        &player_for_main,
-                        &was_for_main,
-                        &rpc_for_main,
-                        &rpc_sync_for_main,
-                        &ui_emit_for_main,
-                    );
+                if !player.is_source_active() {
+                    continue;
                 }
+
+                let sink_emit = sink.clone();
+                let player_for_main = player.clone();
+                let was_for_main = was_playing.clone();
+                let rpc_for_main = last_rpc_state.clone();
+                let rpc_sync_for_main = last_rpc_sync.clone();
+                let ui_emit_for_main = last_ui_emit.clone();
+                Self::position_poll_tick(
+                    &sink_emit,
+                    &player_for_main,
+                    &was_for_main,
+                    &rpc_for_main,
+                    &rpc_sync_for_main,
+                    &ui_emit_for_main,
+                );
             });
     }
 
@@ -5251,7 +4587,6 @@ impl Player {
                     } else {
                         44_100
                     };
-                    // Stereo float mixer: 8 bytes per frame already waiting to play.
                     let queued_secs =
                         (bass.channel_data_available(inner.mixer_handle) / 8) as f32 / rate as f32;
                     Self::publish_meter_delay(bass, queued_secs);
@@ -5260,25 +4595,18 @@ impl Player {
             if inner.mixer_handle == 0 || inner.bass.is_none() {
                 return Ok(None);
             }
-            // Allow current_source==0 during intentional silence gap (pending next).
             if inner.current_source == 0 && inner.mix_crossfade.is_none() {
                 return Ok(None);
             }
 
             let now = Self::now_millis();
-            // Playlist mix mode: a saved transition may be due on this very tick.
-            // Checked before gapless so the mix wins the end of the outgoing track.
             if inner.armed_mix.is_some() {
                 Self::poll_armed_mix(inner);
             }
-            // Mix timeline: inject next only when graph delay has elapsed
-            // (never early when prev ends — that kills user-planned pauses).
-            // Drop prev when its remaining length is done (audio time or STOPPED).
             if inner.mix_crossfade.is_some() {
                 let (inject, drop_from, mix_secs, delay_left, ui_switch_due) = {
                     let mix = inner.mix_crossfade.as_ref().unwrap();
                     let bass = inner.bass.as_ref().unwrap();
-                    // Graph / playhead clock (1× wall) — not content time under Speed.
                     let mix_secs = Self::mix_timeline_secs(mix, bass, now);
                     let inject =
                         mix.pending_to.is_some() && mix_secs + 0.002 >= mix.to_graph_delay_secs;
@@ -5286,14 +4614,11 @@ impl Player {
                     if mix.from_source != 0 {
                         let from_stopped =
                             bass.channel_is_active(mix.from_source) == bass::BASS_ACTIVE_STOPPED;
-                        // End prev when the *layout* says so (or stream already dry).
                         let duration_done = mix.from_duration_secs > 0.0
                             && mix_secs + 0.05 >= mix.from_duration_secs;
                         drop_from = from_stopped || duration_done;
                     }
                     let delay_left = mix.to_graph_delay_secs - mix_secs;
-                    // Playlist mix mode: the display follows the incoming track from
-                    // the middle of the transition, long before the outgoing deck dies.
                     let ui_switch_due = !mix.ui_switched
                         && mix.to_source != 0
                         && mix.ui_switch_secs.is_some_and(|at| mix_secs + 0.002 >= at);
@@ -5303,7 +4628,6 @@ impl Player {
                     Self::inject_pending_to_deck(inner);
                 }
                 if drop_from {
-                    // Prev done but next still in the future on the graph → silence gap.
                     let wait_for_next = inner
                         .mix_crossfade
                         .as_ref()
@@ -5313,11 +4637,8 @@ impl Player {
                         Self::apply_mix_volume_automation(inner);
                         return Ok(None);
                     }
-                    // The display already moved to this track mid-transition; a second
-                    // track-changed would only reset its position back to zero.
                     let ui_done = inner.mix_crossfade.as_ref().is_some_and(|m| m.ui_switched);
                     let path = Self::finish_mix_from_deck(inner);
-                    // Apply follow-volume immediately after handoff.
                     Self::apply_mix_volume_automation(inner);
                     return Ok(if ui_done { None } else { path });
                 }
@@ -5326,24 +4647,16 @@ impl Player {
                     Self::apply_mix_volume_automation(inner);
                     return Ok(adopted);
                 }
-                // Drive volume envelopes every poll tick while dual-deck is live.
                 Self::apply_mix_volume_automation(inner);
-                // Still in mix session — no normal gapless / end teardown.
                 return Ok(None);
             }
-            // Surviving next deck after handoff — keep envelope running.
             if inner.mix_vol_follow.is_some() {
                 Self::apply_mix_volume_automation(inner);
             }
-            // Live radio stream: never auto-advance, never tear down on transient
-            // stalls. ICY now-playing metadata is polled separately (below) so the
-            // emit can run with the AppHandle outside this BASS closure.
             if inner.live_source.is_some() {
                 Self::maybe_reconnect_live_url(inner);
                 return Ok(None);
             }
-            // Pitch/rate topology rebuild and seeks can briefly look "ended".
-            // Never advance or tear down during the suppress window.
             if now < inner.suppress_gapless_until {
                 return Ok(None);
             }
@@ -5356,8 +4669,6 @@ impl Player {
                 } else {
                     bass::BASS_ACTIVE_STOPPED
                 };
-                // Content timeline (decode handle) — required for correct CUE INDEX end detection
-                // with tempo wrappers and for absolute-vs-relative seek reporting.
                 let reported = Self::content_absolute_secs(
                     bass,
                     inner.current_source,
@@ -5367,10 +4678,8 @@ impl Player {
 
                 let playing = mixer_active == bass::BASS_ACTIVE_PLAYING && !inner.user_paused;
                 let ending = playing && Self::track_ending(inner, bass, reported);
-                // Source ended (or no source) means the track is done, even if mixer is still "playing" silence (NONSTOP)
                 let stream_done_raw = src_active == bass::BASS_ACTIVE_STOPPED
                     || mixer_active == bass::BASS_ACTIVE_STOPPED;
-                // Ignore mid-track STOPPED glitches (very common right after CUE seeks).
                 let real_stream_done =
                     Self::stream_done_is_real_end(inner, bass, reported, stream_done_raw);
                 let past_guard = Self::past_spurious_end_guard(inner, bass);
@@ -5378,9 +4687,6 @@ impl Player {
             };
 
             if Self::has_next_in_gapless_queue(inner) && (ending || real_stream_done) {
-                // Guard against spurious early advance after manual click in que
-                // (new track can briefly appear done). Short tracks cap the guard
-                // by their own duration so <1s files still auto-advance.
                 if past_guard {
                     return Self::try_advance_gapless(inner).map(Some).map_err(|error| {
                         eprintln!("Gapless advance failed: {error}");
@@ -5391,10 +4697,6 @@ impl Player {
 
             if (ending || real_stream_done) && !Self::has_next_in_gapless_queue(inner) && past_guard
             {
-                // End of playlist: ensure source is gone (AUTOFREE usually handles it).
-                // Wait for the duration-aware guard so short last tracks still emit
-                // track-ended promptly (duration is known while the source lives).
-                // Do not stop the mixer — keep it running (silent) so next playback starts without device hiccup.
                 if inner.current_source != 0 {
                     if let Some(bass) = inner.bass.as_ref() {
                         let _ = bass.mixer_channel_remove(inner.current_source);
@@ -5420,8 +4722,6 @@ impl Player {
             }
         };
 
-        // Live radio: read ICY tags on the BASS thread and, if the now-playing
-        // title or station name changed, push it to the UI. Rate-limited inside.
         if let Ok(Some(update)) =
             player_for_main.run_on_bass_thread(|inner| Ok(Self::poll_live_metadata(inner)))
         {
@@ -5429,7 +4729,6 @@ impl Player {
         }
 
         if let Some(path) = advanced_path {
-            // Gapless auto-advance is a new play start for the next track.
             player_for_main.record_play_stat(&path);
             player_for_main.set_source_active(true);
             let mut was = was_for_main.lock().unwrap_or_else(|e| e.into_inner());
@@ -5472,14 +4771,8 @@ impl Player {
                     };
                     sink_emit.emit(names::POSITION, &payload);
                 }
-                // Note: do not emit player:state on every poll tick.
-                // The position event already carries the state, and the
-                // frontend position listener applies it (with pause guard).
-                // Frequent player:state was causing extra clobbering of isPlaying.
             }
             PlaybackState::Paused => {
-                // Emit on transition into pause, while focused (seek while paused),
-                // or on the cold interval — never spam 20 Hz while paused in background.
                 let entered_pause = *was;
                 *was = false;
                 if Self::should_emit_ui_position(player_for_main, last_ui_emit, entered_pause) {
@@ -5498,8 +4791,6 @@ impl Player {
                             return Ok(None);
                         }
                         let now = Self::now_millis();
-                        // Same guards as the playing-path advance: pitch/rate
-                        // topology rebuilds can briefly look "stopped".
                         if now < inner.suppress_gapless_until {
                             return Ok(None);
                         }
@@ -5544,9 +4835,6 @@ impl Player {
                     return;
                 }
 
-                // End-of-queue (or gapless failed): emit track-ended only after the
-                // anti-spurious window, so sub-second tracks aren't torn down too early
-                // and frontend can still advance once the guard elapses.
                 let ended_path = player_for_main
                     .run_on_bass_thread(|inner| {
                         let now = Self::now_millis();
@@ -5568,7 +4856,6 @@ impl Player {
                     .flatten();
 
                 let Some(ended_path) = ended_path else {
-                    // Guard still active — keep *was so we retry on the next poll.
                     return;
                 };
 
@@ -5607,8 +4894,6 @@ impl Player {
                 }
                 *rpc_state = Some(snapshot.state);
             } else if snapshot.state == PlaybackState::Playing {
-                // While playing, re-push timestamps every few seconds so Discord
-                // progress does not drift (rate changes, clock skew, long tracks).
                 let due = rpc_sync_for_main
                     .lock()
                     .map(|last| last.elapsed() >= Duration::from_millis(RPC_POSITION_SYNC_MS))
@@ -5781,7 +5066,6 @@ unsafe extern "system" fn live_meta_sync_proc(
         return;
     }
     let cap = &*(user as *const LiveMetaUser);
-    // 64-bit BASS passes the metadata pointer in `data`; GetTags is often already empty.
     let from_data = crate::audio::bass::ffi::BassLibrary::copy_tag_ptr(data, false);
     let meta = from_data.or_else(|| {
         copy_tag_via(
@@ -5831,9 +5115,6 @@ unsafe fn copy_tag_via(
     crate::audio::bass::ffi::BassLibrary::copy_tag_ptr(get_tags(handle, tags), list)
 }
 
-/// Pull a header value (case-insensitive key) out of an ICY header block.
-/// BASS returns lines like `icy-name:Some Station` separated by NULs — the FFI
-/// layer already joined them, so we scan line by line for `key:value`.
 fn parse_comment_tag(raw: &str, key: &str) -> Option<String> {
     for line in raw.split(|c| c == '\n' || c == '\r' || c == '\0') {
         let line = line.trim();
@@ -5953,7 +5234,6 @@ mod tests {
             parse_icy_stream_title("StreamTitle='Only Title';"),
             Some("Only Title".to_string())
         );
-        // Empty title between songs → None (don't clobber the last good title).
         assert_eq!(parse_icy_stream_title("StreamTitle='';StreamUrl='';"), None);
         assert_eq!(parse_icy_stream_title("NoTitleHere"), None);
     }

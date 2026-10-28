@@ -162,6 +162,21 @@ impl MainWindow {
         let cover_el = div()
             .id("transport-cover")
             .flex_shrink_0()
+            .cursor_pointer()
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, event: &gpui::MouseUpEvent, window, cx| {
+                    let Some(at) = this.press_at else {
+                        return;
+                    };
+                    let moved = event.position - at;
+                    if moved.x.abs() > px(4.) || moved.y.abs() > px(4.) || this.item_drag.is_some()
+                    {
+                        return;
+                    }
+                    this.open_fullscreen(window, cx);
+                }),
+            )
             .child(cover_art(cover.as_deref(), 48.));
         let cover_el = match bar_drag.clone() {
             Some(drag) => attach_bar_drag(cover_el, drag, cx),
@@ -228,7 +243,7 @@ impl MainWindow {
             .into_any_element()
     }
 
-    fn transport_controls(
+    pub(crate) fn transport_controls(
         &self,
         playing: bool,
         has_track: bool,
@@ -333,12 +348,10 @@ impl MainWindow {
             ))
     }
 
-    fn glyph_button(
+    pub(crate) fn glyph_button(
         &self,
         id: &'static str,
         glyph: &'static [u8],
-        // Second glyph crossfades in when the bool is true. Both stay mounted
-        // so the play/pause swap does not drop the icon for a frame.
         swap: Option<(&'static [u8], bool)>,
         size: f32,
         icon_size: f32,
@@ -351,8 +364,6 @@ impl MainWindow {
         let pressed = self.pressed_ui.as_deref() == Some(id);
         let hover_id = SharedString::from(format!("{id}-hover"));
         let on_hover = Self::hover_listener(SharedString::from(id), cx);
-        // Shrink starts on press. The action waits for release on this button.
-        // Mouse up, not on_click: a pending click makes GPUI drop the hover.
         let on_press = cx.listener(
             move |this: &mut MainWindow, _: &gpui::MouseDownEvent, _, cx| {
                 this.arm(id, true);
@@ -366,8 +377,6 @@ impl MainWindow {
                 }
             },
         );
-        // Layout size stays put. The disc and glyph scale in paint, so they
-        // do not step across device pixels.
         div()
             .id(id)
             .size(px(size))
@@ -420,7 +429,11 @@ impl MainWindow {
         )
     }
 
-    fn volume_control(&mut self, volume: f32, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn volume_control(
+        &mut self,
+        volume: f32,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         div()
             .flex()
             .flex_1()
@@ -479,7 +492,7 @@ impl MainWindow {
             .child(self.slider("volume", volume, SliderDrag::Volume, theme::accent(), cx))
     }
 
-    fn progress_bar(
+    pub(crate) fn progress_bar(
         &mut self,
         progress: f32,
         time: &str,
@@ -532,37 +545,32 @@ impl MainWindow {
                     this.drag_to(event.position.x, cx);
                 }),
             )
-            .on_scroll_wheel(
-                cx.listener(move |this, event: &gpui::ScrollWheelEvent, _, cx| {
-                    let delta_y = match event.delta {
-                        gpui::ScrollDelta::Lines(point) => point.y,
-                        gpui::ScrollDelta::Pixels(point) => point.y.as_f32(),
-                    };
-                    if delta_y == 0.0 {
-                        return;
+            .on_scroll(cx.listener(move |this, event: &gpui::ScrollEvent, _, cx| {
+                let delta_y = match event.delta {
+                    gpui::ScrollDelta::Lines(point) => point.y,
+                    gpui::ScrollDelta::Pixels(point) => point.y.as_f32(),
+                };
+                if delta_y == 0.0 {
+                    return;
+                }
+                cx.stop_propagation();
+                match kind {
+                    SliderDrag::Volume => {
+                        let step = if delta_y > 0.0 { 0.05 } else { -0.05 };
+                        this.session.update(cx, |session, cx| {
+                            session.set_volume(session.volume + step);
+                            cx.notify();
+                        });
                     }
-                    // Windows reports a wheel notch away from the user as
-                    // positive. One notch is a fixed step, not the line count:
-                    // volume ±5%, seek ±5 seconds. Up is louder and later.
-                    cx.stop_propagation();
-                    match kind {
-                        SliderDrag::Volume => {
-                            let step = if delta_y > 0.0 { 0.05 } else { -0.05 };
-                            this.session.update(cx, |session, cx| {
-                                session.set_volume(session.volume + step);
-                                cx.notify();
-                            });
-                        }
-                        SliderDrag::Progress => {
-                            let step = if delta_y > 0.0 { 5.0 } else { -5.0 };
-                            this.session.update(cx, |session, cx| {
-                                session.seek_by(step);
-                                cx.notify();
-                            });
-                        }
+                    SliderDrag::Progress => {
+                        let step = if delta_y > 0.0 { 5.0 } else { -5.0 };
+                        this.session.update(cx, |session, cx| {
+                            session.seek_by(step);
+                            cx.notify();
+                        });
                     }
-                }),
-            )
+                }
+            }))
             .child(
                 canvas(
                     move |bounds, _window, app| {
@@ -642,7 +650,6 @@ impl MainWindow {
         });
     }
 
-    /// Either clock flips the left label between elapsed and `-1:35`.
     fn time_label(
         &mut self,
         id: &'static str,
@@ -685,9 +692,6 @@ fn time_slot(label: &str) -> String {
 }
 
 fn seek_time(label: &str, slot: &str, align_end: bool) -> gpui::Div {
-    // The slot is a zeroed copy of this label, drawn with tabular figures.
-    // Each side keeps its own width, so a short elapsed time is not padded
-    // out to an hour-long duration.
     let features = gpui::FontFeatures(std::sync::Arc::new(vec![("tnum".into(), 1)]));
     div()
         .relative()

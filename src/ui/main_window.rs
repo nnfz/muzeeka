@@ -42,81 +42,48 @@ pub struct MainWindow {
     pub(crate) focus: FocusHandle,
     pub(crate) use_ui_font: bool,
     settings_window: Option<WindowHandle<SettingsWindow>>,
-    /// One properties window per set of paths. The same track focuses the one already open.
     properties: HashMap<String, WindowHandle<PropertiesWindow>>,
-    /// Track and cover the accent was sampled from. The cover path is part of
-    /// the key so replacing art on the current track recolors the window.
     accent_source: Option<(Option<TrackId>, Option<PathBuf>)>,
-    /// Bumped on every sample so a slow cover decode cannot paint over a newer track.
     accent_epoch: u64,
-    /// The restored row is scrolled into view once the list has a real height.
     revealed_current: bool,
     pub(crate) progress_bounds: Bounds<Pixels>,
     pub(crate) volume_bounds: Bounds<Pixels>,
     pub(crate) drag: Option<SliderDrag>,
-    /// Album column width in the track table. Dragged from the header grip.
     pub(crate) album_width: f32,
-    /// Pointer x and album width when the header grip was pressed.
     pub(crate) album_resize: Option<(Pixels, f32)>,
-    /// Track row currently under the pointer. Drives the list hover fade.
     pub(crate) hovered_track: Option<TrackId>,
-    /// Sidebar row, transport button, or slider currently under the pointer.
     pub(crate) hovered_ui: Option<SharedString>,
-    /// Playlist cover under the pointer. Separate from the row, so the play
-    /// button can show without the row hover wiping it.
     pub(crate) hovered_cover: Option<SharedString>,
-    /// Transport button held down. Drives the press shrink.
     pub(crate) pressed_ui: Option<SharedString>,
-    /// Control that received the mouse down. Its action runs on mouse up
-    /// only while this still matches, and only if the pointer is still over it.
-    /// GPUI on_click is not used: a pending click clears on_hover for the hold.
     pub(crate) armed_ui: Option<SharedString>,
-    /// Where the pointer went down. A GPUI drag starts at 2px; the reorder waits
-    /// for the longer travel measured from this point.
     pub(crate) press_at: Option<gpui::Point<Pixels>>,
-    /// Track or playlist reorder. Cleared on drop, or when the GPUI drag ends
-    /// without one, so a release outside the window does not stick the gap.
     pub(crate) item_drag: Option<crate::ui::item_drag::ItemDrag>,
-    /// Track list scroll. Wheel notches ease toward a target instead of jumping.
     pub(crate) track_scroll: UniformListScrollHandle,
-    /// Playlist list in the sidebar. Same eased wheel as the track list.
     pub(crate) sidebar_scroll: ScrollHandle,
-    /// Search results plate. Same eased wheel as the track list.
     pub(crate) search_scroll: UniformListScrollHandle,
-    /// Context menu and its playlist submenu. Separate so each list scrolls alone.
     menu_scroll: ScrollHandle,
     submenu_scroll: ScrollHandle,
     track_ease: EaseScroll,
     sidebar_ease: EaseScroll,
     search_ease: EaseScroll,
-    /// Query, library size, and hit ids. Reused while the text is unchanged
-    /// so a wheel frame does not scan the library again.
     pub(crate) search_hits: Option<(String, usize, Arc<Vec<TrackId>>)>,
-    /// Highlighted suggestion or result. Arrows move it. Tab accepts it.
     pub(crate) search_pick: usize,
-    /// Query `search_pick` belongs to. A newer query highlights the first row.
     pub(crate) search_pick_query: String,
     bar_drag: Option<BarDrag>,
     menu: PopMenu,
     pub(crate) rename_field: gpui::Entity<TextField>,
     rename_wired: bool,
-    /// Kept alive so leaving the inline name commits the edit.
     rename_blur: Option<gpui::Subscription>,
     pub(crate) file_drop: crate::ui::file_drop::FileDropState,
     pub(crate) download: crate::ui::download_ui::DownloadState,
-    /// Track to scroll into the open playlist, and how many frames to keep trying.
     pending_reveal: Option<(TrackId, u8)>,
-    /// Track just scrolled into view, and when its white blink started.
     found_flash: Option<(TrackId, Instant)>,
-    /// Playlists that blink with `found_flash` because the track is in more than one.
     found_playlists: Vec<String>,
     shown_title: String,
     taskbar_attached: bool,
-    /// Visible track rows. Reused while the library view is unchanged, so the
-    /// playing bars can tick without scanning the library again.
     pub(crate) listed: Option<crate::ui::track_list::ListedTracks>,
-    /// Left time reads the remainder (`-1:35`) instead of the elapsed time.
     pub(crate) show_remaining: bool,
+    pub(crate) fullscreen: crate::ui::fullscreen::Fullscreen,
     _tick: Task<()>,
 }
 
@@ -152,7 +119,6 @@ pub(crate) enum Scroller {
     Submenu,
 }
 
-/// Critically damped follow of a scroll offset. Not the hover spring.
 struct EaseScroll {
     spring: SpringState,
     target: f32,
@@ -170,8 +136,6 @@ impl EaseScroll {
         }
     }
 
-    /// GPUI already applied the wheel delta. Put the offset back and ease to it.
-    /// Returns true when a frame should be queued.
     fn note(
         &mut self,
         handle: &ScrollHandle,
@@ -214,7 +178,6 @@ impl EaseScroll {
         }
     }
 
-    /// Steps the spring. Returns true while it still needs another frame.
     fn step(&mut self, handle: &ScrollHandle) -> bool {
         let now = Instant::now();
         let dt = now
@@ -258,7 +221,6 @@ struct BarDrag {
     max: f32,
 }
 
-/// Thumb height, top, and drag travel inside the scroll viewport.
 fn thumb_metrics(offset: f32, viewport: f32, max: f32) -> Option<(f32, f32, f32)> {
     if max <= 1. || viewport <= 1. {
         return None;
@@ -277,12 +239,10 @@ fn thumb_metrics(offset: f32, viewport: f32, max: f32) -> Option<(f32, f32, f32)
 }
 
 impl MainWindow {
-    /// Same spring as the track-list hover. Stiffness, damping, mass.
     pub(crate) fn hover_spring(on: bool) -> SpringAnimation<bool> {
         SpringAnimation::new(SpringConfig::new(580.0, 26.8, 1.0)).to(on)
     }
 
-    /// Critically damped, about 200ms. Sidebar rows and the drop gap use it.
     pub(crate) fn smooth_config() -> SpringConfig {
         SpringConfig::new(324.0, 36.0, 1.0)
     }
@@ -291,17 +251,14 @@ impl MainWindow {
         SpringAnimation::new(Self::smooth_config()).to(on)
     }
 
-    /// The same spring as a pixel offset, so a reordering row eases into its slot.
     pub(crate) fn smooth_spring_px(offset: f32) -> SpringAnimation<gpui::Pixels> {
         SpringAnimation::new(Self::smooth_config()).to(px(offset))
     }
 
-    /// Pressed transport buttons draw at 92% so the shrink stays small.
     pub(crate) fn press_scale(phase: gpui::AnimationPhase) -> f32 {
         1.0 - 0.08 * phase.0.clamp(0.0, 1.0)
     }
 
-    /// Arm a control on mouse down. `shrink` also starts the press scale.
     pub(crate) fn arm(&mut self, id: impl Into<SharedString>, shrink: bool) {
         let id = id.into();
         if shrink {
@@ -310,7 +267,6 @@ impl MainWindow {
         self.armed_ui = Some(id);
     }
 
-    /// True when this control is the one the pointer went down on.
     pub(crate) fn armed(&self, id: &str) -> bool {
         self.armed_ui.as_deref() == Some(id)
     }
@@ -323,8 +279,6 @@ impl MainWindow {
         move |over, _, app| {
             entity.update(app, |this, cx| {
                 let same = this.hovered_ui.as_ref() == Some(&id);
-                // GPUI drops hover as soon as a press becomes a drag. Hold the wash
-                // on the pressed row until the pointer comes back up.
                 if !*over && same && this.press_at.is_some() {
                     return;
                 }
@@ -386,8 +340,6 @@ impl MainWindow {
                         session.update(app, |_session, cx| {
                             cx.notify();
                         });
-                        // The clear button updates this window and then the field.
-                        // Updating the window again from that callback panics.
                         let host = host.clone();
                         window.defer(app, move |_window, app| {
                             host.update(app, |this, cx| {
@@ -508,6 +460,7 @@ impl MainWindow {
             taskbar_attached: false,
             listed: None,
             show_remaining: session::load_remaining_time(),
+            fullscreen: crate::ui::fullscreen::Fullscreen::new(),
             _tick: tick,
         }
     }
@@ -527,14 +480,10 @@ impl MainWindow {
             Scroller::Tracks => &mut self.track_ease,
             Scroller::Sidebar => &mut self.sidebar_ease,
             Scroller::Search => &mut self.search_ease,
-            // The menu uses the element's own wheel scroll. Easing it would
-            // put the thumb back to zero on the next frame.
             Scroller::Menu | Scroller::Submenu => unreachable!("context menu scroll is not eased"),
         }
     }
 
-    /// Hit ids for the open query. The scan runs when the text or the library
-    /// size changes, and the plate then scrolls back to the top.
     pub(crate) fn cached_search_ids(
         &mut self,
         query: &str,
@@ -557,8 +506,6 @@ impl MainWindow {
         hits
     }
 
-    /// One extra frame after the results list mounts, so the thumb can read
-    /// a real viewport. Skipped once that viewport exists.
     pub(crate) fn warm_search_scrollbar(&self, window: &mut Window, cx: &mut Context<Self>) {
         let pending = self
             .search_scroll
@@ -578,8 +525,6 @@ impl MainWindow {
         });
     }
 
-    /// Mouse-wheel lines jump by a full row. The scroller applies that jump
-    /// first; this puts the offset back and eases toward the same place.
     pub(crate) fn note_scroll(
         &mut self,
         which: Scroller,
@@ -597,8 +542,6 @@ impl MainWindow {
         }
     }
 
-    /// The thumb is built from the previous layout. Ask for one more frame
-    /// until that layout has a real viewport, so the bar shows without a hover.
     fn warm_scrollbars(&self, window: &mut Window, cx: &mut Context<Self>) {
         let tracks_pending = self
             .track_scroll
@@ -620,7 +563,6 @@ impl MainWindow {
         });
     }
 
-    /// Bring the restored track on screen once. Later frames leave the user's scroll alone.
     fn reveal_current(&mut self, cx: &mut Context<Self>) {
         if self.revealed_current {
             return;
@@ -663,8 +605,6 @@ impl MainWindow {
         self.search_ease.sync_if_idle(&search);
     }
 
-    /// Move the playlist list by `delta` on the offset (negative scrolls down).
-    /// Snaps the wheel spring so the next frame does not pull the offset back.
     pub(crate) fn scroll_sidebar_by(&mut self, delta: f32) -> bool {
         let current = self.sidebar_scroll.offset();
         let max = self.sidebar_scroll.max_offset().y.as_f32();
@@ -682,8 +622,6 @@ impl MainWindow {
         true
     }
 
-    /// Clear the press, the armed click, and any slider drag. A drop consumes
-    /// the mouse-up, so the drop path has to do this itself.
     pub(crate) fn release_pointer_gesture(&mut self) -> bool {
         self.drag = None;
         let resized = self.album_resize.take().is_some();
@@ -729,7 +667,6 @@ impl MainWindow {
         cx.notify();
     }
 
-    /// Overlay thumb. GPUI does not paint scrollbars. Hidden when nothing overflows.
     pub(crate) fn scrollbar(&self, which: Scroller, cx: &mut Context<Self>) -> AnyElement {
         let handle = self.scroll_handle(which);
         let Some((thumb_h, thumb_y, _)) = thumb_metrics(
@@ -841,9 +778,6 @@ impl MainWindow {
                 },
             )
             .expect("open main window");
-        // Settings is its own OS window. Closing that one leaves the player up.
-        // Closing the player has to take the others with it, including Alt+F4,
-        // which only destroys the window that received it.
         let main_id = main.window_id();
         cx.on_window_closed(move |cx, closed| {
             if closed != main_id {
@@ -861,8 +795,6 @@ impl MainWindow {
         cx.activate(true);
     }
 
-    /// Point the accent at the current track's cover. A missing or gray cover
-    /// falls back to [`theme::DEFAULT_ACCENT`].
     fn sync_accent(&mut self, cx: &mut Context<Self>) {
         let (track_id, cover) = {
             let session = self.session.read(cx);
@@ -1035,6 +967,25 @@ impl Render for MainWindow {
         self.attach_taskbar(window);
         self.wire_rename(window, cx);
         let session = self.session.clone();
+        let main_ui: Vec<AnyElement> = if self.fullscreen_covered() {
+            Vec::new()
+        } else {
+            vec![
+                self.header(window, cx).into_any_element(),
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .px(px(8.))
+                    .pb(px(102.))
+                    .child(self.sidebar(cx))
+                    .child(self.track_list(cx))
+                    .into_any_element(),
+                self.transport(cx).into_any_element(),
+                self.search_suggestions(window, cx).into_any_element(),
+            ]
+        };
+        let fullscreen = self.fullscreen_layer(window, cx);
         div()
             .id("muzeeka-root")
             .relative()
@@ -1070,6 +1021,10 @@ impl Render for MainWindow {
                 }
             }))
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                if event.keystroke.key == "f11" {
+                    window.toggle_fullscreen();
+                    return;
+                }
                 if event.keystroke.key == "escape" && this.download.open {
                     this.download.open = false;
                     cx.notify();
@@ -1077,10 +1032,10 @@ impl Render for MainWindow {
                 }
                 if event.keystroke.key == "escape" && this.menu.is_open() {
                     this.close_menu(window, cx);
+                } else if event.keystroke.key == "escape" && this.fullscreen.is_open() {
+                    this.close_fullscreen(cx);
                 }
             }))
-            // Alt alone, with the pointer still down, is the start of Alt+Tab.
-            // Hand the files over before the switch, or the other app never sees them.
             .on_modifiers_changed(cx.listener(
                 |this, event: &gpui::ModifiersChangedEvent, window, cx| {
                     if event.modifiers.alt {
@@ -1137,19 +1092,8 @@ impl Render for MainWindow {
                     this.finish_playlist_drag(drag, cx);
                 }),
             )
-            .child(self.header(window, cx))
-            .child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .min_h(px(0.))
-                    .px(px(8.))
-                    .pb(px(102.))
-                    .child(self.sidebar(cx))
-                    .child(self.track_list(cx)),
-            )
-            .child(self.transport(cx))
-            .child(self.search_suggestions(window, cx))
+            .children(main_ui)
+            .children(fullscreen)
             .child(self.drop_overlay(window, cx))
             .child(self.menu_layer(window, cx))
     }
@@ -1197,7 +1141,6 @@ impl MainWindow {
         }
     }
 
-    /// Close a menu, saving a playlist rename that is still open.
     pub(crate) fn dismiss_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.commit_rename_if_editing(window, cx);
         self.close_menu(window, cx);
@@ -1213,7 +1156,6 @@ impl MainWindow {
         cx.notify();
     }
 
-    /// Scroll `id` into `view` without starting playback.
     pub(crate) fn reveal_in_playlist(
         &mut self,
         id: TrackId,
@@ -1235,7 +1177,6 @@ impl MainWindow {
         cx.notify();
     }
 
-    /// The list may still be the previous page on the first frame. Retry a few.
     fn reveal_queued(&mut self, cx: &mut Context<Self>) {
         let Some((id, left)) = self.pending_reveal else {
             return;
@@ -1275,7 +1216,6 @@ impl MainWindow {
         };
     }
 
-    /// 0 at rest, 1 at the peak of a reveal blink. Other rows stay at 0.
     pub(crate) fn found_flash_amount(&self, id: TrackId, reduce_motion: bool) -> f32 {
         let Some((found, started)) = self.found_flash else {
             return 0.0;
@@ -1286,7 +1226,6 @@ impl MainWindow {
         flash_amount(started.elapsed().as_millis(), reduce_motion)
     }
 
-    /// Same clock as the found track. Quiet unless this playlist is one of several homes.
     pub(crate) fn found_playlist_flash_amount(&self, id: &str, reduce_motion: bool) -> f32 {
         let Some((_, started)) = self.found_flash else {
             return 0.0;
@@ -1297,8 +1236,6 @@ impl MainWindow {
         flash_amount(started.elapsed().as_millis(), reduce_motion)
     }
 
-    /// Draw another frame while the blink is fading. A reduced-motion hold
-    /// does not pulse, so the 100ms tick is enough to clear it.
     fn pump_found_flash(&mut self, window: &mut Window, reduce_motion: bool) {
         let Some((_, started)) = self.found_flash else {
             return;
@@ -1313,8 +1250,6 @@ impl MainWindow {
         }
     }
 
-    /// Clear the blink once it has finished. Frames repaint the fade; this
-    /// only asks for a paint when the wash actually goes away.
     fn tick_found_flash(&mut self, reduce_motion: bool) -> bool {
         let Some((_, started)) = self.found_flash else {
             return false;
@@ -1328,8 +1263,6 @@ impl MainWindow {
         }
     }
 
-    /// First Esc clears a filled search. The next Esc, or the only Esc on an
-    /// empty field, leaves the field so the bar collapses.
     fn on_search_escape(&mut self, cx: &mut Context<Self>) -> bool {
         if self.download.open {
             self.download.open = false;
@@ -1421,9 +1354,6 @@ impl MainWindow {
             field.select_all_text(cx);
         });
         self.menu = PopMenu::Rename { id };
-        // The row mounts the field on this frame. Focusing now would blur
-        // straight away, because the closing menu still owns the focus, and
-        // that blur would save before the name is editable.
         let handle = self.rename_field.read(cx).focus.clone();
         let entity = cx.entity().clone();
         window.on_next_frame(move |window, cx| {
@@ -1442,7 +1372,6 @@ impl MainWindow {
         self.submenu_scroll.set_offset(top);
     }
 
-    /// One more frame after the menu mounts, so the thumb can read a real viewport.
     fn warm_menu_bar(&self, which: Scroller, window: &mut Window, cx: &mut Context<Self>) {
         if self.scroll_handle(which).bounds().size.height > px(1.) {
             return;
@@ -1453,7 +1382,6 @@ impl MainWindow {
         });
     }
 
-    /// Context menu list. At most twelve rows stay on screen; the rest scroll.
     fn menu_frame(
         &mut self,
         id: &'static str,
@@ -1465,8 +1393,6 @@ impl MainWindow {
     ) -> AnyElement {
         let count = items.len();
         let handle = self.scroll_handle(which);
-        // The border sits on the shell, so the scroller's cap is the old panel
-        // height without that border. Twelve rows still fit without scrolling.
         let mut list = div()
             .id(id)
             .flex()
@@ -1503,7 +1429,6 @@ impl MainWindow {
         if !self.menu.is_open() {
             return div().into_any_element();
         }
-        // Rename edits the playlist title in its own row, not in a popup.
         if matches!(self.menu, PopMenu::None | PopMenu::Rename { .. }) {
             return div().into_any_element();
         }
@@ -1896,8 +1821,6 @@ impl MainWindow {
     }
 }
 
-/// Alt+wheel changes volume by 1% anywhere over this window.
-/// Registered in capture, before list and slider wheels, so those do not also move.
 pub(crate) fn alt_wheel_layer(session: gpui::Entity<Session>) -> impl IntoElement {
     canvas(
         |_, _, _| session,
@@ -1942,14 +1865,12 @@ pub fn bind_keys(cx: &mut App) {
     ]);
 }
 
-/// One blink eases in, eases out, then rests. Four of these, then the wash is gone.
 const FLASH_RISE_MS: u128 = 170;
 const FLASH_FALL_MS: u128 = 170;
 const FLASH_REST_MS: u128 = 60;
 const FLASH_COUNT: u128 = 4;
 const FLASH_CYCLE_MS: u128 = FLASH_RISE_MS + FLASH_FALL_MS + FLASH_REST_MS;
 const FLASH_TOTAL_MS: u128 = FLASH_CYCLE_MS * FLASH_COUNT;
-/// Reduced motion keeps a steady dim mark, then drops it. No repeated blink.
 const FLASH_STILL_MS: u128 = 800;
 
 fn smoothstep(t: f32) -> f32 {
@@ -1966,8 +1887,6 @@ fn flash_done(elapsed_ms: u128, reduce_motion: bool) -> bool {
         }
 }
 
-/// Strength of the reveal wash, 0–1. Each pulse leaves and returns at rest
-/// with a flat slope, so the four blinks read as fades rather than a strobe.
 fn flash_amount(elapsed_ms: u128, reduce_motion: bool) -> f32 {
     if reduce_motion {
         return if elapsed_ms < FLASH_STILL_MS {

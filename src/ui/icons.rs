@@ -1,6 +1,3 @@
-// Icons from src/ui/src/icons/svgs, drawn as alpha masks and tinted by text color.
-// The search mark is inline: the asset folder has no search glyph, and the web app inlines it too.
-
 use gpui::{px, size, svg, Hsla, IntoElement, Pixels, Styled, Svg, Transformation};
 
 pub fn icon(data: &'static [u8], color: impl Into<Hsla>, box_size: Pixels) -> impl IntoElement {
@@ -67,14 +64,12 @@ fn view_box(data: &[u8]) -> (f32, f32) {
     }
 }
 
-// player
 pub const PLAY: &[u8] = include_bytes!("src/icons/svgs/play.svg");
 pub const PAUSE: &[u8] = include_bytes!("src/icons/svgs/pause.svg");
 pub const PREV: &[u8] = include_bytes!("src/icons/svgs/playbackward.svg");
 pub const NEXT: &[u8] = include_bytes!("src/icons/svgs/playforward.svg");
 pub const SHUFFLE: &[u8] = include_bytes!("src/icons/svgs/shuffle.svg");
 pub const SHUFFLE_OFF: &[u8] = include_bytes!("src/icons/svgs/noshuffle.svg");
-/// Die. The pips are holes, so the tint shows the face and not five dots.
 pub const RANDOM: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 49 49"><path fill="white" fill-rule="evenodd" d="M14 6h21a8 8 0 0 1 8 8v21a8 8 0 0 1-8 8H14a8 8 0 0 1-8-8V14a8 8 0 0 1 8-8zm2 7a3 3 0 1 0 6 0a3 3 0 1 0-6 0zm13 0a3 3 0 1 0 6 0a3 3 0 1 0-6 0zm-6.5 6.5a3 3 0 1 0 6 0a3 3 0 1 0-6 0zm-6.5 6.5a3 3 0 1 0 6 0a3 3 0 1 0-6 0zm13 0a3 3 0 1 0 6 0a3 3 0 1 0-6 0z"/></svg>"#;
 pub const REPEAT_ONE: &[u8] = include_bytes!("src/icons/svgs/repeat.svg");
 pub const REPEAT_ALL: &[u8] = include_bytes!("src/icons/svgs/repeatplaylist.svg");
@@ -83,12 +78,13 @@ pub const VOL_MIN: &[u8] = include_bytes!("src/icons/svgs/volmin.svg");
 pub const VOL_MED: &[u8] = include_bytes!("src/icons/svgs/volmed.svg");
 pub const VOL_MAX: &[u8] = include_bytes!("src/icons/svgs/volmax.svg");
 pub const MUTE: &[u8] = include_bytes!("src/icons/svgs/mute.svg");
+pub const LYRICS: &[u8] = include_bytes!("src/icons/svgs/text.svg");
+pub const LYRICS_OFF: &[u8] = include_bytes!("src/icons/svgs/textclose.svg");
+pub const CLOSE_FULLSCREEN: &[u8] = include_bytes!("src/icons/svgs/closefullscreen.svg");
 
-// track
 pub const HEART: &[u8] = include_bytes!("src/icons/svgs/heart.svg");
 pub const HEART_FILLED: &[u8] = include_bytes!("src/icons/svgs/heartfilled.svg");
 
-// main
 pub const OPTIONS: &[u8] = include_bytes!("src/icons/svgs/options.svg");
 pub const SEARCH: &[u8] = include_bytes!("src/icons/svgs/search.svg");
 pub const MINIMIZE: &[u8] = include_bytes!("src/icons/svgs/minimize.svg");
@@ -96,7 +92,10 @@ pub const MAXIMIZE: &[u8] = include_bytes!("src/icons/svgs/maximize.svg");
 pub const RESTORE: &[u8] = include_bytes!("src/icons/svgs/revertmaximize.svg");
 pub const CLOSE: &[u8] = include_bytes!("src/icons/svgs/close.svg");
 
-// playlist
 pub const TIME: &[u8] = include_bytes!("src/icons/svgs/time.svg");
 pub const PLUS: &[u8] = include_bytes!("src/icons/svgs/plus.svg");
 pub const ALL: &[u8] = include_bytes!("src/icons/svgs/all.svg");
+
+pub const NOTE: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="#efefef" d="M9 17.5a2.5 2.5 0 1 1-2-2.45V5.2l12-2v10.15a2.5 2.5 0 1 1-2-2.45V6.1l-8 1.35V17.5z"/></svg>"##;
+pub const ARROW: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="#efefef" d="M11 3h2v9.2l3.3-3.3 1.4 1.4L12 16.1 6.3 10.3l1.4-1.4L11 12.2V3zM5 19h14v2H5z"/></svg>"##;
+pub const SPINNER: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><circle cx="8" cy="2.2" r="1.7" fill="#efefef"/><circle cx="12.4" cy="4.6" r="1.45" fill="#efefef" opacity=".8"/><circle cx="13.8" cy="8.8" r="1.2" fill="#efefef" opacity=".55"/><circle cx="11.2" cy="12.4" r="1.05" fill="#efefef" opacity=".35"/><circle cx="7.2" cy="13.6" r="0.9" fill="#efefef" opacity=".2"/></svg>"##;

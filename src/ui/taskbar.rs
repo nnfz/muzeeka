@@ -1,8 +1,3 @@
-//! Previous, play, and next on the Windows taskbar thumbnail.
-//!
-//! The window proc only stores a click. The session tick performs it, so a
-//! button never calls back into GPUI while Windows is still inside the message.
-
 use std::fs;
 use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
@@ -56,7 +51,6 @@ pub enum Action {
     Next,
 }
 
-/// Subclass the main window and add the buttons once the taskbar allows it.
 pub fn attach(window: &Window) -> bool {
     let Some(hwnd) = hwnd_of(window) else {
         return false;
@@ -83,7 +77,6 @@ pub fn attach(window: &Window) -> bool {
     true
 }
 
-/// Read a thumbnail click and refresh the icons when playback changes.
 pub fn poll(playing: bool, can_play: bool, has_prev: bool, has_next: bool) -> Option<Action> {
     let hwnd = hwnd_bits();
     if hwnd.0.is_null() {
@@ -122,7 +115,6 @@ fn hwnd_bits() -> HWND {
 }
 
 fn hwnd_of(window: &Window) -> Option<HWND> {
-    // `Window::window_handle` is GPUI's own handle. The raw HWND is the trait method.
     let handle = HasWindowHandle::window_handle(window).ok()?;
     let RawWindowHandle::Win32(win) = handle.as_raw() else {
         return None;
@@ -156,7 +148,6 @@ fn install(hwnd: HWND, playing: bool, can_play: bool, has_prev: bool, has_next: 
         let Some(buttons) = buttons(playing, can_play, has_prev, has_next) else {
             return false;
         };
-        // Add once. A later call replaces the set after Explorer restarts.
         taskbar.ThumbBarAddButtons(hwnd, &buttons).is_ok()
     }
 }

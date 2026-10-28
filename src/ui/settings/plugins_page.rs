@@ -1,7 +1,3 @@
-//! Settings → Plugins. The list is loaded when the section opens and about
-//! once a second while it stays open. Text fields are created here, not during
-//! render, so a refresh does not wipe text the user is still editing.
-
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -92,8 +88,12 @@ impl SettingsWindow {
                 }
             }
         }
-        self.plugins.fields.retain(|key, _| live.iter().any(|live| live == key));
-        self.plugins.synced.retain(|key, _| live.iter().any(|live| live == key));
+        self.plugins
+            .fields
+            .retain(|key, _| live.iter().any(|live| live == key));
+        self.plugins
+            .synced
+            .retain(|key, _| live.iter().any(|live| live == key));
     }
 
     pub(super) fn plugins_section(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -269,15 +269,17 @@ impl SettingsWindow {
             .when(!plugin.log.is_empty(), |card| {
                 let lines = plugin.log.clone();
                 card.child(
-                    div().flex().flex_col().gap(px(2.)).children(
-                        lines.into_iter().map(|line| {
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .children(lines.into_iter().map(|line| {
                             div()
                                 .text_size(px(11.))
                                 .text_color(theme::text_muted())
                                 .child(line)
                                 .into_any_element()
-                        }),
-                    ),
+                        })),
                 )
             })
             .into_any_element()
@@ -506,10 +508,7 @@ impl SettingsWindow {
         label: &'static str,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let id = SharedString::from(format!(
-            "plugin-step:{plugin_id}:{}:{delta}",
-            spec.key
-        ));
+        let id = SharedString::from(format!("plugin-step:{plugin_id}:{}:{delta}", spec.key));
         let arm_id = id.clone();
         let release_id = id.clone();
         let plugin_id = plugin_id.to_string();
@@ -754,7 +753,6 @@ impl SettingsWindow {
         let display = json_display(&value);
         self.plugins.synced.insert(draft.clone(), display.clone());
         if let Some(field) = self.plugins.fields.get(&draft).cloned() {
-            // Enter is handled inside the field. Updating it here would borrow it twice.
             cx.defer(move |app| {
                 field.update(app, |field, cx| {
                     if field.content.to_string() != display {

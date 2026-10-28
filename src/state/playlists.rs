@@ -1,5 +1,3 @@
-// Playlist state
-
 use std::path::PathBuf;
 
 #[derive(Clone)]
@@ -28,7 +26,8 @@ impl PlaylistState {
     }
 
     pub fn get_active_playlist(&self) -> Option<&Playlist> {
-        self.active_playlist_id.as_ref()
+        self.active_playlist_id
+            .as_ref()
             .and_then(|id| self.playlists.iter().find(|p| &p.id == id))
     }
 }

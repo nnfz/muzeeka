@@ -1,5 +1,3 @@
-// Player state
-
 use parking_lot::RwLock;
 
 pub struct PlayerState {

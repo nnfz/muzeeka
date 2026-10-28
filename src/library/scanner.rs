@@ -1,9 +1,3 @@
-// Library scanning module — STUB
-//
-// TODO: Port from src-tauri/src/library.rs (743 lines)
-// - rayon parallel scanning
-// - rusqlite DB integration
-
 #[derive(Debug, Clone)]
 pub struct MusicFile {
     pub path: String,

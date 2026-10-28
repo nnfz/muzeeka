@@ -1,6 +1,3 @@
-//! Radio-stream diagnostics. Every line goes to stderr, a temp file, and the
-//! in-app developer log so we can see why a URL that plays in a browser is silent.
-
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;

@@ -1,5 +1,3 @@
-// Discord Rich Presence — track, artist, playback time, and MusicBrainz cover art.
-
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -16,24 +14,16 @@ use crate::audio::cue;
 use crate::audio::metadata::{self, TrackMetadata};
 use crate::audio::player::{PlaybackState, PlayerStateSnapshot};
 use crate::library::MusicFile;
-// TODO: port imgbb, musicbrainz modules
-// use crate::imgbb;
-// use crate::musicbrainz;
 
-/// Discord Application ID — https://discord.com/developers/applications
 pub const DISCORD_CLIENT_ID: &str = "1525094033666473995";
 
-/// Small MRU cache of parsed track tags — Discord can fire on play/pause/seek/gapless.
-/// A few slots cover current + next/prev without re-parsing large APIC frames.
 const META_CACHE_CAP: usize = 4;
 
-/// Path → metadata, most-recently-used at the end.
 static META_CACHE: Mutex<Vec<(String, TrackMetadata)>> = Mutex::new(Vec::new());
 
 #[derive(Clone)]
 pub struct DiscordPresence {
     inner: Arc<Mutex<PresenceInner>>,
-    /// Bumped on every cover lookup / clear so stale network work discards results.
     lookup_generation: Arc<AtomicU64>,
 }
 
@@ -76,7 +66,6 @@ impl DiscordPresence {
         }
     }
 
-    /// Invalidate in-flight cover lookups (track change, stop, disable, shutdown).
     fn bump_lookup_generation(&self) -> u64 {
         self.lookup_generation.fetch_add(1, Ordering::SeqCst) + 1
     }
@@ -199,14 +188,12 @@ impl DiscordPresence {
         let gen = Arc::clone(&self.lookup_generation);
         let inner = self.inner.clone();
         thread::spawn(move || {
-            // Cheap bail-out if the user already skipped ahead before we start network I/O.
             if !Self::lookup_is_current(generation, &gen) {
                 return;
             }
 
             let cover_url = resolve_cover_url(&track_path, &artist, &title, album.as_deref());
 
-            // Drop result if a newer track (or clear/shutdown) won the race.
             if !Self::lookup_is_current(generation, &gen) {
                 return;
             }
@@ -392,14 +379,9 @@ fn resolve_cover_url(
     _album: Option<&str>,
 ) -> Option<String> {
     // TODO: port musicbrainz and imgbb modules
-    // if let Some(url) = musicbrainz::lookup_cover_url(artist, title, album) {
-    //     return Some(url);
-    // }
-    // local_cover_path(track_path).and_then(|path| imgbb::upload_image(&path))
     None
 }
 
-/// Cover from the real audio file (CUE virtual paths point at the image, not the track file).
 fn local_cover_from_audio(track_path: &str, track: &MusicFile) -> Option<String> {
     if let Some(audio_path) = track.audio_path.as_deref() {
         let audio = Path::new(audio_path);
@@ -426,14 +408,12 @@ fn filename_title(path: &str) -> String {
 }
 
 fn metadata_for_path(track_path: &str) -> TrackMetadata {
-    // Discord updates can fire on play/pause/seek/gapless; re-reading ID3 + decoding
-    // embedded art each time made some tracks (large APIC) stutter for free.
     {
         let mut cache = META_CACHE.lock();
         if let Some(pos) = cache.iter().position(|(path, _)| path == track_path) {
             let entry = cache.remove(pos);
             let meta = entry.1.clone();
-            cache.push(entry); // MRU at the end
+            cache.push(entry);
             return meta;
         }
     }
@@ -443,7 +423,7 @@ fn metadata_for_path(track_path: &str) -> TrackMetadata {
         let mut cache = META_CACHE.lock();
         cache.retain(|(path, _)| path != track_path);
         if cache.len() >= META_CACHE_CAP {
-            cache.remove(0); // drop LRU
+            cache.remove(0);
         }
         cache.push((track_path.to_string(), meta.clone()));
     }

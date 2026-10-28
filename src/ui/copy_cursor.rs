@@ -1,11 +1,3 @@
-//! The arrow-with-a-plus shown while a track is dragged out of the list.
-//!
-//! That cursor is not one of the system `IDC_*` shapes. Explorer loads it
-//! from `ole32.dll` (resource 3, or 7 at a larger cursor size) while a file
-//! drag would copy. GPUI cannot name it, and a drag holds the mouse so
-//! Windows sends no `WM_SETCURSOR`, so this loads the same cursor and sets it
-//! directly for as long as the drag wants it.
-
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 
 use gpui::Window;
@@ -19,7 +11,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 const HTCLIENT: u32 = 1;
-/// Copy cursor in `ole32.dll`. 3 is the small one, 7 the large one.
 const OLE_COPY: u16 = 3;
 const OLE_COPY_LARGE: u16 = 7;
 
@@ -27,8 +18,6 @@ static SUBCLASSED: AtomicBool = AtomicBool::new(false);
 static ARMED: AtomicBool = AtomicBool::new(false);
 static CURSOR: AtomicIsize = AtomicIsize::new(0);
 
-/// `on` shows the plus cursor until the next call with `false`.
-/// False means it could not be installed, so the caller should fall back.
 pub fn set(window: &Window, on: bool) -> bool {
     let Some(hwnd) = hwnd_of(window) else {
         return false;
@@ -41,9 +30,6 @@ pub fn set(window: &Window, on: bool) -> bool {
         }
     }
     if !on {
-        // A drag holds the mouse, so Windows sends no `WM_SETCURSOR` to put
-        // the old cursor back. The arrow is right for almost everywhere a
-        // track drag ends; the next move corrects a text field or a resize edge.
         if ARMED.swap(false, Ordering::Relaxed) {
             unsafe { SetCursor(LoadCursorW(None, IDC_ARROW).ok()) };
         }
@@ -57,7 +43,6 @@ pub fn set(window: &Window, on: bool) -> bool {
     let cursor = CURSOR.load(Ordering::Relaxed);
     ARMED.store(cursor != 0, Ordering::Relaxed);
     if cursor != 0 {
-        // Held during the drag, when `WM_SETCURSOR` is not sent at all.
         unsafe { SetCursor(Some(HCURSOR(cursor as *mut _))) };
     }
     cursor != 0
@@ -93,7 +78,6 @@ unsafe extern "system" fn subclass_proc(
     unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
 }
 
-/// The copy cursor Explorer uses. The module stays loaded: the cursor is its.
 fn load() -> Option<HCURSOR> {
     unsafe {
         let name: Vec<u16> = "ole32.dll"

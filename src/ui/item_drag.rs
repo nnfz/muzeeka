@@ -1,16 +1,3 @@
-//! In-window drags for track rows and playlist rows.
-//!
-//! GPUI starts a drag at 2px. The old player waits longer (4px for a track,
-//! 5px for a playlist) and still plays or selects on a shorter move. `shown`
-//! is that longer threshold: the highlight and the commit wait for it.
-//! Inside a list the dragged row is the real one, shifted so the grab stays
-//! under the pointer, with no spring. Neighbors snap to the insertion slot.
-//! Once a track leaves the list, or the drag started on the transport title
-//! or cover, the row stays put and the cursor switches to the copy pointer.
-//! Nothing else is drawn. Leaving the window hands the file to Windows
-//! (copy, not move) on a later turn, so `DoDragDrop` does not re-enter the
-//! window while `App` is borrowed.
-
 use std::path::PathBuf;
 
 use gpui::{
@@ -22,7 +9,6 @@ use crate::ui::main_window::MainWindow;
 use crate::ui::reorder::{playlist_slot, slot_from_y, stabilize_slot};
 use crate::ui::session::{LibraryView, TrackId};
 
-/// Visual hole while reordering tracks. Shorter than a file-drop row.
 pub(crate) const REORDER_GAP: f32 = 44.;
 
 const TRACK_THRESHOLD: f32 = 4.;
@@ -41,8 +27,6 @@ pub(crate) struct TrackDrag {
     pub ids: Vec<TrackId>,
     pub source: LibraryView,
     pub paths: Vec<PathBuf>,
-    /// Started from the transport title or cover. The open track list does not
-    /// reorder; the copy cursor is the only preview.
     pub from_bar: bool,
 }
 
@@ -64,21 +48,13 @@ enum DragKind {
 pub(crate) struct ItemDrag {
     kind: DragKind,
     pointer: Point<Pixels>,
-    /// Pointer on the move that first counted as a drag.
     anchor: Point<Pixels>,
-    /// List scroll when the drag first counted. The held row tracks the pointer,
-    /// so a scroll under a still pointer has to count too.
     anchor_scroll: f32,
-    /// Files of a track drag, so Alt can hand them to Windows without waiting for
-    /// the pointer to leave the window.
     paths: Vec<PathBuf>,
     shown: bool,
-    /// The pointer has left the track list, or the drag started on the bar.
-    /// The row stays put and the copy cursor is the preview.
     floating: bool,
     copy: bool,
     track_slot: Option<usize>,
-    /// Visible row of the dragged track. Stable while the list order is.
     track_from: Option<usize>,
     playlist_slot: Option<usize>,
     playlist_slots: Vec<f32>,
@@ -126,19 +102,14 @@ impl ItemDrag {
         matches!(&self.kind, DragKind::Tracks { ids, .. } if ids.contains(&id))
     }
 
-    /// The source row is the one sliding inside the list.
     pub(crate) fn lifts_track(&self, id: TrackId) -> bool {
         self.shown && !self.floating && self.track_slot.is_some() && self.holds_track(id)
     }
 
-    /// A track drag whose preview is the copy cursor, not a sliding row.
     pub(crate) fn shows_ghost(&self) -> bool {
         self.shown && self.floating
     }
 
-    /// Rows the visible track at `row` should slide, in row units.
-    /// Zero while the pointer is outside the list, while copying, or when
-    /// nothing is moving. The held row itself is placed by [`Self::hold_y`].
     pub(crate) fn track_row_delta(&self, row: usize) -> i32 {
         if !self.shown || self.floating || self.copy {
             return 0;
@@ -159,8 +130,6 @@ impl ItemDrag {
         }
     }
 
-    /// Vertical offset that puts the playlist at `index` on its preview slot.
-    /// `centers` were captured in content space, so variable row heights work.
     pub(crate) fn playlist_slide(&self, index: usize, count: usize, from: usize) -> f32 {
         if !self.shown || !self.is_playlist() || self.playlist_slots.len() != count {
             return 0.;
@@ -183,9 +152,6 @@ impl ItemDrag {
         self.shown && matches!(&self.kind, DragKind::Playlist { id: dragged } if dragged == id)
     }
 
-    /// Where the held row sits, in pixels from its slot. The grab point stays
-    /// under the pointer, and scrolling the list while holding still moves the
-    /// row with the content rather than away from the cursor.
     pub(crate) fn hold_y(&self, scroll: f32) -> f32 {
         self.pointer.y.as_f32() - self.anchor.y.as_f32() + scroll - self.anchor_scroll
     }
@@ -207,27 +173,20 @@ impl ItemDrag {
     }
 }
 
-/// GPUI still wants a drag view, but the row being moved is the real one.
 pub(crate) struct PlaylistGhost;
 
 impl Render for PlaylistGhost {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        // The playlist being moved is the real row, shifted in place. A second
-        // copy here would follow the pointer sideways and look different.
         div().w(px(0.)).h(px(0.))
     }
 }
 
-/// GPUI drag preview for a playlist. Drawn at the element's origin, which is
-/// the grabbed row, so the pointer keeps the same point on the row.
 pub(crate) fn spawn_playlist_ghost(
 ) -> impl Fn(&PlaylistDrag, Point<Pixels>, &mut Window, &mut App) -> Entity<PlaylistGhost> + 'static
 {
     |_, _, _, app| app.new(|_| PlaylistGhost)
 }
 
-/// GPUI still wants a drag view. The row being moved is the real one, and a
-/// drag that has left the list shows only the copy cursor.
 pub(crate) struct TrackGhost;
 
 impl Render for TrackGhost {
@@ -236,13 +195,11 @@ impl Render for TrackGhost {
     }
 }
 
-/// GPUI drag preview for a track. Empty: the row or the cursor is the preview.
 pub(crate) fn spawn_track_ghost(
 ) -> impl Fn(&TrackDrag, Point<Pixels>, &mut Window, &mut App) -> Entity<TrackGhost> + 'static {
     |_, _, _, app| app.new(|_| TrackGhost)
 }
 
-/// File handed to the OS when the pointer leaves the window. Not a delete.
 pub(crate) fn file_drag_payload(
     drag: &TrackDrag,
     _: &mut Window,
@@ -292,12 +249,6 @@ impl MainWindow {
         }
         let shown = already_shown || show_now;
         let in_window = pointer_inside(window, position);
-        // GPUI never starts a native file drag on Windows. Once the pointer
-        // leaves, OLE takes the files so they can drop into Telegram.
-        // Alt does the same while the pointer is still inside: Alt+Tab must
-        // already be holding the file, not the in-window reorder.
-        // DoDragDrop pumps this window. Running it inside the mouse handler
-        // borrows App twice and panics, so the drag starts on the next turn.
         if shown
             && (event.event.modifiers.alt || !in_window)
             && dragged.paths.iter().any(|path| path.is_file())
@@ -306,8 +257,6 @@ impl MainWindow {
             return;
         }
         let in_tracks = in_window && self.pointer_in_tracks(position);
-        // Outside the list the row stays where it is. A bar drag has no row
-        // to slide, so it is the same from the first move that counts.
         let floating = shown && (dragged.from_bar || !in_tracks);
         let prev = self.item_drag.as_ref().and_then(|drag| drag.track_slot);
         let (target, slot) = if !shown || !in_window {
@@ -476,7 +425,6 @@ impl MainWindow {
         }
     }
 
-    /// Keep scrolling while a playlist drag sits near the list edge.
     pub(crate) fn tick_playlist_autoscroll(&mut self, window: &mut Window) {
         let Some(pointer) = self
             .item_drag
@@ -515,8 +463,6 @@ impl MainWindow {
         window.request_animation_frame();
     }
 
-    /// Alt went down during a track drag. The pointer may not have moved since,
-    /// so this cannot wait for the next drag-move event.
     pub(crate) fn hand_held_tracks_out(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(paths) = self
             .item_drag
@@ -530,9 +476,6 @@ impl MainWindow {
         }
     }
 
-    /// Give the held track files to Windows right now, before the pointer leaves.
-    /// Alt+Tab switches apps while the button is still down, and the other app
-    /// only sees the file if the OLE drag is already running.
     pub(crate) fn hand_tracks_out(
         &mut self,
         paths: Vec<PathBuf>,
@@ -553,7 +496,6 @@ impl MainWindow {
         }
     }
 
-    /// The platform drag ended without a drop on this window. Forget the gesture.
     pub(crate) fn retire_item_drag_if_finished(&mut self, cx: &gpui::App) {
         if self.item_drag.is_none() || cx.has_active_drag() {
             return;
@@ -671,9 +613,6 @@ fn scroll_speed(distance: f32) -> f32 {
     (2. + distance / 3.).min(AUTOSCROLL_MAX)
 }
 
-/// Copy cursor while a track drag is outside the list. GPUI's own cursor
-/// loses on Windows, where `DragCopy` is a plain arrow, so the window cursor
-/// is replaced directly and only falls back when that fails.
 pub(crate) fn drag_cursor_layer(host: Entity<MainWindow>) -> impl IntoElement {
     canvas(
         |_, _, _| host,

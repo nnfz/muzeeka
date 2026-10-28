@@ -1,21 +1,13 @@
-// Muzeeka colors, matched to the CSS variables in src/app.css.
-//
-// `accent` follows the playing track. Every call reads the current value, so a
-// window redraw after `set_accent_rgb` picks the new color up without each
-// control storing its own copy.
-
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use gpui::{rgb, rgba, Rgba};
 
-/// Purple used when nothing is playing, or the cover has no usable color.
 pub const DEFAULT_ACCENT: u32 = 0xcdcecd;
-/// Same wash as the old `rgba(0x8b5cf61f)`.
 const ACCENT_SOFT_ALPHA: f32 = 31.0 / 255.0;
 
 static ACCENT: AtomicU32 = AtomicU32::new(DEFAULT_ACCENT);
 
-pub const FONT_FAMILY: &str = "Google Sans Flex";
+pub const FONT_FAMILY: &str = "Google Sans";
 
 pub fn bg_deep() -> Rgba {
     rgb(0x0a0a0a)
@@ -37,12 +29,10 @@ pub fn hover() -> Rgba {
     rgb(0x202020)
 }
 
-/// Neutral foreground for primary text and idle controls: like, play, pause, volume.
 pub fn text() -> Rgba {
     rgb(0xdcdce1)
 }
 
-/// Same neutral as [`text`], so secondary icons do not drift to another gray.
 pub fn text_secondary() -> Rgba {
     rgb(0xdcdce1)
 }
@@ -60,19 +50,11 @@ pub fn accent() -> Rgba {
 }
 
 pub fn accent_soft() -> Rgba {
-    // Flattened onto the row background. A plain alpha wash lets the rows
-    // behind a dragged row show through it.
     mix(bg_surface(), accent(), ACCENT_SOFT_ALPHA)
 }
 
-/// How much white a reveal blink mixes in at full strength.
-/// High enough to read on `#111`, low enough that the row stays gray.
 const FLASH_PEAK: f32 = 0.22;
 
-/// Soft gray lift for a track that was just scrolled into view.
-/// `amount` is 0 at rest and 1 at the peak of a blink. Flattened onto `base`
-/// for the same reason as [`accent_soft`]: a plain alpha wash lets the rows
-/// behind a dragged row show through.
 pub fn flash_wash(base: Rgba, amount: f32) -> Rgba {
     mix(base, rgb(0xffffff), FLASH_PEAK * amount.clamp(0.0, 1.0))
 }
@@ -90,7 +72,6 @@ fn channel(base: f32, over: f32, t: f32) -> u32 {
         .mul_add(255.0, 0.5) as u32
 }
 
-/// Install `0xRRGGBB` as the accent. Returns whether it changed.
 pub fn set_accent_rgb(rgb24: u32) -> bool {
     let next = rgb24 & 0x00ff_ffff;
     ACCENT.swap(next, Ordering::Relaxed) != next
@@ -104,7 +85,6 @@ pub fn white() -> Rgba {
     rgb(0xffffff)
 }
 
-/// Web `::-webkit-scrollbar-thumb`, 6px on a transparent track.
 pub fn scrollbar_thumb() -> Rgba {
     rgb(0x1c1c1c)
 }
