@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::sync::{mpsc, Arc, LazyLock, OnceLock};
 use std::time::Duration;
 
@@ -44,10 +45,171 @@ pub(crate) struct Query {
 
 type Outcome = Result<Option<(Tier, String)>, String>;
 
+thread_local! {
+    static LYRIC_LABEL: RefCell<String> = RefCell::new(String::new());
+}
+
+fn set_label(query: &Query) {
+    LYRIC_LABEL.with(|label| {
+        *label.borrow_mut() = format!("\"{}\" — {}", query.title.trim(), query.artist.trim());
+    });
+}
+
+fn log_line(message: impl std::fmt::Display) {
+    LYRIC_LABEL.with(|label| {
+        let label = label.borrow();
+        if label.is_empty() {
+            eprintln!("[lyrics] {message}");
+        } else {
+            eprintln!("[lyrics] {label} · {message}");
+        }
+    });
+}
+
+fn source_name(index: usize) -> &'static str {
+    match index {
+        0 => "paxsenix",
+        1 => "lrc.red",
+        2 => "zarz",
+        3 => "lyrics+",
+        _ => "lrclib",
+    }
+}
+
+fn tier_name(tier: Tier) -> &'static str {
+    match tier {
+        Tier::Word => "word",
+        Tier::Line => "line",
+        Tier::Plain => "plain",
+    }
+}
+
+fn one_line(text: &str, limit: usize) -> String {
+    let mut flat = String::new();
+    let mut count = 0usize;
+    let mut pending_space = false;
+    let mut truncated = false;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            pending_space = !flat.is_empty();
+            continue;
+        }
+        if count >= limit {
+            truncated = true;
+            break;
+        }
+        if pending_space {
+            flat.push(' ');
+            pending_space = false;
+        }
+        flat.push(ch);
+        count += 1;
+    }
+    if truncated {
+        flat.push('…');
+    }
+    flat
+}
+
+fn lyric_sample(ttml: &str) -> String {
+    let mut text = String::new();
+    let mut tag = false;
+    for ch in ttml.chars() {
+        if ch == '<' {
+            tag = true;
+            continue;
+        }
+        if ch == '>' {
+            tag = false;
+            continue;
+        }
+        if !tag {
+            text.push(ch);
+        }
+    }
+    let flat = one_line(text.trim(), 80);
+    if flat.is_empty() {
+        "(no text)".to_string()
+    } else {
+        format!("\"{flat}\"")
+    }
+}
+
+fn outcome_detail(outcome: &Outcome) -> String {
+    match outcome {
+        Err(error) => format!("error: {error}"),
+        Ok(None) => "miss".to_string(),
+        Ok(Some((tier, text))) => format!("{} {} chars", tier_name(*tier), text.len()),
+    }
+}
+
+fn board(outcomes: &[Option<Outcome>]) -> String {
+    outcomes
+        .iter()
+        .enumerate()
+        .map(|(index, outcome)| {
+            let state = outcome
+                .as_ref()
+                .map(outcome_detail)
+                .unwrap_or_else(|| "pending".to_string());
+            format!("{}={state}", source_name(index))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn log_decision(outcomes: &[Option<Outcome>], answer: &Result<Option<String>, String>) {
+    let state = board(outcomes);
+    match answer {
+        Ok(Some(text)) => {
+            let winner = outcomes
+                .iter()
+                .enumerate()
+                .filter_map(|(index, outcome)| match outcome {
+                    Some(Ok(Some((tier, _)))) => Some(((*tier, index), index, *tier)),
+                    _ => None,
+                })
+                .min_by_key(|(key, _, _)| *key);
+            match winner {
+                Some((_, index, tier)) => log_line(format!(
+                    "use {} {} · {} lines · {} chars · {} · {state}",
+                    source_name(index),
+                    tier_name(tier),
+                    text.matches("<p ").count(),
+                    text.len(),
+                    lyric_sample(text),
+                )),
+                None => log_line(format!("use {} chars · {state}", text.len())),
+            }
+        }
+        Ok(None) => log_line(format!("no lyrics · {state}")),
+        Err(error) => log_line(format!("all sources failed: {error} · {state}")),
+    }
+    let pending: Vec<&str> = outcomes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, outcome)| outcome.is_none().then_some(source_name(index)))
+        .collect();
+    if !pending.is_empty() {
+        log_line(format!("still running: {}", pending.join(", ")));
+    }
+}
+
 pub(crate) fn fetch(query: Query) -> Result<Option<String>, String> {
+    set_label(&query);
+    let album = query.album.as_deref().unwrap_or("");
+    let duration = if query.duration_secs > 0 {
+        format!("{}s", query.duration_secs)
+    } else {
+        "unknown".to_string()
+    };
     if query.title.trim().is_empty() || query.artist.trim().is_empty() {
+        log_line("skip, title or artist is empty");
         return Ok(None);
     }
+    log_line(format!(
+        "search album=\"{album}\" duration={duration} · sources paxsenix, lrc.red, zarz, lyrics+, lrclib · prefer word, then line, then plain"
+    ));
     let apple_id: Arc<OnceLock<Option<u64>>> = Arc::new(OnceLock::new());
     let (tx, rx) = mpsc::channel::<(usize, Outcome)>();
     for index in 0..SOURCE_COUNT {
@@ -62,12 +224,21 @@ pub(crate) fn fetch(query: Query) -> Result<Option<String>, String> {
     drop(tx);
     let mut outcomes: Vec<Option<Outcome>> = (0..SOURCE_COUNT).map(|_| None).collect();
     while let Ok((index, outcome)) = rx.recv() {
+        log_line(format!(
+            "{} finished {}",
+            source_name(index),
+            outcome_detail(&outcome)
+        ));
         outcomes[index] = Some(outcome);
         if let Some(answer) = decide(&outcomes) {
+            log_decision(&outcomes, &answer);
             return answer;
         }
+        log_line(format!("waiting · {}", board(&outcomes)));
     }
-    decide(&outcomes).unwrap_or(Ok(None))
+    let answer = decide(&outcomes).unwrap_or(Ok(None));
+    log_decision(&outcomes, &answer);
+    answer
 }
 
 fn decide(outcomes: &[Option<Outcome>]) -> Option<Result<Option<String>, String>> {
@@ -109,20 +280,74 @@ fn decide(outcomes: &[Option<Outcome>]) -> Option<Result<Option<String>, String>
 }
 
 fn run_source(index: usize, query: &Query, apple_id: &OnceLock<Option<u64>>) -> Outcome {
-    let ttml = match index {
+    set_label(query);
+    let name = source_name(index);
+    log_line(format!("{name} start"));
+    match fetch_source(index, query, apple_id) {
+        Ok(ttml) => accept_source(name, ttml, query.duration_secs),
+        Err(error) => {
+            log_line(format!("{name} error: {error}"));
+            Err(error)
+        }
+    }
+}
+
+fn fetch_source(
+    index: usize,
+    query: &Query,
+    apple_id: &OnceLock<Option<u64>>,
+) -> Result<Option<String>, String> {
+    Ok(match index {
         0 => match apple_track_id(query, apple_id) {
-            Some(id) => apple_lyrics(&format!("{PAXSENIX}?id={id}"), TIMEOUT_SECS)?,
-            None => None,
+            Some(id) => {
+                log_line(format!("paxsenix apple id {id}"));
+                apple_lyrics(&format!("{PAXSENIX}?id={id}"), TIMEOUT_SECS, "paxsenix")?
+            }
+            None => {
+                log_line("paxsenix no apple id");
+                None
+            }
         },
         1 => lrc_red(query)?,
         2 => match apple_track_id(query, apple_id) {
-            Some(id) => apple_lyrics(&format!("{ZARZ}?id={id}&v=1"), ZARZ_TIMEOUT_SECS)?,
-            None => None,
+            Some(id) => {
+                log_line(format!("zarz apple id {id}"));
+                apple_lyrics(&format!("{ZARZ}?id={id}&v=1"), ZARZ_TIMEOUT_SECS, "zarz")?
+            }
+            None => {
+                log_line("zarz no apple id");
+                None
+            }
         },
         3 => lyrics_plus(query)?,
         _ => lrclib(query)?,
+    })
+}
+
+fn accept_source(name: &str, ttml: Option<String>, duration_secs: u32) -> Outcome {
+    let Some(ttml) = ttml else {
+        log_line(format!("{name} miss"));
+        return Ok(None);
     };
-    Ok(ttml.and_then(|ttml| classify(&ttml, query.duration_secs).map(|tier| (tier, ttml))))
+    match classify(&ttml, duration_secs) {
+        Some(tier) => {
+            log_line(format!(
+                "{name} {} · {} lines · {} chars · {}",
+                tier_name(tier),
+                ttml.matches("<p ").count(),
+                ttml.len(),
+                lyric_sample(&ttml)
+            ));
+            Ok(Some((tier, ttml)))
+        }
+        None => {
+            log_line(format!(
+                "{name} dropped · no sung words · {} chars",
+                ttml.len()
+            ));
+            Ok(None)
+        }
+    }
 }
 
 fn classify(ttml: &str, duration_secs: u32) -> Option<Tier> {
@@ -157,6 +382,7 @@ fn get_text(url: &str, timeout_secs: u64) -> Result<Option<String>, String> {
 }
 
 fn get_raw(url: &str, timeout_secs: u64) -> Result<Fetched, String> {
+    log_line(format!("GET {url} · timeout {timeout_secs}s"));
     let config = ureq::config::Config::builder()
         .timeout_global(Some(Duration::from_secs(timeout_secs)))
         .user_agent(USER_AGENT)
@@ -165,18 +391,35 @@ fn get_raw(url: &str, timeout_secs: u64) -> Result<Fetched, String> {
     let mut response = match agent.get(url).call() {
         Ok(response) => response,
         Err(ureq::Error::StatusCode(code)) if code == 429 || code >= 500 => {
+            log_line(format!("{code} {url} · busy"));
             return Ok(Fetched::Busy);
         }
         Err(ureq::Error::StatusCode(code)) if matches!(code, 400 | 403 | 404 | 410 | 422) => {
+            log_line(format!("{code} {url} · missing"));
             return Ok(Fetched::Missing);
         }
-        Err(error) => return Err(format!("Lyrics request failed: {error}")),
+        Err(error) => {
+            let message = format!("Lyrics request failed: {error}");
+            log_line(format!("fail {url} · {message}"));
+            return Err(message);
+        }
     };
-    response
-        .body_mut()
-        .read_to_string()
-        .map(Fetched::Body)
-        .map_err(|error| format!("Lyrics response failed: {error}"))
+    let status = response.status().as_u16();
+    match response.body_mut().read_to_string() {
+        Ok(body) => {
+            log_line(format!(
+                "{status} {url} · {} bytes · {}",
+                body.len(),
+                one_line(&body, 300)
+            ));
+            Ok(Fetched::Body(body))
+        }
+        Err(error) => {
+            let message = format!("Lyrics response failed: {error}");
+            log_line(format!("{status} {url} · {message}"));
+            Err(message)
+        }
+    }
 }
 
 fn get_json<T: DeserializeOwned>(url: &str, timeout_secs: u64) -> Result<Option<T>, String> {
@@ -184,11 +427,16 @@ fn get_json<T: DeserializeOwned>(url: &str, timeout_secs: u64) -> Result<Option<
         return Ok(None);
     };
     if body.trim_start().starts_with('<') {
+        log_line(format!("html from {url} · treated as no result"));
         return Ok(None);
     }
-    serde_json::from_str(&body)
-        .map(Some)
-        .map_err(|error| format!("Invalid lyrics response: {error}"))
+    match serde_json::from_str(&body) {
+        Ok(value) => Ok(Some(value)),
+        Err(error) => {
+            log_line(format!("invalid json from {url}: {error}"));
+            Err(format!("Invalid lyrics response: {error}"))
+        }
+    }
 }
 
 fn enc(value: &str) -> String {
@@ -244,41 +492,101 @@ fn itunes_lookup(query: &Query) -> Result<Option<u64>, String> {
         .album
         .as_deref()
         .map(str::trim)
-        .filter(|a| !a.is_empty())
+        .filter(|album| !album.is_empty())
     {
         searches.push((format!("{title} {album}"), ""));
     }
     let mut best: Option<((bool, bool, u32), u64)> = None;
     let mut last_error = None;
     for country in ["", "&country=ru"] {
+        let country_label = if country.is_empty() { "any" } else { "ru" };
         for (term, attribute) in &searches {
+            let attr = if attribute.is_empty() {
+                "all"
+            } else {
+                "songTerm"
+            };
             let url = format!(
                 "{ITUNES_SEARCH}?term={}&entity=song&limit=50{attribute}{country}",
                 enc(term)
             );
+            log_line(format!(
+                "itunes search term={term:?} attr={attr} country={country_label}"
+            ));
             match get_json::<ItunesResults>(&url, 10) {
                 Ok(Some(found)) => {
-                    if let Some(candidate) = itunes_best(query, found) {
-                        if best.is_none_or(|current| candidate.0 < current.0) {
-                            best = Some(candidate);
+                    let total = found.results.len();
+                    let sample = itunes_sample(&found);
+                    match itunes_best(query, found) {
+                        Some((key, id, label)) => {
+                            log_line(format!(
+                                "itunes {total} tracks · pick id={id} {label} · {}",
+                                itunes_rank(key)
+                            ));
+                            if best.is_none_or(|current| key < current.0) {
+                                best = Some((key, id));
+                            }
                         }
+                        None => log_line(format!("itunes {total} tracks · no match · {sample}")),
                     }
                 }
-                Ok(None) => {}
-                Err(error) => last_error = Some(error),
+                Ok(None) => log_line("itunes no result"),
+                Err(error) => {
+                    log_line(format!("itunes {error}"));
+                    last_error = Some(error);
+                }
             }
-            if best.is_some_and(|(key, _)| key == (false, false, 0)) {
-                return Ok(best.map(|(_, id)| id));
+            if let Some((key, id)) = best {
+                if key == (false, false, 0) {
+                    log_line(format!("itunes exact id={id}, stop"));
+                    return Ok(Some(id));
+                }
             }
         }
     }
     match (best, last_error) {
         (None, Some(error)) => Err(error),
-        (best, _) => Ok(best.map(|(_, id)| id)),
+        (best, _) => {
+            match best {
+                Some((_, id)) => log_line(format!("itunes id={id}")),
+                None => log_line("itunes no id"),
+            }
+            Ok(best.map(|(_, id)| id))
+        }
     }
 }
 
-fn itunes_best(query: &Query, found: ItunesResults) -> Option<((bool, bool, u32), u64)> {
+fn itunes_rank((title_differs, album_differs, distance): (bool, bool, u32)) -> String {
+    format!(
+        "title {} · album {} · Δ{distance}s",
+        if title_differs { "loose" } else { "exact" },
+        if album_differs { "differs" } else { "same" }
+    )
+}
+
+fn itunes_sample(found: &ItunesResults) -> String {
+    if found.results.is_empty() {
+        return "empty".to_string();
+    }
+    found
+        .results
+        .iter()
+        .take(8)
+        .map(|track| {
+            let secs = ms(track.track_time_millis).map(|value| ((value + 500) / 1000) as u32);
+            format!(
+                "\"{}\" — {} · {}s",
+                track.track_name.as_deref().unwrap_or("—"),
+                track.artist_name.as_deref().unwrap_or("—"),
+                secs.map(|secs| secs.to_string())
+                    .unwrap_or_else(|| "?".into())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn itunes_best(query: &Query, found: ItunesResults) -> Option<((bool, bool, u32), u64, String)> {
     let title = fold(&query.title);
     let album = query.album.as_deref().map(fold);
     found
@@ -291,16 +599,30 @@ fn itunes_best(query: &Query, found: ItunesResults) -> Option<((bool, bool, u32)
             if !identity_matches(&query.title, &query.artist, name, artist) {
                 return None;
             }
-            let secs = ms(track.track_time_millis).map(|ms| ((ms + 500) / 1000) as u32);
-            let distance = duration_distance(query.duration_secs, secs)?;
+            let secs = ms(track.track_time_millis).map(|value| ((value + 500) / 1000) as u32);
+            let Some(distance) = duration_distance(query.duration_secs, secs) else {
+                log_line(format!(
+                    "itunes duration skip id={id} \"{name}\" — {artist} · wanted {}s got {}s",
+                    query.duration_secs,
+                    secs.map(|secs| secs.to_string())
+                        .unwrap_or_else(|| "?".into())
+                ));
+                return None;
+            };
             let title_differs = fold(name) != title;
             let album_differs = match (&album, track.collection_name.as_deref()) {
                 (Some(wanted), Some(found)) => fold(found) != *wanted,
                 _ => false,
             };
-            Some(((title_differs, album_differs, distance), id))
+            let label = format!(
+                "\"{name}\" — {artist} · {} · {}s",
+                track.collection_name.as_deref().unwrap_or("—"),
+                secs.map(|secs| secs.to_string())
+                    .unwrap_or_else(|| "?".into())
+            );
+            Some(((title_differs, album_differs, distance), id, label))
         })
-        .min_by_key(|(key, _)| *key)
+        .min_by_key(|(key, _, _)| *key)
 }
 
 #[derive(Deserialize)]
@@ -337,34 +659,69 @@ struct AppleSyllable {
     part: Option<bool>,
 }
 
-fn apple_lyrics(url: &str, timeout_secs: u64) -> Result<Option<String>, String> {
+fn apple_lyrics(url: &str, timeout_secs: u64, source: &str) -> Result<Option<String>, String> {
     const ATTEMPTS: u64 = 3;
     for attempt in 1..=ATTEMPTS {
         let busy = match get_raw(url, timeout_secs)? {
-            Fetched::Missing => return Ok(None),
+            Fetched::Missing => {
+                log_line(format!("{source} no lyrics (attempt {attempt})"));
+                return Ok(None);
+            }
             Fetched::Busy => true,
             Fetched::Body(body) => {
                 let trimmed = body.trim_start();
                 if trimmed.starts_with('<') {
+                    log_line(format!("{source} html page, no lyrics"));
                     return Ok(None);
                 }
-                let value: serde_json::Value = serde_json::from_str(trimmed)
-                    .map_err(|error| format!("Invalid lyrics response: {error}"))?;
-                if value.get("error").and_then(|e| e.as_bool()) == Some(true) {
-                    let message = value.get("message").and_then(|m| m.as_str()).unwrap_or("");
+                let value: serde_json::Value = match serde_json::from_str(trimmed) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        log_line(format!("{source} invalid json: {error}"));
+                        return Err(format!("Invalid lyrics response: {error}"));
+                    }
+                };
+                if value.get("error").and_then(|error| error.as_bool()) == Some(true) {
+                    let message = value
+                        .get("message")
+                        .and_then(|message| message.as_str())
+                        .unwrap_or("");
                     if !message.to_lowercase().contains("busy") {
+                        log_line(format!("{source} error reply: {message}"));
                         return Ok(None);
                     }
+                    log_line(format!("{source} busy: {message}"));
                     true
                 } else {
+                    let kind = value
+                        .get("type")
+                        .and_then(|kind| kind.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let lines = value
+                        .get("content")
+                        .and_then(|content| content.as_array())
+                        .map(|content| content.len())
+                        .unwrap_or(0);
                     let lyrics: AppleLyrics = serde_json::from_value(value)
                         .map_err(|error| format!("Invalid lyrics response: {error}"))?;
-                    return Ok(apple_to_ttml(lyrics));
+                    let ttml = apple_to_ttml(lyrics);
+                    log_line(match &ttml {
+                        Some(text) => format!(
+                            "{source} parsed type={kind} lines={lines} → {} chars",
+                            text.len()
+                        ),
+                        None => format!("{source} parsed type={kind} lines={lines} → empty"),
+                    });
+                    return Ok(ttml);
                 }
             }
         };
         if busy && attempt < ATTEMPTS {
+            log_line(format!("{source} retry {attempt}/{ATTEMPTS}"));
             std::thread::sleep(Duration::from_millis(1000 * attempt));
+        } else if busy {
+            log_line(format!("{source} still busy after {ATTEMPTS} attempts"));
         }
     }
     Ok(None)
@@ -448,38 +805,106 @@ struct LrcRedHit {
 fn lrc_red(query: &Query) -> Result<Option<String>, String> {
     let term = format!("{} {}", query.title.trim(), query.artist.trim());
     let url = format!("{LRC_RED}?q={}", enc(&term));
+    log_line(format!("lrc.red search {term:?}"));
     let Some(found) = get_json::<LrcRedSearch>(&url, TIMEOUT_SECS)? else {
+        log_line("lrc.red no result");
         return Ok(None);
     };
+    let total = found.results.len();
+    let mut skipped_url = 0usize;
+    let mut skipped_identity = 0usize;
+    let mut skipped_duration = 0usize;
+    let mut notes = Vec::new();
     let best = found
         .results
         .into_iter()
         .filter_map(|hit| {
-            let lyrics_url = hit
-                .lyrics_url
-                .filter(|url| url.starts_with(LRC_RED_FILES))?;
+            let name = hit.track_name.clone().unwrap_or_default();
+            let artist = hit.artist_name.clone().unwrap_or_default();
+            let shown = format!("\"{name}\" — {artist}");
+            let Some(lyrics_url) = hit.lyrics_url.filter(|url| url.starts_with(LRC_RED_FILES))
+            else {
+                skipped_url += 1;
+                if notes.len() < 8 {
+                    notes.push(format!("{shown} (bad url)"));
+                }
+                return None;
+            };
             if !identity_matches(
                 &query.title,
                 &query.artist,
                 hit.track_name.as_deref().unwrap_or(""),
                 hit.artist_name.as_deref().unwrap_or(""),
             ) {
+                skipped_identity += 1;
+                if notes.len() < 8 {
+                    notes.push(format!("{shown} (identity)"));
+                }
                 return None;
             }
             let secs = hit.duration.map(|secs| secs.round().max(0.0) as u32);
-            let distance = duration_distance(query.duration_secs, secs)?;
+            let Some(distance) = duration_distance(query.duration_secs, secs) else {
+                skipped_duration += 1;
+                log_line(format!(
+                    "lrc.red duration skip {shown} · wanted {}s got {}s",
+                    query.duration_secs,
+                    secs.map(|secs| secs.to_string())
+                        .unwrap_or_else(|| "?".into())
+                ));
+                return None;
+            };
+            let timing = hit
+                .timing_type
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
             let rank = match hit.timing_type.as_deref() {
                 Some("word") => 0,
                 Some("line") => 1,
                 _ => 2,
             };
-            Some(((rank, distance), lyrics_url))
+            let secs_label = secs
+                .map(|secs| secs.to_string())
+                .unwrap_or_else(|| "?".into());
+            Some((
+                (rank, distance),
+                lyrics_url,
+                format!("{shown} · {timing} · {secs_label}s"),
+            ))
         })
-        .min_by_key(|(key, _)| *key);
-    let Some((_, lyrics_url)) = best else {
+        .min_by_key(|(key, _, _)| *key);
+    log_line(format!(
+        "lrc.red {total} hits · skip url={skipped_url} identity={skipped_identity} duration={skipped_duration}"
+    ));
+    if best.is_none() && !notes.is_empty() {
+        log_line(format!("lrc.red saw {}", notes.join("; ")));
+    }
+    let Some(((_, distance), lyrics_url, label)) = best else {
+        log_line("lrc.red no candidate");
         return Ok(None);
     };
-    Ok(get_text(&lyrics_url, TIMEOUT_SECS)?.filter(|text| text.contains("<tt")))
+    log_line(format!("lrc.red pick Δ{distance}s {label} · {lyrics_url}"));
+    match get_text(&lyrics_url, TIMEOUT_SECS)? {
+        Some(text) if text.contains("<tt") => {
+            log_line(format!(
+                "lrc.red file {} chars · {}",
+                text.len(),
+                lyric_sample(&text)
+            ));
+            Ok(Some(text))
+        }
+        Some(text) => {
+            log_line(format!(
+                "lrc.red file is not ttml · {} chars · {}",
+                text.len(),
+                one_line(&text, 160)
+            ));
+            Ok(None)
+        }
+        None => {
+            log_line("lrc.red file missing");
+            Ok(None)
+        }
+    }
 }
 
 // ---------------------------------------------------------------- LyricsPlus
@@ -530,11 +955,39 @@ fn lyrics_plus(query: &Query) -> Result<Option<String>, String> {
     if query.duration_secs > 0 {
         params.push_str(&format!("&duration={}", query.duration_secs));
     }
+    log_line(format!(
+        "lyrics+ title={:?} artist={:?} album={:?} duration={}s sources={LYRICS_PLUS_SOURCES}",
+        query.title.trim(),
+        query.artist.trim(),
+        query.album.as_deref().unwrap_or(""),
+        query.duration_secs
+    ));
     let mut last = Ok(None);
     for host in LYRICS_PLUS_HOSTS {
-        match get_json::<PlusLyrics>(&format!("{host}/v2/lyrics/get?{params}"), TIMEOUT_SECS) {
-            Ok(Some(body)) => return Ok(plus_to_ttml(body)),
-            other => last = other.map(|_| None),
+        let url = format!("{host}/v2/lyrics/get?{params}");
+        match get_json::<PlusLyrics>(&url, TIMEOUT_SECS) {
+            Ok(Some(body)) => {
+                let kind = body.kind.clone().unwrap_or_default();
+                let count = body.lyrics.as_ref().map(|lines| lines.len()).unwrap_or(0);
+                let ttml = plus_to_ttml(body);
+                log_line(match &ttml {
+                    Some(text) => format!(
+                        "{host} type={kind} lines={count} → {} chars · {}",
+                        text.len(),
+                        lyric_sample(text)
+                    ),
+                    None => format!("{host} type={kind} lines={count} → empty"),
+                });
+                return Ok(ttml);
+            }
+            Ok(None) => {
+                log_line(format!("{host} no result"));
+                last = Ok(None);
+            }
+            Err(error) => {
+                log_line(format!("{host} {error}"));
+                last = Err(error);
+            }
         }
     }
     last
@@ -601,12 +1054,39 @@ fn lrclib(query: &Query) -> Result<Option<String>, String> {
     let artist = enc(&query.artist);
     let mut best: Option<((Tier, u32), String)> = None;
     fn consider(best: &mut Option<((Tier, u32), String)>, track: LrclibTrack, query: &Query) {
-        if let Some(candidate) = lrclib_candidate(track, query) {
-            if best.as_ref().is_none_or(|(key, _)| candidate.0 < *key) {
-                *best = Some(candidate);
+        let name = track.track_name.clone().unwrap_or_default();
+        let artist = track.artist_name.clone().unwrap_or_default();
+        let duration = track
+            .duration
+            .map(|secs| format!("{secs:.0}"))
+            .unwrap_or_else(|| "?".to_string());
+        match lrclib_candidate(track, query) {
+            Ok(candidate) => {
+                log_line(format!(
+                    "lrclib keep \"{name}\" — {artist} · {duration}s · {} Δ{}s · {} chars · {}",
+                    tier_name(candidate.0 .0),
+                    candidate.0 .1,
+                    candidate.1.len(),
+                    lyric_sample(&candidate.1)
+                ));
+                if best.as_ref().is_none_or(|(key, _)| candidate.0 < *key) {
+                    *best = Some(candidate);
+                }
+            }
+            Err(reason) => {
+                log_line(format!(
+                    "lrclib skip \"{name}\" — {artist} · {duration}s · {reason}"
+                ));
             }
         }
     }
+    log_line(format!(
+        "lrclib title={:?} artist={:?} album={:?} duration={}s",
+        query.title.trim(),
+        query.artist.trim(),
+        query.album.as_deref().unwrap_or(""),
+        query.duration_secs
+    ));
     if query.duration_secs > 0 {
         let mut url = format!(
             "{LRCLIB_GET}?track_name={title}&artist_name={artist}&duration={}",
@@ -619,47 +1099,77 @@ fn lrclib(query: &Query) -> Result<Option<String>, String> {
         {
             url.push_str(&format!("&album_name={}", enc(album)));
         }
-        if let Some(track) = get_json::<LrclibTrack>(&url, TIMEOUT_SECS)? {
-            consider(&mut best, track, query);
+        log_line("lrclib exact get");
+        match get_json::<LrclibTrack>(&url, TIMEOUT_SECS)? {
+            Some(track) => consider(&mut best, track, query),
+            None => log_line("lrclib exact get no result"),
         }
+    } else {
+        log_line("lrclib skip exact get, duration unknown");
     }
-    if !best
+    if best
         .as_ref()
         .is_some_and(|((tier, _), _)| *tier <= Tier::Line)
     {
+        log_line("lrclib skip search, already have line or word");
+    } else {
         let url = format!("{LRCLIB_SEARCH}?track_name={title}&artist_name={artist}");
-        for track in get_json::<Vec<LrclibTrack>>(&url, TIMEOUT_SECS)?.unwrap_or_default() {
+        log_line("lrclib search");
+        let tracks = get_json::<Vec<LrclibTrack>>(&url, TIMEOUT_SECS)?.unwrap_or_default();
+        log_line(format!("lrclib search {} tracks", tracks.len()));
+        for track in tracks {
             consider(&mut best, track, query);
         }
+    }
+    match &best {
+        Some(((tier, distance), text)) => log_line(format!(
+            "lrclib best {} Δ{distance}s · {} chars",
+            tier_name(*tier),
+            text.len()
+        )),
+        None => log_line("lrclib no candidate"),
     }
     Ok(best.map(|(_, ttml)| ttml))
 }
 
-fn lrclib_candidate(track: LrclibTrack, query: &Query) -> Option<((Tier, u32), String)> {
-    if track.instrumental == Some(true)
-        || !identity_matches(
-            &query.title,
-            &query.artist,
-            track.track_name.as_deref().unwrap_or(""),
-            track.artist_name.as_deref().unwrap_or(""),
-        )
-    {
-        return None;
+fn lrclib_candidate(track: LrclibTrack, query: &Query) -> Result<((Tier, u32), String), String> {
+    if track.instrumental == Some(true) {
+        return Err("instrumental".to_string());
+    }
+    if !identity_matches(
+        &query.title,
+        &query.artist,
+        track.track_name.as_deref().unwrap_or(""),
+        track.artist_name.as_deref().unwrap_or(""),
+    ) {
+        return Err("title or artist differs".to_string());
     }
     let secs = track.duration.map(|secs| secs.round().max(0.0) as u32);
-    let distance = duration_distance(query.duration_secs, secs)?;
+    let Some(distance) = duration_distance(query.duration_secs, secs) else {
+        return Err(format!(
+            "duration wanted {}s got {}s",
+            query.duration_secs,
+            secs.map(|secs| secs.to_string())
+                .unwrap_or_else(|| "?".into())
+        ));
+    };
     let song_ms = secs
         .filter(|secs| *secs > 0)
         .unwrap_or(query.duration_secs)
         .saturating_mul(1000);
-    let ttml = track
+    let Some(ttml) = track
         .synced_lyrics
         .as_deref()
         .filter(|text| !text.trim().is_empty())
         .and_then(|text| lrc_to_ttml(text, song_ms))
-        .or_else(|| track.plain_lyrics.as_deref().and_then(plain_to_ttml))?;
-    let tier = classify(&ttml, query.duration_secs)?;
-    Some(((tier, distance), ttml))
+        .or_else(|| track.plain_lyrics.as_deref().and_then(plain_to_ttml))
+    else {
+        return Err("no lyrics text".to_string());
+    };
+    let Some(tier) = classify(&ttml, query.duration_secs) else {
+        return Err("no sung words".to_string());
+    };
+    Ok(((tier, distance), ttml))
 }
 
 // ---------------------------------------------------------------- TTML output

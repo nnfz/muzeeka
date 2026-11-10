@@ -106,28 +106,54 @@ pub fn load_or_fetch(
     duration_secs: Option<u32>,
 ) -> Option<String> {
     if title.trim().is_empty() && artist.trim().is_empty() {
+        eprintln!("[lyrics] skip, no title or artist");
         return None;
     }
     let key = cache_key(title, artist, album, duration_secs);
     if cleared_path(&key).is_file() {
+        note(
+            title,
+            artist,
+            format!("cleared {} · not searching", cleared_path(&key).display()),
+        );
         return None;
     }
-    if let Ok(text) = fs::read_to_string(hit_path(&key)) {
+    let path = hit_path(&key);
+    if let Ok(text) = fs::read_to_string(&path) {
         if !text.trim().is_empty() {
+            note(
+                title,
+                artist,
+                format!("cache hit {} · {} chars", path.display(), text.len()),
+            );
             return Some(text);
         }
     }
+    note(title, artist, format!("cache miss {}", path.display()));
     let album = album.map(str::trim).filter(|album| !album.is_empty());
-    let fetched = fetch_uncached(
+    match fetch_uncached(
         title.trim(),
         artist.trim(),
         album,
         duration_secs.unwrap_or(0),
-    )
-    .ok()
-    .flatten()?;
-    let _ = fs::write(hit_path(&key), &fetched);
-    Some(fetched)
+    ) {
+        Ok(Some(fetched)) => {
+            match fs::write(&path, &fetched) {
+                Ok(()) => note(
+                    title,
+                    artist,
+                    format!("saved cache {} · {} chars", path.display(), fetched.len()),
+                ),
+                Err(error) => note(title, artist, format!("cache write failed: {error}")),
+            }
+            Some(fetched)
+        }
+        Ok(None) => None,
+        Err(error) => {
+            note(title, artist, format!("fetch failed: {error}"));
+            None
+        }
+    }
 }
 
 pub fn refetch(
@@ -168,6 +194,15 @@ pub fn refetch(
                 .map(str::to_string)
         });
 
+    note(
+        title,
+        artist,
+        format!(
+            "refetch as \"{query_title}\" — {query_artist} album=\"{}\" duration={}s",
+            query_album.as_deref().unwrap_or(""),
+            duration_secs.unwrap_or(0)
+        ),
+    );
     let fetched = fetch_uncached(
         &query_title,
         &query_artist,
@@ -175,10 +210,26 @@ pub fn refetch(
         duration_secs.unwrap_or(0),
     )?;
     if let Some(ttml) = fetched.as_deref() {
-        fs::write(hit_path(&key), ttml)
-            .map_err(|error| format!("Failed to write lyrics: {error}"))?;
+        let path = hit_path(&key);
+        if let Err(error) = fs::write(&path, ttml) {
+            note(title, artist, format!("cache write failed: {error}"));
+            return Err(format!("Failed to write lyrics: {error}"));
+        }
+        note(
+            title,
+            artist,
+            format!("saved cache {} · {} chars", path.display(), ttml.len()),
+        );
     }
     Ok(fetched)
+}
+
+fn note(title: &str, artist: &str, message: impl std::fmt::Display) {
+    eprintln!(
+        "[lyrics] \"{}\" — {} · {message}",
+        title.trim(),
+        artist.trim()
+    );
 }
 
 fn fetch_uncached(

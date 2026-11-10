@@ -29,24 +29,24 @@ const BACKDROP_FADE_SEC: f32 = 0.7;
 const TOP_BAR_H: f32 = 48.;
 const BOTTOM_CHROME_H: f32 = 128.;
 
-const STAGGER_SEC: f32 = 0.045;
-const STAGGER_MAX_SEC: f32 = 0.4;
-const LINE_MOVE_SEC: f32 = 0.62;
 const WHEEL_MOVE_SEC: f32 = 0.28;
 const USER_HOLD: Duration = Duration::from_secs(3);
-const ANCHOR_FRACTION: f32 = 0.5;
 const COLUMN_TOP_PAD: f32 = 80.;
+const CLOCK_LATE_S: f64 = 0.06;
 
-const PAST_ALPHA: f32 = 0.18;
-const UPCOMING_ALPHA: f32 = 0.26;
-const ACTIVE_ALPHA: f32 = 0.4;
-const LINE_HEIGHT: f32 = 1.2;
-const WIPE_BANDS: usize = 4;
-const LONG_GROUP_CHARS: usize = 20;
+/// Unsung words. The white wipe is its own layer, so the active line stays this gray underneath.
+const INACTIVE_ALPHA: f32 = 0.3;
+/// Braccato `--blyrics-line-height`.
+const LINE_HEIGHT: f32 = 1.333;
+/// Slices of the Braccato mask gradient. The edge is 0.1 of the word, same as
+/// `--mask-fade`, and these stops keep that ramp from turning into a hard cut.
+const WIPE_BANDS: usize = 32;
 const BACKGROUND_SCALE: f32 = 0.75;
-const BACKGROUND_DIM: f32 = 0.78;
-const GLOW_RADIUS_EM: f32 = 0.45;
-const GLOW_ALPHA: f32 = 0.14;
+/// `--blyrics-padding: 2rem`. Two lines leave twice this much air between them.
+const LINE_PAD: f32 = 32.;
+const WORD_SPACE_EM: f32 = 0.26;
+/// Below this the swell is invisible, so the letter stays one text node.
+const SCALE_SNAP: f32 = 1.004;
 const PRE_ROLL_MS: f64 = 1000.0;
 
 pub(crate) struct Fullscreen {
@@ -74,6 +74,14 @@ pub(crate) struct Fullscreen {
 struct GroupCache {
     key: Option<(TrackId, usize)>,
     lines: Vec<(Vec<Group>, Vec<Group>)>,
+    /// Quantized font and column width the row breaks were measured at.
+    wrap_key: Option<(i32, i32)>,
+    wraps: Vec<LineWrap>,
+}
+
+struct LineWrap {
+    main: Vec<Vec<usize>>,
+    back: Vec<Vec<usize>>,
 }
 
 impl Fullscreen {
@@ -121,11 +129,12 @@ impl Fullscreen {
     fn line_offsets(
         &mut self,
         track: TrackId,
-        count: usize,
+        lines: &[LyricLine],
+        scroll_time: f64,
         untimed: bool,
-        anchor: Option<usize>,
     ) -> Option<Vec<f32>> {
         let now = Instant::now();
+        let count = lines.len();
         let measure = self.measure.clone();
         let mut m = measure.borrow_mut();
         let s = &mut self.scroll;
@@ -133,7 +142,7 @@ impl Fullscreen {
             *s = LyricScroll {
                 track: Some(track),
                 count,
-                ..Default::default()
+                ..LyricScroll::default()
             };
             m.tops = vec![0.; count];
             m.heights = vec![0.; count];
@@ -142,32 +151,106 @@ impl Fullscreen {
             m.applied = vec![0.; count];
             return None;
         }
-        let goal = auto_target(&m, anchor, untimed);
-        let anchor_index = anchor.unwrap_or(0);
-        if s.motions.len() != count {
-            s.motions = vec![Motion::rest(goal); count];
-            s.target = goal;
-            s.anchor = anchor;
-        } else if let Some(at) = s.user {
-            if !untimed && now.duration_since(at) > USER_HOLD {
-                s.user = None;
-                s.anchor = anchor;
-                s.force = false;
-                s.retarget(goal, anchor_index, now);
-            }
-        } else if s.anchor != anchor || s.force {
-            s.anchor = anchor;
-            s.force = false;
-            s.retarget(goal, anchor_index, now);
-        } else if (goal - s.target).abs() > 0.5 {
-            let delta = goal - s.target;
-            for motion in &mut s.motions {
-                motion.from += delta;
-                motion.to += delta;
-            }
-            s.target = goal;
+        if s.shifts.len() != count {
+            s.shifts = (0..count).map(|_| Vec::new()).collect();
         }
-        let values: Vec<f32> = s.motions.iter().map(|motion| motion.value(now)).collect();
+        for row in &mut s.shifts {
+            row.retain(|shift| shift.alive(now));
+        }
+        if untimed {
+            if !s.placed {
+                s.glide = Glide::rest(0.0);
+                s.placed = true;
+            }
+            let values = s.visuals(now);
+            m.applied = values.clone();
+            return Some(values);
+        }
+
+        let resume = s.user.is_some_and(|at| now.duration_since(at) > USER_HOLD);
+        let held = s.user.is_some() && !resume;
+        if held && s.placed {
+            s.last_time = Some(scroll_time);
+            let values = s.visuals(now);
+            m.applied = values.clone();
+            return Some(values);
+        }
+        if resume {
+            s.user = None;
+        }
+
+        let boxes: Vec<lyric_motion::LyricBox> = (0..count)
+            .map(|index| lyric_motion::LyricBox {
+                time: lines[index].start_ms as f64 / 1000.0,
+                duration: lines[index].duration_ms as f64 / 1000.0,
+                top: m.tops[index],
+                height: m.heights[index],
+            })
+            .collect();
+        let jumped = s
+            .last_time
+            .is_some_and(|previous| (scroll_time - previous).abs() > 0.5);
+        let force = s.force || jumped || resume;
+        let Some(plan) = lyric_motion::plan_scroll(
+            &boxes,
+            scroll_time,
+            m.view_h,
+            &s.group,
+            s.pinned,
+            force,
+        ) else {
+            return None;
+        };
+        let current = s.glide.pos(now);
+        if !s.placed {
+            s.glide = Glide::rest(plan.target);
+            s.group = plan.active;
+            s.pinned = plan.pin;
+            s.placed = true;
+            s.force = false;
+        } else if plan.commit {
+            let delta = plan.target - current;
+            // The scroll position jumps, and each visible line starts translated by
+            // the same distance so the picture does not move. The translation then
+            // eases to zero on its own duration. A later scroll adds another
+            // translation instead of restarting the one already running.
+            if delta.abs() > 2.0 {
+                let distance = delta.abs();
+                let step = lyric_motion::neighbor_step(&boxes, plan.focus);
+                let view_h = m.view_h;
+                for index in 0..count {
+                    let line = &boxes[index];
+                    if !lyric_motion::line_crosses_scroll(
+                        line.top, line.height, current, plan.target, view_h,
+                    ) {
+                        continue;
+                    }
+                    let relative = index as i32 - plan.focus as i32;
+                    s.shifts[index].push(Shift {
+                        from: delta,
+                        start: now,
+                        dur: lyric_motion::line_shift_ms(
+                            relative, delta, distance, step, plan.natural,
+                        ) / 1000.0,
+                    });
+                }
+            }
+            s.glide = Glide::rest(plan.target);
+            s.group = plan.active;
+            s.pinned = plan.pin;
+            s.force = false;
+        } else if s.group == plan.active
+            && s.shifts.iter().all(|row| row.is_empty())
+            && s.glide.done(now)
+            && (plan.target - current).abs() > 8.0
+        {
+            // The lookahead already moves the target. Following it here snapped
+            // the line change instead of letting the commit slide. A drift with
+            // the same group is the layout changing under a scroll that is done.
+            s.glide = Glide::rest(plan.target);
+        }
+        s.last_time = Some(scroll_time);
+        let values = s.visuals(now);
         m.applied = values.clone();
         Some(values)
     }
@@ -175,23 +258,19 @@ impl Fullscreen {
     fn wheel(&mut self, delta: f32, untimed: bool) {
         let m = self.measure.borrow();
         let count = m.tops.len();
-        if !m.valid(count) || self.scroll.motions.len() != count {
+        if !m.valid(count) || self.scroll.count != count || !self.scroll.placed {
             return;
         }
         let now = Instant::now();
         let (lo, hi) = scroll_range(&m, untimed);
         let s = &mut self.scroll;
-        let next = (s.target - delta).clamp(lo, hi);
-        for motion in &mut s.motions {
-            *motion = Motion {
-                from: motion.value(now),
-                to: next,
-                start: now,
-                delay: 0.0,
-                dur: WHEEL_MOVE_SEC,
-            };
-        }
-        s.target = next;
+        let current = s.glide.pos(now);
+        s.glide = Glide {
+            from: current,
+            to: (current - delta).clamp(lo, hi),
+            start: now,
+            dur: WHEEL_MOVE_SEC,
+        };
         s.user = Some(now);
     }
 }
@@ -215,7 +294,6 @@ fn stamp_of(path: Option<&Path>) -> Option<(PathBuf, Option<SystemTime>)> {
 struct Clock {
     shown: f64,
     real: f64,
-    real_at: Option<Instant>,
     at: Option<Instant>,
     track: Option<TrackId>,
     playing: bool,
@@ -228,31 +306,27 @@ impl Clock {
 
     fn time(&mut self, track: Option<TrackId>, real: f64, playing: bool) -> f64 {
         let now = Instant::now();
-        let snap = self.at.is_none() || self.track != track || self.playing != playing;
-        if snap || real != self.real {
-            self.real = real;
-            self.real_at = Some(now);
-        }
-        let real_age = self
-            .real_at
-            .map(|at| now.duration_since(at).as_secs_f64().min(0.5))
+        let switched = self.at.is_none() || self.track != track || self.playing != playing;
+        let dt = self
+            .at
+            .map(|at| now.saturating_duration_since(at).as_secs_f64().min(0.25))
             .unwrap_or(0.0);
-        let target = if playing { real + real_age } else { real };
-        if snap {
-            self.shown = target;
-        } else {
-            let dt = self
-                .at
-                .map(|at| now.duration_since(at).as_secs_f64().min(0.5))
-                .unwrap_or(0.0);
-            let predicted = if playing { self.shown + dt } else { target };
-            let error = target - predicted;
-            self.shown = if error.abs() > 0.25 {
-                target
+        if !playing || switched {
+            self.shown = real;
+        } else if real != self.real {
+            let predicted = self.shown + dt;
+            let error = real - predicted;
+            // A sample that arrives a little late must not pull the wipe backwards.
+            // A seek, or a sample that is ahead, is taken whole.
+            if error < -0.001 && error > -CLOCK_LATE_S {
+                self.shown = predicted + error * 0.15;
             } else {
-                predicted + error * (1.0 - (-dt * 6.0).exp())
-            };
+                self.shown = real;
+            }
+        } else {
+            self.shown += dt;
         }
+        self.real = real;
         self.track = track;
         self.playing = playing;
         self.at = Some(now);
@@ -261,38 +335,59 @@ impl Clock {
 }
 
 #[derive(Clone, Copy)]
-struct Motion {
+struct Glide {
     from: f32,
     to: f32,
     start: Instant,
-    delay: f32,
     dur: f32,
 }
 
-impl Motion {
+impl Default for Glide {
+    fn default() -> Self {
+        Self::rest(0.0)
+    }
+}
+
+impl Glide {
     fn rest(value: f32) -> Self {
         Self {
             from: value,
             to: value,
             start: Instant::now(),
-            delay: 0.0,
             dur: 0.0,
         }
     }
 
-    fn value(&self, now: Instant) -> f32 {
-        let t = now.saturating_duration_since(self.start).as_secs_f32() - self.delay;
+    fn pos(&self, now: Instant) -> f32 {
+        let t = now.saturating_duration_since(self.start).as_secs_f32();
         if self.dur <= 0.0 || t >= self.dur {
             return self.to;
-        }
-        if t <= 0.0 {
-            return self.from;
         }
         self.from + (self.to - self.from) * ease_out_cubic(t / self.dur)
     }
 
     fn done(&self, now: Instant) -> bool {
-        now.saturating_duration_since(self.start).as_secs_f32() >= self.delay + self.dur
+        now.saturating_duration_since(self.start).as_secs_f32() >= self.dur
+    }
+}
+
+struct Shift {
+    from: f32,
+    start: Instant,
+    dur: f32,
+}
+
+impl Shift {
+    fn value(&self, now: Instant) -> f32 {
+        let t = now.saturating_duration_since(self.start).as_secs_f32();
+        if self.dur <= 0.0 || t >= self.dur {
+            return 0.0;
+        }
+        self.from * (1.0 - lyric_motion::SCROLL_EASE.at(t / self.dur))
+    }
+
+    fn alive(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.start).as_secs_f32() < self.dur
     }
 }
 
@@ -300,36 +395,35 @@ impl Motion {
 struct LyricScroll {
     track: Option<TrackId>,
     count: usize,
-    motions: Vec<Motion>,
-    target: f32,
-    anchor: Option<usize>,
+    glide: Glide,
+    shifts: Vec<Vec<Shift>>,
+    group: Vec<usize>,
+    pinned: Option<usize>,
+    last_time: Option<f64>,
     user: Option<Instant>,
     force: bool,
+    placed: bool,
 }
 
 impl LyricScroll {
-    fn retarget(&mut self, goal: f32, anchor: usize, now: Instant) {
-        let forward = goal >= self.target;
-        for (index, motion) in self.motions.iter_mut().enumerate() {
-            let rank = if forward {
-                index.saturating_sub(anchor)
-            } else {
-                anchor.saturating_sub(index)
-            };
-            let delay = (rank as f32 * STAGGER_SEC).min(STAGGER_MAX_SEC);
-            *motion = Motion {
-                from: motion.value(now),
-                to: goal,
-                start: now,
-                delay,
-                dur: LINE_MOVE_SEC,
-            };
-        }
-        self.target = goal;
+    fn visuals(&self, now: Instant) -> Vec<f32> {
+        (0..self.count)
+            .map(|index| {
+                let extra: f32 = self.shifts[index]
+                    .iter()
+                    .map(|shift| shift.value(now))
+                    .sum();
+                self.glide.pos(now) - extra
+            })
+            .collect()
     }
 
     fn animating(&self, now: Instant) -> bool {
-        self.motions.iter().any(|motion| !motion.done(now))
+        !self.glide.done(now)
+            || self
+                .shifts
+                .iter()
+                .any(|row| row.iter().any(|shift| shift.alive(now)))
     }
 }
 
@@ -359,23 +453,17 @@ impl Measure {
     }
 }
 
-fn auto_target(m: &Measure, anchor: Option<usize>, untimed: bool) -> f32 {
-    match anchor {
-        Some(index) if !untimed && index < m.tops.len() => {
-            m.tops[index] + m.heights[index] / 2.0 - m.view_h * ANCHOR_FRACTION
-        }
-        _ => 0.0,
-    }
-}
-
 fn scroll_range(m: &Measure, untimed: bool) -> (f32, f32) {
     let content = m.content_h();
-    if untimed {
-        (0.0, (content - m.view_h * 0.7).max(0.0))
-    } else {
-        let lo = m.tops.first().copied().unwrap_or(0.0) - m.view_h * ANCHOR_FRACTION;
-        (lo, (content - m.view_h * ANCHOR_FRACTION).max(lo))
+    if untimed || m.tops.is_empty() {
+        return (0.0, (content - m.view_h * 0.7).max(0.0));
     }
+    let place = |index: usize| {
+        m.tops[index] + m.heights[index] * 0.5 - m.view_h * lyric_motion::TARGET_RATIO
+    };
+    let lo = place(0);
+    let hi = place(m.tops.len() - 1).max(lo);
+    (lo, hi)
 }
 
 #[derive(Default)]
@@ -484,8 +572,11 @@ struct Unit {
     text: String,
     lit: Lit,
     highlight: f32,
-    glow: f32,
     lift: f32,
+    /// The letter is still inside its rise. A settled letter snaps to one pixel.
+    traveling: bool,
+    /// Paint scale of one letter. The layout box stays at 1.
+    scale: f32,
     rtl: bool,
 }
 
@@ -587,28 +678,39 @@ fn line_parts(text: &str, start_ms: f64) -> Vec<Part> {
     parts
 }
 
-fn line_groups(line: &LyricLine, sync: SyncType) -> (Vec<Group>, Vec<Group>) {
-    if sync == SyncType::Rich && !line.parts.is_empty() {
-        let mut main = Vec::new();
-        let mut back = Vec::new();
-        for part in &line.parts {
-            let entry = Part {
-                text: part.words.clone(),
-                start_ms: part.start_ms as f64,
-                duration_ms: part.duration_ms as f32,
-            };
-            if part.background {
-                back.push(entry);
-            } else {
-                main.push(entry);
-            }
-        }
-        return (groups_of(main), groups_of(back));
+fn backing_is_the_line(line: &LyricLine, backs: &[Part]) -> bool {
+    if backs.is_empty() || line.parts.iter().any(|part| !part.background) {
+        return false;
     }
-    (
-        groups_of(line_parts(&line.words, line.start_ms as f64)),
-        Vec::new(),
-    )
+    let backing: String = backs.iter().map(|part| part.text.as_str()).collect();
+    let backing = backing.split_whitespace().collect::<Vec<_>>().join(" ");
+    let words = line.words.split_whitespace().collect::<Vec<_>>().join(" ");
+    words.is_empty() || words == backing
+}
+
+fn line_groups(line: &LyricLine, sync: SyncType) -> (Vec<Group>, Vec<Group>) {
+    let mut main = Vec::new();
+    let mut back = Vec::new();
+    for part in &line.parts {
+        let entry = Part {
+            text: part.words.clone(),
+            start_ms: part.start_ms as f64,
+            duration_ms: part.duration_ms as f32,
+        };
+        if part.background {
+            back.push(entry);
+        } else {
+            main.push(entry);
+        }
+    }
+    let main = if sync == SyncType::Rich && !main.is_empty() {
+        groups_of(main)
+    } else if backing_is_the_line(line, &back) {
+        Vec::new()
+    } else {
+        groups_of(line_parts(&line.words, line.start_ms as f64))
+    };
+    (main, groups_of(back))
 }
 
 fn part_units(part: &Part, view: LineView, font: f32) -> Vec<Unit> {
@@ -616,18 +718,15 @@ fn part_units(part: &Part, view: LineView, font: f32) -> Vec<Unit> {
     let rtl = is_rtl(&part.text);
     let since = (view.now_ms - part.start_ms) as f32;
     let fade = if motion.still { 0.0 } else { motion.highlight };
-    let glow = if motion.past || motion.still {
-        0.0
-    } else {
-        lyric_motion::glow(since, part.duration_ms)
-    };
+    let long = part.duration_ms > lyric_motion::LONG_WORD_MS;
     let whole = |lit: Lit, highlight: f32| {
         vec![Unit {
             text: part.text.clone(),
             lit,
             highlight,
-            glow,
             lift: 0.0,
+            traveling: false,
+            scale: 1.0,
             rtl,
         }]
     };
@@ -646,17 +745,21 @@ fn part_units(part: &Part, view: LineView, font: f32) -> Vec<Unit> {
         .into_iter()
         .zip(waves)
         .enumerate()
-        .map(|(index, (text, wave))| Unit {
-            text,
-            lit: lyric_motion::letter_lit(start, index, count),
-            highlight,
-            glow,
-            lift: snap(
-                lyric_motion::float(since, wave) * font * fade,
-                view.px_scale,
-                1.0,
-            ),
-            rtl,
+        .map(|(index, (text, wave))| {
+            let local = since - wave.delay_ms;
+            Unit {
+                text,
+                lit: lyric_motion::letter_lit(start, index, count),
+                highlight,
+                lift: lyric_motion::float(since, wave) * font * fade,
+                traveling: local >= 0.0 && local < wave.duration_ms,
+                scale: if long {
+                    lyric_motion::emphasis(since, wave)
+                } else {
+                    1.0
+                },
+                rtl,
+            }
         })
         .collect()
 }
@@ -689,98 +792,132 @@ fn clip_layer(text: &SharedString, from: f32, to: f32, color: Hsla) -> Option<An
 
 fn unit_text(unit: &Unit, base: f32) -> gpui::Div {
     let text = SharedString::from(unit.text.clone());
-    let over = |alpha: f32| alpha + base * (1.0 - alpha);
+    // One glyph already mixes the white reveal with the gray base.
+    let flat = |reveal: f32| reveal + base * (1.0 - reveal);
     if unit.highlight <= 0.0 || unit.lit.dark() {
         return div().text_color(white_a(base)).child(text);
     }
     if unit.lit.full() {
-        return div().text_color(white_a(over(unit.highlight))).child(text);
+        return div().text_color(white_a(flat(unit.highlight))).child(text);
     }
     let lo = unit.lit.edge.clamp(0.0, 1.0);
     let hi = (unit.lit.edge + unit.lit.fade).clamp(0.0, 1.0);
     let mut layers: Vec<AnyElement> = Vec::new();
-    let mut push = |from: f32, to: f32, alpha: f32| {
+    let mut push = |from: f32, to: f32, reveal: f32| {
+        if reveal <= 0.004 {
+            return;
+        }
         let (from, to) = if unit.rtl {
             (1.0 - to, 1.0 - from)
         } else {
             (from, to)
         };
-        layers.extend(clip_layer(&text, from, to, white_a(alpha)));
+        layers.extend(clip_layer(&text, from, to, white_a(reveal)));
     };
-    push(0.0, lo, over(unit.highlight));
+    // The clip sits on top of the gray glyph. Its alpha is only the white
+    // reveal. Mixing the base in here as well paints that gray twice.
+    push(0.0, lo, unit.highlight);
     for band in 0..WIPE_BANDS {
         let from = lo + (hi - lo) * band as f32 / WIPE_BANDS as f32;
         let to = lo + (hi - lo) * (band + 1) as f32 / WIPE_BANDS as f32;
-        push(
-            from,
-            to,
-            over(unit.lit.at((from + to) * 0.5) * unit.highlight),
-        );
+        push(from, to, unit.lit.at((from + to) * 0.5) * unit.highlight);
     }
-    push(hi, 1.0, base);
     div()
         .relative()
-        .child(div().text_color(white_a(0.0)).child(text))
+        .child(div().text_color(white_a(base)).child(text))
         .children(layers)
 }
 
-fn unit_glow(unit: &Unit, font: f32) -> Option<AnyElement> {
-    let amount = unit.lit.amount();
-    let strength = unit.glow * unit.highlight * amount;
-    if strength <= 0.01 {
-        return None;
+fn unit_body(unit: &Unit, font: f32, base: f32) -> gpui::Div {
+    let text = unit_text(unit, base).whitespace_nowrap();
+    if unit.scale <= SCALE_SNAP {
+        return text;
     }
-    let left = if unit.rtl { 1.0 - amount } else { 0.0 };
-    Some(
-        div()
-            .absolute()
-            .top(px(font * 0.22))
-            .bottom(px(font * 0.22))
-            .left(relative(left))
-            .w(relative(amount))
-            .rounded(px(font * 0.3))
-            .shadow(vec![BoxShadow {
-                color: white_a(GLOW_ALPHA * strength),
-                offset: point(px(0.), px(0.)),
-                blur_radius: px(font * GLOW_RADIUS_EM * unit.glow),
-                spread_radius: px(0.),
-                inset: false,
-            }])
-            .into_any_element(),
-    )
-}
-
-fn unit_element(unit: Unit, font: f32, base: f32) -> AnyElement {
-    let glow = unit_glow(&unit, font);
-    if glow.is_none() && unit.lift == 0.0 {
-        return unit_text(&unit, base)
-            .whitespace_nowrap()
-            .into_any_element();
-    }
+    // GPUI has no paint-only scale. The invisible copy keeps the letter's box,
+    // and the visible copy grows from the center without pushing its neighbors.
+    let size = font * unit.scale;
     div()
         .relative()
-        .top(px(-unit.lift))
         .whitespace_nowrap()
-        .children(glow)
-        .child(unit_text(&unit, base))
+        .child(text.opacity(0.))
+        .child(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .bottom_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    unit_text(unit, base)
+                        .whitespace_nowrap()
+                        .text_size(px(size))
+                        .line_height(px(size * LINE_HEIGHT)),
+                ),
+        )
+}
+
+fn unit_element(unit: Unit, font: f32, base: f32, px_scale: f32) -> AnyElement {
+    // Glyph Y snaps to a device pixel, so a raw offset steps from letter to
+    // letter. While the wave is moving, a faint copy sits on the neighboring
+    // pixel and the crest travels instead of popping.
+    let quantum = 1.0 / px_scale.max(1.0);
+    let steps = unit.lift / quantum;
+    let primary_step = steps.round();
+    let primary_y = primary_step * quantum;
+    let residual = if unit.traveling {
+        steps - primary_step
+    } else {
+        0.0
+    };
+    if primary_y.abs() <= 0.04 && residual.abs() <= 0.04 {
+        return unit_body(&unit, font, base).into_any_element();
+    }
+    let shell = div().relative().whitespace_nowrap().child(
+        div()
+            .opacity(0.)
+            .whitespace_nowrap()
+            .child(unit.text.clone()),
+    );
+    let placed = |y: f32, opacity: f32| {
+        div()
+            .absolute()
+            .top(px(-y))
+            .left_0()
+            .opacity(opacity)
+            .child(unit_body(&unit, font, base))
+    };
+    if residual.abs() <= 0.04 {
+        return shell.child(placed(primary_y, 1.0)).into_any_element();
+    }
+    let ghost_y = (primary_step + residual.signum()) * quantum;
+    shell
+        .child(placed(primary_y, 1.0))
+        .child(placed(ghost_y, residual.abs() * 0.65))
         .into_any_element()
 }
 
-fn group_element(group: &Group, view: LineView, font: f32) -> AnyElement {
-    let chars: usize = group
-        .parts
-        .iter()
-        .map(|part| part.text.chars().count())
-        .sum();
+fn group_element(
+    group: &Group,
+    view: LineView,
+    font: f32,
+    pull_next: bool,
+    align: Align,
+) -> AnyElement {
+    // A run with no space after it cancels the row gap, so CJK stays tight.
+    // The gap itself is not drawn after the last word of a wrapped line.
+    let tighten = |el: gpui::Div| el.when(pull_next, |el| el.mr(px(font * -WORD_SPACE_EM)));
     if !view.detailed {
         let text: String = group.parts.iter().map(|part| part.text.as_str()).collect();
-        return div()
-            .text_color(white_a(view.base))
-            .when(chars > LONG_GROUP_CHARS, |el| el.max_w_full())
-            .when(chars <= LONG_GROUP_CHARS, |el| el.whitespace_nowrap())
-            .when(group.space_after, |el| el.mr(px(font * 0.26)))
-            .child(text)
-            .into_any_element();
+        return tighten(
+            div()
+                .text_color(white_a(view.base))
+                .whitespace_nowrap(),
+        )
+        .child(text)
+        .into_any_element();
     }
     let motion = view.motion;
     let first_ms = group.parts.first().map_or(0.0, |part| part.start_ms);
@@ -794,24 +931,38 @@ fn group_element(group: &Group, view: LineView, font: f32) -> AnyElement {
         .parts
         .iter()
         .flat_map(|part| part_units(part, view, font))
-        .map(|unit| unit_element(unit, font, view.base));
-    div()
+        .map(|unit| unit_element(unit, font, view.base, view.px_scale));
+    let row = div()
         .relative()
         .left(px(shift))
         .flex()
         .flex_row()
-        .when(chars > LONG_GROUP_CHARS, |el| el.flex_wrap().max_w_full())
-        .when(group.space_after, |el| el.mr(px(font * 0.26)))
-        .children(units)
-        .into_any_element()
+        .whitespace_nowrap()
+        .when(matches!(align, Align::Start), |el| el.justify_start())
+        .when(matches!(align, Align::Center), |el| el.justify_center())
+        .when(matches!(align, Align::End), |el| el.justify_end())
+        .children(units);
+    tighten(row).into_any_element()
 }
 
-fn word_row(groups: &[Group], view: LineView, font: f32, align: Align) -> gpui::Div {
+fn word_row(
+    groups: &[Group],
+    indices: &[usize],
+    view: LineView,
+    font: f32,
+    align: Align,
+) -> gpui::Div {
+    let last = indices.len().saturating_sub(1);
     let row = div()
+        .w_full()
         .flex()
         .flex_row()
-        .flex_wrap()
-        .children(groups.iter().map(|group| group_element(group, view, font)));
+        .gap_x(px(font * WORD_SPACE_EM))
+        .children(indices.iter().enumerate().filter_map(|(place, index)| {
+            let group = groups.get(*index)?;
+            let pull_next = !group.space_after && place < last;
+            Some(group_element(group, view, font, pull_next, align))
+        }));
     match align {
         Align::Start => row.justify_start(),
         Align::Center => row.justify_center(),
@@ -819,28 +970,161 @@ fn word_row(groups: &[Group], view: LineView, font: f32, align: Align) -> gpui::
     }
 }
 
+/// Breaks chosen at the full font size. Later paint, including the 0.95 scale,
+/// keeps these rows, so a growing line does not wrap again and jump.
+fn pack_rows(widths: &[f32], gap_before: &[f32], max_w: f32) -> Vec<Vec<usize>> {
+    let mut rows: Vec<Vec<usize>> = Vec::new();
+    let mut row: Vec<usize> = Vec::new();
+    let mut used = 0.0;
+    for (index, &width) in widths.iter().enumerate() {
+        let gap = if row.is_empty() {
+            0.0
+        } else {
+            gap_before.get(index).copied().unwrap_or(0.0)
+        };
+        if !row.is_empty() && used + gap + width > max_w {
+            rows.push(std::mem::take(&mut row));
+            used = 0.0;
+        }
+        let gap = if row.is_empty() { 0.0 } else { gap };
+        used += gap + width;
+        row.push(index);
+    }
+    if !row.is_empty() {
+        rows.push(row);
+    }
+    rows
+}
+
+fn resolved_rows(count: usize, planned: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    if count == 0 {
+        return Vec::new();
+    }
+    if planned.is_empty() {
+        return vec![(0..count).collect()];
+    }
+    planned.to_vec()
+}
+
+fn text_width(window: &mut Window, text: &str, font_px: f32, weight: gpui::FontWeight) -> f32 {
+    if text.is_empty() || font_px <= 0.0 {
+        return 0.0;
+    }
+    let mut font = gpui::font(theme::FONT_FAMILY);
+    font.weight = weight;
+    let run = gpui::TextRun {
+        len: text.len(),
+        font,
+        ..Default::default()
+    };
+    window
+        .text_system()
+        .shape_line(SharedString::from(text), px(font_px), &[run], None)
+        .width()
+        .as_f32()
+}
+
+fn group_width(window: &mut Window, group: &Group, font_px: f32, weight: gpui::FontWeight) -> f32 {
+    group
+        .parts
+        .iter()
+        .map(|part| text_width(window, &part.text, font_px, weight))
+        .sum()
+}
+
+fn measure_rows(
+    window: &mut Window,
+    groups: &[Group],
+    font_px: f32,
+    weight: gpui::FontWeight,
+    max_w: f32,
+) -> Vec<Vec<usize>> {
+    if groups.is_empty() {
+        return Vec::new();
+    }
+    let gap_px = font_px * WORD_SPACE_EM;
+    let widths: Vec<f32> = groups
+        .iter()
+        .map(|group| group_width(window, group, font_px, weight))
+        .collect();
+    let gap_before: Vec<f32> = groups
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            if index > 0 && groups[index - 1].space_after {
+                gap_px
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    pack_rows(&widths, &gap_before, max_w)
+}
+
+/// The row keeps its full-size box. A smaller copy is painted from the line's
+/// origin, the way `transform: scale(0.95)` does, so the scroll measure holds still.
+fn resting_scale(full: AnyElement, small: AnyElement, align: Align, size: f32) -> AnyElement {
+    div()
+        .relative()
+        .w_full()
+        .child(div().w_full().opacity(0.).child(full))
+        .child(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .bottom_0()
+                .flex()
+                .items_center()
+                .text_size(px(size))
+                .line_height(px(size * LINE_HEIGHT))
+                .when(matches!(align, Align::Start), |row| row.justify_start())
+                .when(matches!(align, Align::End), |row| row.justify_end())
+                .when(matches!(align, Align::Center), |row| row.justify_center())
+                .child(small),
+        )
+        .into_any_element()
+}
+
+fn text_block(
+    groups: &[Group],
+    planned: &[Vec<usize>],
+    view: LineView,
+    font: f32,
+    align: Align,
+) -> gpui::Div {
+    let rows = resolved_rows(groups.len(), planned);
+    div().w_full().flex().flex_col().children(
+        rows.iter()
+            .map(|row| word_row(groups, row, view, font, align)),
+    )
+}
+
 fn lyric_line(
     main: &[Group],
     back: &[Group],
+    main_rows: &[Vec<usize>],
+    back_rows: &[Vec<usize>],
     view: LineView,
     font: f32,
     align: Align,
 ) -> AnyElement {
     let back_font = font * BACKGROUND_SCALE;
-    let back_view = LineView {
-        base: view.base * BACKGROUND_DIM,
-        ..view
-    };
     div()
+        .w_full()
         .flex()
         .flex_col()
+        .when(matches!(align, Align::Start), |column| column.items_start())
+        .when(matches!(align, Align::Center), |column| column.items_center())
+        .when(matches!(align, Align::End), |column| column.items_end())
         .when(!main.is_empty(), |column| {
-            column.child(word_row(main, view, font, align))
+            column.child(text_block(main, main_rows, view, font, align))
         })
         .when(!back.is_empty(), |column| {
             column.child(
-                word_row(back, back_view, back_font, align)
-                    .mt(px(font * 0.1))
+                text_block(back, back_rows, view, back_font, align)
+                    .when(!main.is_empty(), |row| row.mt(px(font * 0.1)))
                     .text_size(px(back_font))
                     .line_height(px(back_font * LINE_HEIGHT))
                     .font_weight(gpui::FontWeight::MEDIUM),
@@ -938,7 +1222,20 @@ impl MainWindow {
                         .as_deref()
                         .and_then(|path| std::fs::read_to_string(path).ok());
                     let (text, fetched) = match cached {
-                        Some(text) => (Some(text), false),
+                        Some(text) => {
+                            let path = track
+                                .lyrics
+                                .as_ref()
+                                .map(|path| path.display().to_string())
+                                .unwrap_or_default();
+                            eprintln!(
+                                "[lyrics] \"{}\" — {} · cache file {path} · {} chars",
+                                track.title,
+                                track.artist,
+                                text.len()
+                            );
+                            (Some(text), false)
+                        }
                         None => {
                             let text = crate::ui::lyrics_store::load_or_fetch(
                                 &track.title,
@@ -1133,7 +1430,8 @@ impl MainWindow {
         let (panel, panel_ready) = match (&lyrics_now, panel_mounted) {
             (Some(lyr), true) => {
                 let px_scale = window.scale_factor();
-                let (panel, ready) = self.lyrics_panel(id, lyr.clone(), time, vw, px_scale, cx);
+                let (panel, ready) =
+                    self.lyrics_panel(id, lyr.clone(), time, vw, px_scale, window, cx);
                 (Some(panel), ready)
             }
             _ => (None, true),
@@ -1479,25 +1777,22 @@ impl MainWindow {
         time: f64,
         vw: f32,
         px_scale: f32,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> (AnyElement, bool) {
         let untimed = lyr.sync == SyncType::None;
         let lines = &lyr.lines;
-        let anchor = if untimed {
-            None
-        } else {
-            lyrics::scroll_anchor(lines, time + lyrics::LINE_LEAD_SEC)
-        };
         let lead_ms = if lyr.sync == SyncType::Rich {
             lyric_motion::RICH_LEAD_MS
         } else {
             lyric_motion::LINE_LEAD_MS
         };
         let now_ms = time * 1000.0 + lead_ms;
+        let scroll_time = time + lead_ms as f64 / 1000.0 + lyric_motion::SCROLL_LEAD_SEC;
         let current = lyrics::active_lines(lines, now_ms / 1000.0);
         let offsets = self
             .fullscreen
-            .line_offsets(id, lines.len(), untimed, anchor);
+            .line_offsets(id, lines, scroll_time, untimed);
         let ready = offsets.is_some();
         let offsets = offsets.unwrap_or_else(|| vec![0.; lines.len()]);
         let (tops, heights, view_h) = {
@@ -1516,6 +1811,26 @@ impl MainWindow {
                 .iter()
                 .map(|line| line_groups(line, lyr.sync))
                 .collect();
+            groups.wrap_key = None;
+        }
+        let text_w = ((vw * 0.5 - 56.).max(200.) - 28.).max(80.);
+        let wrap_key = ((font * 10.0).round() as i32, (text_w * 2.0).round() as i32);
+        if groups.wrap_key != Some(wrap_key) || groups.wraps.len() != groups.lines.len() {
+            groups.wraps = groups
+                .lines
+                .iter()
+                .map(|(main, back)| LineWrap {
+                    main: measure_rows(window, main, font, gpui::FontWeight::BOLD, text_w),
+                    back: measure_rows(
+                        window,
+                        back,
+                        font * BACKGROUND_SCALE,
+                        gpui::FontWeight::MEDIUM,
+                        text_w,
+                    ),
+                })
+                .collect();
+            groups.wrap_key = Some(wrap_key);
         }
 
         let mut rows: Vec<AnyElement> = Vec::with_capacity(lines.len());
@@ -1529,8 +1844,8 @@ impl MainWindow {
             } else {
                 1.0
             };
-            let right = matches!(line.agent.as_deref(), Some("v2") | Some("v3"));
             let centered = line.agent.as_deref() == Some("v1000");
+            let right = !centered && matches!(line.agent.as_deref(), Some("v2") | Some("v3"));
             let seekable = !untimed && !line.instrumental;
             let seek = line.start_ms as f64 / 1000.0;
             let arm_id = SharedString::from(format!("fs-lyric-{index}"));
@@ -1547,8 +1862,8 @@ impl MainWindow {
                         let applied = m.applied.get(index).copied().unwrap_or(0.);
                         let natural = bounds.origin.y.as_f32() - m.view_top + applied;
                         let height = bounds.size.height.as_f32();
-                        if (m.tops[index] - natural).abs() > 0.5
-                            || (m.heights[index] - height).abs() > 0.5
+                        if (m.tops[index] - natural).abs() > 2.0
+                            || (m.heights[index] - height).abs() > 2.0
                         {
                             m.tops[index] = natural;
                             m.heights[index] = height;
@@ -1563,12 +1878,24 @@ impl MainWindow {
                 .right(px(0.))
                 .bottom(px(0.))
             };
-            let align = if right {
-                Align::End
-            } else if centered {
+            let align = if centered {
                 Align::Center
+            } else if right {
+                Align::End
             } else {
                 Align::Start
+            };
+            let grown = if untimed {
+                1.0
+            } else {
+                let own = line.start_ms as f64
+                    + line.duration_ms as f64
+                    + lyric_motion::LINE_SETTLE_MS;
+                let end = lines
+                    .get(index + 1)
+                    .map(|next| (next.start_ms as f64).max(own))
+                    .unwrap_or(own);
+                lyric_motion::line_scale(now_ms, line.start_ms as f64, end)
             };
             let content: AnyElement = if untimed {
                 div()
@@ -1578,13 +1905,21 @@ impl MainWindow {
             } else if line.instrumental {
                 let progress = lyrics::break_progress(lines, index, time);
                 let active = current.contains(&index);
+                let dot_font = font * grown;
                 div()
+                    .w_full()
+                    .min_h(px(font * 1.15))
+                    .flex()
+                    .items_center()
+                    .when(matches!(align, Align::End), |el| el.justify_end())
+                    .when(matches!(align, Align::Center), |el| el.justify_center())
+                    .when(matches!(align, Align::Start), |el| el.justify_start())
                     .with_spring(
                         SharedString::from(format!("fs-line-{}-{index}", id.0)),
                         SpringAnimation::new(SpringConfig::new(170.0, 26.0, 1.0)).to(active),
                         move |el, phase| {
                             let phase = phase.0.clamp(0.0, 1.0);
-                            el.child(break_dots(progress, phase, font, pulse))
+                            el.child(break_dots(progress, phase, dot_font, pulse))
                         },
                     )
                     .into_any_element()
@@ -1592,6 +1927,7 @@ impl MainWindow {
                 let start_ms = line
                     .parts
                     .iter()
+                    .filter(|part| !part.background)
                     .map(|part| part.start_ms)
                     .min()
                     .unwrap_or(line.start_ms)
@@ -1602,29 +1938,42 @@ impl MainWindow {
                 if motion.still && !motion.past && now_ms >= start_ms - PRE_ROLL_MS {
                     motion.still = false;
                 }
-                let rest = if motion.past {
-                    PAST_ALPHA
-                } else {
-                    UPCOMING_ALPHA
-                };
                 let view = LineView {
                     motion,
                     now_ms,
-                    base: rest + (ACTIVE_ALPHA - rest) * motion.presence,
+                    base: INACTIVE_ALPHA,
                     px_scale,
-                    detailed: !motion.still || edge > 0.0,
+                    detailed: !motion.still,
                 };
                 let (main, back) = &groups.lines[index];
-                lyric_line(main, back, view, font, align)
+                let wrap = &groups.wraps[index];
+                let full = lyric_line(main, back, &wrap.main, &wrap.back, view, font, align);
+                if (grown - 1.0).abs() < 0.004 {
+                    full
+                } else {
+                    resting_scale(
+                        full,
+                        lyric_line(
+                            main,
+                            back,
+                            &wrap.main,
+                            &wrap.back,
+                            view,
+                            font * grown,
+                            align,
+                        ),
+                        align,
+                        font * grown,
+                    )
+                }
             };
             let row = div()
                 .id(arm_id.clone())
                 .relative()
                 .top(px(-offset))
                 .w_full()
-                .mb(px(font * 0.3))
                 .px(px(14.))
-                .py(px(font * 0.26))
+                .py(px(LINE_PAD))
                 .rounded(px(14.))
                 .opacity(edge)
                 .when(right, |row| row.text_right())
@@ -1669,7 +2018,7 @@ impl MainWindow {
                     let mut m = measure.borrow_mut();
                     m.view_top = bounds.origin.y.as_f32();
                     let height = bounds.size.height.as_f32();
-                    if (m.view_h - height).abs() > 0.5 {
+                    if (m.view_h - height).abs() > 2.0 {
                         m.view_h = height;
                         window.request_animation_frame();
                     }
@@ -1798,5 +2147,41 @@ mod tests {
         assert_eq!(letters_of("👩\u{200D}🎤!").len(), 2);
         assert!(splittable("Привет"));
         assert!(!splittable("مرحبا"));
+    }
+
+    #[test]
+    fn a_late_position_sample_does_not_rewind_the_lyric_clock() {
+        let mut clock = Clock::default();
+        let start = clock.time(Some(TrackId(1)), 10.0, true);
+        assert!((start - 10.0).abs() < 1e-9);
+        let held = clock.time(Some(TrackId(1)), 9.98, true);
+        assert!(held > 9.99, "{held}");
+        let seek = clock.time(Some(TrackId(1)), 30.0, true);
+        assert!((seek - 30.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn words_wrap_before_they_are_painted() {
+        let widths = [30.0, 30.0, 30.0, 80.0];
+        let gaps = [0.0, 8.0, 8.0, 8.0];
+        let rows = pack_rows(&widths, &gaps, 80.0);
+        assert_eq!(rows, vec![vec![0, 1], vec![2], vec![3]]);
+        let wide = pack_rows(&[200.0, 10.0], &[0.0, 4.0], 80.0);
+        assert_eq!(wide, vec![vec![0], vec![1]]);
+        assert_eq!(pack_rows(&[], &[], 80.0), Vec::<Vec<usize>>::new());
+    }
+
+    #[test]
+    fn a_scroll_commit_holds_the_picture_still() {
+        let now = Instant::now();
+        let delta = 120.0;
+        let glide = Glide::rest(500.0 + delta);
+        let shift = Shift {
+            from: delta,
+            start: now,
+            dur: 0.8,
+        };
+        let visual = glide.pos(now) - shift.value(now);
+        assert!((visual - 500.0).abs() < 0.01);
     }
 }

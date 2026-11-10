@@ -2,9 +2,7 @@ use std::collections::HashMap;
 use std::sync::mpsc;
 use std::thread;
 
-use boa_engine::{
-    js_string, Context, JsArgs, JsResult, JsString, JsValue, NativeFunction, Source,
-};
+use boa_engine::{js_string, Context, JsArgs, JsResult, JsString, JsValue, NativeFunction, Source};
 
 use super::host::{PluginCall, PluginHost};
 
@@ -186,7 +184,11 @@ fn start_plugin(live: &mut HashMap<String, LivePlugin>, job: StartJob) {
     let result = (|| {
         let mut context = Context::default();
         context
-            .register_global_callable(js_string!("__host"), 2, NativeFunction::from_fn_ptr(js_host))
+            .register_global_callable(
+                js_string!("__host"),
+                2,
+                NativeFunction::from_fn_ptr(js_host),
+            )
             .map_err(|error| format!("JS init: {error}"))?;
         context
             .eval(Source::from_bytes(PRELUDE))

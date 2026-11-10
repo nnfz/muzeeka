@@ -1,8 +1,11 @@
 use std::collections::HashSet;
 
 const INSTRUMENTAL_GAP_MS: u32 = 3000;
-pub const LINE_LEAD_SEC: f64 = 0.15;
 const LYRIC_ENDING_SEC: f64 = 0.5;
+// A line sung over a longer one. A tenth of a second of overlap is just the
+// next line starting early, so only a line that spends most of itself inside
+// another one is backing.
+const BACKING_COVER: f32 = 0.65;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct LyricPart {
@@ -42,7 +45,7 @@ pub fn parse(ttml: &str, song_ms: u32) -> Option<Lyrics> {
         ..Default::default()
     };
     let doc = roxmltree::Document::parse_with_options(&source, options).ok()?;
-    let mut lines = Vec::new();
+    let mut parsed = Vec::new();
     for paragraph in doc.descendants().filter(|node| {
         node.is_element()
             && node.tag_name().name() == "p"
@@ -50,35 +53,52 @@ pub fn parse(ttml: &str, song_ms: u32) -> Option<Lyrics> {
     }) {
         let begin = parse_time(attr(paragraph, "begin"));
         let end = parse_time(attr(paragraph, "end"));
-        let (parts, text, word_synced) = paragraph_parts(paragraph, begin);
+        let backing = attr(paragraph, "role") == Some("x-bg");
+        let (mut parts, text, word_synced) = paragraph_parts(paragraph, begin);
         if text.is_empty() {
             continue;
         }
-        lines.push(LyricLine {
-            start_ms: begin,
-            duration_ms: end.saturating_sub(begin),
-            words: text,
-            parts: if word_synced { parts } else { Vec::new() },
-            instrumental: false,
-            agent: attr(paragraph, "agent").map(str::to_string),
-        });
+        if backing {
+            for part in &mut parts {
+                part.background = true;
+            }
+        }
+        parsed.push((
+            LyricLine {
+                start_ms: begin,
+                duration_ms: end.saturating_sub(begin),
+                words: text,
+                parts: if word_synced { parts } else { Vec::new() },
+                instrumental: false,
+                agent: attr(paragraph, "agent").map(str::to_string),
+            },
+            backing,
+        ));
     }
-    if lines.is_empty() {
+    if parsed.is_empty() {
         return None;
     }
-    lines.sort_by_key(|line| line.start_ms);
-    if lines
+    parsed.sort_by_key(|(line, _)| line.start_ms);
+    if parsed
         .iter()
-        .all(|line| line.start_ms == 0 && line.parts.is_empty())
+        .all(|(line, _)| line.start_ms == 0 && line.parts.is_empty())
     {
         return Some(Lyrics {
-            lines,
+            lines: parsed.into_iter().map(|(line, _)| line).collect(),
             sync: SyncType::None,
         });
     }
+    let (mut lines, backing): (Vec<_>, Vec<_>) = parsed.into_iter().unzip();
     finalize_durations(&mut lines, song_ms);
+    let mut lines = attach_parallel_backs(lines, &backing);
+    for line in &mut lines {
+        mark_parenthetical_line(line);
+    }
     let lines = insert_instrumental_breaks(lines, song_ms);
-    let sync = if lines.iter().any(|line| line.parts.len() > 1) {
+    let sync = if lines.iter().any(|line| {
+        let sung = line.parts.iter().filter(|part| !part.background).count();
+        sung > 1 || (sung > 0 && line.parts.len() > sung)
+    }) {
         SyncType::Rich
     } else {
         SyncType::Line
@@ -314,6 +334,188 @@ fn finalize_durations(lines: &mut [LyricLine], song_ms: u32) {
     }
 }
 
+fn overlap_ms(a: &LyricLine, b: &LyricLine) -> u32 {
+    let a_end = a.start_ms.saturating_add(a.duration_ms);
+    let b_end = b.start_ms.saturating_add(b.duration_ms);
+    a_end.min(b_end).saturating_sub(a.start_ms.max(b.start_ms))
+}
+
+fn same_voice(a: &LyricLine, b: &LyricLine) -> bool {
+    match (a.agent.as_deref(), b.agent.as_deref()) {
+        (Some(a), Some(b)) => a == b,
+        _ => true,
+    }
+}
+
+fn best_host(lines: &[LyricLine], backing: &[bool], index: usize) -> Option<usize> {
+    let line = &lines[index];
+    if line.instrumental || line.words.trim().is_empty() {
+        return None;
+    }
+    let mut best: Option<(usize, u32)> = None;
+    for (other_index, other) in lines.iter().enumerate() {
+        if other_index == index || other.instrumental || backing[other_index] {
+            continue;
+        }
+        let overlap = overlap_ms(line, other);
+        if overlap == 0 {
+            continue;
+        }
+        let cover = overlap as f32 / line.duration_ms.max(1) as f32;
+        let parallel = cover >= BACKING_COVER
+            && other.duration_ms >= line.duration_ms
+            && same_voice(line, other);
+        if !backing[index] && !parallel {
+            continue;
+        }
+        let replace = match best {
+            None => true,
+            Some((prev, prev_overlap)) => {
+                overlap > prev_overlap
+                    || (overlap == prev_overlap && other.duration_ms > lines[prev].duration_ms)
+                    || (overlap == prev_overlap
+                        && other.duration_ms == lines[prev].duration_ms
+                        && other.start_ms < lines[prev].start_ms)
+            }
+        };
+        if replace {
+            best = Some((other_index, overlap));
+        }
+    }
+    best.map(|(host, _)| host).or_else(|| {
+        if !backing[index] {
+            return None;
+        }
+        let previous = (0..index).rev().find(|&candidate| {
+            !backing[candidate] && !lines[candidate].instrumental
+        })?;
+        let previous_end = lines[previous]
+            .start_ms
+            .saturating_add(lines[previous].duration_ms);
+        (line.start_ms.saturating_sub(previous_end) <= 400).then_some(previous)
+    })
+}
+
+fn resolve_host(host_of: &[Option<usize>], start: usize) -> Option<usize> {
+    let mut current = host_of[start]?;
+    let mut seen = vec![start];
+    loop {
+        if seen.contains(&current) {
+            let host = seen.iter().copied().min()?;
+            return (host != start).then_some(host);
+        }
+        seen.push(current);
+        match host_of[current] {
+            Some(next) => current = next,
+            None => return Some(current),
+        }
+    }
+}
+
+/// A whole line wrapped in parentheses is an aside, the way a background vocal is.
+fn wrapped_in_parens(text: &str) -> bool {
+    let text = text.trim();
+    let mut chars = text.chars();
+    let Some(open) = chars.next() else {
+        return false;
+    };
+    let Some(close) = chars.next_back() else {
+        return false;
+    };
+    matches!(open, '(' | '（') && matches!(close, ')' | '）')
+}
+
+fn mark_parenthetical_line(line: &mut LyricLine) {
+    if line.instrumental || !wrapped_in_parens(&line.words) {
+        return;
+    }
+    if line.parts.is_empty() {
+        line.parts.push(LyricPart {
+            start_ms: line.start_ms,
+            duration_ms: line.duration_ms,
+            words: line.words.clone(),
+            background: true,
+        });
+        return;
+    }
+    for part in &mut line.parts {
+        part.background = true;
+    }
+}
+
+fn backing_parts(line: &LyricLine) -> Vec<LyricPart> {
+    if line.parts.is_empty() {
+        return vec![LyricPart {
+            start_ms: line.start_ms,
+            duration_ms: line.duration_ms,
+            words: line.words.clone(),
+            background: true,
+        }];
+    }
+    line.parts
+        .iter()
+        .cloned()
+        .map(|mut part| {
+            part.background = true;
+            part
+        })
+        .collect()
+}
+
+fn attach_parallel_backs(mut lines: Vec<LyricLine>, backing: &[bool]) -> Vec<LyricLine> {
+    let count = lines.len();
+    if backing.len() != count || count < 2 {
+        return lines;
+    }
+    let mut host_of: Vec<Option<usize>> = (0..count)
+        .map(|index| best_host(&lines, backing, index))
+        .collect();
+    for index in 0..count {
+        let Some(other) = host_of[index] else {
+            continue;
+        };
+        if host_of[other] != Some(index) {
+            continue;
+        }
+        let keep = if lines[index].start_ms < lines[other].start_ms
+            || (lines[index].start_ms == lines[other].start_ms && index < other)
+        {
+            index
+        } else {
+            other
+        };
+        host_of[keep] = None;
+    }
+    let root: Vec<Option<usize>> = (0..count)
+        .map(|index| resolve_host(&host_of, index))
+        .collect();
+    let mut absorbed = vec![false; count];
+    for index in 0..count {
+        let Some(host) = root[index] else {
+            continue;
+        };
+        if host == index || absorbed[host] {
+            continue;
+        }
+        let bg_end = lines[index]
+            .start_ms
+            .saturating_add(lines[index].duration_ms);
+        let parts = backing_parts(&lines[index]);
+        let host_line = &mut lines[host];
+        let host_end = host_line.start_ms.saturating_add(host_line.duration_ms);
+        if bg_end > host_end {
+            host_line.duration_ms = bg_end.saturating_sub(host_line.start_ms);
+        }
+        host_line.parts.extend(parts);
+        absorbed[index] = true;
+    }
+    lines
+        .into_iter()
+        .zip(absorbed)
+        .filter_map(|(line, drop)| (!drop).then_some(line))
+        .collect()
+}
+
 fn instrumental(start_ms: u32, duration_ms: u32) -> LyricLine {
     LyricLine {
         start_ms,
@@ -465,5 +667,135 @@ mod tests {
         assert_eq!(scroll_anchor(&lines, 3.7), Some(1));
         assert_eq!(active_lines(&lines, 5.5), vec![1]);
         assert_eq!(scroll_anchor(&lines, 0.0), Some(0));
+    }
+
+    #[test]
+    fn a_parallel_backing_line_sits_under_the_lead() {
+        let ttml = r#"<tt xmlns:ttm="http://www.w3.org/ns/ttml#metadata"><body>
+            <p begin="10s" end="14s" ttm:agent="v1">Lead line</p>
+            <p begin="11s" end="12s" ttm:agent="v1">(yeah)</p>
+            <p begin="14s" end="16s" ttm:agent="v1">Next</p>
+        </body></tt>"#;
+        let lyrics = parse(ttml, 16_000).expect("parsed");
+        let sung: Vec<_> = lyrics.lines.iter().filter(|line| !line.instrumental).collect();
+        assert_eq!(sung.len(), 2);
+        assert_eq!(sung[0].words, "Lead line");
+        assert_eq!(sung[0].parts.len(), 1);
+        assert!(sung[0].parts[0].background);
+        assert_eq!(sung[0].parts[0].words, "(yeah)");
+        assert_eq!(sung[0].parts[0].start_ms, 11_000);
+        let lead = lyrics
+            .lines
+            .iter()
+            .position(|line| line.words == "Lead line")
+            .expect("lead");
+        assert_eq!(scroll_anchor(&lyrics.lines, 11.5), Some(lead));
+    }
+
+    #[test]
+    fn a_small_overlap_stays_two_lines() {
+        let ttml = r#"<tt><body>
+            <p begin="1s" end="3.2s">One</p>
+            <p begin="3s" end="5s">Two</p>
+        </body></tt>"#;
+        let lyrics = parse(ttml, 5_000).expect("parsed");
+        let sung: Vec<_> = lyrics
+            .lines
+            .iter()
+            .filter(|line| !line.instrumental)
+            .map(|line| line.words.as_str())
+            .collect();
+        assert_eq!(sung, ["One", "Two"]);
+    }
+
+    #[test]
+    fn a_duet_line_stays_on_its_own() {
+        let ttml = r#"<tt xmlns:ttm="http://www.w3.org/ns/ttml#metadata"><body>
+            <p begin="10s" end="14s" ttm:agent="v1">Lead</p>
+            <p begin="11s" end="13s" ttm:agent="v2">Harmony</p>
+        </body></tt>"#;
+        let lyrics = parse(ttml, 14_000).expect("parsed");
+        let sung: Vec<_> = lyrics
+            .lines
+            .iter()
+            .filter(|line| !line.instrumental)
+            .map(|line| line.words.as_str())
+            .collect();
+        assert_eq!(sung, ["Lead", "Harmony"]);
+    }
+
+    #[test]
+    fn word_synced_parallel_line_becomes_background_parts() {
+        let ttml = r#"<tt><body>
+            <p begin="10s" end="14s"><span begin="10s" end="12s">Lead</span> <span begin="12s" end="14s">line</span></p>
+            <p begin="11s" end="12.5s"><span begin="11s" end="12.5s">(yeah)</span></p>
+        </body></tt>"#;
+        let lyrics = parse(ttml, 14_000).expect("parsed");
+        assert_eq!(lyrics.sync, SyncType::Rich);
+        let lead = lyrics
+            .lines
+            .iter()
+            .find(|line| line.words.starts_with("Lead"))
+            .expect("lead");
+        assert_eq!(lead.parts.iter().filter(|part| !part.background).count(), 2);
+        assert!(lead.parts.iter().any(|part| part.background && part.words.contains("yeah")));
+    }
+
+    #[test]
+    fn a_parenthetical_line_stays_its_own_small_line() {
+        let ttml = r#"<tt xmlns:ttm="http://www.w3.org/ns/ttml#metadata"><body>
+            <p begin="121.945s" end="123.548s" ttm:agent="v1"><span begin="121.945s" end="122.096s">я</span> <span begin="122.096s" end="123.548s">наебал</span></p>
+            <p begin="123.795s" end="125.864s" ttm:agent="v1"><span begin="123.795s" end="123.870s">(я</span> <span begin="123.870s" end="124.795s">всегда</span> <span begin="124.795s" end="125.864s">это)</span></p>
+            <p begin="126.835s" end="129.053s" ttm:agent="v1"><span begin="126.835s" end="129.053s">ангел</span></p>
+        </body></tt>"#;
+        let lyrics = parse(ttml, 130_000).expect("parsed");
+        let aside = lyrics
+            .lines
+            .iter()
+            .find(|line| line.words.contains("всегда"))
+            .expect("aside");
+        assert!(aside.parts.iter().all(|part| part.background));
+        assert_eq!(aside.parts.len(), 3);
+        assert!(aside.parts[0].words.contains('('));
+        assert!(aside.parts[2].words.contains(')'));
+        let sung: Vec<_> = lyrics
+            .lines
+            .iter()
+            .filter(|line| !line.instrumental)
+            .map(|line| line.words.as_str())
+            .collect();
+        assert_eq!(sung.len(), 3);
+    }
+
+    #[test]
+    fn a_line_synced_aside_is_one_background_part() {
+        let ttml = r#"<tt><body>
+            <p begin="10s" end="12s">Lead</p>
+            <p begin="12s" end="14s">(я всегда настоящий)</p>
+        </body></tt>"#;
+        let lyrics = parse(ttml, 14_000).expect("parsed");
+        assert_eq!(lyrics.sync, SyncType::Line);
+        let aside = lyrics
+            .lines
+            .iter()
+            .find(|line| line.words.contains("настоящий"))
+            .expect("aside");
+        assert_eq!(aside.parts.len(), 1);
+        assert!(aside.parts[0].background);
+        assert_eq!(aside.parts[0].words, "(я всегда настоящий)");
+    }
+
+    #[test]
+    fn an_explicit_background_paragraph_joins_the_line_it_overlaps() {
+        let ttml = r#"<tt xmlns:ttm="http://www.w3.org/ns/ttml#metadata"><body>
+            <p begin="10s" end="16s">Lead line</p>
+            <p begin="14s" end="20s" ttm:role="x-bg">(oh oh)</p>
+        </body></tt>"#;
+        let lyrics = parse(ttml, 20_000).expect("parsed");
+        let sung: Vec<_> = lyrics.lines.iter().filter(|line| !line.instrumental).collect();
+        assert_eq!(sung.len(), 1);
+        assert_eq!(sung[0].words, "Lead line");
+        assert!(sung[0].parts.iter().any(|part| part.background && part.words.contains("oh")));
+        assert_eq!(sung[0].start_ms + sung[0].duration_ms, 20_000);
     }
 }
