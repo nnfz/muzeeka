@@ -19,6 +19,7 @@ use crate::ui::lyrics::{self, LyricLine, Lyrics, SyncType};
 use crate::ui::main_window::MainWindow;
 use crate::ui::session::{self, TrackId};
 use crate::ui::theme;
+use crate::ui::track_list::like_face;
 
 const APPEAR_SEC: f32 = 0.48;
 const CLOSE_SEC: f32 = 0.32;
@@ -41,13 +42,23 @@ const LINE_HEIGHT: f32 = 1.333;
 /// Slices of the Braccato mask gradient. The edge is 0.1 of the word, same as
 /// `--mask-fade`, and these stops keep that ramp from turning into a hard cut.
 const WIPE_BANDS: usize = 32;
-const BACKGROUND_SCALE: f32 = 0.75;
+const BACKGROUND_SCALE: f32 = 0.65;
+/// Backing under a lead line. A line that is only backing keeps the line alpha.
+const BACKGROUND_OPACITY: f32 = 0.7;
+/// Peak opacity of the white copy drawn just above a letter during its wave.
+const GLOW_ALPHA: f32 = 0.3;
+const GLOW_LIFT_PX: f32 = 1.5;
+/// A letter eases up and apart before its wave, then the wave takes over.
+const PRE_LIFT_EM: f32 = 0.02;
+const PRE_SPREAD_EM: f32 = 0.04;
 /// `--blyrics-padding: 2rem`. Two lines leave twice this much air between them.
 const LINE_PAD: f32 = 32.;
 const WORD_SPACE_EM: f32 = 0.26;
 /// Below this the swell is invisible, so the letter stays one text node.
 const SCALE_SNAP: f32 = 1.004;
-const PRE_ROLL_MS: f64 = 1000.0;
+/// The letter mask may open this early. Layout and the sideways wobble wait
+/// until the line itself starts, so the row does not change shape beforehand.
+const PRE_ROLL_MS: f64 = lyric_motion::LETTER_PRE_ROLL_MS as f64;
 
 pub(crate) struct Fullscreen {
     open: bool,
@@ -68,6 +79,15 @@ pub(crate) struct Fullscreen {
     drift_at: Instant,
     full_covers: HashMap<PathBuf, PathBuf>,
     groups: GroupCache,
+    scale_track: Option<TrackId>,
+    scales: Vec<ScaleAnim>,
+}
+
+#[derive(Clone)]
+struct ScaleAnim {
+    from: f32,
+    to: f32,
+    started: Instant,
 }
 
 #[derive(Default)]
@@ -77,11 +97,21 @@ struct GroupCache {
     /// Quantized font and column width the row breaks were measured at.
     wrap_key: Option<(i32, i32)>,
     wraps: Vec<LineWrap>,
+    /// Positions cache: [line_index][group_index] -> Vec<f32> (x positions for each letter)
+    positions_key: Option<(i32, i32)>,
+    positions: Vec<Vec<Vec<f32>>>,
 }
 
 struct LineWrap {
     main: Vec<Vec<usize>>,
     back: Vec<Vec<usize>>,
+}
+
+fn scale_value(anim: &ScaleAnim, now: Instant) -> f32 {
+    let t = now.saturating_duration_since(anim.started).as_secs_f64()
+        / (lyric_motion::LINE_SCALE_MS / 1000.0);
+    let t = t.clamp(0.0, 1.0) as f32;
+    anim.from + (anim.to - anim.from) * lyric_motion::EASE.at(t)
 }
 
 impl Fullscreen {
@@ -106,7 +136,33 @@ impl Fullscreen {
             drift_at: now,
             full_covers: HashMap::new(),
             groups: GroupCache::default(),
+            scale_track: None,
+            scales: Vec::new(),
         }
+    }
+
+    /// Paint scale follows the target over [`lyric_motion::LINE_SCALE_MS`].
+    /// A seek changes the target at once, and the line still eases instead of jumping.
+    fn step_scale(&mut self, index: usize, target: f32, now: Instant) -> f32 {
+        if index >= self.scales.len() {
+            self.scales.resize(
+                index + 1,
+                ScaleAnim {
+                    from: target,
+                    to: target,
+                    started: now - Duration::from_secs(1),
+                },
+            );
+        }
+        if (self.scales[index].to - target).abs() > 0.0008 {
+            let shown = scale_value(&self.scales[index], now);
+            self.scales[index] = ScaleAnim {
+                from: shown,
+                to: target,
+                started: now,
+            };
+        }
+        scale_value(&self.scales[index], now)
     }
 
     pub(crate) fn is_open(&self) -> bool {
@@ -191,14 +247,9 @@ impl Fullscreen {
             .last_time
             .is_some_and(|previous| (scroll_time - previous).abs() > 0.5);
         let force = s.force || jumped || resume;
-        let Some(plan) = lyric_motion::plan_scroll(
-            &boxes,
-            scroll_time,
-            m.view_h,
-            &s.group,
-            s.pinned,
-            force,
-        ) else {
+        let Some(plan) =
+            lyric_motion::plan_scroll(&boxes, scroll_time, m.view_h, &s.group, s.pinned, force)
+        else {
             return None;
         };
         let current = s.glide.pos(now);
@@ -221,7 +272,11 @@ impl Fullscreen {
                 for index in 0..count {
                     let line = &boxes[index];
                     if !lyric_motion::line_crosses_scroll(
-                        line.top, line.height, current, plan.target, view_h,
+                        line.top,
+                        line.height,
+                        current,
+                        plan.target,
+                        view_h,
                     ) {
                         continue;
                     }
@@ -230,7 +285,11 @@ impl Fullscreen {
                         from: delta,
                         start: now,
                         dur: lyric_motion::line_shift_ms(
-                            relative, delta, distance, step, plan.natural,
+                            relative,
+                            delta,
+                            distance,
+                            step,
+                            plan.natural,
                         ) / 1000.0,
                     });
                 }
@@ -562,6 +621,8 @@ enum Align {
 #[derive(Clone, Copy)]
 struct LineView {
     motion: LineMotion,
+    /// The line's own clock has started. The wipe may paint earlier; the wobble may not.
+    live: bool,
     now_ms: f64,
     base: f32,
     px_scale: f32,
@@ -578,6 +639,12 @@ struct Unit {
     /// Paint scale of one letter. The layout box stays at 1.
     scale: f32,
     rtl: bool,
+    /// White copy under the glyph. Zero except while the letter's wave is up.
+    glow_alpha: f32,
+    /// Paint-only horizontal offset. Layout width stays the measured row.
+    spread: f32,
+    /// Absolute x position if word is shaped. None means flex positioning.
+    abs_x: Option<f32>,
 }
 
 fn snap(value: f32, px_scale: f32, steps: f32) -> f32 {
@@ -713,55 +780,102 @@ fn line_groups(line: &LyricLine, sync: SyncType) -> (Vec<Group>, Vec<Group>) {
     (main, groups_of(back))
 }
 
-fn part_units(part: &Part, view: LineView, font: f32) -> Vec<Unit> {
+fn part_units_with_shaping(
+    window: &mut Window,
+    part: &Part,
+    view: LineView,
+    font: f32,
+    placed: Option<&[f32]>,
+) -> (Vec<Unit>, f32) {
     let motion = view.motion;
     let rtl = is_rtl(&part.text);
     let since = (view.now_ms - part.start_ms) as f32;
     let fade = if motion.still { 0.0 } else { motion.highlight };
     let long = part.duration_ms > lyric_motion::LONG_WORD_MS;
-    let whole = |lit: Lit, highlight: f32| {
-        vec![Unit {
-            text: part.text.clone(),
-            lit,
-            highlight,
-            lift: 0.0,
-            traveling: false,
-            scale: 1.0,
-            rtl,
-        }]
+
+    if part.duration_ms <= 0.0 || !splittable(&part.text) {
+        let whole = |lit: Lit, highlight: f32| {
+            (
+                vec![Unit {
+                    text: part.text.clone(),
+                    lit,
+                    highlight,
+                    lift: 0.0,
+                    traveling: false,
+                    scale: 1.0,
+                    rtl,
+                    glow_alpha: 0.0,
+                    spread: 0.0,
+                    abs_x: None,
+                }],
+                0.0,
+            )
+        };
+        if part.duration_ms <= 0.0 {
+            return whole(Lit::FULL, lyric_motion::line_synced_fade(since) * fade);
+        }
+        let start = lyric_motion::swipe_start(since, part.duration_ms);
+        return whole(lyric_motion::word_lit(start), if since >= 0.0 { fade } else { 0.0 });
+    }
+
+    // Positions from the whole word keep syllables on the same advances as the
+    // idle line. Shaping each syllable alone, then gapping the boxes, prints
+    // "los er" for "loser".
+    let (positions, word_width) = match placed {
+        Some(xs) => (xs.to_vec(), 0.0),
+        None => shape_word(window, &part.text, font, gpui::FontWeight::BOLD),
     };
-    if part.duration_ms <= 0.0 {
-        return whole(Lit::FULL, lyric_motion::line_synced_fade(since) * fade);
-    }
-    let highlight = if since >= 0.0 { fade } else { 0.0 };
+
     let start = lyric_motion::swipe_start(since, part.duration_ms);
-    if !splittable(&part.text) {
-        return whole(lyric_motion::word_lit(start), highlight);
-    }
     let letters = letters_of(&part.text);
     let count = letters.len();
     let waves = lyric_motion::letter_waves(count, part.duration_ms);
-    letters
+
+    let units = letters
         .into_iter()
         .zip(waves)
         .enumerate()
         .map(|(index, (text, wave))| {
             let local = since - wave.delay_ms;
+            let pre = lyric_motion::pre_roll_lit(since, wave.delay_ms);
+            let real = lyric_motion::letter_lit(start, index, count);
+            let approach = if pre <= 0.0 {
+                0.0
+            } else if local < 0.0 {
+                (pre / lyric_motion::LETTER_PRE_ROLL_PEAK).clamp(0.0, 1.0)
+            } else {
+                (1.0 - (local / 200.0).clamp(0.0, 1.0)).max(0.0)
+            };
+
+            let lift_amount = if long {
+                lyric_motion::float(since, wave).max(PRE_LIFT_EM * approach) * font * fade
+            } else {
+                0.0
+            };
+
             Unit {
                 text,
-                lit: lyric_motion::letter_lit(start, index, count),
-                highlight,
-                lift: lyric_motion::float(since, wave) * font * fade,
-                traveling: local >= 0.0 && local < wave.duration_ms,
+                lit: Lit {
+                    edge: lyric_motion::pre_roll_edge(real, pre),
+                    fade: real.fade,
+                },
+                highlight: if since >= 0.0 || pre > 0.0 { fade } else { 0.0 },
+                lift: lift_amount,
+                traveling: (local >= 0.0 && local < wave.duration_ms) || (local < 0.0 && pre > 0.0),
                 scale: if long {
                     lyric_motion::emphasis(since, wave)
                 } else {
                     1.0
                 },
                 rtl,
+                glow_alpha: lyric_motion::wave_glow(since, wave) * GLOW_ALPHA * fade,
+                spread: 0.0,
+                abs_x: positions.get(index).copied(),
             }
         })
-        .collect()
+        .collect();
+
+    (units, word_width)
 }
 
 fn clip_layer(text: &SharedString, from: f32, to: f32, color: Hsla) -> Option<AnyElement> {
@@ -828,10 +942,40 @@ fn unit_text(unit: &Unit, base: f32) -> gpui::Div {
         .children(layers)
 }
 
-fn unit_body(unit: &Unit, font: f32, base: f32) -> gpui::Div {
-    let text = unit_text(unit, base).whitespace_nowrap();
-    if unit.scale <= SCALE_SNAP {
+/// GPUI has no glyph shadow. A second white copy, shifted up, is the halo.
+fn with_glow(unit: &Unit, text: gpui::Div, glyph_font: f32) -> gpui::Div {
+    if unit.glow_alpha <= 0.001 {
         return text;
+    }
+    div()
+        .relative()
+        .whitespace_nowrap()
+        .child(
+            div()
+                .absolute()
+                .top(px(-GLOW_LIFT_PX))
+                .left_0()
+                .whitespace_nowrap()
+                .text_size(px(glyph_font))
+                .line_height(px(glyph_font * LINE_HEIGHT))
+                .text_color(white_a(unit.glow_alpha))
+                .child(unit.text.clone()),
+        )
+        .child(text)
+}
+
+fn unit_body(unit: &Unit, font: f32, base: f32) -> gpui::Div {
+    let glyph = |glyph_font: f32| {
+        let mut text = unit_text(unit, base).whitespace_nowrap();
+        if (glyph_font - font).abs() > 0.01 {
+            text = text
+                .text_size(px(glyph_font))
+                .line_height(px(glyph_font * LINE_HEIGHT));
+        }
+        with_glow(unit, text, glyph_font)
+    };
+    if unit.scale <= SCALE_SNAP {
+        return glyph(font);
     }
     // GPUI has no paint-only scale. The invisible copy keeps the letter's box,
     // and the visible copy grows from the center without pushing its neighbors.
@@ -839,7 +983,7 @@ fn unit_body(unit: &Unit, font: f32, base: f32) -> gpui::Div {
     div()
         .relative()
         .whitespace_nowrap()
-        .child(text.opacity(0.))
+        .child(unit_text(unit, base).whitespace_nowrap().opacity(0.))
         .child(
             div()
                 .absolute()
@@ -850,19 +994,25 @@ fn unit_body(unit: &Unit, font: f32, base: f32) -> gpui::Div {
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(
-                    unit_text(unit, base)
-                        .whitespace_nowrap()
-                        .text_size(px(size))
-                        .line_height(px(size * LINE_HEIGHT)),
-                ),
+                .child(glyph(size)),
         )
 }
 
 fn unit_element(unit: Unit, font: f32, base: f32, px_scale: f32) -> AnyElement {
-    // Glyph Y snaps to a device pixel, so a raw offset steps from letter to
-    // letter. While the wave is moving, a faint copy sits on the neighboring
-    // pixel and the crest travels instead of popping.
+    // Absolutely positioned letter (when abs_x is set)
+    if let Some(x) = unit.abs_x {
+        let body = unit_body(&unit, font, base);
+        return div()
+            .absolute()
+            .left(px(x))
+            .top(px(unit.lift))
+            .w_auto()  // Critical: don't stretch to full width
+            .h_auto()
+            .child(body)
+            .into_any_element();
+    }
+
+    // Flex positioned letter (default, for line-synced or unsplittable)
     let quantum = 1.0 / px_scale.max(1.0);
     let steps = unit.lift / quantum;
     let primary_step = steps.round();
@@ -873,7 +1023,10 @@ fn unit_element(unit: Unit, font: f32, base: f32, px_scale: f32) -> AnyElement {
         0.0
     };
     if primary_y.abs() <= 0.04 && residual.abs() <= 0.04 {
-        return unit_body(&unit, font, base).into_any_element();
+        return div()
+            .relative()
+            .child(unit_body(&unit, font, base))
+            .into_any_element();
     }
     let shell = div().relative().whitespace_nowrap().child(
         div()
@@ -899,49 +1052,109 @@ fn unit_element(unit: Unit, font: f32, base: f32, px_scale: f32) -> AnyElement {
         .into_any_element()
 }
 
+fn group_shift(
+    still: bool,
+    rich: bool,
+    since_ms: f32,
+    font: f32,
+    highlight: f32,
+    px_scale: f32,
+) -> f32 {
+    if still || !rich {
+        return 0.0;
+    }
+    let em = lyric_motion::wobble(since_ms);
+    snap(em * font * highlight, px_scale, 4.0)
+}
+
 fn group_element(
     group: &Group,
     view: LineView,
     font: f32,
     pull_next: bool,
     align: Align,
+    rich: bool,
+    window: &mut Window,
 ) -> AnyElement {
-    // A run with no space after it cancels the row gap, so CJK stays tight.
-    // The gap itself is not drawn after the last word of a wrapped line.
     let tighten = |el: gpui::Div| el.when(pull_next, |el| el.mr(px(font * -WORD_SPACE_EM)));
     if !view.detailed {
         let text: String = group.parts.iter().map(|part| part.text.as_str()).collect();
-        return tighten(
-            div()
-                .text_color(white_a(view.base))
-                .whitespace_nowrap(),
-        )
-        .child(text)
-        .into_any_element();
+        return tighten(div().text_color(white_a(view.base)).whitespace_nowrap())
+            .child(text)
+            .into_any_element();
     }
-    let motion = view.motion;
     let first_ms = group.parts.first().map_or(0.0, |part| part.start_ms);
-    let shift = if motion.still {
-        0.0
-    } else {
-        let em = lyric_motion::wobble((view.now_ms - first_ms) as f32);
-        snap(em * font * motion.highlight, view.px_scale, 4.0)
-    };
-    let units = group
+    let shift = group_shift(
+        !view.live,
+        rich,
+        (view.now_ms - first_ms) as f32,
+        font,
+        view.motion.highlight,
+        view.px_scale,
+    );
+    let counts: Vec<usize> = group
         .parts
         .iter()
-        .flat_map(|part| part_units(part, view, font))
-        .map(|unit| unit_element(unit, font, view.base, view.px_scale));
-    let row = div()
-        .relative()
-        .left(px(shift))
-        .flex()
-        .flex_row()
-        .whitespace_nowrap()
-        .when(matches!(align, Align::Start), |el| el.justify_start())
-        .when(matches!(align, Align::Center), |el| el.justify_center())
-        .when(matches!(align, Align::End), |el| el.justify_end())
-        .children(units);
+        .map(|part| letters_of(&part.text).len())
+        .collect();
+    let joined: String = group.parts.iter().map(|part| part.text.as_str()).collect();
+    let all_split = group.parts.iter().all(|part| {
+        part.duration_ms > 0.0 && splittable(&part.text) && !part.text.is_empty()
+    });
+    let shared = all_split
+        && counts.iter().sum::<usize>() == letters_of(&joined).len()
+        && !joined.is_empty();
+    let (places, group_width) = if shared {
+        shape_word(window, &joined, font, gpui::FontWeight::BOLD)
+    } else {
+        (Vec::new(), 0.0)
+    };
+    let shared = shared && places.len() == counts.iter().sum::<usize>();
+
+    let mut cursor = 0usize;
+    let mut letters = Vec::new();
+    for (part, count) in group.parts.iter().zip(counts) {
+        let xs = if shared {
+            let end = (cursor + count).min(places.len());
+            places.get(cursor..end)
+        } else {
+            None
+        };
+        cursor += count;
+        let (units, _) = part_units_with_shaping(window, part, view, font, xs);
+        letters.extend(units);
+    }
+
+    let row = if shared {
+        div()
+            .relative()
+            .left(px(shift))
+            .w(px(group_width))
+            .h(px(font * LINE_HEIGHT))
+            .children(
+                letters
+                    .into_iter()
+                    .map(|unit| unit_element(unit, font, view.base, view.px_scale)),
+            )
+    } else {
+        div()
+            .relative()
+            .left(px(shift))
+            .flex()
+            .flex_row()
+            .children(
+                letters
+                    .into_iter()
+                    .map(|unit| unit_element(unit, font, view.base, view.px_scale)),
+            )
+    };
+
+    let row = match align {
+        Align::Start => row.justify_start(),
+        Align::Center => row.justify_center(),
+        Align::End => row.justify_end(),
+    };
+
     tighten(row).into_any_element()
 }
 
@@ -951,6 +1164,8 @@ fn word_row(
     view: LineView,
     font: f32,
     align: Align,
+    rich: bool,
+    window: &mut Window,
 ) -> gpui::Div {
     let last = indices.len().saturating_sub(1);
     let row = div()
@@ -961,7 +1176,7 @@ fn word_row(
         .children(indices.iter().enumerate().filter_map(|(place, index)| {
             let group = groups.get(*index)?;
             let pull_next = !group.space_after && place < last;
-            Some(group_element(group, view, font, pull_next, align))
+            Some(group_element(group, view, font, pull_next, align, rich, window))
         }));
     match align {
         Align::Start => row.justify_start(),
@@ -1022,6 +1237,40 @@ fn text_width(window: &mut Window, text: &str, font_px: f32, weight: gpui::FontW
         .shape_line(SharedString::from(text), px(font_px), &[run], None)
         .width()
         .as_f32()
+}
+
+fn shape_word(
+    window: &mut Window,
+    text: &str,
+    font_px: f32,
+    weight: gpui::FontWeight,
+) -> (Vec<f32>, f32) {
+    if text.is_empty() || font_px <= 0.0 {
+        return (Vec::new(), 0.0);
+    }
+    let mut font = gpui::font(theme::FONT_FAMILY);
+    font.weight = weight;
+    let run = gpui::TextRun {
+        len: text.len(),
+        font,
+        ..Default::default()
+    };
+    let line = window
+        .text_system()
+        .shape_line(SharedString::from(text), px(font_px), &[run], None);
+
+    let letters = letters_of(text);
+    let mut positions = Vec::new();
+    let mut byte_pos = 0;
+
+    for letter in letters {
+        let x = line.x_for_index(byte_pos).as_f32();
+        positions.push(x);
+        byte_pos += letter.len();
+    }
+
+    let width = line.width().as_f32();
+    (positions, width)
 }
 
 fn group_width(window: &mut Window, group: &Group, font_px: f32, weight: gpui::FontWeight) -> f32 {
@@ -1093,11 +1342,13 @@ fn text_block(
     view: LineView,
     font: f32,
     align: Align,
+    rich: bool,
+    window: &mut Window,
 ) -> gpui::Div {
     let rows = resolved_rows(groups.len(), planned);
     div().w_full().flex().flex_col().children(
         rows.iter()
-            .map(|row| word_row(groups, row, view, font, align)),
+            .map(|row| word_row(groups, row, view, font, align, rich, window)),
     )
 }
 
@@ -1109,6 +1360,8 @@ fn lyric_line(
     view: LineView,
     font: f32,
     align: Align,
+    rich: bool,
+    window: &mut Window,
 ) -> AnyElement {
     let back_font = font * BACKGROUND_SCALE;
     div()
@@ -1116,21 +1369,52 @@ fn lyric_line(
         .flex()
         .flex_col()
         .when(matches!(align, Align::Start), |column| column.items_start())
-        .when(matches!(align, Align::Center), |column| column.items_center())
+        .when(matches!(align, Align::Center), |column| {
+            column.items_center()
+        })
         .when(matches!(align, Align::End), |column| column.items_end())
         .when(!main.is_empty(), |column| {
-            column.child(text_block(main, main_rows, view, font, align))
+            column.child(text_block(main, main_rows, view, font, align, rich, window))
         })
         .when(!back.is_empty(), |column| {
             column.child(
-                text_block(back, back_rows, view, back_font, align)
-                    .when(!main.is_empty(), |row| row.mt(px(font * 0.1)))
+                text_block(back, back_rows, view, back_font, align, rich, window)
+                    .when(!main.is_empty(), |row| {
+                        row.mt(px(font * 0.1)).opacity(BACKGROUND_OPACITY)
+                    })
                     .text_size(px(back_font))
                     .line_height(px(back_font * LINE_HEIGHT))
                     .font_weight(gpui::FontWeight::MEDIUM),
             )
         })
         .into_any_element()
+}
+
+/// Opacity and paint scale for a line this many rows from the one being sung.
+/// GPUI cannot blur text, so a far line is smaller and dimmer.
+fn line_depth(distance: i32) -> (f32, f32) {
+    match distance {
+        0 => (1.0, 1.0),
+        1 => (0.45, 0.99),
+        _ => (0.3, 0.98),
+    }
+}
+
+/// Ink of a line before the white wipe. A line-synced line keeps the neighbor's
+/// brightness when it becomes current, so the fade up does not dip through the
+/// darker unsung-word gray first.
+fn line_ink(distance: i32, rich: bool) -> f32 {
+    if distance == 0 && !rich {
+        line_depth(1).0
+    } else if distance == 0 {
+        INACTIVE_ALPHA
+    } else {
+        line_depth(distance).0
+    }
+}
+
+fn pause_factor(phase: f32) -> f32 {
+    0.88 + 0.12 * phase.clamp(0.0, 1.0)
 }
 
 fn break_dots(progress: f32, phase: f32, font: f32, pulse: f32) -> AnyElement {
@@ -1681,92 +1965,103 @@ impl MainWindow {
         let id = track.id;
         let size = (area_h - 90.).min(vw * 0.36).clamp(160., 560.);
         let full = track.cover.as_deref().map(|thumb| self.full_cover(thumb));
-        let art = div()
-            .id("fs-cover")
-            .size(px(size))
-            .flex()
-            .items_center()
-            .justify_center()
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
-                    cx.stop_propagation();
-                    this.open_track_menu(id, event.position, window, cx);
-                }),
-            )
-            .child(div().with_spring(
-                "fs-cover-pause",
-                SpringAnimation::new(SpringConfig::new(170.0, 22.0, 1.0)).to(playing),
-                move |el, phase| {
-                    let scaled = size * (0.88 + 0.12 * phase.0);
-                    let picture = match full {
-                        Some(path) => img(path)
-                            .size(px(scaled))
-                            .rounded(px(12.))
-                            .object_fit(ObjectFit::Cover)
-                            .into_any_element(),
-                        None => cover_art(None, scaled),
-                    };
-                    el.size(px(scaled))
-                        .rounded(px(12.))
-                        .shadow(vec![BoxShadow {
-                            color: black_a(0.45),
-                            offset: point(px(0.), px(18.)),
-                            blur_radius: px(48.),
-                            spread_radius: px(0.),
-                            inset: false,
-                        }])
-                        .child(picture)
-                },
-            ));
-        let like = self.like_button(
+        let title = track.title.clone();
+        let artist = track.artist.clone();
+        let liked = track.liked;
+        let like = self.like_handlers(
             SharedString::from(format!("fs-like-{}", id.0)),
-            track.liked,
             id,
-            40.,
-            22.,
-            theme::text(),
             false,
             cx,
         );
+        let on_cover_menu =
+            cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                cx.stop_propagation();
+                this.open_track_menu(id, event.position, window, cx);
+            });
+        let on_meta_menu =
+            cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                cx.stop_propagation();
+                this.open_track_menu(id, event.position, window, cx);
+            });
+        // Pause scales this column as one card: cover, title, artist, and like.
         div()
             .flex()
             .flex_col()
             .items_center()
-            .child(art)
-            .child(
-                div()
-                    .w(px(size))
-                    .mt(px(22.))
-                    .flex()
-                    .items_center()
-                    .gap(px(12.))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .child(
-                                div()
-                                    .text_size(px(26.))
-                                    .line_height(px(32.))
-                                    .font_weight(gpui::FontWeight::BOLD)
-                                    .text_color(theme::white())
-                                    .truncate()
-                                    .child(track.title.clone()),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(16.))
-                                    .line_height(px(22.))
-                                    .text_color(white_a(0.6))
-                                    .truncate()
-                                    .child(track.artist.clone()),
-                            ),
-                    )
-                    .child(like),
-            )
+            .child(div().with_spring(
+                "fs-cover-pause",
+                SpringAnimation::new(SpringConfig::new(170.0, 22.0, 1.0)).to(playing),
+                move |card, phase| {
+                    let s = pause_factor(phase.0);
+                    let box_size = size * s;
+                    let radius = 12. * s;
+                    let picture = match &full {
+                        Some(path) => img(path.clone())
+                            .size(px(box_size))
+                            .rounded(px(radius))
+                            .object_fit(ObjectFit::Cover)
+                            .into_any_element(),
+                        None => cover_art(None, box_size),
+                    };
+                    card.flex()
+                        .flex_col()
+                        .items_center()
+                        .w(px(box_size))
+                        .child(
+                            div()
+                                .id("fs-cover")
+                                .size(px(box_size))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(radius))
+                                .shadow(vec![BoxShadow {
+                                    color: black_a(0.45),
+                                    offset: point(px(0.), px(18. * s)),
+                                    blur_radius: px(48. * s),
+                                    spread_radius: px(0.),
+                                    inset: false,
+                                }])
+                                .on_mouse_down(MouseButton::Right, on_cover_menu)
+                                .child(picture),
+                        )
+                        .child(
+                            div()
+                                .w(px(box_size))
+                                .mt(px(22. * s))
+                                .flex()
+                                .items_center()
+                                .gap(px(12. * s))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .on_mouse_down(MouseButton::Right, on_meta_menu)
+                                        .child(
+                                            div()
+                                                .text_size(px(26. * s))
+                                                .line_height(px(32. * s))
+                                                .font_weight(gpui::FontWeight::BOLD)
+                                                .text_color(theme::white())
+                                                .truncate()
+                                                .child(title.clone()),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(16. * s))
+                                                .line_height(px(22. * s))
+                                                .text_color(white_a(0.6))
+                                                .truncate()
+                                                .child(artist.clone()),
+                                        ),
+                                )
+                                .child(like_face(like, liked, 40. * s, 22. * s, theme::text(), false)),
+                        )
+                },
+            ))
             .into_any_element()
     }
 
@@ -1833,6 +2128,22 @@ impl MainWindow {
             groups.wrap_key = Some(wrap_key);
         }
 
+        let rich = lyr.sync == SyncType::Rich;
+        let sung_anchor = if current.is_empty() {
+            lines
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, line)| now_ms >= line.start_ms as f64)
+                .map(|(index, _)| index)
+        } else {
+            None
+        };
+        let wall = Instant::now();
+        if self.fullscreen.scale_track != Some(id) {
+            self.fullscreen.scale_track = Some(id);
+            self.fullscreen.scales.clear();
+        }
         let mut rows: Vec<AnyElement> = Vec::with_capacity(lines.len());
         for (index, line) in lines.iter().enumerate() {
             let offset = offsets[index];
@@ -1846,7 +2157,7 @@ impl MainWindow {
             };
             let centered = line.agent.as_deref() == Some("v1000");
             let right = !centered && matches!(line.agent.as_deref(), Some("v2") | Some("v3"));
-            let seekable = !untimed && !line.instrumental;
+            let seekable = !untimed;
             let seek = line.start_ms as f64 / 1000.0;
             let arm_id = SharedString::from(format!("fs-lyric-{index}"));
             let release_id = arm_id.clone();
@@ -1885,18 +2196,39 @@ impl MainWindow {
             } else {
                 Align::Start
             };
-            let grown = if untimed {
-                1.0
+            let distance = if untimed {
+                0
+            } else if !current.is_empty() {
+                current
+                    .iter()
+                    .map(|active| (index as i32 - *active as i32).abs())
+                    .min()
+                    .unwrap_or(0)
             } else {
-                let own = line.start_ms as f64
-                    + line.duration_ms as f64
-                    + lyric_motion::LINE_SETTLE_MS;
-                let end = lines
+                sung_anchor
+                    .map(|anchor| (index as i32 - anchor as i32).abs())
+                    .unwrap_or(2)
+            };
+            let (depth_opacity, size_mult) = line_depth(distance);
+            // Far lines stay on the full layout box. Only the paint shrinks.
+            // The target flips on a click; the shown scale eases over the same
+            // 166ms the playback grow uses, so the line does not pop.
+            let grow_end = {
+                let own =
+                    line.start_ms as f64 + line.duration_ms as f64 + lyric_motion::LINE_SETTLE_MS;
+                lines
                     .get(index + 1)
                     .map(|next| (next.start_ms as f64).max(own))
-                    .unwrap_or(own);
-                lyric_motion::line_scale(now_ms, line.start_ms as f64, end)
+                    .unwrap_or(own)
             };
+            let grown = if untimed || (now_ms >= line.start_ms as f64 && now_ms < grow_end) {
+                1.0
+            } else {
+                lyric_motion::LINE_REST_SCALE
+            };
+            let paint = self
+                .fullscreen
+                .step_scale(index, grown * size_mult, wall);
             let content: AnyElement = if untimed {
                 div()
                     .text_color(white_a(1.0))
@@ -1905,7 +2237,7 @@ impl MainWindow {
             } else if line.instrumental {
                 let progress = lyrics::break_progress(lines, index, time);
                 let active = current.contains(&index);
-                let dot_font = font * grown;
+                let dot_font = font * paint;
                 div()
                     .w_full()
                     .min_h(px(font * 1.15))
@@ -1934,21 +2266,26 @@ impl MainWindow {
                     .min(line.start_ms) as f64;
                 let end_ms = (lyrics::line_until_sec(lines, index) * 1000.0)
                     .max((line.start_ms + line.duration_ms) as f64 + lyric_motion::LINE_SETTLE_MS);
-                let mut motion = lyric_motion::line_motion(start_ms, end_ms, now_ms);
+                let motion = lyric_motion::line_motion(start_ms, end_ms, now_ms);
+                let live = !motion.still;
+                let mut motion = motion;
                 if motion.still && !motion.past && now_ms >= start_ms - PRE_ROLL_MS {
                     motion.still = false;
                 }
                 let view = LineView {
                     motion,
+                    live,
                     now_ms,
-                    base: INACTIVE_ALPHA,
+                    // Rich sync keeps unsung words gray. Line sync stays at the
+                    // neighbor ink so the brighten does not flash darker first.
+                    base: line_ink(distance, rich),
                     px_scale,
                     detailed: !motion.still,
                 };
                 let (main, back) = &groups.lines[index];
                 let wrap = &groups.wraps[index];
-                let full = lyric_line(main, back, &wrap.main, &wrap.back, view, font, align);
-                if (grown - 1.0).abs() < 0.004 {
+                let full = lyric_line(main, back, &wrap.main, &wrap.back, view, font, align, rich, window);
+                if (paint - 1.0).abs() < 0.004 {
                     full
                 } else {
                     resting_scale(
@@ -1959,13 +2296,20 @@ impl MainWindow {
                             &wrap.main,
                             &wrap.back,
                             view,
-                            font * grown,
+                            font * paint,
                             align,
+                            rich,
+                            window,
                         ),
                         align,
-                        font * grown,
+                        font * paint,
                     )
                 }
+            };
+            let row_opacity = if !untimed && line.instrumental {
+                edge * depth_opacity
+            } else {
+                edge
             };
             let row = div()
                 .id(arm_id.clone())
@@ -1975,7 +2319,7 @@ impl MainWindow {
                 .px(px(14.))
                 .py(px(LINE_PAD))
                 .rounded(px(14.))
-                .opacity(edge)
+                .opacity(row_opacity)
                 .when(right, |row| row.text_right())
                 .when(centered, |row| row.text_center())
                 .child(probe)
@@ -2169,6 +2513,47 @@ mod tests {
         let wide = pack_rows(&[200.0, 10.0], &[0.0, 4.0], 80.0);
         assert_eq!(wide, vec![vec![0], vec![1]]);
         assert_eq!(pack_rows(&[], &[], 80.0), Vec::<Vec<usize>>::new());
+    }
+
+    #[test]
+    fn line_synced_words_do_not_wobble() {
+        let rich = group_shift(false, true, 60.0, 40.0, 1.0, 1.0);
+        let line = group_shift(false, false, 60.0, 40.0, 1.0, 1.0);
+        assert!(rich.abs() > 0.0);
+        assert_eq!(line, 0.0);
+        assert_eq!(group_shift(true, true, 60.0, 40.0, 1.0, 1.0), 0.0);
+    }
+
+    #[test]
+    fn lines_farther_from_the_sung_one_are_smaller_and_dimmer() {
+        assert_eq!(line_depth(0), (1.0, 1.0));
+        assert_eq!(line_depth(1), (0.45, 0.99));
+        assert_eq!(line_depth(2), (0.3, 0.98));
+        assert_eq!(line_depth(5), (0.3, 0.98));
+    }
+
+    #[test]
+    fn a_line_synced_line_does_not_dip_when_it_brightens() {
+        let neighbor = line_ink(1, false);
+        let active = line_ink(0, false);
+        assert_eq!(active, neighbor);
+        assert!(active > line_ink(0, true));
+    }
+
+    #[test]
+    fn a_clicked_line_eases_to_its_new_size() {
+        let start = Instant::now();
+        let anim = ScaleAnim {
+            from: lyric_motion::LINE_REST_SCALE,
+            to: 1.0,
+            started: start,
+        };
+        assert!((scale_value(&anim, start) - lyric_motion::LINE_REST_SCALE).abs() < 1e-4);
+        let mid = start + Duration::from_millis((lyric_motion::LINE_SCALE_MS * 0.5) as u64);
+        let at = scale_value(&anim, mid);
+        assert!(at > lyric_motion::LINE_REST_SCALE && at < 1.0);
+        let done = start + Duration::from_millis(lyric_motion::LINE_SCALE_MS as u64 + 5);
+        assert!((scale_value(&anim, done) - 1.0).abs() < 1e-4);
     }
 
     #[test]

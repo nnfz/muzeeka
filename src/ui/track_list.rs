@@ -3,8 +3,9 @@ use std::time::Duration;
 
 use gpui::{
     deferred, div, linear_color_stop, linear_gradient, prelude::*, px, rgb, svg, uniform_list,
-    Animation, AnimationExt, AnyElement, Context, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, Pixels, Rgba, SharedString, Styled,
+    Animation, AnimationExt, AnyElement, App, Context, InteractiveElement, IntoElement,
+    MouseButton, MouseDownEvent, MouseUpEvent, ParentElement, Pixels, Rgba, SharedString, Styled,
+    Window,
 };
 
 use crate::ui::cover::cover_art;
@@ -775,47 +776,41 @@ impl MainWindow {
         stop_row_click: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let spring_id = SharedString::from(format!("{id}-fill"));
-        let hot_id = SharedString::from(format!("{id}-hot"));
+        like_face(
+            self.like_handlers(id, track_id, stop_row_click, cx),
+            liked,
+            slot,
+            icon_size,
+            idle,
+            stop_row_click,
+        )
+    }
+
+    /// Click handlers for a like heart. The face is built separately so a parent
+    /// spring can size the same button while it is already animating.
+    pub(crate) fn like_handlers(
+        &self,
+        id: SharedString,
+        track_id: TrackId,
+        stop_row_click: bool,
+        cx: &mut Context<Self>,
+    ) -> LikeHandlers {
         let hovered = self.hovered_ui.as_ref() == Some(&id);
-        let glyphs = move |scale: f32| {
-            let spring_id = spring_id.clone();
-            let hot_id = hot_id.clone();
-            div().relative().size(px(icon_size)).with_spring(
-                spring_id,
-                MainWindow::hover_spring(liked),
-                move |stack, phase| {
-                    let t = phase.0.clamp(0.0, 1.0);
-                    let hot_id = hot_id.clone();
-                    stack.child(div().absolute().inset_0().with_spring(
-                        hot_id,
-                        MainWindow::hover_spring(hovered),
-                        move |layer, hot| {
-                            let color = mix_rgba(idle, rgb(0xe25555), hot.0);
-                            layer
-                                .child(like_glyph(icons::HEART, color, icon_size, 1.0 - t, scale))
-                                .child(like_glyph(icons::HEART_FILLED, color, icon_size, t, scale))
-                        },
-                    ))
-                },
-            )
-        };
-        let button_id = id.clone();
-        let release_id = id.clone();
-        let hover_id = id.clone();
-        let press_id = SharedString::from(format!("{id}-press"));
         let pressed = self.pressed_ui.as_ref() == Some(&id);
-        let on_down = cx.listener(move |this, _: &gpui::MouseDownEvent, _, cx| {
+        let button_id = id.clone();
+        let down_id = id.clone();
+        let release_id = id.clone();
+        let on_down = cx.listener(move |this, _: &MouseDownEvent, _, cx| {
             if stop_row_click {
                 cx.stop_propagation();
             }
             let shrink = !stop_row_click;
-            this.arm(id.clone(), shrink);
+            this.arm(down_id.clone(), shrink);
             if shrink {
                 cx.notify();
             }
         });
-        let on_release = cx.listener(move |this, _: &gpui::MouseUpEvent, _, cx| {
+        let on_up = cx.listener(move |this, _: &MouseUpEvent, _, cx| {
             if !this.armed(&release_id) {
                 return;
             }
@@ -824,35 +819,100 @@ impl MainWindow {
                 cx.notify();
             });
         });
-        let button = div()
-            .id(button_id)
-            .flex()
-            .flex_shrink_0()
-            .items_center()
-            .justify_center()
-            .size(px(slot))
-            .cursor_pointer()
-            .on_hover(Self::hover_listener(hover_id, cx))
-            .on_mouse_down(MouseButton::Left, on_down)
-            .on_mouse_up(MouseButton::Left, on_release);
-        if stop_row_click {
-            button.rounded_sm().child(glyphs(1.0)).into_any_element()
-        } else {
-            button
-                .child(
-                    div()
-                        .size(px(slot))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .with_spring(
-                            press_id,
-                            Self::hover_spring(pressed),
-                            move |frame, phase| frame.child(glyphs(Self::press_scale(phase))),
-                        ),
-                )
-                .into_any_element()
+        let on_hover = Self::hover_listener(id, cx);
+        LikeHandlers {
+            id: button_id,
+            hovered,
+            pressed,
+            on_hover: Box::new(on_hover),
+            on_down: Box::new(on_down),
+            on_up: Box::new(on_up),
         }
+    }
+}
+
+pub(crate) struct LikeHandlers {
+    id: SharedString,
+    hovered: bool,
+    pressed: bool,
+    on_hover: Box<dyn Fn(&bool, &mut Window, &mut App) + 'static>,
+    on_down: Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App) + 'static>,
+    on_up: Box<dyn Fn(&MouseUpEvent, &mut Window, &mut App) + 'static>,
+}
+
+pub(crate) fn like_face(
+    handlers: LikeHandlers,
+    liked: bool,
+    slot: f32,
+    icon_size: f32,
+    idle: Rgba,
+    stop_row_click: bool,
+) -> AnyElement {
+    let LikeHandlers {
+        id,
+        hovered,
+        pressed,
+        on_hover,
+        on_down,
+        on_up,
+    } = handlers;
+    let spring_id = SharedString::from(format!("{id}-fill"));
+    let hot_id = SharedString::from(format!("{id}-hot"));
+    let press_id = SharedString::from(format!("{id}-press"));
+    let glyphs = move |scale: f32| {
+        let spring_id = spring_id.clone();
+        let hot_id = hot_id.clone();
+        div().relative().size(px(icon_size)).with_spring(
+            spring_id,
+            MainWindow::hover_spring(liked),
+            move |stack, phase| {
+                let t = phase.0.clamp(0.0, 1.0);
+                let hot_id = hot_id.clone();
+                stack.child(div().absolute().inset_0().with_spring(
+                    hot_id,
+                    MainWindow::hover_spring(hovered),
+                    move |layer, hot| {
+                        let color = mix_rgba(idle, rgb(0xe25555), hot.0);
+                        layer
+                            .child(like_glyph(icons::HEART, color, icon_size, 1.0 - t, scale))
+                            .child(like_glyph(icons::HEART_FILLED, color, icon_size, t, scale))
+                    },
+                ))
+            },
+        )
+    };
+    let button = div()
+        .id(id)
+        .flex()
+        .flex_shrink_0()
+        .items_center()
+        .justify_center()
+        .size(px(slot))
+        .cursor_pointer()
+        .on_hover(move |over, window, app| on_hover(over, window, app))
+        .on_mouse_down(MouseButton::Left, move |event, window, app| {
+            on_down(event, window, app)
+        })
+        .on_mouse_up(MouseButton::Left, move |event, window, app| {
+            on_up(event, window, app)
+        });
+    if stop_row_click {
+        button.rounded_sm().child(glyphs(1.0)).into_any_element()
+    } else {
+        button
+            .child(
+                div()
+                    .size(px(slot))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .with_spring(
+                        press_id,
+                        MainWindow::hover_spring(pressed),
+                        move |frame, phase| frame.child(glyphs(MainWindow::press_scale(phase))),
+                    ),
+            )
+            .into_any_element()
     }
 }
 

@@ -29,6 +29,11 @@ const WOBBLE_PEAK: f32 = 0.125;
 const WOBBLE_SETTLE: f32 = 0.75;
 const WOBBLE_SHIFT_EM: f32 = 0.05;
 
+/// How early a letter starts to open, before its own wave.
+pub const LETTER_PRE_ROLL_MS: f32 = 500.0;
+/// Brightest the pre-roll mask gets. The sung swipe replaces it after that.
+pub const LETTER_PRE_ROLL_PEAK: f32 = 0.3;
+
 const WAVE_MS: f32 = 900.0;
 const WAVE_CREST: f32 = 0.4;
 const WAVE_RISE_EM: f32 = 0.05;
@@ -144,7 +149,7 @@ pub fn line_synced_fade(since_ms: f32) -> f32 {
 
 /// How much of the highlight drop-shadow is left. Braccato starts at a full
 /// `0.8rem` blur on the revealed glyphs and eases it to nothing. A box shadow
-/// would light the whole line, so the player does not paint this.
+/// would light the whole line, so the player paints [`wave_glow`] instead.
 #[allow(dead_code)]
 pub fn glow(since_ms: f32, duration_ms: f32) -> f32 {
     let dur = (duration_ms * GLOW_DURATION_RATIO).max(GLOW_MIN_MS);
@@ -167,6 +172,27 @@ pub fn wobble(since_ms: f32) -> f32 {
         0.0
     };
     WOBBLE_SHIFT_EM * k
+}
+
+/// 0 before the pre-roll, then up to [`LETTER_PRE_ROLL_PEAK`] at `wave_delay_ms`.
+/// `since_ms` is the time since the word started, not since the letter's wave.
+pub fn pre_roll_lit(since_ms: f32, wave_delay_ms: f32) -> f32 {
+    let since_pre = since_ms - wave_delay_ms + LETTER_PRE_ROLL_MS;
+    if since_pre < 0.0 {
+        return 0.0;
+    }
+    (since_pre / LETTER_PRE_ROLL_MS).clamp(0.0, 1.0) * LETTER_PRE_ROLL_PEAK
+}
+
+/// Mask edge while a letter is warming up. The left of the glyph reaches
+/// `opened` (at most [`LETTER_PRE_ROLL_PEAK`]). The real swipe wins once it is
+/// ahead, so the hint does not snap off when the wave starts.
+pub fn pre_roll_edge(real: Lit, opened: f32) -> f32 {
+    if opened <= 0.001 || real.fade <= 0.001 {
+        return real.edge;
+    }
+    let hint = real.fade * (opened.clamp(0.0, LETTER_PRE_ROLL_PEAK) - 1.0);
+    real.edge.max(hint)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -244,6 +270,22 @@ pub fn emphasis(since_ms: f32, wave: Wave) -> f32 {
         1.0 - EASE_OUT.at((p - WAVE_CREST) / (1.0 - WAVE_CREST))
     };
     1.0 + (EMPHASIS_SCALE - 1.0) * k
+}
+
+/// 0 before a letter's wave, 1 at the crest, 0 once the wave has finished.
+/// The halo uses this. [`glow`] fades for much longer and is not painted.
+pub fn wave_glow(since_ms: f32, wave: Wave) -> f32 {
+    let Some(p) = wave_progress(since_ms, wave) else {
+        return 0.0;
+    };
+    if p >= 1.0 {
+        return 0.0;
+    }
+    if p < WAVE_CREST {
+        EASE_IN_OUT.at(p / WAVE_CREST)
+    } else {
+        1.0 - EASE_OUT.at((p - WAVE_CREST) / (1.0 - WAVE_CREST))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -325,9 +367,17 @@ enum ScrollSide {
 fn scroll_side(relative: i32, delta: f32) -> ScrollSide {
     let upward = delta < 0.0;
     if relative < 0 {
-        if upward { ScrollSide::Below } else { ScrollSide::Above }
+        if upward {
+            ScrollSide::Below
+        } else {
+            ScrollSide::Above
+        }
     } else if relative > 0 {
-        if upward { ScrollSide::Above } else { ScrollSide::Below }
+        if upward {
+            ScrollSide::Above
+        } else {
+            ScrollSide::Below
+        }
     } else {
         ScrollSide::Active
     }
@@ -337,9 +387,7 @@ fn scroll_duration_ms(side: ScrollSide, distance: usize) -> f32 {
     let n = distance as f32;
     match side {
         ScrollSide::Above => 750.0 + n.min(6.0) * 20.0,
-        ScrollSide::Active | ScrollSide::Below => {
-            750.0 + (n + 2.0).ln() * 80.0 + (n + 1.0) * 20.0
-        }
+        ScrollSide::Active | ScrollSide::Below => 750.0 + (n + 2.0).ln() * 80.0 + (n + 1.0) * 20.0,
     }
 }
 
@@ -347,7 +395,10 @@ fn scroll_duration_ms(side: ScrollSide, distance: usize) -> f32 {
 /// `delta` is the new scroll minus the one on screen. `step` is the gap to the
 /// neighbouring line, used to stop a seek from spreading the lines apart.
 pub fn line_shift_ms(relative: i32, delta: f32, distance: f32, step: f32, natural: bool) -> f32 {
-    let own = scroll_duration_ms(scroll_side(relative, delta), relative.unsigned_abs() as usize);
+    let own = scroll_duration_ms(
+        scroll_side(relative, delta),
+        relative.unsigned_abs() as usize,
+    );
     let active = scroll_duration_ms(scroll_side(0, delta), 0);
     let scale = if natural || distance <= 1.0 {
         1.0
@@ -466,9 +517,9 @@ pub fn plan_scroll(
     let last = &lines[*sung.last().unwrap()];
     let overflows = last.top + last.height - first.top > view_h;
     let pin = overflows.then_some(anchor);
-    let arrived = active.iter().any(|&index| {
-        scroll_time >= lines[index].time && !previous.contains(&index)
-    });
+    let arrived = active
+        .iter()
+        .any(|&index| scroll_time >= lines[index].time && !previous.contains(&index));
     let pin_done = pinned.is_some_and(|index| {
         index >= lines.len()
             || !sung.contains(&index)
@@ -541,12 +592,52 @@ mod tests {
     }
 
     #[test]
+    fn a_letter_opens_a_little_before_its_wave() {
+        assert_eq!(pre_roll_lit(-600.0, 0.0), 0.0);
+        assert!((pre_roll_lit(-250.0, 0.0) - 0.15).abs() < 1e-4);
+        assert!((pre_roll_lit(0.0, 0.0) - LETTER_PRE_ROLL_PEAK).abs() < 1e-4);
+        // 100ms into a word whose letter waits until 400ms: 200ms of the 500ms hint.
+        assert!((pre_roll_lit(100.0, 400.0) - 0.12).abs() < 1e-4);
+        let dark = letter_lit(-0.2, 0, 4);
+        let hinted = pre_roll_edge(dark, LETTER_PRE_ROLL_PEAK);
+        assert!(hinted > dark.edge);
+        let warm = Lit {
+            edge: hinted,
+            fade: dark.fade,
+        };
+        assert!((warm.at(0.0) - LETTER_PRE_ROLL_PEAK).abs() < 1e-3);
+        assert_eq!(
+            pre_roll_edge(Lit::FULL, LETTER_PRE_ROLL_PEAK),
+            Lit::FULL.edge
+        );
+        assert_eq!(pre_roll_edge(dark, 0.0), dark.edge);
+    }
+
+    #[test]
+    fn the_halo_peaks_inside_the_wave_and_then_goes_out() {
+        let wave = Wave {
+            delay_ms: 100.0,
+            duration_ms: 900.0,
+        };
+        assert_eq!(wave_glow(0.0, wave), 0.0);
+        let crest = wave.delay_ms + wave.duration_ms * WAVE_CREST;
+        assert!(wave_glow(crest, wave) > 0.9);
+        assert_eq!(wave_glow(wave.delay_ms + wave.duration_ms, wave), 0.0);
+        assert_eq!(
+            wave_glow(wave.delay_ms + wave.duration_ms + 500.0, wave),
+            0.0
+        );
+    }
+
+    #[test]
     fn the_sung_line_grows_and_the_finished_one_settles() {
         assert_eq!(line_scale(900.0, 1000.0, 3000.0), LINE_REST_SCALE);
         assert!((line_scale(1000.0, 1000.0, 3000.0) - LINE_REST_SCALE).abs() < 1e-4);
         assert!((line_scale(1000.0 + LINE_SCALE_MS, 1000.0, 3000.0) - 1.0).abs() < 1e-4);
         assert!((line_scale(2000.0, 1000.0, 3000.0) - 1.0).abs() < 1e-4);
-        assert!((line_scale(3000.0 + LINE_SCALE_MS, 1000.0, 3000.0) - LINE_REST_SCALE).abs() < 1e-4);
+        assert!(
+            (line_scale(3000.0 + LINE_SCALE_MS, 1000.0, 3000.0) - LINE_REST_SCALE).abs() < 1e-4
+        );
         let mid = line_scale(1000.0 + LINE_SCALE_MS * 0.5, 1000.0, 3000.0);
         assert!(mid > LINE_REST_SCALE && mid < 1.0);
     }
