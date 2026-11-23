@@ -94,6 +94,7 @@ pub fn parse(ttml: &str, song_ms: u32) -> Option<Lyrics> {
     for line in &mut lines {
         mark_parenthetical_line(line);
     }
+    let lines = attach_parentheticals(lines);
     let lines = insert_instrumental_breaks(lines, song_ms);
     let sync = if lines.iter().any(|line| {
         let sung = line.parts.iter().filter(|part| !part.background).count();
@@ -443,6 +444,50 @@ fn mark_parenthetical_line(line: &mut LyricLine) {
     }
 }
 
+/// A line wrapped in parentheses belongs to the line above it. The two share
+/// one row: the aside is the background vocal under that line, and the scroll
+/// does not treat the aside as its own line.
+fn attach_parentheticals(lines: Vec<LyricLine>) -> Vec<LyricLine> {
+    let mut keep: Vec<LyricLine> = Vec::with_capacity(lines.len());
+    for line in lines {
+        if line.instrumental || !wrapped_in_parens(&line.words) {
+            keep.push(line);
+            continue;
+        }
+        let Some(host) = keep.last_mut().filter(|host| !host.instrumental) else {
+            keep.push(line);
+            continue;
+        };
+        absorb_aside(host, &line);
+    }
+    keep
+}
+
+fn absorb_aside(host: &mut LyricLine, aside: &LyricLine) {
+    let mut parts = backing_parts(aside);
+    let host_is_aside =
+        wrapped_in_parens(&host.words) && host.parts.iter().all(|part| part.background);
+    if host.parts.iter().any(|part| part.background) {
+        if let Some(first) = parts.first_mut() {
+            if !first.words.starts_with(char::is_whitespace) {
+                first.words.insert(0, ' ');
+            }
+        }
+    }
+    if host_is_aside {
+        if !host.words.ends_with(char::is_whitespace) {
+            host.words.push(' ');
+        }
+        host.words.push_str(aside.words.trim());
+    }
+    let bg_end = aside.start_ms.saturating_add(aside.duration_ms);
+    let host_end = host.start_ms.saturating_add(host.duration_ms);
+    if bg_end > host_end {
+        host.duration_ms = bg_end.saturating_sub(host.start_ms);
+    }
+    host.parts.extend(parts);
+}
+
 fn backing_parts(line: &LyricLine) -> Vec<LyricPart> {
     if line.parts.is_empty() {
         return vec![LyricPart {
@@ -742,47 +787,90 @@ mod tests {
     }
 
     #[test]
-    fn a_parenthetical_line_stays_its_own_small_line() {
+    fn a_parenthetical_line_joins_the_line_above() {
         let ttml = r#"<tt xmlns:ttm="http://www.w3.org/ns/ttml#metadata"><body>
             <p begin="121.945s" end="123.548s" ttm:agent="v1"><span begin="121.945s" end="122.096s">я</span> <span begin="122.096s" end="123.548s">наебал</span></p>
             <p begin="123.795s" end="125.864s" ttm:agent="v1"><span begin="123.795s" end="123.870s">(я</span> <span begin="123.870s" end="124.795s">всегда</span> <span begin="124.795s" end="125.864s">это)</span></p>
             <p begin="126.835s" end="129.053s" ttm:agent="v1"><span begin="126.835s" end="129.053s">ангел</span></p>
         </body></tt>"#;
         let lyrics = parse(ttml, 130_000).expect("parsed");
-        let aside = lyrics
+        let lead = lyrics
             .lines
             .iter()
-            .find(|line| line.words.contains("всегда"))
-            .expect("aside");
-        assert!(aside.parts.iter().all(|part| part.background));
-        assert_eq!(aside.parts.len(), 3);
-        assert!(aside.parts[0].words.contains('('));
-        assert!(aside.parts[2].words.contains(')'));
+            .find(|line| line.words.contains("наебал"))
+            .expect("lead");
+        let aside: Vec<_> = lead
+            .parts
+            .iter()
+            .filter(|part| part.background)
+            .map(|part| part.words.as_str())
+            .collect();
+        assert_eq!(aside.len(), 3);
+        assert!(aside[0].contains('('));
+        assert!(aside[1].contains("всегда"));
+        assert!(aside[2].contains(')'));
+        assert_eq!(lead.start_ms + lead.duration_ms, 125_864);
         let sung: Vec<_> = lyrics
             .lines
             .iter()
             .filter(|line| !line.instrumental)
             .map(|line| line.words.as_str())
             .collect();
-        assert_eq!(sung.len(), 3);
+        assert_eq!(sung, ["я наебал", "ангел"]);
+        let lead_index = lyrics
+            .lines
+            .iter()
+            .position(|line| line.words == "я наебал")
+            .expect("lead");
+        assert_eq!(scroll_anchor(&lyrics.lines, 124.5), Some(lead_index));
     }
 
     #[test]
-    fn a_line_synced_aside_is_one_background_part() {
+    fn a_line_synced_aside_joins_the_line_above() {
         let ttml = r#"<tt><body>
             <p begin="10s" end="12s">Lead</p>
             <p begin="12s" end="14s">(я всегда настоящий)</p>
         </body></tt>"#;
         let lyrics = parse(ttml, 14_000).expect("parsed");
         assert_eq!(lyrics.sync, SyncType::Line);
-        let aside = lyrics
+        let sung: Vec<_> = lyrics.lines.iter().filter(|line| !line.instrumental).collect();
+        assert_eq!(sung.len(), 1);
+        let lead = sung[0];
+        assert_eq!(lead.words, "Lead");
+        assert_eq!(lead.parts.len(), 1);
+        assert!(lead.parts[0].background);
+        assert_eq!(lead.parts[0].words, "(я всегда настоящий)");
+        assert_eq!(lead.start_ms + lead.duration_ms, 14_000);
+    }
+
+    #[test]
+    fn a_leading_parenthetical_stays_until_a_line_is_above_it() {
+        let ttml = r#"<tt><body>
+            <p begin="1s" end="2s">(intro)</p>
+            <p begin="2s" end="4s">Lead</p>
+            <p begin="4s" end="5s">(a)</p>
+            <p begin="5s" end="6s">(b)</p>
+        </body></tt>"#;
+        let lyrics = parse(ttml, 6_000).expect("parsed");
+        let sung: Vec<_> = lyrics
             .lines
             .iter()
-            .find(|line| line.words.contains("настоящий"))
-            .expect("aside");
-        assert_eq!(aside.parts.len(), 1);
-        assert!(aside.parts[0].background);
-        assert_eq!(aside.parts[0].words, "(я всегда настоящий)");
+            .filter(|line| !line.instrumental)
+            .map(|line| line.words.as_str())
+            .collect();
+        assert_eq!(sung, ["(intro)", "Lead"]);
+        let lead = lyrics
+            .lines
+            .iter()
+            .find(|line| line.words == "Lead")
+            .expect("lead");
+        let aside = lead
+            .parts
+            .iter()
+            .filter(|part| part.background)
+            .map(|part| part.words.as_str())
+            .collect::<String>();
+        assert_eq!(aside, "(a) (b)");
     }
 
     #[test]

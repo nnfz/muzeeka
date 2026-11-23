@@ -7,14 +7,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use gpui::{
-    canvas, div, img, linear_color_stop, linear_gradient, point, prelude::*, px, relative,
+    canvas, div, img, linear_color_stop, linear_gradient, point, prelude::*, px,
     AnimationExt, AnyElement, BoxShadow, Context, Hsla, Image, MouseButton, ObjectFit,
     SharedString, SpringAnimation, SpringConfig, Window, WindowControlArea,
 };
 
 use crate::ui::cover::cover_art;
 use crate::ui::icons::{self, icon};
-use crate::ui::lyric_motion::{self, LineMotion, Lit};
+use crate::ui::lyric_motion::{self, LineMotion};
 use crate::ui::lyrics::{self, LyricLine, Lyrics, SyncType};
 use crate::ui::main_window::MainWindow;
 use crate::ui::session::{self, TrackId};
@@ -35,30 +35,14 @@ const USER_HOLD: Duration = Duration::from_secs(3);
 const COLUMN_TOP_PAD: f32 = 80.;
 const CLOCK_LATE_S: f64 = 0.06;
 
-/// Unsung words. The white wipe is its own layer, so the active line stays this gray underneath.
-const INACTIVE_ALPHA: f32 = 0.3;
 /// Braccato `--blyrics-line-height`.
 const LINE_HEIGHT: f32 = 1.333;
-/// Slices of the Braccato mask gradient. The edge is 0.1 of the word, same as
-/// `--mask-fade`, and these stops keep that ramp from turning into a hard cut.
-const WIPE_BANDS: usize = 32;
 const BACKGROUND_SCALE: f32 = 0.65;
 /// Backing under a lead line. A line that is only backing keeps the line alpha.
 const BACKGROUND_OPACITY: f32 = 0.7;
-/// Peak opacity of the white copy drawn just above a letter during its wave.
-const GLOW_ALPHA: f32 = 0.3;
-const GLOW_LIFT_PX: f32 = 1.5;
-/// A letter eases up and apart before its wave, then the wave takes over.
-const PRE_LIFT_EM: f32 = 0.02;
-const PRE_SPREAD_EM: f32 = 0.04;
 /// `--blyrics-padding: 2rem`. Two lines leave twice this much air between them.
 const LINE_PAD: f32 = 32.;
 const WORD_SPACE_EM: f32 = 0.26;
-/// Below this the swell is invisible, so the letter stays one text node.
-const SCALE_SNAP: f32 = 1.004;
-/// The letter mask may open this early. Layout and the sideways wobble wait
-/// until the line itself starts, so the row does not change shape beforehand.
-const PRE_ROLL_MS: f64 = lyric_motion::LETTER_PRE_ROLL_MS as f64;
 
 pub(crate) struct Fullscreen {
     open: bool,
@@ -97,9 +81,6 @@ struct GroupCache {
     /// Quantized font and column width the row breaks were measured at.
     wrap_key: Option<(i32, i32)>,
     wraps: Vec<LineWrap>,
-    /// Positions cache: [line_index][group_index] -> Vec<f32> (x positions for each letter)
-    positions_key: Option<(i32, i32)>,
-    positions: Vec<Vec<Vec<f32>>>,
 }
 
 struct LineWrap {
@@ -375,7 +356,7 @@ impl Clock {
         } else if real != self.real {
             let predicted = self.shown + dt;
             let error = real - predicted;
-            // A sample that arrives a little late must not pull the wipe backwards.
+            // A sample that arrives a little late must not pull the lyric clock backwards.
             // A seek, or a sample that is ahead, is taken whole.
             if error < -0.001 && error > -CLOCK_LATE_S {
                 self.shown = predicted + error * 0.15;
@@ -603,7 +584,6 @@ fn duration_ms(duration: f64) -> u32 {
 struct Part {
     text: String,
     start_ms: f64,
-    duration_ms: f32,
 }
 
 struct Group {
@@ -621,72 +601,13 @@ enum Align {
 #[derive(Clone, Copy)]
 struct LineView {
     motion: LineMotion,
-    /// The line's own clock has started. The wipe may paint earlier; the wobble may not.
-    live: bool,
     now_ms: f64,
     base: f32,
-    px_scale: f32,
     detailed: bool,
-}
-
-struct Unit {
-    text: String,
-    lit: Lit,
-    highlight: f32,
-    lift: f32,
-    /// The letter is still inside its rise. A settled letter snaps to one pixel.
-    traveling: bool,
-    /// Paint scale of one letter. The layout box stays at 1.
-    scale: f32,
-    rtl: bool,
-    /// White copy under the glyph. Zero except while the letter's wave is up.
-    glow_alpha: f32,
-    /// Paint-only horizontal offset. Layout width stays the measured row.
-    spread: f32,
-    /// Absolute x position if word is shaped. None means flex positioning.
-    abs_x: Option<f32>,
-}
-
-fn snap(value: f32, px_scale: f32, steps: f32) -> f32 {
-    let unit = px_scale.max(1.0) * steps;
-    (value * unit).round() / unit
 }
 
 fn is_cjk(ch: char) -> bool {
     ch as u32 >= 0x2E80
-}
-
-fn splittable(text: &str) -> bool {
-    !text.chars().any(|ch| {
-        matches!(ch as u32,
-            0x0590..=0x08FF | 0x0900..=0x0DFF | 0x0E00..=0x0FFF | 0x1000..=0x109F
-            | 0x1780..=0x18AF | 0xA8E0..=0xA8FF | 0xFB1D..=0xFDFF | 0xFE70..=0xFEFF)
-    })
-}
-
-fn is_rtl(text: &str) -> bool {
-    text.chars()
-        .any(|ch| matches!(ch as u32, 0x0590..=0x08FF | 0xFB1D..=0xFDFF | 0xFE70..=0xFEFF))
-}
-
-fn is_mark(ch: char) -> bool {
-    matches!(ch as u32,
-        0x0300..=0x036F | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0x20D0..=0x20FF
-        | 0xFE00..=0xFE0F | 0xFE20..=0xFE2F | 0x1F3FB..=0x1F3FF | 0xE0100..=0xE01EF)
-}
-
-fn letters_of(text: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let mut joined = false;
-    for ch in text.chars() {
-        let attach = joined || is_mark(ch) || ch == '\u{200D}';
-        joined = ch == '\u{200D}';
-        match out.last_mut() {
-            Some(last) if attach => last.push(ch),
-            _ => out.push(ch.to_string()),
-        }
-    }
-    out
 }
 
 fn groups_of(parts: Vec<Part>) -> Vec<Group> {
@@ -731,7 +652,6 @@ fn line_parts(text: &str, start_ms: f64) -> Vec<Part> {
             parts.push(Part {
                 text: std::mem::take(&mut token),
                 start_ms,
-                duration_ms: 0.0,
             });
         }
     }
@@ -739,7 +659,6 @@ fn line_parts(text: &str, start_ms: f64) -> Vec<Part> {
         parts.push(Part {
             text: token,
             start_ms,
-            duration_ms: 0.0,
         });
     }
     parts
@@ -755,407 +674,40 @@ fn backing_is_the_line(line: &LyricLine, backs: &[Part]) -> bool {
     words.is_empty() || words == backing
 }
 
-fn line_groups(line: &LyricLine, sync: SyncType) -> (Vec<Group>, Vec<Group>) {
-    let mut main = Vec::new();
-    let mut back = Vec::new();
-    for part in &line.parts {
-        let entry = Part {
+fn line_groups(line: &LyricLine) -> (Vec<Group>, Vec<Group>) {
+    let backs: Vec<Part> = line
+        .parts
+        .iter()
+        .filter(|part| part.background)
+        .map(|part| Part {
             text: part.words.clone(),
-            start_ms: part.start_ms as f64,
-            duration_ms: part.duration_ms as f32,
-        };
-        if part.background {
-            back.push(entry);
-        } else {
-            main.push(entry);
-        }
-    }
-    let main = if sync == SyncType::Rich && !main.is_empty() {
-        groups_of(main)
-    } else if backing_is_the_line(line, &back) {
+            start_ms: line.start_ms as f64,
+        })
+        .collect();
+    let main = if backing_is_the_line(line, &backs) {
         Vec::new()
     } else {
         groups_of(line_parts(&line.words, line.start_ms as f64))
     };
-    (main, groups_of(back))
+    (main, groups_of(backs))
 }
 
-fn part_units_with_shaping(
-    window: &mut Window,
-    part: &Part,
-    view: LineView,
-    font: f32,
-    placed: Option<&[f32]>,
-) -> (Vec<Unit>, f32) {
-    let motion = view.motion;
-    let rtl = is_rtl(&part.text);
-    let since = (view.now_ms - part.start_ms) as f32;
-    let fade = if motion.still { 0.0 } else { motion.highlight };
-    let long = part.duration_ms > lyric_motion::LONG_WORD_MS;
-
-    if part.duration_ms <= 0.0 || !splittable(&part.text) {
-        let whole = |lit: Lit, highlight: f32| {
-            (
-                vec![Unit {
-                    text: part.text.clone(),
-                    lit,
-                    highlight,
-                    lift: 0.0,
-                    traveling: false,
-                    scale: 1.0,
-                    rtl,
-                    glow_alpha: 0.0,
-                    spread: 0.0,
-                    abs_x: None,
-                }],
-                0.0,
-            )
-        };
-        if part.duration_ms <= 0.0 {
-            return whole(Lit::FULL, lyric_motion::line_synced_fade(since) * fade);
-        }
-        let start = lyric_motion::swipe_start(since, part.duration_ms);
-        return whole(lyric_motion::word_lit(start), if since >= 0.0 { fade } else { 0.0 });
-    }
-
-    // Positions from the whole word keep syllables on the same advances as the
-    // idle line. Shaping each syllable alone, then gapping the boxes, prints
-    // "los er" for "loser".
-    let (positions, word_width) = match placed {
-        Some(xs) => (xs.to_vec(), 0.0),
-        None => shape_word(window, &part.text, font, gpui::FontWeight::BOLD),
+fn group_element(group: &Group, view: LineView, font: f32, pull_next: bool) -> AnyElement {
+    let text: String = group.parts.iter().map(|part| part.text.as_str()).collect();
+    let start = group.parts.first().map(|part| part.start_ms).unwrap_or(0.0);
+    let ink = if view.detailed {
+        let since = (view.now_ms - start) as f32;
+        let fade = lyric_motion::line_synced_fade(since) * view.motion.highlight;
+        fade + view.base * (1.0 - fade)
+    } else {
+        view.base
     };
-
-    let start = lyric_motion::swipe_start(since, part.duration_ms);
-    let letters = letters_of(&part.text);
-    let count = letters.len();
-    let waves = lyric_motion::letter_waves(count, part.duration_ms);
-
-    let units = letters
-        .into_iter()
-        .zip(waves)
-        .enumerate()
-        .map(|(index, (text, wave))| {
-            let local = since - wave.delay_ms;
-            let pre = lyric_motion::pre_roll_lit(since, wave.delay_ms);
-            let real = lyric_motion::letter_lit(start, index, count);
-            let approach = if pre <= 0.0 {
-                0.0
-            } else if local < 0.0 {
-                (pre / lyric_motion::LETTER_PRE_ROLL_PEAK).clamp(0.0, 1.0)
-            } else {
-                (1.0 - (local / 200.0).clamp(0.0, 1.0)).max(0.0)
-            };
-
-            let lift_amount = if long {
-                lyric_motion::float(since, wave).max(PRE_LIFT_EM * approach) * font * fade
-            } else {
-                0.0
-            };
-
-            Unit {
-                text,
-                lit: Lit {
-                    edge: lyric_motion::pre_roll_edge(real, pre),
-                    fade: real.fade,
-                },
-                highlight: if since >= 0.0 || pre > 0.0 { fade } else { 0.0 },
-                lift: lift_amount,
-                traveling: (local >= 0.0 && local < wave.duration_ms) || (local < 0.0 && pre > 0.0),
-                scale: if long {
-                    lyric_motion::emphasis(since, wave)
-                } else {
-                    1.0
-                },
-                rtl,
-                glow_alpha: lyric_motion::wave_glow(since, wave) * GLOW_ALPHA * fade,
-                spread: 0.0,
-                abs_x: positions.get(index).copied(),
-            }
-        })
-        .collect();
-
-    (units, word_width)
-}
-
-fn clip_layer(text: &SharedString, from: f32, to: f32, color: Hsla) -> Option<AnyElement> {
-    let width = to - from;
-    if width <= 0.0005 {
-        return None;
-    }
-    Some(
-        div()
-            .absolute()
-            .top_0()
-            .bottom_0()
-            .left(relative(from))
-            .w(relative(width))
-            .overflow_hidden()
-            .child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .left(relative(-from / width))
-                    .whitespace_nowrap()
-                    .text_color(color)
-                    .child(text.clone()),
-            )
-            .into_any_element(),
-    )
-}
-
-fn unit_text(unit: &Unit, base: f32) -> gpui::Div {
-    let text = SharedString::from(unit.text.clone());
-    // One glyph already mixes the white reveal with the gray base.
-    let flat = |reveal: f32| reveal + base * (1.0 - reveal);
-    if unit.highlight <= 0.0 || unit.lit.dark() {
-        return div().text_color(white_a(base)).child(text);
-    }
-    if unit.lit.full() {
-        return div().text_color(white_a(flat(unit.highlight))).child(text);
-    }
-    let lo = unit.lit.edge.clamp(0.0, 1.0);
-    let hi = (unit.lit.edge + unit.lit.fade).clamp(0.0, 1.0);
-    let mut layers: Vec<AnyElement> = Vec::new();
-    let mut push = |from: f32, to: f32, reveal: f32| {
-        if reveal <= 0.004 {
-            return;
-        }
-        let (from, to) = if unit.rtl {
-            (1.0 - to, 1.0 - from)
-        } else {
-            (from, to)
-        };
-        layers.extend(clip_layer(&text, from, to, white_a(reveal)));
-    };
-    // The clip sits on top of the gray glyph. Its alpha is only the white
-    // reveal. Mixing the base in here as well paints that gray twice.
-    push(0.0, lo, unit.highlight);
-    for band in 0..WIPE_BANDS {
-        let from = lo + (hi - lo) * band as f32 / WIPE_BANDS as f32;
-        let to = lo + (hi - lo) * (band + 1) as f32 / WIPE_BANDS as f32;
-        push(from, to, unit.lit.at((from + to) * 0.5) * unit.highlight);
-    }
     div()
-        .relative()
-        .child(div().text_color(white_a(base)).child(text))
-        .children(layers)
-}
-
-/// GPUI has no glyph shadow. A second white copy, shifted up, is the halo.
-fn with_glow(unit: &Unit, text: gpui::Div, glyph_font: f32) -> gpui::Div {
-    if unit.glow_alpha <= 0.001 {
-        return text;
-    }
-    div()
-        .relative()
+        .text_color(white_a(ink))
         .whitespace_nowrap()
-        .child(
-            div()
-                .absolute()
-                .top(px(-GLOW_LIFT_PX))
-                .left_0()
-                .whitespace_nowrap()
-                .text_size(px(glyph_font))
-                .line_height(px(glyph_font * LINE_HEIGHT))
-                .text_color(white_a(unit.glow_alpha))
-                .child(unit.text.clone()),
-        )
+        .when(pull_next, |el| el.mr(px(font * -WORD_SPACE_EM)))
         .child(text)
-}
-
-fn unit_body(unit: &Unit, font: f32, base: f32) -> gpui::Div {
-    let glyph = |glyph_font: f32| {
-        let mut text = unit_text(unit, base).whitespace_nowrap();
-        if (glyph_font - font).abs() > 0.01 {
-            text = text
-                .text_size(px(glyph_font))
-                .line_height(px(glyph_font * LINE_HEIGHT));
-        }
-        with_glow(unit, text, glyph_font)
-    };
-    if unit.scale <= SCALE_SNAP {
-        return glyph(font);
-    }
-    // GPUI has no paint-only scale. The invisible copy keeps the letter's box,
-    // and the visible copy grows from the center without pushing its neighbors.
-    let size = font * unit.scale;
-    div()
-        .relative()
-        .whitespace_nowrap()
-        .child(unit_text(unit, base).whitespace_nowrap().opacity(0.))
-        .child(
-            div()
-                .absolute()
-                .top_0()
-                .left_0()
-                .right_0()
-                .bottom_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(glyph(size)),
-        )
-}
-
-fn unit_element(unit: Unit, font: f32, base: f32, px_scale: f32) -> AnyElement {
-    // Absolutely positioned letter (when abs_x is set)
-    if let Some(x) = unit.abs_x {
-        let body = unit_body(&unit, font, base);
-        return div()
-            .absolute()
-            .left(px(x))
-            .top(px(unit.lift))
-            .w_auto()  // Critical: don't stretch to full width
-            .h_auto()
-            .child(body)
-            .into_any_element();
-    }
-
-    // Flex positioned letter (default, for line-synced or unsplittable)
-    let quantum = 1.0 / px_scale.max(1.0);
-    let steps = unit.lift / quantum;
-    let primary_step = steps.round();
-    let primary_y = primary_step * quantum;
-    let residual = if unit.traveling {
-        steps - primary_step
-    } else {
-        0.0
-    };
-    if primary_y.abs() <= 0.04 && residual.abs() <= 0.04 {
-        return div()
-            .relative()
-            .child(unit_body(&unit, font, base))
-            .into_any_element();
-    }
-    let shell = div().relative().whitespace_nowrap().child(
-        div()
-            .opacity(0.)
-            .whitespace_nowrap()
-            .child(unit.text.clone()),
-    );
-    let placed = |y: f32, opacity: f32| {
-        div()
-            .absolute()
-            .top(px(-y))
-            .left_0()
-            .opacity(opacity)
-            .child(unit_body(&unit, font, base))
-    };
-    if residual.abs() <= 0.04 {
-        return shell.child(placed(primary_y, 1.0)).into_any_element();
-    }
-    let ghost_y = (primary_step + residual.signum()) * quantum;
-    shell
-        .child(placed(primary_y, 1.0))
-        .child(placed(ghost_y, residual.abs() * 0.65))
         .into_any_element()
-}
-
-fn group_shift(
-    still: bool,
-    rich: bool,
-    since_ms: f32,
-    font: f32,
-    highlight: f32,
-    px_scale: f32,
-) -> f32 {
-    if still || !rich {
-        return 0.0;
-    }
-    let em = lyric_motion::wobble(since_ms);
-    snap(em * font * highlight, px_scale, 4.0)
-}
-
-fn group_element(
-    group: &Group,
-    view: LineView,
-    font: f32,
-    pull_next: bool,
-    align: Align,
-    rich: bool,
-    window: &mut Window,
-) -> AnyElement {
-    let tighten = |el: gpui::Div| el.when(pull_next, |el| el.mr(px(font * -WORD_SPACE_EM)));
-    if !view.detailed {
-        let text: String = group.parts.iter().map(|part| part.text.as_str()).collect();
-        return tighten(div().text_color(white_a(view.base)).whitespace_nowrap())
-            .child(text)
-            .into_any_element();
-    }
-    let first_ms = group.parts.first().map_or(0.0, |part| part.start_ms);
-    let shift = group_shift(
-        !view.live,
-        rich,
-        (view.now_ms - first_ms) as f32,
-        font,
-        view.motion.highlight,
-        view.px_scale,
-    );
-    let counts: Vec<usize> = group
-        .parts
-        .iter()
-        .map(|part| letters_of(&part.text).len())
-        .collect();
-    let joined: String = group.parts.iter().map(|part| part.text.as_str()).collect();
-    let all_split = group.parts.iter().all(|part| {
-        part.duration_ms > 0.0 && splittable(&part.text) && !part.text.is_empty()
-    });
-    let shared = all_split
-        && counts.iter().sum::<usize>() == letters_of(&joined).len()
-        && !joined.is_empty();
-    let (places, group_width) = if shared {
-        shape_word(window, &joined, font, gpui::FontWeight::BOLD)
-    } else {
-        (Vec::new(), 0.0)
-    };
-    let shared = shared && places.len() == counts.iter().sum::<usize>();
-
-    let mut cursor = 0usize;
-    let mut letters = Vec::new();
-    for (part, count) in group.parts.iter().zip(counts) {
-        let xs = if shared {
-            let end = (cursor + count).min(places.len());
-            places.get(cursor..end)
-        } else {
-            None
-        };
-        cursor += count;
-        let (units, _) = part_units_with_shaping(window, part, view, font, xs);
-        letters.extend(units);
-    }
-
-    let row = if shared {
-        div()
-            .relative()
-            .left(px(shift))
-            .w(px(group_width))
-            .h(px(font * LINE_HEIGHT))
-            .children(
-                letters
-                    .into_iter()
-                    .map(|unit| unit_element(unit, font, view.base, view.px_scale)),
-            )
-    } else {
-        div()
-            .relative()
-            .left(px(shift))
-            .flex()
-            .flex_row()
-            .children(
-                letters
-                    .into_iter()
-                    .map(|unit| unit_element(unit, font, view.base, view.px_scale)),
-            )
-    };
-
-    let row = match align {
-        Align::Start => row.justify_start(),
-        Align::Center => row.justify_center(),
-        Align::End => row.justify_end(),
-    };
-
-    tighten(row).into_any_element()
 }
 
 fn word_row(
@@ -1164,8 +716,6 @@ fn word_row(
     view: LineView,
     font: f32,
     align: Align,
-    rich: bool,
-    window: &mut Window,
 ) -> gpui::Div {
     let last = indices.len().saturating_sub(1);
     let row = div()
@@ -1176,7 +726,7 @@ fn word_row(
         .children(indices.iter().enumerate().filter_map(|(place, index)| {
             let group = groups.get(*index)?;
             let pull_next = !group.space_after && place < last;
-            Some(group_element(group, view, font, pull_next, align, rich, window))
+            Some(group_element(group, view, font, pull_next))
         }));
     match align {
         Align::Start => row.justify_start(),
@@ -1237,40 +787,6 @@ fn text_width(window: &mut Window, text: &str, font_px: f32, weight: gpui::FontW
         .shape_line(SharedString::from(text), px(font_px), &[run], None)
         .width()
         .as_f32()
-}
-
-fn shape_word(
-    window: &mut Window,
-    text: &str,
-    font_px: f32,
-    weight: gpui::FontWeight,
-) -> (Vec<f32>, f32) {
-    if text.is_empty() || font_px <= 0.0 {
-        return (Vec::new(), 0.0);
-    }
-    let mut font = gpui::font(theme::FONT_FAMILY);
-    font.weight = weight;
-    let run = gpui::TextRun {
-        len: text.len(),
-        font,
-        ..Default::default()
-    };
-    let line = window
-        .text_system()
-        .shape_line(SharedString::from(text), px(font_px), &[run], None);
-
-    let letters = letters_of(text);
-    let mut positions = Vec::new();
-    let mut byte_pos = 0;
-
-    for letter in letters {
-        let x = line.x_for_index(byte_pos).as_f32();
-        positions.push(x);
-        byte_pos += letter.len();
-    }
-
-    let width = line.width().as_f32();
-    (positions, width)
 }
 
 fn group_width(window: &mut Window, group: &Group, font_px: f32, weight: gpui::FontWeight) -> f32 {
@@ -1342,14 +858,13 @@ fn text_block(
     view: LineView,
     font: f32,
     align: Align,
-    rich: bool,
-    window: &mut Window,
 ) -> gpui::Div {
     let rows = resolved_rows(groups.len(), planned);
-    div().w_full().flex().flex_col().children(
-        rows.iter()
-            .map(|row| word_row(groups, row, view, font, align, rich, window)),
-    )
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .children(rows.iter().map(|row| word_row(groups, row, view, font, align)))
 }
 
 fn lyric_line(
@@ -1360,8 +875,6 @@ fn lyric_line(
     view: LineView,
     font: f32,
     align: Align,
-    rich: bool,
-    window: &mut Window,
 ) -> AnyElement {
     let back_font = font * BACKGROUND_SCALE;
     div()
@@ -1374,11 +887,11 @@ fn lyric_line(
         })
         .when(matches!(align, Align::End), |column| column.items_end())
         .when(!main.is_empty(), |column| {
-            column.child(text_block(main, main_rows, view, font, align, rich, window))
+            column.child(text_block(main, main_rows, view, font, align))
         })
         .when(!back.is_empty(), |column| {
             column.child(
-                text_block(back, back_rows, view, back_font, align, rich, window)
+                text_block(back, back_rows, view, back_font, align)
                     .when(!main.is_empty(), |row| {
                         row.mt(px(font * 0.1)).opacity(BACKGROUND_OPACITY)
                     })
@@ -1400,14 +913,11 @@ fn line_depth(distance: i32) -> (f32, f32) {
     }
 }
 
-/// Ink of a line before the white wipe. A line-synced line keeps the neighbor's
-/// brightness when it becomes current, so the fade up does not dip through the
-/// darker unsung-word gray first.
-fn line_ink(distance: i32, rich: bool) -> f32 {
-    if distance == 0 && !rich {
+/// Ink before the line brightens. The current line starts at the neighbor's
+/// brightness, so the fade up does not dip through a darker gray first.
+fn line_ink(distance: i32) -> f32 {
+    if distance == 0 {
         line_depth(1).0
-    } else if distance == 0 {
-        INACTIVE_ALPHA
     } else {
         line_depth(distance).0
     }
@@ -1713,9 +1223,7 @@ impl MainWindow {
 
         let (panel, panel_ready) = match (&lyrics_now, panel_mounted) {
             (Some(lyr), true) => {
-                let px_scale = window.scale_factor();
-                let (panel, ready) =
-                    self.lyrics_panel(id, lyr.clone(), time, vw, px_scale, window, cx);
+                let (panel, ready) = self.lyrics_panel(id, lyr.clone(), time, vw, window, cx);
                 (Some(panel), ready)
             }
             _ => (None, true),
@@ -2071,17 +1579,12 @@ impl MainWindow {
         lyr: Arc<Lyrics>,
         time: f64,
         vw: f32,
-        px_scale: f32,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> (AnyElement, bool) {
         let untimed = lyr.sync == SyncType::None;
         let lines = &lyr.lines;
-        let lead_ms = if lyr.sync == SyncType::Rich {
-            lyric_motion::RICH_LEAD_MS
-        } else {
-            lyric_motion::LINE_LEAD_MS
-        };
+        let lead_ms = lyric_motion::LINE_LEAD_MS;
         let now_ms = time * 1000.0 + lead_ms;
         let scroll_time = time + lead_ms as f64 / 1000.0 + lyric_motion::SCROLL_LEAD_SEC;
         let current = lyrics::active_lines(lines, now_ms / 1000.0);
@@ -2102,10 +1605,7 @@ impl MainWindow {
         let mut groups = std::mem::take(&mut self.fullscreen.groups);
         if groups.key != Some(key) {
             groups.key = Some(key);
-            groups.lines = lines
-                .iter()
-                .map(|line| line_groups(line, lyr.sync))
-                .collect();
+            groups.lines = lines.iter().map(line_groups).collect();
             groups.wrap_key = None;
         }
         let text_w = ((vw * 0.5 - 56.).max(200.) - 28.).max(80.);
@@ -2128,7 +1628,6 @@ impl MainWindow {
             groups.wrap_key = Some(wrap_key);
         }
 
-        let rich = lyr.sync == SyncType::Rich;
         let sung_anchor = if current.is_empty() {
             lines
                 .iter()
@@ -2256,35 +1755,19 @@ impl MainWindow {
                     )
                     .into_any_element()
             } else {
-                let start_ms = line
-                    .parts
-                    .iter()
-                    .filter(|part| !part.background)
-                    .map(|part| part.start_ms)
-                    .min()
-                    .unwrap_or(line.start_ms)
-                    .min(line.start_ms) as f64;
+                let start_ms = line.start_ms as f64;
                 let end_ms = (lyrics::line_until_sec(lines, index) * 1000.0)
                     .max((line.start_ms + line.duration_ms) as f64 + lyric_motion::LINE_SETTLE_MS);
                 let motion = lyric_motion::line_motion(start_ms, end_ms, now_ms);
-                let live = !motion.still;
-                let mut motion = motion;
-                if motion.still && !motion.past && now_ms >= start_ms - PRE_ROLL_MS {
-                    motion.still = false;
-                }
                 let view = LineView {
                     motion,
-                    live,
                     now_ms,
-                    // Rich sync keeps unsung words gray. Line sync stays at the
-                    // neighbor ink so the brighten does not flash darker first.
-                    base: line_ink(distance, rich),
-                    px_scale,
+                    base: line_ink(distance),
                     detailed: !motion.still,
                 };
                 let (main, back) = &groups.lines[index];
                 let wrap = &groups.wraps[index];
-                let full = lyric_line(main, back, &wrap.main, &wrap.back, view, font, align, rich, window);
+                let full = lyric_line(main, back, &wrap.main, &wrap.back, view, font, align);
                 if (paint - 1.0).abs() < 0.004 {
                     full
                 } else {
@@ -2298,8 +1781,6 @@ impl MainWindow {
                             view,
                             font * paint,
                             align,
-                            rich,
-                            window,
                         ),
                         align,
                         font * paint,
@@ -2438,20 +1919,19 @@ fn backdrop_layer(image: Arc<Image>, alpha: f32, vw: f32, vh: f32, drift: f64) -
 mod tests {
     use super::*;
 
-    fn part(text: &str, duration_ms: f32) -> Part {
+    fn part(text: &str) -> Part {
         Part {
             text: text.into(),
             start_ms: 0.0,
-            duration_ms,
         }
     }
 
     #[test]
     fn syllables_join_into_words_at_spaces() {
         let groups = groups_of(vec![
-            part("Hel", 200.),
-            part("lo ", 900.),
-            part("world", 300.),
+            part("Hel"),
+            part("lo "),
+            part("world"),
         ]);
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].parts.len(), 2);
@@ -2462,14 +1942,14 @@ mod tests {
 
     #[test]
     fn leading_space_starts_a_new_word() {
-        let groups = groups_of(vec![part("Привет", 100.), part(" мир", 100.)]);
+        let groups = groups_of(vec![part("Привет"), part(" мир")]);
         assert_eq!(groups.len(), 2);
         assert!(groups[0].space_after);
     }
 
     #[test]
     fn cjk_syllables_stay_separate_so_lines_wrap() {
-        let groups = groups_of(vec![part("夜", 100.), part("に", 100.), part("駆", 100.)]);
+        let groups = groups_of(vec![part("夜"), part("に"), part("駆")]);
         assert_eq!(groups.len(), 3);
         assert!(groups.iter().all(|group| !group.space_after));
     }
@@ -2482,15 +1962,6 @@ mod tests {
             .map(|group| group.parts.iter().map(|part| part.text.as_str()).collect())
             .collect();
         assert_eq!(words, vec!["Hello", "big", "世", "界"]);
-    }
-
-    #[test]
-    fn letters_keep_marks_and_joined_emoji() {
-        assert_eq!(letters_of("й").len(), 1);
-        assert_eq!(letters_of("e\u{301}a").len(), 2);
-        assert_eq!(letters_of("👩\u{200D}🎤!").len(), 2);
-        assert!(splittable("Привет"));
-        assert!(!splittable("مرحبا"));
     }
 
     #[test]
@@ -2516,15 +1987,6 @@ mod tests {
     }
 
     #[test]
-    fn line_synced_words_do_not_wobble() {
-        let rich = group_shift(false, true, 60.0, 40.0, 1.0, 1.0);
-        let line = group_shift(false, false, 60.0, 40.0, 1.0, 1.0);
-        assert!(rich.abs() > 0.0);
-        assert_eq!(line, 0.0);
-        assert_eq!(group_shift(true, true, 60.0, 40.0, 1.0, 1.0), 0.0);
-    }
-
-    #[test]
     fn lines_farther_from_the_sung_one_are_smaller_and_dimmer() {
         assert_eq!(line_depth(0), (1.0, 1.0));
         assert_eq!(line_depth(1), (0.45, 0.99));
@@ -2534,10 +1996,9 @@ mod tests {
 
     #[test]
     fn a_line_synced_line_does_not_dip_when_it_brightens() {
-        let neighbor = line_ink(1, false);
-        let active = line_ink(0, false);
+        let neighbor = line_ink(1);
+        let active = line_ink(0);
         assert_eq!(active, neighbor);
-        assert!(active > line_ink(0, true));
     }
 
     #[test]
