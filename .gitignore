@@ -3,3 +3,4 @@ target
 PORTING_STATUS.md
 .env
 examples
+plugins
