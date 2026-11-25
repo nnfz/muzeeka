@@ -554,7 +554,7 @@ impl MainWindow {
                     .child(self.title_cell(&track, current))
                     .child({
                         let base_color = if lit { row_color } else { theme::bg_surface() };
-                        let album_fade_id = SharedString::from(format!("track-hover-{}", id.0));
+                        let album_fade_id = SharedString::from(format!("track-album-fade-{}", id.0));
                         div()
                             .relative()
                             .w(px(self.album_width))
@@ -582,9 +582,12 @@ impl MainWindow {
                                     .bottom(px(0.))
                                     .right(px(0.))
                                     .w(px(24.))
-                                    .with_animation(
+                                    // A spring starts at its target, so a row that scrolls
+                                    // into view is already clear. The old oneshot began at
+                                    // phase 0, and `1 - phase` painted that as full hover.
+                                    .with_spring(
                                         album_fade_id,
-                                        MainWindow::row_fade(),
+                                        MainWindow::smooth_spring(hovered && !lit),
                                         move |overlay, phase| {
                                             let fade_color = if lit {
                                                 base_color
@@ -592,7 +595,7 @@ impl MainWindow {
                                                 mix_rgba(
                                                     theme::bg_surface(),
                                                     theme::hover(),
-                                                    if hovered { phase } else { 1.0 - phase },
+                                                    phase.0,
                                                 )
                                             };
                                             let fade_color_transparent = Rgba {
@@ -609,18 +612,14 @@ impl MainWindow {
                             )
                     })
                     .child(self.duration_cell(like_id, liked, id, track.duration, cx))
-                    .with_animation(
+                    .with_spring(
                         SharedString::from(format!("track-hover-{}", id.0)),
-                        MainWindow::row_fade(),
+                        MainWindow::smooth_spring(hovered && !lit),
                         move |row, phase| {
-                            if lit {
+                            if lit || phase.0 <= 0.0 {
                                 row
                             } else {
-                                row.bg(theme::hover().opacity(if hovered {
-                                    phase
-                                } else {
-                                    1.0 - phase
-                                }))
+                                row.bg(theme::hover().opacity(phase.0))
                             }
                         },
                     ),
