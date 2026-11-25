@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use gpui::{
-    div, prelude::*, px, uniform_list, AnimationExt, AnyElement, Context, CursorStyle,
+    div, prelude::*, px, size, uniform_list, AnimationExt, AnyElement, Context, CursorStyle,
     InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, SpringAnimation,
     SpringConfig, Styled, Window,
 };
@@ -72,7 +72,7 @@ impl MainWindow {
             .cursor_pointer()
             .text_size(px(14.))
             .text_color(theme::text_muted())
-            .hover(|style| style.bg(theme::hover()).text_color(theme::text()))
+            .hover_style(|style| style.bg(theme::hover()).text_color(theme::text()))
             .child("×")
             .on_mouse_down(
                 MouseButton::Left,
@@ -273,7 +273,7 @@ impl MainWindow {
                             .px(px(12.))
                             .cursor_pointer()
                             .when(index == pick, |row| row.bg(theme::accent_soft()))
-                            .hover(|style| style.bg(theme::accent_soft()))
+                            .hover_style(|style| style.bg(theme::accent_soft()))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _: &gpui::MouseDownEvent, _, _cx| {
@@ -469,9 +469,10 @@ impl MainWindow {
                 })
                 .h(px(list_h))
                 .w_full()
+                .with_fixed_item_size(size(px(0.), px(SEARCH_ROW_H)))
                 .track_scroll(&self.search_scroll)
-                .on_scroll(cx.listener(
-                    |this, event: &gpui::ScrollEvent, window, cx| {
+                .on_scroll_wheel(cx.listener(
+                    |this, event: &gpui::ScrollWheelEvent, window, cx| {
                         this.note_scroll(Scroller::Search, event, window, cx);
                     },
                 )),
@@ -509,7 +510,7 @@ impl MainWindow {
             .h(px(SEARCH_ROW_H))
             .px(px(12.))
             .when(active || primary, |row| row.bg(theme::accent_soft()))
-            .hover(|style| {
+            .hover_style(|style| {
                 style.bg(if active || primary {
                     theme::accent_soft()
                 } else {

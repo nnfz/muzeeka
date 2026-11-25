@@ -3,11 +3,12 @@ use std::rc::Rc;
 
 use gpui::prelude::*;
 use gpui::{
-    actions, div, fill, point, px, relative, size, App, Bounds, ClipboardItem, Context,
-    CursorStyle, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler, FocusHandle,
-    GlobalElementId, InspectorElementId, InteractiveElement, IntoElement, LayoutId, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement, Pixels, Point,
-    ShapedLine, SharedString, Styled, TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window,
+    actions, div, point, px, relative, rgb_to_hsla, size, App, Bounds, CaretPosition,
+    ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler, Entity,
+    EntityInputHandler, FocusHandle, GlobalElementId, InspectorElementId, InteractiveElement,
+    IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
+    ParentElement, Pixels, Point, ShapedLine, SharedString, Styled, TextAlign,
+    TextRun, UTF16Selection, UnderlineStyle, Window,
 };
 
 use crate::ui::theme;
@@ -362,7 +363,7 @@ impl TextField {
         let x = self
             .line_layouts
             .get(current)
-            .map(|line| line.x_for_index(offset.saturating_sub(current_start)))
+            .map(|line| x_at(line, offset.saturating_sub(current_start)))
             .unwrap_or(px(0.));
         let start = self.line_starts[next];
         let boundary = self
@@ -378,7 +379,7 @@ impl TextField {
         let rel = self
             .line_layouts
             .get(next)
-            .map(|line| line.closest_index_for_x(x))
+            .map(|line| index_at_x(line, x))
             .unwrap_or(0);
         let dest = start.saturating_add(rel).min(end);
         self.move_to(dest, cx);
@@ -440,7 +441,7 @@ impl TextField {
         if position.y > bounds.bottom() {
             return self.content.len();
         }
-        line.closest_index_for_x(position.x - bounds.left())
+        index_at_x(line, position.x - bounds.left())
     }
 
     fn index_for_multiline(&self, position: Point<Pixels>) -> usize {
@@ -486,9 +487,7 @@ impl TextField {
         let Some(layout) = self.line_layouts.get(index) else {
             return start;
         };
-        let rel = layout
-            .closest_index_for_x(position.x - bounds.left())
-            .min(end - start);
+        let rel = index_at_x(layout, position.x - bounds.left()).min(end - start);
         start + rel
     }
 
@@ -667,11 +666,11 @@ impl EntityInputHandler for TextField {
             let y = bounds.top() - self.scroll_y + self.line_h * line as f32;
             return Some(Bounds::from_corners(
                 point(
-                    bounds.left() + layout.x_for_index(range.start.saturating_sub(start)),
+                    bounds.left() + x_at(layout, range.start.saturating_sub(start)),
                     y,
                 ),
                 point(
-                    bounds.left() + layout.x_for_index(range.end.saturating_sub(start)),
+                    bounds.left() + x_at(layout, range.end.saturating_sub(start)),
                     y + self.line_h,
                 ),
             ));
@@ -679,11 +678,11 @@ impl EntityInputHandler for TextField {
         let last_layout = self.last_layout.as_ref()?;
         Some(Bounds::from_corners(
             point(
-                bounds.left() + last_layout.x_for_index(range.start),
+                bounds.left() + x_at(last_layout, range.start),
                 bounds.top(),
             ),
             point(
-                bounds.left() + last_layout.x_for_index(range.end),
+                bounds.left() + x_at(last_layout, range.end),
                 bounds.bottom(),
             ),
         ))
@@ -700,8 +699,29 @@ impl EntityInputHandler for TextField {
         }
         let bounds = self.last_bounds?;
         let last_layout = self.last_layout.as_ref()?;
-        let utf8_index = last_layout.index_for_x(point.x - bounds.left())?;
+        let utf8_index = index_at_x(last_layout, point.x - bounds.left());
         Some(self.offset_to_utf16(utf8_index))
+    }
+}
+
+fn line_box(line: &ShapedLine) -> Pixels {
+    (line.ascent + line.descent).max(px(1.))
+}
+
+fn x_at(line: &ShapedLine, index: usize) -> Pixels {
+    line.platform_layout
+        .caret_bounds(CaretPosition::attached_to_next_cluster(index), line_box(line))
+        .map(|bounds| bounds.origin.x)
+        .unwrap_or(px(0.))
+}
+
+fn index_at_x(line: &ShapedLine, x: Pixels) -> usize {
+    let height = line_box(line);
+    match line
+        .platform_layout
+        .caret_from_pixel_point(point(x, px(0.)), height)
+    {
+        Ok(caret) | Err(caret) => caret.index,
     }
 }
 
@@ -780,7 +800,7 @@ impl Element for TextElement {
         let style = window.text_style();
         let placeholder = content.is_empty();
         let (display_text, text_color) = if placeholder {
-            (input.placeholder.clone(), theme::text_muted().into())
+            (input.placeholder.clone(), rgb_to_hsla(theme::text_muted()))
         } else {
             (content, style.color)
         };
@@ -792,6 +812,7 @@ impl Element for TextElement {
             background_color: None,
             underline: None,
             strikethrough: None,
+            letter_spacing: None,
         };
         let runs = if let Some(marked_range) = input.marked_range.clone() {
             vec![
@@ -823,11 +844,11 @@ impl Element for TextElement {
         let font_size = style.font_size.to_pixels(window.rem_size());
         let line = window
             .text_system()
-            .shape_line(display_text, font_size, &runs, None);
+            .shape_line(display_text, font_size, &runs);
         let cursor_x = if placeholder {
             px(0.)
         } else {
-            line.x_for_index(cursor)
+            x_at(&line, cursor)
         };
         let scroll = (cursor_x - (bounds.size.width - px(4.))).max(px(0.));
         let origin_x = bounds.left() - scroll;
@@ -835,29 +856,29 @@ impl Element for TextElement {
         let (selection, cursor_quad) = if placeholder || selected_range.is_empty() {
             (
                 None,
-                Some(fill(
-                    Bounds::new(
+                Some(
+                    PaintQuad::new(Bounds::new(
                         point(origin_x + cursor_x, bounds.top()),
                         size(px(1.5), bounds.size.height),
-                    ),
-                    theme::accent(),
-                )),
+                    ))
+                    .background(theme::accent()),
+                ),
             )
         } else {
             (
-                Some(fill(
-                    Bounds::from_corners(
+                Some(
+                    PaintQuad::new(Bounds::from_corners(
                         point(
-                            origin_x + line.x_for_index(selected_range.start),
+                            origin_x + x_at(&line, selected_range.start),
                             bounds.top(),
                         ),
                         point(
-                            origin_x + line.x_for_index(selected_range.end),
+                            origin_x + x_at(&line, selected_range.end),
                             bounds.bottom(),
                         ),
-                    ),
-                    theme::accent_soft(),
-                )),
+                    ))
+                    .background(theme::accent_soft()),
+                ),
                 None,
             )
         };
@@ -980,7 +1001,7 @@ impl TextElement {
             content.to_string()
         };
         let color = if placeholder {
-            theme::text_muted().into()
+            rgb_to_hsla(theme::text_muted())
         } else {
             style.color
         };
@@ -997,12 +1018,12 @@ impl TextElement {
                 background_color: None,
                 underline: None,
                 strikethrough: None,
+                letter_spacing: None,
             };
             lines.push(window.text_system().shape_line(
                 SharedString::from(source.as_str()),
                 font_size,
                 &[run],
-                None,
             ));
         } else {
             let mut offset = 0usize;
@@ -1026,11 +1047,12 @@ impl TextElement {
                     background_color: None,
                     underline: None,
                     strikethrough: None,
+                    letter_spacing: None,
                 };
                 lines.push(
                     window
                         .text_system()
-                        .shape_line(display, font_size, &[run], None),
+                        .shape_line(display, font_size, &[run]),
                 );
                 offset += line.len() + 1;
                 match next {
@@ -1077,16 +1099,16 @@ impl TextElement {
                 }
                 let y = bounds.top() - scroll_y + line_h * index as f32;
                 let layout = &lines[index];
-                selections.push(fill(
-                    Bounds::from_corners(
-                        point(bounds.left() + layout.x_for_index(sel_start - start), y),
+                selections.push(
+                    PaintQuad::new(Bounds::from_corners(
+                        point(bounds.left() + x_at(layout, sel_start - start), y),
                         point(
-                            bounds.left() + layout.x_for_index(sel_end - start),
+                            bounds.left() + x_at(layout, sel_end - start),
                             y + line_h,
                         ),
-                    ),
-                    theme::accent_soft(),
-                ));
+                    ))
+                    .background(theme::accent_soft()),
+                );
             }
         }
         let cursor_quad = if placeholder || selected_range.is_empty() {
@@ -1096,14 +1118,17 @@ impl TextElement {
             } else {
                 lines
                     .get(cursor_line)
-                    .map(|line| line.x_for_index(cursor.saturating_sub(start)))
+                    .map(|line| x_at(line, cursor.saturating_sub(start)))
                     .unwrap_or(px(0.))
             };
             let y = bounds.top() - scroll_y + line_h * cursor_line as f32;
-            Some(fill(
-                Bounds::new(point(bounds.left() + cursor_x, y), size(px(1.5), line_h)),
-                theme::accent(),
-            ))
+            Some(
+                PaintQuad::new(Bounds::new(
+                    point(bounds.left() + cursor_x, y),
+                    size(px(1.5), line_h),
+                ))
+                .background(theme::accent()),
+            )
         } else {
             None
         };

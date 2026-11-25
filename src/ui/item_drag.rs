@@ -307,7 +307,7 @@ impl MainWindow {
         let already_shown = self.item_drag.as_ref().is_some_and(|drag| drag.shown);
         let show_now = !already_shown && travelled >= PLAYLIST_THRESHOLD;
         let centers = if show_now {
-            self.playlist_slot_centers()
+            self.playlist_slot_centers(cx)
         } else {
             self.item_drag
                 .as_ref()
@@ -575,7 +575,7 @@ impl MainWindow {
         if y < top - PLAYLIST_SLACK || y > bottom + PLAYLIST_SLACK {
             return None;
         }
-        let scroll = -self.sidebar_scroll.offset().y.as_f32();
+        let scroll = self.sidebar_scroll_y();
         Some(playlist_slot(
             y - top + scroll,
             centers,
@@ -591,7 +591,14 @@ impl MainWindow {
     }
 
     fn sidebar_scroll_y(&self) -> f32 {
-        -self.sidebar_scroll.offset().y.as_f32()
+        -self
+            .sidebar_scroll
+            .0
+            .borrow()
+            .base_handle
+            .offset()
+            .y
+            .as_f32()
     }
 }
 

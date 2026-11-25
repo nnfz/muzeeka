@@ -1,6 +1,9 @@
+use std::ops::Range;
+use std::rc::Rc;
+
 use gpui::{
-    deferred, div, prelude::*, px, AnimationExt, AnyElement, Context, InteractiveElement,
-    IntoElement, MouseButton, ParentElement, SharedString, Styled,
+    div, prelude::*, px, size, uniform_list, AnimationExt, AnyElement, ColorExt, Context,
+    InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString, Styled,
 };
 
 use crate::ui::cover::cover_art;
@@ -16,11 +19,8 @@ impl MainWindow {
         let all_count = session.track_count();
         let liked_count = session.liked_count();
         let playlists = session.playlists.clone();
-        let current = session.current;
         let density = session.playlist_density;
         let bars_id = session.bars_playlist().map(str::to_owned);
-        let playing_here =
-            |playlist: &Playlist| current.is_some_and(|id| playlist.track_ids.contains(&id));
 
         div()
             .relative()
@@ -59,7 +59,7 @@ impl MainWindow {
                 |this, window, cx| this.select_view(LibraryView::Liked, window, cx),
             ))
             .child(div().mt(px(6.)).mx(px(8.)).h(px(1.)).bg(theme::border()))
-            .child(self.playlist_list(playlists, view, density, playing_here, bars_id, cx))
+            .child(self.playlist_list(playlists, view, density, bars_id, cx))
     }
 
     fn sidebar_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -183,14 +183,14 @@ impl MainWindow {
                             .child(count.to_string()),
                     ),
             )
-            .with_spring(
+            .with_animation(
                 SharedString::from(format!("{id}-hover")),
-                Self::smooth_spring(hovered),
+                MainWindow::sidebar_fade(),
                 move |row, phase| {
                     if active {
                         row
                     } else {
-                        row.bg(theme::hover().opacity(phase.0))
+                        row.bg(theme::hover().opacity(if hovered { phase } else { 1.0 - phase }))
                     }
                 },
             )
@@ -421,7 +421,7 @@ impl MainWindow {
             .text_color(theme::text_secondary())
             .whitespace_nowrap()
             .cursor_pointer()
-            .hover(|style| style.bg(theme::hover()).text_color(theme::text()))
+            .hover_style(|style| style.bg(theme::hover()).text_color(theme::text()))
             .child("Go to track")
             .on_mouse_down(
                 MouseButton::Left,
@@ -448,18 +448,9 @@ impl MainWindow {
         playlists: Vec<Playlist>,
         view: LibraryView,
         density: PlaylistDensity,
-        playing_here: impl Fn(&Playlist) -> bool,
         bars_id: Option<String>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let can_reorder = playlists.len() > 1;
-        let renaming = self.renaming_id().map(str::to_owned);
-        let slide_from = self
-            .item_drag
-            .as_ref()
-            .and_then(|drag| drag.playlist_id())
-            .and_then(|id| playlists.iter().position(|playlist| playlist.id == id));
-        let slide_count = playlists.len();
         if playlists.is_empty() {
             return div()
                 .flex()
@@ -485,342 +476,472 @@ impl MainWindow {
                 .into_any_element();
         }
 
+        let playlists = Rc::new(playlists);
+        let overlay =
+            self.lifted_playlist_overlay(&playlists, &view, density, bars_id.as_deref(), cx);
+        let this = cx.entity().clone();
+        let rows = Rc::clone(&playlists);
+        let row_view = view;
+        let row_bars = bars_id;
+        let count = playlists.len();
+        let slot_h = playlist_slot_h(density);
         div()
             .flex_1()
             .min_h(px(0.))
             .relative()
+            .overflow_hidden()
             .child(self.playlist_list_canvas(cx))
             .child(
+                uniform_list("playlist-list", count, move |range, _window, app| {
+                    let playlists = Rc::clone(&rows);
+                    let view = row_view.clone();
+                    let bars_id = row_bars.clone();
+                    let this = this.clone();
+                    this.update(app, |window, cx| {
+                        window.playlist_slots(
+                            &playlists,
+                            &view,
+                            density,
+                            bars_id.as_deref(),
+                            range,
+                            cx,
+                        )
+                    })
+                })
+                .pt(px(PLAYLIST_LIST_PAD_TOP))
+                .pb(px(PLAYLIST_LIST_PAD_BOTTOM))
+                .with_fixed_item_size(size(px(0.), px(slot_h)))
+                .size_full()
+                .track_scroll(&self.sidebar_scroll)
+                .on_scroll_wheel(cx.listener(
+                    |this, event: &gpui::ScrollWheelEvent, window, cx| {
+                        this.note_scroll(
+                            crate::ui::main_window::Scroller::Sidebar,
+                            event,
+                            window,
+                            cx,
+                        );
+                    },
+                )),
+            )
+            .when_some(overlay, |list, overlay| list.child(overlay))
+            .child(self.scrollbar(crate::ui::main_window::Scroller::Sidebar, cx))
+            .into_any_element()
+    }
+
+    fn playlist_slots(
+        &self,
+        playlists: &[Playlist],
+        view: &LibraryView,
+        density: PlaylistDensity,
+        bars_id: Option<&str>,
+        range: Range<usize>,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let can_reorder = playlists.len() > 1;
+        let renaming = self.renaming_id().map(str::to_owned);
+        let slide_from = self
+            .item_drag
+            .as_ref()
+            .and_then(|drag| drag.playlist_id())
+            .and_then(|id| playlists.iter().position(|playlist| playlist.id == id));
+        let slide_count = playlists.len();
+        let current = self.session.read(cx).current;
+        range
+            .filter_map(|index| {
+                let playlist = playlists.get(index)?.clone();
+                let playing = current.is_some_and(|id| playlist.track_ids.contains(&id));
+                let lifted = self
+                    .item_drag
+                    .as_ref()
+                    .is_some_and(|drag| drag.lifts_playlist(&playlist.id));
+                Some(self.playlist_slot(
+                    index,
+                    playlist,
+                    view,
+                    density,
+                    playing,
+                    bars_id,
+                    can_reorder,
+                    renaming.as_deref(),
+                    slide_from,
+                    slide_count,
+                    !lifted,
+                    cx,
+                ))
+            })
+            .collect()
+    }
+
+    fn lifted_playlist_overlay(
+        &self,
+        playlists: &[Playlist],
+        view: &LibraryView,
+        density: PlaylistDensity,
+        bars_id: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let (index, offset_y) = {
+            let drag = self.item_drag.as_ref()?;
+            let id = drag.playlist_id()?;
+            if !drag.lifts_playlist(id) {
+                return None;
+            }
+            let index = playlists.iter().position(|playlist| playlist.id == id)?;
+            let offset_y = self
+                .sidebar_scroll
+                .0
+                .borrow()
+                .base_handle
+                .offset()
+                .y
+                .as_f32();
+            (index, offset_y)
+        };
+        let playlist = playlists.get(index)?.clone();
+        let playing = self
+            .session
+            .read(cx)
+            .current
+            .is_some_and(|id| playlist.track_ids.contains(&id));
+        let can_reorder = playlists.len() > 1;
+        let renaming = self.renaming_id().map(str::to_owned);
+        let slide_from = self
+            .item_drag
+            .as_ref()
+            .and_then(|drag| drag.playlist_id())
+            .and_then(|id| playlists.iter().position(|playlist| playlist.id == id));
+        let slot_h = playlist_slot_h(density);
+        let top = PLAYLIST_LIST_PAD_TOP + index as f32 * slot_h + offset_y;
+        let slot = self.playlist_slot(
+            index,
+            playlist,
+            view,
+            density,
+            playing,
+            bars_id,
+            can_reorder,
+            renaming.as_deref(),
+            slide_from,
+            playlists.len(),
+            true,
+            cx,
+        );
+        Some(
+            div()
+                .absolute()
+                .left(px(0.))
+                .right(px(0.))
+                .top(px(top))
+                .child(slot)
+                .into_any_element(),
+        )
+    }
+
+    fn playlist_slot(
+        &self,
+        index: usize,
+        playlist: Playlist,
+        view: &LibraryView,
+        density: PlaylistDensity,
+        playing: bool,
+        bars_id: Option<&str>,
+        can_reorder: bool,
+        renaming: Option<&str>,
+        slide_from: Option<usize>,
+        slide_count: usize,
+        show_face: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let active = matches!(view, LibraryView::Playlist(id) if id == &playlist.id);
+        let count = playlist.track_ids.len();
+        let id = playlist.id.clone();
+        let rename_id = id.clone();
+        let drop_id = id.clone();
+        let drop_name = playlist.name.clone();
+        let element_id = SharedString::from(format!("playlist-{}", playlist.id));
+        let hovered = self.hovered_ui.as_ref() == Some(&element_id);
+        let drop_here = self.drop_row_lit(&playlist.id);
+        let can_drag = can_reorder && renaming != Some(playlist.id.as_str());
+        let editing = renaming == Some(playlist.id.as_str());
+        let show_bars = bars_id == Some(playlist.id.as_str());
+        let lifted = self
+            .item_drag
+            .as_ref()
+            .is_some_and(|drag| drag.lifts_playlist(&playlist.id));
+        let scroll = self
+            .sidebar_scroll
+            .0
+            .borrow()
+            .base_handle
+            .offset()
+            .y
+            .as_f32();
+        let held = lifted.then(|| {
+            self.item_drag
+                .as_ref()
+                .map(|drag| drag.hold_y(-scroll))
+                .unwrap_or(0.)
+        });
+        let delta = held.unwrap_or_else(|| {
+            slide_from
+                .and_then(|from| {
+                    self.item_drag
+                        .as_ref()
+                        .map(|drag| drag.playlist_slide(index, slide_count, from))
+                })
+                .unwrap_or(0.)
+        });
+        let slot_h = playlist_slot_h(density);
+        let name_color = if playing {
+            theme::accent()
+        } else {
+            theme::text()
+        };
+        let flash = self.found_playlist_flash_amount(&playlist.id, cx.reduce_motion());
+        let row_base = if active {
+            theme::accent_soft()
+        } else {
+            theme::bg_surface()
+        };
+        let row_color = theme::flash_wash(row_base, flash);
+        let row = div()
+            .id(element_id.clone())
+            .relative()
+            .child(div().absolute().inset_0().rounded_md().with_spring(
+                SharedString::from(format!("playlist-drop-{}", playlist.id)),
+                Self::smooth_spring(drop_here),
+                |layer, phase| layer.bg(theme::accent_soft().opacity(phase.0)),
+            ))
+            .flex()
+            .flex_shrink(0.)
+            .items_center()
+            .mx(px(6.))
+            .px(px(6.))
+            .rounded_md()
+            .cursor_pointer()
+            .when(density == PlaylistDensity::Normal, |row| {
+                row.gap(px(10.)).py(px(6.))
+            })
+            .when(density == PlaylistDensity::Compact, |row| {
+                row.gap(px(10.))
+                    .h(px(40.))
+                    .min_h(px(40.))
+                    .max_h(px(40.))
+                    .overflow_hidden()
+            })
+            .when(density == PlaylistDensity::Nano, |row| {
+                row.h(px(28.))
+                    .min_h(px(28.))
+                    .max_h(px(28.))
+                    .overflow_hidden()
+                    .px(px(8.))
+            })
+            .when(active || flash > 0.0, |row| row.bg(row_color))
+            .on_hover(Self::hover_listener(element_id.clone(), cx))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener({
+                    let element_id = element_id.clone();
+                    move |this, event: &gpui::MouseDownEvent, _, _cx| {
+                        if can_drag {
+                            this.press_at = Some(event.position);
+                        }
+                        this.arm(element_id.clone(), false);
+                    }
+                }),
+            )
+            .when(can_drag, {
+                let drag_id = id.clone();
+                move |row| {
+                    row.on_drag(
+                        crate::ui::item_drag::PlaylistDrag { id: drag_id },
+                        crate::ui::item_drag::spawn_playlist_ghost(),
+                    )
+                }
+            })
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener({
+                    let element_id = element_id.clone();
+                    move |this, _: &gpui::MouseUpEvent, window, cx| {
+                        if !this.armed(&element_id) {
+                            return;
+                        }
+                        this.select_view(LibraryView::Playlist(id.clone()), window, cx);
+                    }
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener({
+                    let id = playlist.id.clone();
+                    move |this, event: &gpui::MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        this.open_playlist_menu(id.clone(), event.position, window, cx);
+                    }
+                }),
+            )
+            .when(density == PlaylistDensity::Normal, |row| {
+                row.child(self.playlist_mark(
+                    playlist.id.clone(),
+                    playlist.cover.clone(),
+                    count > 0,
+                    38.,
+                    show_bars && !editing,
+                    cx,
+                ))
+            })
+            .when(density == PlaylistDensity::Compact, |row| {
+                row.child(self.playlist_mark(
+                    playlist.id.clone(),
+                    playlist.cover.clone(),
+                    count > 0,
+                    28.,
+                    show_bars && !editing,
+                    cx,
+                ))
+            })
+            .child(
                 div()
-                    .id("playlist-list")
                     .flex()
                     .flex_col()
-                    .size_full()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.sidebar_scroll)
-                    .on_scroll(cx.listener(
-                        |this, event: &gpui::ScrollEvent, window, cx| {
-                            this.note_scroll(
-                                crate::ui::main_window::Scroller::Sidebar,
-                                event,
-                                window,
-                                cx,
-                            );
-                        },
-                    ))
-                    .pt(px(4.))
-                    .pb(px(8.))
-                    .children(playlists.into_iter().enumerate().map(|(index, playlist)| {
-                        let active =
-                            matches!(&view, LibraryView::Playlist(id) if id == &playlist.id);
-                        let playing = playing_here(&playlist);
-                        let count = playlist.track_ids.len();
-                        let id = playlist.id.clone();
-                        let rename_id = id.clone();
-                        let drop_name = playlist.name.clone();
-                        let element_id = SharedString::from(format!("playlist-{}", playlist.id));
-                        let hovered = self.hovered_ui.as_ref() == Some(&element_id);
-                        let drop_here = self.drop_row_lit(&playlist.id);
-                        let can_drag =
-                            can_reorder && renaming.as_deref() != Some(playlist.id.as_str());
-                        let editing = renaming.as_deref() == Some(playlist.id.as_str());
-                        let show_bars = bars_id.as_deref() == Some(playlist.id.as_str());
-                        let lifted = self
-                            .item_drag
-                            .as_ref()
-                            .is_some_and(|drag| drag.lifts_playlist(&playlist.id));
-                        let scroll = self.sidebar_scroll.offset().y.as_f32();
-                        let held = lifted.then(|| {
-                            self.item_drag
-                                .as_ref()
-                                .map(|drag| drag.hold_y(-scroll))
-                                .unwrap_or(0.)
-                        });
-                        let delta = held.unwrap_or_else(|| {
-                            slide_from
-                                .and_then(|from| {
-                                    self.item_drag
-                                        .as_ref()
-                                        .map(|drag| drag.playlist_slide(index, slide_count, from))
-                                })
-                                .unwrap_or(0.)
-                        });
-                        let slot_h = playlist_slot_h(density);
-                        let name_color = if playing {
-                            theme::accent()
-                        } else {
-                            theme::text()
-                        };
-                        let flash =
-                            self.found_playlist_flash_amount(&playlist.id, cx.reduce_motion());
-                        let row_base = if active {
-                            theme::accent_soft()
-                        } else {
-                            theme::bg_surface()
-                        };
-                        let row_color = theme::flash_wash(row_base, flash);
-                        let row = div()
-                            .id(element_id.clone())
-                            .relative()
-                            .child(div().absolute().inset_0().rounded_md().with_spring(
-                                SharedString::from(format!("playlist-drop-{}", playlist.id)),
-                                Self::smooth_spring(drop_here),
-                                |layer, phase| layer.bg(theme::accent_soft().opacity(phase.0)),
-                            ))
+                    .flex_1()
+                    .min_w(px(0.))
+                    .overflow_hidden()
+                    .gap(px(if density == PlaylistDensity::Compact {
+                        0.
+                    } else {
+                        2.
+                    }))
+                    .child(if editing {
+                        div()
                             .flex()
-                            .flex_shrink(0.)
-                            .items_center()
-                            .mx(px(6.))
-                            .px(px(6.))
-                            .rounded_md()
-                            .cursor_pointer()
-                            .when(density == PlaylistDensity::Normal, |row| {
-                                row.gap(px(10.)).py(px(6.))
+                            .w_full()
+                            .h(px(20.))
+                            .px(px(4.))
+                            .rounded(px(3.))
+                            .bg(theme::bg_elevated())
+                            .border_1()
+                            .border_color(theme::accent())
+                            .on_mouse_down(MouseButton::Left, |_: &gpui::MouseDownEvent, _, cx| {
+                                cx.stop_propagation();
                             })
-                            .when(density == PlaylistDensity::Compact, |row| {
-                                row.gap(px(10.))
-                                    .h(px(40.))
-                                    .min_h(px(40.))
-                                    .max_h(px(40.))
-                                    .overflow_hidden()
+                            .on_mouse_up(MouseButton::Left, |_: &gpui::MouseUpEvent, _, cx| {
+                                cx.stop_propagation();
                             })
-                            .when(density == PlaylistDensity::Nano, |row| {
-                                row.h(px(28.))
-                                    .min_h(px(28.))
-                                    .max_h(px(28.))
-                                    .overflow_hidden()
-                                    .px(px(8.))
+                            .child(self.rename_field.clone())
+                            .into_any_element()
+                    } else {
+                        div()
+                            .id(SharedString::from(format!("playlist-name-{}", playlist.id)))
+                            .text_size(px(12.))
+                            .when(density != PlaylistDensity::Nano, |name| {
+                                name.line_height(px(14.))
                             })
-                            .when(active || flash > 0.0, |row| row.bg(row_color))
-                            .on_hover(Self::hover_listener(element_id.clone(), cx))
+                            .font_weight(if density == PlaylistDensity::Normal {
+                                gpui::FontWeight::MEDIUM
+                            } else {
+                                gpui::FontWeight::SEMIBOLD
+                            })
+                            .text_color(name_color)
+                            .truncate()
+                            .child(playlist.name)
                             .on_mouse_down(
                                 MouseButton::Left,
-                                cx.listener({
-                                    let element_id = element_id.clone();
-                                    move |this, event: &gpui::MouseDownEvent, _, _cx| {
-                                        if can_drag {
-                                            this.press_at = Some(event.position);
-                                        }
-                                        this.arm(element_id.clone(), false);
-                                    }
-                                }),
-                            )
-                            .when(can_drag, {
-                                let drag_id = id.clone();
-                                move |row| {
-                                    row.on_drag(
-                                        crate::ui::item_drag::PlaylistDrag { id: drag_id },
-                                        crate::ui::item_drag::spawn_playlist_ghost(),
-                                    )
-                                }
-                            })
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener({
-                                    let element_id = element_id.clone();
-                                    move |this, _: &gpui::MouseUpEvent, window, cx| {
-                                        if !this.armed(&element_id) {
+                                cx.listener(
+                                    move |this, event: &gpui::MouseDownEvent, window, cx| {
+                                        if event.click_count < 2 {
                                             return;
                                         }
-                                        this.select_view(
-                                            LibraryView::Playlist(id.clone()),
-                                            window,
-                                            cx,
-                                        );
-                                    }
-                                }),
-                            )
-                            .on_mouse_down(
-                                MouseButton::Right,
-                                cx.listener({
-                                    let id = playlist.id.clone();
-                                    move |this, event: &gpui::MouseDownEvent, window, cx| {
                                         cx.stop_propagation();
-                                        this.open_playlist_menu(
-                                            id.clone(),
-                                            event.position,
-                                            window,
-                                            cx,
-                                        );
-                                    }
-                                }),
+                                        this.armed_ui = None;
+                                        this.press_at = None;
+                                        this.begin_rename(rename_id.clone(), window, cx);
+                                    },
+                                ),
                             )
-                            .when(density == PlaylistDensity::Normal, |row| {
-                                row.child(self.playlist_mark(
-                                    playlist.id.clone(),
-                                    playlist.cover.clone(),
-                                    count > 0,
-                                    38.,
-                                    show_bars && !editing,
-                                    cx,
-                                ))
-                            })
-                            .when(density == PlaylistDensity::Compact, |row| {
-                                row.child(self.playlist_mark(
-                                    playlist.id.clone(),
-                                    playlist.cover.clone(),
-                                    count > 0,
-                                    28.,
-                                    show_bars && !editing,
-                                    cx,
-                                ))
-                            })
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .flex_1()
-                                    .min_w(px(0.))
-                                    .overflow_hidden()
-                                    .gap(px(if density == PlaylistDensity::Compact {
-                                        0.
-                                    } else {
-                                        2.
-                                    }))
-                                    .child(if editing {
-                                        div()
-                                            .flex()
-                                            .w_full()
-                                            .h(px(20.))
-                                            .px(px(4.))
-                                            .rounded(px(3.))
-                                            .bg(theme::bg_elevated())
-                                            .border_1()
-                                            .border_color(theme::accent())
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                |_: &gpui::MouseDownEvent, _, cx| {
-                                                    cx.stop_propagation();
-                                                },
-                                            )
-                                            .on_mouse_up(
-                                                MouseButton::Left,
-                                                |_: &gpui::MouseUpEvent, _, cx| {
-                                                    cx.stop_propagation();
-                                                },
-                                            )
-                                            .child(self.rename_field.clone())
-                                            .into_any_element()
-                                    } else {
-                                        div()
-                                            .id(SharedString::from(format!(
-                                                "playlist-name-{}",
-                                                playlist.id
-                                            )))
-                                            .text_size(px(12.))
-                                            .when(density != PlaylistDensity::Nano, |name| {
-                                                name.line_height(px(14.))
-                                            })
-                                            .font_weight(if density == PlaylistDensity::Normal {
-                                                gpui::FontWeight::MEDIUM
-                                            } else {
-                                                gpui::FontWeight::SEMIBOLD
-                                            })
-                                            .text_color(name_color)
-                                            .truncate()
-                                            .child(playlist.name)
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
-                                                    if event.click_count < 2 {
-                                                        return;
-                                                    }
-                                                    cx.stop_propagation();
-                                                    this.armed_ui = None;
-                                                    this.press_at = None;
-                                                    this.begin_rename(rename_id.clone(), window, cx);
-                                                }),
-                                            )
-                                            .into_any_element()
-                                    })
-                                    .when(density != PlaylistDensity::Nano, |col| {
-                                        col.child(
-                                            div()
-                                                .text_size(px(10.))
-                                                .when(density != PlaylistDensity::Nano, |count| {
-                                                    count.line_height(px(12.))
-                                                })
-                                                .text_color(theme::text_muted())
-                                                .child(count_label(count)),
-                                        )
-                                    }),
-                            )
-                            .when(
-                                show_bars && !editing && density == PlaylistDensity::Nano,
-                                |row| {
-                                    let bars_key =
-                                        SharedString::from(format!("playlist-eq-{}", playlist.id));
-                                    row.child(div().ml(px(8.)).flex_shrink_0().child(
-                                        crate::ui::track_list::eq_bars(
-                                            bars_key,
-                                            cx.reduce_motion(),
-                                        ),
-                                    ))
-                                },
-                            )
-                            .with_spring(
-                                SharedString::from(format!("{element_id}-hover")),
-                                Self::smooth_spring(hovered && !drop_here),
-                                move |row, phase| {
-                                    if active || flash > 0.0 {
-                                        row
-                                    } else {
-                                        row.bg(theme::hover().opacity(phase.0))
-                                    }
-                                },
-                            );
-                        let slide_id = SharedString::from(format!("{element_id}-slide"));
-                        div()
-                            .relative()
-                            .w_full()
-                            .h(px(slot_h))
-                            .min_h(px(slot_h))
-                            .max_h(px(slot_h))
-                            .flex_shrink_0()
-                            .child(
-                                div()
-                                    .absolute()
-                                    .top(px(0.))
-                                    .bottom(px(0.))
-                                    .left(px(6.))
-                                    .right(px(6.))
-                                    .child(self.playlist_drop_canvas(
-                                        playlist.id.clone(),
-                                        drop_name,
-                                        cx,
-                                    )),
-                            )
-                            .child(if held.is_some() {
-                                deferred(
-                                    div()
-                                        .absolute()
-                                        .left(px(0.))
-                                        .right(px(0.))
-                                        .top(px(delta))
-                                        .flex()
-                                        .flex_col()
-                                        .child(row),
-                                )
-                                .with_priority(1)
-                                .into_any_element()
-                            } else {
-                                div()
-                                    .absolute()
-                                    .left(px(0.))
-                                    .right(px(0.))
-                                    .flex()
-                                    .flex_col()
-                                    .with_spring(
-                                        slide_id,
-                                        Self::smooth_spring_px(delta),
-                                        |row, top| row.top(top),
-                                    )
-                                    .child(row)
-                                    .into_any_element()
-                            })
-                    })),
+                            .into_any_element()
+                    })
+                    .when(density != PlaylistDensity::Nano, |col| {
+                        col.child(
+                            div()
+                                .text_size(px(10.))
+                                .when(density != PlaylistDensity::Nano, |count| {
+                                    count.line_height(px(12.))
+                                })
+                                .text_color(theme::text_muted())
+                                .child(count_label(count)),
+                        )
+                    }),
             )
-            .child(self.scrollbar(crate::ui::main_window::Scroller::Sidebar, cx))
+            .when(
+                show_bars && !editing && density == PlaylistDensity::Nano,
+                |row| {
+                    let bars_key = SharedString::from(format!("playlist-eq-{}", playlist.id));
+                    row.child(
+                        div()
+                            .ml(px(8.))
+                            .flex_shrink_0()
+                            .child(crate::ui::track_list::eq_bars(bars_key, cx.reduce_motion())),
+                    )
+                },
+            )
+            .with_spring(
+                SharedString::from(format!("{element_id}-hover")),
+                Self::smooth_spring(hovered && !drop_here),
+                move |row, phase| {
+                    if active || flash > 0.0 {
+                        row
+                    } else {
+                        row.bg(theme::hover().opacity(phase.0))
+                    }
+                },
+            );
+        let slide_id = SharedString::from(format!("{element_id}-slide"));
+        div()
+            .relative()
+            .w_full()
+            .h(px(slot_h))
+            .min_h(px(slot_h))
+            .max_h(px(slot_h))
+            .flex_shrink_0()
+            .when(!lifted || !show_face, move |slot| {
+                slot.child(
+                    div()
+                        .absolute()
+                        .top(px(0.))
+                        .bottom(px(0.))
+                        .left(px(6.))
+                        .right(px(6.))
+                        .child(self.playlist_drop_canvas(drop_id, drop_name, cx)),
+                )
+            })
+            .when(show_face, move |slot| {
+                slot.child(if held.is_some() {
+                    div()
+                        .absolute()
+                        .left(px(0.))
+                        .right(px(0.))
+                        .top(px(delta))
+                        .flex()
+                        .flex_col()
+                        .child(row)
+                        .into_any_element()
+                } else {
+                    div()
+                        .absolute()
+                        .left(px(0.))
+                        .right(px(0.))
+                        .flex()
+                        .flex_col()
+                        .with_spring(slide_id, Self::smooth_spring_px(delta), |row, top| {
+                            row.top(top)
+                        })
+                        .child(row)
+                        .into_any_element()
+                })
+            })
             .into_any_element()
     }
 
@@ -838,7 +959,10 @@ impl MainWindow {
     }
 }
 
-fn playlist_slot_h(density: PlaylistDensity) -> f32 {
+pub(crate) const PLAYLIST_LIST_PAD_TOP: f32 = 4.;
+const PLAYLIST_LIST_PAD_BOTTOM: f32 = 8.;
+
+pub(crate) fn playlist_slot_h(density: PlaylistDensity) -> f32 {
     match density {
         // py 6 + cover 38.
         PlaylistDensity::Normal => 50.,

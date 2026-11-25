@@ -631,19 +631,14 @@ impl MainWindow {
             .find_map(|(id, _, bounds)| bounds.contains(&position).then(|| id.clone()))
     }
 
-    pub(crate) fn playlist_slot_centers(&self) -> Vec<f32> {
-        let top = self.file_drop.list_bounds.top().as_f32();
-        let scroll = -self.sidebar_scroll.offset().y.as_f32();
-        let mut centers: Vec<f32> = self
-            .file_drop
-            .rows
-            .iter()
-            .map(|(_, _, bounds)| {
-                bounds.top().as_f32() - top + scroll + bounds.size.height.as_f32() * 0.5
+    pub(crate) fn playlist_slot_centers(&self, cx: &gpui::App) -> Vec<f32> {
+        let session = self.session.read(cx);
+        let slot_h = crate::ui::sidebar::playlist_slot_h(session.playlist_density);
+        (0..session.playlists.len())
+            .map(|index| {
+                crate::ui::sidebar::PLAYLIST_LIST_PAD_TOP + (index as f32 + 0.5) * slot_h
             })
-            .collect();
-        centers.sort_by(|left, right| left.total_cmp(right));
-        centers
+            .collect()
     }
 
     pub(crate) fn drop_gap(&self) -> Option<(f32, f32)> {
@@ -729,7 +724,7 @@ impl MainWindow {
             },
             |bounds, tint, window, _app| {
                 if tint {
-                    window.paint_quad(gpui::fill(bounds, theme::accent_soft()));
+                    window.paint_quad(gpui::PaintQuad::new(bounds).background(theme::accent_soft()));
                 }
             },
         )

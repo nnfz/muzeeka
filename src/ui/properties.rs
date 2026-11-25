@@ -120,7 +120,7 @@ impl PropertiesWindow {
     ) -> Option<WindowHandle<Self>> {
         if let Some(handle) = existing {
             if handle
-                .update(cx, |_, window, _| window.activate_window())
+                .update(cx, |_, window, _| window.activate())
                 .is_ok()
             {
                 return Some(handle);
@@ -148,6 +148,7 @@ impl PropertiesWindow {
                 }),
                 window_min_size: Some(size(px(720.), px(560.))),
                 is_minimizable: false,
+                inactive_frame_interval: None,
                 ..Default::default()
             },
             move |_window, cx| cx.new(|cx| Self::new(session, ids, use_ui_font, cx)),
@@ -1084,7 +1085,7 @@ impl PropertiesWindow {
             } else {
                 theme::bg_elevated()
             })
-            .hover(move |style| {
+            .hover_style(move |style| {
                 if enabled {
                     style.bg(if primary {
                         theme::accent_soft()
@@ -1152,7 +1153,7 @@ impl PropertiesWindow {
                     .rounded_md()
                     .cursor_pointer()
                     .child(icon(icons::CLOSE, theme::text_secondary(), px(10.)))
-                    .hover(|style| style.bg(theme::danger()))
+                    .hover_style(|style| style.bg(theme::danger()))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _: &gpui::MouseDownEvent, _, _| {
@@ -1201,7 +1202,7 @@ impl PropertiesWindow {
                         theme::text_secondary()
                     })
                     .when(active, |row| row.bg(theme::accent_soft()))
-                    .hover(move |style| {
+                    .hover_style(move |style| {
                         style.bg(if active {
                             theme::accent_soft()
                         } else {
@@ -1734,7 +1735,7 @@ impl PropertiesWindow {
                                     .items_center()
                                     .text_size(px(12.))
                                     .cursor_pointer()
-                                    .hover(|style| style.bg(theme::hover()))
+                                    .hover_style(|style| style.bg(theme::hover()))
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(

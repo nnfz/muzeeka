@@ -87,7 +87,7 @@ impl SettingsWindow {
     ) -> Option<WindowHandle<Self>> {
         if let Some(handle) = existing {
             if handle
-                .update(cx, |_, window, _| window.activate_window())
+                .update(cx, |_, window, _| window.activate())
                 .is_ok()
             {
                 return Some(handle);
@@ -104,6 +104,7 @@ impl SettingsWindow {
                 }),
                 window_min_size: Some(size(px(870.), px(480.))),
                 is_minimizable: false,
+                inactive_frame_interval: None,
                 ..Default::default()
             },
             move |_window, cx| cx.new(|cx| Self::new(session, use_ui_font, cx)),
@@ -206,7 +207,7 @@ impl SettingsWindow {
                     .rounded_md()
                     .cursor_pointer()
                     .child(icon(icons::CLOSE, theme::text_secondary(), px(10.)))
-                    .hover(|style| style.bg(theme::danger())),
+                    .hover_style(|style| style.bg(theme::danger())),
             )
     }
 
@@ -238,7 +239,7 @@ impl SettingsWindow {
                         theme::text_secondary()
                     })
                     .when(active, |row| row.bg(theme::accent_soft()))
-                    .hover(|style| {
+                    .hover_style(|style| {
                         style.bg(if active {
                             theme::accent_soft()
                         } else {
@@ -723,7 +724,7 @@ impl SettingsWindow {
             .rounded_md()
             .bg(theme::bg_elevated())
             .cursor_pointer()
-            .hover(|style| style.bg(theme::hover()))
+            .hover_style(|style| style.bg(theme::hover()))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _: &gpui::MouseDownEvent, _, cx| {
@@ -816,7 +817,7 @@ impl SettingsWindow {
                 theme::text_secondary()
             })
             .when(active, |row| row.bg(theme::accent_soft()))
-            .hover(|style| {
+            .hover_style(|style| {
                 style.bg(if active {
                     theme::accent_soft()
                 } else {
@@ -862,7 +863,7 @@ impl SettingsWindow {
             .bg(theme::bg_elevated())
             .cursor_pointer()
             .text_size(px(12.))
-            .hover(|style| style.bg(theme::hover()))
+            .hover_style(|style| style.bg(theme::hover()))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _: &gpui::MouseDownEvent, _, _cx| {

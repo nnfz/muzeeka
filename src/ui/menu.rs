@@ -79,7 +79,7 @@ pub fn row(button: Stateful<gpui::Div>, tone: Tone) -> Stateful<gpui::Div> {
             Tone::Normal => theme::text(),
         })
         .when(tone == Tone::Active, |row| row.bg(theme::accent_soft()))
-        .hover(move |style| {
+        .hover_style(move |style| {
             if disabled {
                 style
             } else if danger {
@@ -121,7 +121,7 @@ fn place(origin: Point<Pixels>, corner: gpui::Anchor, child: impl IntoElement) -
             .position(origin)
             .child(child),
     )
-    .with_priority(2)
+    .priority(2)
 }
 
 pub fn file_on_disk(path: &str) -> &str {

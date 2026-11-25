@@ -59,7 +59,7 @@ pub struct MainWindow {
     pub(crate) press_at: Option<gpui::Point<Pixels>>,
     pub(crate) item_drag: Option<crate::ui::item_drag::ItemDrag>,
     pub(crate) track_scroll: UniformListScrollHandle,
-    pub(crate) sidebar_scroll: ScrollHandle,
+    pub(crate) sidebar_scroll: UniformListScrollHandle,
     pub(crate) search_scroll: UniformListScrollHandle,
     menu_scroll: ScrollHandle,
     submenu_scroll: ScrollHandle,
@@ -255,6 +255,24 @@ impl MainWindow {
         SpringAnimation::new(Self::smooth_config()).to(px(offset))
     }
 
+    /// A short, fixed-duration transition for list row state. Springs need a
+    /// frame while settling; on a large list that multiplies the cost of every
+    /// notify. The eased phase can be used exactly like a spring's 0..=1 value.
+    pub(crate) fn list_fade(duration: Duration) -> gpui::Animation {
+        gpui::Animation::new(duration).with_easing(|t| {
+            let t = t.clamp(0.0, 1.0);
+            t * t * (3.0 - 2.0 * t)
+        })
+    }
+
+    pub(crate) fn row_fade() -> gpui::Animation {
+        Self::list_fade(Duration::from_millis(120))
+    }
+
+    pub(crate) fn sidebar_fade() -> gpui::Animation {
+        Self::list_fade(Duration::from_millis(140))
+    }
+
     pub(crate) fn press_scale(phase: gpui::AnimationPhase) -> f32 {
         1.0 - 0.08 * phase.0.clamp(0.0, 1.0)
     }
@@ -393,13 +411,11 @@ impl MainWindow {
                             cx.notify();
                         });
                     }
-                    let session_dirty = view.session.update(cx, |session, cx| {
-                        let dirty = session.tick(0.1);
-                        if dirty {
-                            cx.notify();
-                        }
-                        dirty
-                    });
+                    // A changing playback position is not a reason to rebuild
+                    // the whole window. The transport paints its own progress
+                    // element from Session's live position; only discrete
+                    // state changes (track/playing/flags) notify MainWindow.
+                    let session_dirty = view.session.update(cx, |session, _cx| session.tick(0.1));
                     let drop_dirty = view.tick_file_drop();
                     let download_dirty = view.tick_download(cx);
                     let flash_dirty = view.tick_found_flash(cx.reduce_motion());
@@ -436,7 +452,7 @@ impl MainWindow {
             press_at: None,
             item_drag: None,
             track_scroll: UniformListScrollHandle::new(),
-            sidebar_scroll: ScrollHandle::new(),
+            sidebar_scroll: UniformListScrollHandle::new(),
             search_scroll: UniformListScrollHandle::new(),
             menu_scroll: ScrollHandle::new(),
             submenu_scroll: ScrollHandle::new(),
@@ -468,7 +484,7 @@ impl MainWindow {
     fn scroll_handle(&self, which: Scroller) -> ScrollHandle {
         match which {
             Scroller::Tracks => self.track_scroll.0.borrow().base_handle.clone(),
-            Scroller::Sidebar => self.sidebar_scroll.clone(),
+            Scroller::Sidebar => self.sidebar_scroll.0.borrow().base_handle.clone(),
             Scroller::Search => self.search_scroll.0.borrow().base_handle.clone(),
             Scroller::Menu => self.menu_scroll.clone(),
             Scroller::Submenu => self.submenu_scroll.clone(),
@@ -553,7 +569,15 @@ impl MainWindow {
             .height
             <= px(1.);
         let sidebar_pending = !self.session.read(cx).playlists.is_empty()
-            && self.sidebar_scroll.bounds().size.height <= px(1.);
+            && self
+                .sidebar_scroll
+                .0
+                .borrow()
+                .base_handle
+                .bounds()
+                .size
+                .height
+                <= px(1.);
         if !tracks_pending && !sidebar_pending {
             return;
         }
@@ -606,8 +630,9 @@ impl MainWindow {
     }
 
     pub(crate) fn scroll_sidebar_by(&mut self, delta: f32) -> bool {
-        let current = self.sidebar_scroll.offset();
-        let max = self.sidebar_scroll.max_offset().y.as_f32();
+        let handle = self.sidebar_scroll.0.borrow().base_handle.clone();
+        let current = handle.offset();
+        let max = handle.max_offset().y.as_f32();
         let y = current.y.as_f32();
         let next = if max > 0. {
             (y + delta).clamp(-max, 0.)
@@ -617,7 +642,7 @@ impl MainWindow {
         if (next - y).abs() < 0.05 {
             return false;
         }
-        self.sidebar_scroll.set_offset(point(current.x, px(next)));
+        handle.set_offset(point(current.x, px(next)));
         self.sidebar_ease.snap(next);
         true
     }
@@ -768,6 +793,10 @@ impl MainWindow {
                         traffic_light_position: None,
                     }),
                     window_min_size: Some(size(px(860.), px(520.))),
+                    // Default is 30 fps while GPUI treats the window as inactive.
+                    // Dragging the title bar runs in that state, so the window
+                    // would present at 30 until the mouse is released.
+                    inactive_frame_interval: None,
                     ..Default::default()
                 },
                 move |window, cx| {
@@ -1025,6 +1054,11 @@ impl Render for MainWindow {
                     window.toggle_fullscreen();
                     return;
                 }
+                #[cfg(debug_assertions)]
+                if event.keystroke.key == "f3" {
+                    window.cycle_debug_frame_overlay_mode();
+                    return;
+                }
                 if event.keystroke.key == "escape" && this.download.open {
                     this.download.open = false;
                     cx.notify();
@@ -1066,9 +1100,25 @@ impl Render for MainWindow {
                     this.receive_file_drop(paths, false, window.mouse_position(), cx);
                 }),
             )
-            .on_file_drop_exit(cx.listener(|this, _: &gpui::FileDropEvent, _, cx| {
-                this.clear_file_drag(cx);
-            }))
+            .child({
+                let view = cx.entity();
+                canvas(
+                    |_, _, _| (),
+                    move |_, _, window, _cx| {
+                        let view = view.clone();
+                        window.on_mouse_event(move |event: &gpui::FileDropEvent, _, _, cx| {
+                            if matches!(
+                                event,
+                                gpui::FileDropEvent::Exited | gpui::FileDropEvent::Ended
+                            ) {
+                                view.update(cx, |this, cx| this.clear_file_drag(cx));
+                            }
+                        });
+                    },
+                )
+                .absolute()
+                .size(px(0.))
+            })
             .on_drag_move::<crate::ui::item_drag::TrackDrag>(cx.listener(
                 |this, event: &gpui::DragMoveEvent<crate::ui::item_drag::TrackDrag>, window, cx| {
                     this.note_track_drag(event, window, cx);

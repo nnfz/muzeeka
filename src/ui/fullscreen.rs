@@ -7,9 +7,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use gpui::{
-    canvas, div, img, linear_color_stop, linear_gradient, point, prelude::*, px,
-    AnimationExt, AnyElement, BoxShadow, Context, Hsla, Image, MouseButton, ObjectFit,
-    SharedString, SpringAnimation, SpringConfig, Window, WindowControlArea,
+    canvas, div, img, linear_color_stop, linear_gradient, point, prelude::*, px, AnimationExt,
+    AnyElement, BoxShadow, Context, Hsla, Image, MouseButton, ObjectFit, SharedString,
+    SpringAnimation, SpringConfig, Window, WindowControlArea,
 };
 
 use crate::ui::cover::cover_art;
@@ -552,21 +552,11 @@ fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
 }
 
 fn white_a(a: f32) -> Hsla {
-    Hsla {
-        h: 0.,
-        s: 0.,
-        l: 1.,
-        a: a.clamp(0.0, 1.0),
-    }
+    gpui::hsla(0., 0., 1., a)
 }
 
 fn black_a(a: f32) -> Hsla {
-    Hsla {
-        h: 0.,
-        s: 0.,
-        l: 0.,
-        a: a.clamp(0.0, 1.0),
-    }
+    gpui::hsla(0., 0., 0., a)
 }
 
 fn duration_secs(duration: f64) -> Option<u32> {
@@ -784,7 +774,7 @@ fn text_width(window: &mut Window, text: &str, font_px: f32, weight: gpui::FontW
     };
     window
         .text_system()
-        .shape_line(SharedString::from(text), px(font_px), &[run], None)
+        .shape_line(SharedString::from(text), px(font_px), &[run])
         .width()
         .as_f32()
 }
@@ -860,11 +850,10 @@ fn text_block(
     align: Align,
 ) -> gpui::Div {
     let rows = resolved_rows(groups.len(), planned);
-    div()
-        .w_full()
-        .flex()
-        .flex_col()
-        .children(rows.iter().map(|row| word_row(groups, row, view, font, align)))
+    div().w_full().flex().flex_col().children(
+        rows.iter()
+            .map(|row| word_row(groups, row, view, font, align)),
+    )
 }
 
 fn lyric_line(
@@ -1399,7 +1388,7 @@ impl MainWindow {
                     MouseButton::Right,
                     cx.listener(|_, _: &gpui::MouseDownEvent, _, cx| cx.stop_propagation()),
                 )
-                .on_scroll(cx.listener(|_, _: &gpui::ScrollEvent, _, cx| cx.stop_propagation()))
+                .on_scroll_wheel(cx.listener(|_, _: &gpui::ScrollWheelEvent, _, cx| cx.stop_propagation()))
                 .children(backdrop_layers)
                 .child(
                     div()
@@ -1443,7 +1432,7 @@ impl MainWindow {
                 theme::text_secondary(),
                 px(16.),
             ))
-            .hover(|style| style.bg(white_a(0.1)))
+            .hover_style(|style| style.bg(white_a(0.1)))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _: &gpui::MouseDownEvent, _, cx| {
@@ -1482,17 +1471,14 @@ impl MainWindow {
             false,
             cx,
         );
-        let on_cover_menu =
-            cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
-                cx.stop_propagation();
-                this.open_track_menu(id, event.position, window, cx);
-            });
-        let on_meta_menu =
-            cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
-                cx.stop_propagation();
-                this.open_track_menu(id, event.position, window, cx);
-            });
-        // Pause scales this column as one card: cover, title, artist, and like.
+        let on_cover_menu = cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+            cx.stop_propagation();
+            this.open_track_menu(id, event.position, window, cx);
+        });
+        let on_meta_menu = cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+            cx.stop_propagation();
+            this.open_track_menu(id, event.position, window, cx);
+        });
         div()
             .flex()
             .flex_col()
@@ -1501,9 +1487,15 @@ impl MainWindow {
                 "fs-cover-pause",
                 SpringAnimation::new(SpringConfig::new(170.0, 22.0, 1.0)).to(playing),
                 move |card, phase| {
-                    let s = pause_factor(phase.0);
-                    let box_size = size * s;
-                    let radius = 12. * s;
+                    let s = (pause_factor(phase.0) * 50.0).round() / 50.0;
+                    let box_size = (size * s).round();
+                    let radius = (12. * s).round();
+                    let title_px = (26. * s).round();
+                    let title_lh = (32. * s).round();
+                    let artist_px = (16. * s).round();
+                    let artist_lh = (22. * s).round();
+                    let gap = (12. * s).round();
+                    let top = (22. * s).round();
                     let picture = match &full {
                         Some(path) => img(path.clone())
                             .size(px(box_size))
@@ -1525,7 +1517,7 @@ impl MainWindow {
                                 .justify_center()
                                 .rounded(px(radius))
                                 .shadow(vec![BoxShadow {
-                                    color: black_a(0.45),
+                                    color: black_a(0.45).into(),
                                     offset: point(px(0.), px(18. * s)),
                                     blur_radius: px(48. * s),
                                     spread_radius: px(0.),
@@ -1537,10 +1529,10 @@ impl MainWindow {
                         .child(
                             div()
                                 .w(px(box_size))
-                                .mt(px(22. * s))
+                                .mt(px(top))
                                 .flex()
                                 .items_center()
-                                .gap(px(12. * s))
+                                .gap(px(gap))
                                 .child(
                                     div()
                                         .flex()
@@ -1550,8 +1542,8 @@ impl MainWindow {
                                         .on_mouse_down(MouseButton::Right, on_meta_menu)
                                         .child(
                                             div()
-                                                .text_size(px(26. * s))
-                                                .line_height(px(32. * s))
+                                                .text_size(px(title_px))
+                                                .line_height(px(title_lh))
                                                 .font_weight(gpui::FontWeight::BOLD)
                                                 .text_color(theme::white())
                                                 .truncate()
@@ -1559,14 +1551,21 @@ impl MainWindow {
                                         )
                                         .child(
                                             div()
-                                                .text_size(px(16. * s))
-                                                .line_height(px(22. * s))
+                                                .text_size(px(artist_px))
+                                                .line_height(px(artist_lh))
                                                 .text_color(white_a(0.6))
                                                 .truncate()
                                                 .child(artist.clone()),
                                         ),
                                 )
-                                .child(like_face(like, liked, 40. * s, 22. * s, theme::text(), false)),
+                                .child(like_face(
+                                    like,
+                                    liked,
+                                    (40. * s).round(),
+                                    (22. * s).round(),
+                                    theme::text(),
+                                    false,
+                                )),
                         )
                 },
             ))
@@ -1725,9 +1724,7 @@ impl MainWindow {
             } else {
                 lyric_motion::LINE_REST_SCALE
             };
-            let paint = self
-                .fullscreen
-                .step_scale(index, grown * size_mult, wall);
+            let paint = self.fullscreen.step_scale(index, grown * size_mult, wall);
             let content: AnyElement = if untimed {
                 div()
                     .text_color(white_a(1.0))
@@ -1807,7 +1804,7 @@ impl MainWindow {
                 .child(content)
                 .when(seekable, |row| {
                     row.cursor_pointer()
-                        .hover(|style| style.bg(white_a(0.06)))
+                        .hover_style(|style| style.bg(white_a(0.06)))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _: &gpui::MouseDownEvent, _, cx| {
@@ -1862,7 +1859,7 @@ impl MainWindow {
             .relative()
             .size_full()
             .overflow_hidden()
-            .on_scroll(cx.listener(move |this, event: &gpui::ScrollEvent, _, cx| {
+            .on_scroll_wheel(cx.listener(move |this, event: &gpui::ScrollWheelEvent, _, cx| {
                 cx.stop_propagation();
                 let delta = match event.delta {
                     gpui::ScrollDelta::Lines(lines) => lines.y * 48.,
@@ -1928,11 +1925,7 @@ mod tests {
 
     #[test]
     fn syllables_join_into_words_at_spaces() {
-        let groups = groups_of(vec![
-            part("Hel"),
-            part("lo "),
-            part("world"),
-        ]);
+        let groups = groups_of(vec![part("Hel"), part("lo "), part("world")]);
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].parts.len(), 2);
         assert_eq!(groups[0].parts[1].text, "lo");

@@ -623,7 +623,7 @@ impl MainWindow {
             .rounded_md()
             .cursor_pointer()
             .when(open, |button| button.bg(theme::hover()))
-            .hover(|style| style.bg(theme::hover()))
+            .hover_style(|style| style.bg(theme::hover()))
             .child(icon(
                 icons::ARROW,
                 if count > 0 {
@@ -819,7 +819,7 @@ impl MainWindow {
             .text_size(px(11.))
             .text_color(theme::text_secondary())
             .cursor_pointer()
-            .hover(|style| style.bg(theme::hover()).text_color(theme::text()))
+            .hover_style(|style| style.bg(theme::hover()).text_color(theme::text()))
             .child("Clear")
             .on_mouse_down(
                 MouseButton::Left,
@@ -851,7 +851,7 @@ impl MainWindow {
             .text_size(px(14.))
             .text_color(theme::text_muted())
             .cursor_pointer()
-            .hover(|style| style.bg(theme::hover()).text_color(theme::text()))
+            .hover_style(|style| style.bg(theme::hover()).text_color(theme::text()))
             .child("×")
             .on_mouse_down(
                 MouseButton::Left,
@@ -1058,7 +1058,7 @@ impl MainWindow {
             .text_size(px(14.))
             .text_color(theme::text_muted())
             .cursor_pointer()
-            .hover(|style| style.bg(theme::hover()).text_color(theme::text()))
+            .hover_style(|style| style.bg(theme::hover()).text_color(theme::text()))
             .child("×")
             .on_mouse_down(
                 MouseButton::Left,
@@ -1106,7 +1106,7 @@ impl MainWindow {
             .items_center()
             .gap(px(10.))
             .px(px(12.))
-            .when(present, |row| row.hover(|style| style.bg(theme::hover())))
+            .when(present, |row| row.hover_style(|style| style.bg(theme::hover())))
             .child(if present {
                 let key = format!("dl-{index}");
                 self.cover_with_play(&key, 32., cover.as_deref(), cx, move |this, cx| {
@@ -1190,7 +1190,7 @@ impl MainWindow {
             .text_size(px(14.))
             .text_color(theme::text_muted())
             .cursor_pointer()
-            .hover(|style| style.bg(theme::hover()).text_color(theme::text()))
+            .hover_style(|style| style.bg(theme::hover()).text_color(theme::text()))
             .child("×")
             .on_mouse_down(
                 MouseButton::Left,

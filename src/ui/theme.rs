@@ -61,9 +61,9 @@ pub fn flash_wash(base: Rgba, amount: f32) -> Rgba {
 
 fn mix(base: Rgba, over: Rgba, amount: f32) -> Rgba {
     let t = amount.clamp(0.0, 1.0);
-    rgb(channel(base.r, over.r, t) << 16
-        | channel(base.g, over.g, t) << 8
-        | channel(base.b, over.b, t))
+    rgb(channel(base.color.red, over.color.red, t) << 16
+        | channel(base.color.green, over.color.green, t) << 8
+        | channel(base.color.blue, over.color.blue, t))
 }
 
 fn channel(base: f32, over: f32, t: f32) -> u32 {

@@ -1,7 +1,9 @@
 use gpui::{
-    canvas, div, prelude::*, px, relative, AnimationExt, AnyElement, Bounds, Context,
-    InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, SharedString, Styled,
+    canvas, div, prelude::*, px, relative, Animation, AnimationExt, AnyElement, Bounds, ColorExt,
+    Context, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, SharedString,
+    Styled,
 };
+use std::time::Duration;
 
 use crate::ui::cover::cover_art;
 use crate::ui::icons::{self, icon_scaled, scaled_disc};
@@ -148,6 +150,16 @@ impl MainWindow {
                     .child(self.volume_control(volume, cx)),
             )
             .child(self.progress_bar(progress, &time, &duration, cx))
+            // The transport reads Session's live position directly. Tick it at
+            // a modest fixed rate so the progress bar advances without
+            // invalidating the entire window (and every visible list row).
+            .with_animation(
+                "transport-progress-tick",
+                Animation::new(Duration::from_millis(200))
+                    .repeat()
+                    .with_max_fps(10.),
+                |bar, _| bar,
+            )
     }
 
     fn now_playing(
@@ -355,11 +367,10 @@ impl MainWindow {
         swap: Option<(&'static [u8], bool)>,
         size: f32,
         icon_size: f32,
-        color: impl Into<gpui::Hsla> + Copy,
+        color: gpui::Rgba,
         cx: &mut Context<Self>,
         action: impl Fn(&mut MainWindow, &mut gpui::Window, &mut Context<Self>) + 'static,
     ) -> AnyElement {
-        let color = color.into();
         let hovered = self.hovered_ui.as_deref() == Some(id);
         let pressed = self.pressed_ui.as_deref() == Some(id);
         let hover_id = SharedString::from(format!("{id}-hover"));
@@ -520,10 +531,9 @@ impl MainWindow {
         id: &'static str,
         value: f32,
         kind: SliderDrag,
-        fill: impl Into<gpui::Hsla>,
+        fill: gpui::Rgba,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let fill = fill.into();
         let this = cx.entity().clone();
         let kind_for_bounds = kind;
         let dragging = self.drag == Some(kind);
@@ -545,32 +555,34 @@ impl MainWindow {
                     this.drag_to(event.position.x, cx);
                 }),
             )
-            .on_scroll(cx.listener(move |this, event: &gpui::ScrollEvent, _, cx| {
-                let delta_y = match event.delta {
-                    gpui::ScrollDelta::Lines(point) => point.y,
-                    gpui::ScrollDelta::Pixels(point) => point.y.as_f32(),
-                };
-                if delta_y == 0.0 {
-                    return;
-                }
-                cx.stop_propagation();
-                match kind {
-                    SliderDrag::Volume => {
-                        let step = if delta_y > 0.0 { 0.05 } else { -0.05 };
-                        this.session.update(cx, |session, cx| {
-                            session.set_volume(session.volume + step);
-                            cx.notify();
-                        });
+            .on_scroll_wheel(
+                cx.listener(move |this, event: &gpui::ScrollWheelEvent, _, cx| {
+                    let delta_y = match event.delta {
+                        gpui::ScrollDelta::Lines(point) => point.y,
+                        gpui::ScrollDelta::Pixels(point) => point.y.as_f32(),
+                    };
+                    if delta_y == 0.0 {
+                        return;
                     }
-                    SliderDrag::Progress => {
-                        let step = if delta_y > 0.0 { 5.0 } else { -5.0 };
-                        this.session.update(cx, |session, cx| {
-                            session.seek_by(step);
-                            cx.notify();
-                        });
+                    cx.stop_propagation();
+                    match kind {
+                        SliderDrag::Volume => {
+                            let step = if delta_y > 0.0 { 0.05 } else { -0.05 };
+                            this.session.update(cx, |session, cx| {
+                                session.set_volume(session.volume + step);
+                                cx.notify();
+                            });
+                        }
+                        SliderDrag::Progress => {
+                            let step = if delta_y > 0.0 { 5.0 } else { -5.0 };
+                            this.session.update(cx, |session, cx| {
+                                session.seek_by(step);
+                                cx.notify();
+                            });
+                        }
                     }
-                }
-            }))
+                }),
+            )
             .child(
                 canvas(
                     move |bounds, _window, app| {
@@ -721,7 +733,7 @@ fn crossfade_icon(
     off: &'static [u8],
     on: &'static [u8],
     show_on: bool,
-    color: gpui::Hsla,
+    color: gpui::Rgba,
     icon_size: f32,
     scale: f32,
 ) -> AnyElement {
@@ -743,7 +755,7 @@ fn crossfade_icon(
 
 fn faded_glyph(
     data: &'static [u8],
-    color: gpui::Hsla,
+    color: gpui::Rgba,
     icon_size: f32,
     scale: f32,
     opacity: f32,

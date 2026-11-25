@@ -2,10 +2,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    deferred, div, linear_color_stop, linear_gradient, prelude::*, px, rgb, svg, uniform_list,
-    Animation, AnimationExt, AnyElement, App, Context, InteractiveElement, IntoElement,
-    MouseButton, MouseDownEvent, MouseUpEvent, ParentElement, Pixels, Rgba, SharedString, Styled,
-    Window,
+    deferred, div, linear_color_stop, linear_gradient, prelude::*, px, rgb, size, svg,
+    uniform_list, Animation, AnimationExt, AnyElement, App, ColorExt, Context, InteractiveElement,
+    IntoElement, MouseButton, MouseDownEvent, MouseUpEvent, ParentElement, Pixels, Rgba,
+    SharedString, Styled, Window,
 };
 
 use crate::ui::cover::cover_art;
@@ -26,7 +26,6 @@ const SIDE_PAD: f32 = 8.;
 const TRACK_ROW_H: f32 = 52.;
 const TRACK_LIST_PAD: f32 = 8.;
 const TRACK_END_PAD: f32 = 12.;
-const EQ_FPS: f32 = 30.;
 
 pub(crate) struct ListedTracks {
     view: session::LibraryView,
@@ -219,7 +218,7 @@ impl MainWindow {
             } else {
                 theme::text_muted()
             })
-            .hover(|style| style.text_color(theme::text()))
+            .hover_style(|style| style.text_color(theme::text()))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _: &gpui::MouseDownEvent, _, _cx| {
@@ -255,7 +254,7 @@ impl MainWindow {
                     } else {
                         theme::text_muted()
                     })
-                    .group_hover("sort-duration", |glyph| glyph.text_color(theme::text()))
+                    .group_hover_style("sort-duration", |glyph| glyph.text_color(theme::text()))
                     .into_any_element()
             } else {
                 label.into_any_element()
@@ -299,7 +298,7 @@ impl MainWindow {
                     .w(px(2.))
                     .h(px(16.))
                     .opacity(if resizing { 1. } else { 0. })
-                    .group_hover("track-header", |line| line.opacity(1.))
+                    .group_hover_style("track-header", |line| line.opacity(1.))
                     .child(
                         div()
                             .size_full()
@@ -309,7 +308,7 @@ impl MainWindow {
                             } else {
                                 gpui::rgba(0xffffff24)
                             })
-                            .group_hover(grip, |line| line.bg(theme::accent())),
+                            .group_hover_style(grip, |line| line.bg(theme::accent())),
                     ),
             )
             .into_any_element()
@@ -394,10 +393,14 @@ impl MainWindow {
                     })
                 })
                 .py(px(8.))
+                // `uniform_list` re-measures one item on every layout pass.
+                // Supply the fixed row size so it never rebuilds a full track
+                // row (cover art, buttons, springs, equalizer) just to discard it.
+                .with_fixed_item_size(size(px(0.), px(TRACK_ROW_H)))
                 .size_full()
                 .track_scroll(&self.track_scroll)
-                .on_scroll(cx.listener(
-                    |this, event: &gpui::ScrollEvent, window, cx| {
+                .on_scroll_wheel(cx.listener(
+                    |this, event: &gpui::ScrollWheelEvent, window, cx| {
                         this.note_scroll(
                             crate::ui::main_window::Scroller::Tracks,
                             event,
@@ -579,9 +582,9 @@ impl MainWindow {
                                     .bottom(px(0.))
                                     .right(px(0.))
                                     .w(px(24.))
-                                    .with_spring(
+                                    .with_animation(
                                         album_fade_id,
-                                        MainWindow::hover_spring(hovered),
+                                        MainWindow::row_fade(),
                                         move |overlay, phase| {
                                             let fade_color = if lit {
                                                 base_color
@@ -589,11 +592,11 @@ impl MainWindow {
                                                 mix_rgba(
                                                     theme::bg_surface(),
                                                     theme::hover(),
-                                                    phase.0,
+                                                    if hovered { phase } else { 1.0 - phase },
                                                 )
                                             };
                                             let fade_color_transparent = Rgba {
-                                                a: 0.0,
+                                                alpha: 0.0,
                                                 ..fade_color
                                             };
                                             overlay.bg(linear_gradient(
@@ -606,20 +609,24 @@ impl MainWindow {
                             )
                     })
                     .child(self.duration_cell(like_id, liked, id, track.duration, cx))
-                    .with_spring(
+                    .with_animation(
                         SharedString::from(format!("track-hover-{}", id.0)),
-                        MainWindow::hover_spring(hovered),
+                        MainWindow::row_fade(),
                         move |row, phase| {
                             if lit {
                                 row
                             } else {
-                                row.bg(theme::hover().opacity(phase.0))
+                                row.bg(theme::hover().opacity(if hovered {
+                                    phase
+                                } else {
+                                    1.0 - phase
+                                }))
                             }
                         },
                     ),
             ));
         if lifted {
-            deferred(row).with_priority(1).into_any_element()
+            deferred(row).priority(1).into_any_element()
         } else {
             row.into_any_element()
         }
@@ -659,7 +666,7 @@ impl MainWindow {
                     .justify_center()
                     .child(
                         div()
-                            .group_hover(group.clone(), |style| style.invisible())
+                            .group_hover_style(group.clone(), |style| style.invisible())
                             .child(format!("{}", index + 1)),
                     )
                     .child(
@@ -670,7 +677,7 @@ impl MainWindow {
                             .items_center()
                             .justify_center()
                             .invisible()
-                            .group_hover(group, |style| style.visible())
+                            .group_hover_style(group, |style| style.visible())
                             .child(icon(icons::PLAY, theme::text(), px(12.))),
                     )
                     .into_any_element()
@@ -851,33 +858,29 @@ pub(crate) fn like_face(
     let LikeHandlers {
         id,
         hovered,
-        pressed,
         on_hover,
         on_down,
         on_up,
+        ..
     } = handlers;
     let spring_id = SharedString::from(format!("{id}-fill"));
-    let hot_id = SharedString::from(format!("{id}-hot"));
     let press_id = SharedString::from(format!("{id}-press"));
     let glyphs = move |scale: f32| {
-        let spring_id = spring_id.clone();
-        let hot_id = hot_id.clone();
-        div().relative().size(px(icon_size)).with_spring(
-            spring_id,
-            MainWindow::hover_spring(liked),
-            move |stack, phase| {
-                let t = phase.0.clamp(0.0, 1.0);
-                let hot_id = hot_id.clone();
-                stack.child(div().absolute().inset_0().with_spring(
-                    hot_id,
-                    MainWindow::hover_spring(hovered),
-                    move |layer, hot| {
-                        let color = mix_rgba(idle, rgb(0xe25555), hot.0);
-                        layer
-                            .child(like_glyph(icons::HEART, color, icon_size, 1.0 - t, scale))
-                            .child(like_glyph(icons::HEART_FILLED, color, icon_size, t, scale))
-                    },
-                ))
+        div().relative().size(px(icon_size)).with_animation(
+            spring_id.clone(),
+            MainWindow::row_fade(),
+            move |stack, t| {
+                let fill = if liked { t } else { 1.0 - t };
+                // Fill rests at 1, and the outline uses the inverse. Hover is
+                // its own tint: idle at rest, red while the pointer is over it.
+                let color = if hovered { rgb(0xe25555) } else { idle };
+                stack.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .child(like_glyph(icons::HEART, color, icon_size, 1.0 - fill, scale))
+                        .child(like_glyph(icons::HEART_FILLED, color, icon_size, fill, scale)),
+                )
             },
         )
     };
@@ -906,11 +909,9 @@ pub(crate) fn like_face(
                     .flex()
                     .items_center()
                     .justify_center()
-                    .with_spring(
-                        press_id,
-                        MainWindow::hover_spring(pressed),
-                        move |frame, phase| frame.child(glyphs(MainWindow::press_scale(phase))),
-                    ),
+                    .with_animation(press_id, MainWindow::row_fade(), move |frame, phase| {
+                        frame.child(glyphs(MainWindow::press_scale(gpui::AnimationPhase(phase))))
+                    }),
             )
             .into_any_element()
     }
@@ -918,12 +919,12 @@ pub(crate) fn like_face(
 
 fn mix_rgba(from: Rgba, to: Rgba, t: f32) -> Rgba {
     let t = t.clamp(0.0, 1.0);
-    Rgba {
-        r: from.r + (to.r - from.r) * t,
-        g: from.g + (to.g - from.g) * t,
-        b: from.b + (to.b - from.b) * t,
-        a: from.a + (to.a - from.a) * t,
-    }
+    Rgba::new(
+        from.color.red + (to.color.red - from.color.red) * t,
+        from.color.green + (to.color.green - from.color.green) * t,
+        from.color.blue + (to.color.blue - from.color.blue) * t,
+        from.alpha + (to.alpha - from.alpha) * t,
+    )
 }
 
 fn like_glyph(
@@ -1003,7 +1004,11 @@ fn drop_strip(slot: f32, open: f32, scroll: f32, span: f32, reorder: bool) -> An
             .rounded_md()
             .bg(theme::accent_soft())
             .border_1()
-            .border_color(theme::accent().alpha(0.28))
+            .border_color({
+                let mut color = theme::accent();
+                color.alpha = 0.28;
+                color
+            })
             .opacity(open)
             .into_any_element()
     } else {
@@ -1115,11 +1120,14 @@ pub(crate) fn eq_bars(id: impl Into<gpui::ElementId>, reduce_motion: bool) -> An
     if reduce_motion {
         return paint_levels(row).into_any_element();
     }
+    // Levels come from atomic audio state, so the animation is only a repaint
+    // driver. 30 Hz is plenty for three bars and keeps a maximized window from
+    // rebuilding every visible row on every display frame.
     row.with_animation(
         id,
         Animation::new(Duration::from_millis(1_000))
             .repeat()
-            .with_max_fps(EQ_FPS),
+            .with_max_fps(30.),
         |row, _phase| paint_levels(row),
     )
     .into_any_element()

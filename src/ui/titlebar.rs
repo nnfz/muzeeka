@@ -56,7 +56,7 @@ impl MainWindow {
             .rounded_md()
             .cursor_pointer()
             .child(icon(icons::OPTIONS, theme::text_secondary(), px(16.)))
-            .hover(|style| style.bg(theme::hover()).text_color(theme::text()))
+            .hover_style(|style| style.bg(theme::hover()).text_color(theme::text()))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _: &gpui::MouseDownEvent, _, cx| {
@@ -135,7 +135,7 @@ impl MainWindow {
             .rounded_md()
             .cursor_pointer()
             .child(icon(glyph, theme::text_secondary(), px(10.)))
-            .hover(move |style| {
+            .hover_style(move |style| {
                 if close {
                     style.bg(theme::danger()).text_color(theme::white())
                 } else {

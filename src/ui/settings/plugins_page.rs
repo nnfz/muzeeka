@@ -523,7 +523,7 @@ impl SettingsWindow {
             .bg(theme::bg_elevated())
             .cursor_pointer()
             .text_size(px(14.))
-            .hover(|style| style.bg(theme::hover()))
+            .hover_style(|style| style.bg(theme::hover()))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _: &gpui::MouseDownEvent, _, _cx| {
@@ -579,7 +579,7 @@ impl SettingsWindow {
             .bg(theme::bg_elevated())
             .cursor_pointer()
             .text_size(px(12.))
-            .hover(|style| style.bg(theme::hover()))
+            .hover_style(|style| style.bg(theme::hover()))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _: &gpui::MouseDownEvent, _, _cx| {

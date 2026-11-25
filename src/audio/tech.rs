@@ -81,11 +81,11 @@ pub fn read_audio_tech_info(path: &Path) -> AudioTechInfo {
     let mut info = AudioTechInfo::default();
     fill_fs_fields(path, &mut info);
 
-    let Ok(tagged_file) = (Probe::open(path).and_then(|probe| {
+    let Ok(tagged_file) = Probe::open(path).and_then(|probe| {
         probe
             .options(ParseOptions::new().read_cover_art(false))
             .read()
-    })) else {
+    }) else {
         return info;
     };
 

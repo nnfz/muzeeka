@@ -2262,15 +2262,21 @@ impl Session {
         self.remember_playback(true);
     }
 
+    /// Returns true only when something other than the steadily advancing
+    /// playback position changed. The position is consumed by a lightweight
+    /// transport layer; notifying the whole window on every tick would rebuild
+    /// every visible list row ten times a second.
     pub fn tick(&mut self, dt: f64) -> bool {
         let expired = self.expire_playback_error();
         if self.engine.is_some() {
+            let old_track = self.current;
+            let old_playing = self.playing;
             let changed = self.poll_output();
             self.sync_track_rate();
             if self.playing {
                 self.remember_playback(false);
             }
-            return changed || expired;
+            return changed || expired || self.current != old_track || self.playing != old_playing;
         }
         if !self.playing {
             return expired;

@@ -1,10 +1,10 @@
-use gpui::{px, size, svg, Hsla, IntoElement, Pixels, Styled, Svg, Transformation};
+use gpui::{px, rgb_to_hsla, size, svg, Hsla, IntoElement, Pixels, Rgba, Styled, Svg, Transformation};
 
-pub fn icon(data: &'static [u8], color: impl Into<Hsla>, box_size: Pixels) -> impl IntoElement {
+pub fn icon(data: &'static [u8], color: Rgba, box_size: Pixels) -> impl IntoElement {
     let (width, height) = fit_size(data, box_size);
     svg()
         .data(data)
-        .text_color(color)
+        .text_color(rgb_to_hsla(color))
         .w(width)
         .h(height)
         .flex_shrink_0()
@@ -12,17 +12,12 @@ pub fn icon(data: &'static [u8], color: impl Into<Hsla>, box_size: Pixels) -> im
 
 const DISC: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><circle cx="16" cy="16" r="16" fill="white"/></svg>"#;
 
-pub fn icon_scaled(
-    data: &'static [u8],
-    color: impl Into<Hsla>,
-    box_size: Pixels,
-    scale: f32,
-) -> Svg {
-    scaled_svg(data, color.into(), box_size, scale)
+pub fn icon_scaled(data: &'static [u8], color: Rgba, box_size: Pixels, scale: f32) -> Svg {
+    scaled_svg(data, rgb_to_hsla(color), box_size, scale)
 }
 
-pub fn scaled_disc(color: impl Into<Hsla>, box_size: Pixels, scale: f32) -> Svg {
-    scaled_svg(DISC, color.into(), box_size, scale)
+pub fn scaled_disc(color: Rgba, box_size: Pixels, scale: f32) -> Svg {
+    scaled_svg(DISC, rgb_to_hsla(color), box_size, scale)
 }
 
 #[inline(never)]

@@ -6,8 +6,8 @@ authors = ["nnfz"]
 description = "Music player"
 
 [dependencies]
-gpui = { git = "https://github.com/zed-industries/zed" }
-gpui_platform = { git = "https://github.com/zed-industries/zed" }
+gpui = { package = "gpui-ce", path = "gpui-ce/crates/gpui", features = ["profiler"] }
+gpui_platform = { package = "gpui_ce_platform", path = "gpui-ce/crates/gpui_platform" }
 anyhow = "1"
 parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }
@@ -81,3 +81,6 @@ opt-level = 3
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+[features]
+profiler = ["gpui/profiler"]

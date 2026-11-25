@@ -835,7 +835,7 @@ impl SettingsWindow {
                         .justify_center()
                         .rounded_md()
                         .text_size(px(16.))
-                        .hover(|style| style.bg(theme::hover()))
+                        .hover_style(|style| style.bg(theme::hover()))
                         .child("+")
                         .into_any_element()
                     }),
@@ -1032,7 +1032,7 @@ impl SettingsWindow {
                         .items_center()
                         .justify_center()
                         .rounded_md()
-                        .hover(|style| style.bg(theme::hover()))
+                        .hover_style(|style| style.bg(theme::hover()))
                         .child(icon(
                             icons::CLOSE,
                             theme::text_muted(),
@@ -1788,7 +1788,7 @@ impl SettingsWindow {
         .justify_center()
         .rounded_md()
         .text_size(px(12.))
-        .hover(|style| style.bg(theme::hover()))
+        .hover_style(|style| style.bg(theme::hover()))
         .child(mark)
         .into_any_element()
     }
@@ -1935,7 +1935,7 @@ impl SettingsWindow {
                 .rounded(px(3.))
                 .text_size(px(13.))
                 .text_color(theme::text_muted())
-                .hover(|style| {
+                .hover_style(|style| {
                     style
                         .text_color(gpui::rgb(0xf87171))
                         .bg(gpui::rgba(0xf871711f))
@@ -2072,7 +2072,7 @@ fn text_button(
         .items_center()
         .rounded_md()
         .text_size(px(12.))
-        .hover(|style| style.bg(theme::hover()))
+        .hover_style(|style| style.bg(theme::hover()))
         .child(label.into())
 }
 
